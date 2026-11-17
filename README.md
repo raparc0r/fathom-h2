@@ -55,17 +55,20 @@ be overwritten, so you can always get back in from a computer (see below).
 
 ## Installing
 
-You'll need a microSD card formatted FAT32 (exFAT won't work) with your music in a folder
-called `Music`, and the latest `fathom-h2-VERSION.zip` from Releases, unzipped. Charge the
-H2 above 50 % first.
+You'll need a microSD card formatted FAT32 (exFAT won't work), and the latest
+`fathom-h2-VERSION.zip` from Releases, unzipped. Charge the H2 above 50 % first.
 
-1. Copy everything inside the release's `sd/` folder, plus `update.upt`, to the top of the
+1. Put your music in a folder called `Music` at the top of the microSD card (subfolders
+   inside it are fine). Fathom only looks there: music anywhere else on the card won't
+   show up in the library. If your music is at the top of the card or in a folder with
+   another name, move it into `Music` first.
+2. Copy everything inside the release's `sd/` folder, plus `update.upt`, to the top of the
    microSD card.
-2. Put the card in the H2, turn it on as usual and go to System Settings → Firmware Update.
+3. Put the card in the H2, turn it on as usual and go to System Settings → Firmware Update.
    The H2 installs Fathom's bootloader and restarts into Fathom, which then reads your
    library (a few minutes the first time). That's the only thing that's written to the H2
    itself, and it's 128 KiB. You can delete `update.upt` afterwards.
-3. Optional but a good idea: make a backup of your H2. Turn it off, hold Vol+ while turning
+4. Optional but a good idea: make a backup of your H2. Turn it off, hold Vol+ while turning
    it on, and choose Debug tools → Dump entire flash. After a few minutes you'll have a
    `flash.img` on the card. Keep it somewhere safe and don't share it, since it has your
    H2's factory data in it.
@@ -83,8 +86,9 @@ Most of it should feel familiar. A few things worth knowing:
 - Menu opens options for whatever is selected. Holding Menu opens quick settings
   (brightness, shuffle, repeat, EQ, sleep timer...). Holding Back jumps to Now Playing and
   back.
-- To add music, plug the H2 into a computer and choose "Use as a USB drive". Choose "Use as
-  a USB DAC" instead to use it as your computer's sound card.
+- To add music, plug the H2 into a computer, choose "Use as a USB drive" and copy it into
+  the `Music` folder. Choose "Use as a USB DAC" instead to use it as your computer's sound
+  card.
 - Hold Play while turning it on to start the stock firmware instead.
 - With the screen off, play/pause, previous/next and volume still work.
 - For the network drive, turn it on in Settings, then connect to `https://fathom-h2.local`
