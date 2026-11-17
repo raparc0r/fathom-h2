@@ -14,7 +14,11 @@
 
 #define FATHOM_WIFI "/usr/sbin/fathom-wifi"
 #define MAX_NET 24
+/* Status every 2 s while it's joining, every 10 s once connected: each look
+ * runs a shell and wpa_cli several times, which costs the H2's 23 MB more
+ * than the news is worth when nothing is happening. */
 #define POLL_MS 2000
+#define POLL_CONNECTED_MS 10000
 
 enum { CMD_NONE, CMD_START, CMD_STOP, CMD_SCAN, CMD_CONNECT, CMD_FORGET };
 
@@ -216,7 +220,7 @@ static void *worker(void *arg)
         if (!W.cmd) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += POLL_MS / 1000;
+            ts.tv_sec += (W.st.state == UI_WIFI_CONNECTED ? POLL_CONNECTED_MS : POLL_MS) / 1000;
             pthread_cond_timedwait(&W.cv, &W.mu, &ts);
         }
         int cmd = W.cmd, on = W.on;

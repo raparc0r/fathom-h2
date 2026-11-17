@@ -2,20 +2,36 @@
 /* Bluetooth for the player: a worker thread runs fathom-bt (start, scan,
  * pair, connect, ...) so nothing slow happens on the UI thread, and watches
  * bluez-alsa for a connected device's playback PCM. The UI thread reads a
- * snapshot (bt_ui_*, bt_pcm) and asks for things (bt_ui_do, bt_volume). */
+ * snapshot (bt_ui_*, bt_pcm) and asks for things (bt_ui_do, bt_volume).
+ *
+ * The PCM is looked up when bluez-alsa says something changed (a
+ * `bluealsa-cli monitor` kept running while Bluetooth is on), and every 5 s
+ * only while that monitor isn't running (each look wakes bluez-alsa, whose
+ * code, idle, is out of memory: a couple of hundred page faults). Asking every 2 s loaded a shell, bluealsa-cli and its libraries
+ * from the card each time and woke bluez-alsa and D-Bus: in the H2's 23 MB,
+ * with Wi-Fi on too, that kept pushing the player's own code out of memory
+ * (radio stuttered). */
 #include "bt.h"
 
+#include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+extern char **environ;
 
 #define FATHOM_BT "/usr/sbin/fathom-bt"
 #define CLI "LD_LIBRARY_PATH=/mnt/sd/fathom/bt/usr/lib /mnt/sd/fathom/bt/usr/bin/bluealsa-cli"
 #define MAX_DEV 16
-#define POLL_MS 2000
+#define POLL_MS 5000                /* only while the monitor isn't running */
+#define BT_LIBS "/mnt/sd/fathom/bt/usr/lib"
+#define BT_CLI "/mnt/sd/fathom/bt/usr/bin/bluealsa-cli"
 
 enum { CMD_NONE, CMD_START, CMD_STOP, CMD_SCAN, CMD_PAIR, CMD_CONNECT, CMD_DISCONNECT, CMD_FORGET, CMD_VOLUME };
 
@@ -35,6 +51,8 @@ static struct {
     int max;                      /* the volume limit, 0..127 */
     char msg[96];                 /* a toast for the UI, once */
     unsigned seq;
+    int pcm_dirty;                /* bluez-alsa said something changed: look again */
+    pid_t mon_pid;                /* the bluealsa-cli monitor, 0 if none */
 } B = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, .want_vol = -1, .vol = -1, .max = 127};
 
 static int addr_ok(const char *a)
@@ -192,6 +210,7 @@ static void do_cmd(int cmd, const char *addr)
         run(FATHOM_BT " stop 2>/dev/null", NULL, 0);
         pthread_mutex_lock(&B.mu);
         B.on = 0;
+        if (B.mon_pid > 0) kill(B.mon_pid, SIGTERM);   /* its memory back too */
         B.n_dev = 0;
         B.pcm[0] = B.pcm_addr[0] = '\0';
         changed_locked();
@@ -245,13 +264,18 @@ static void *worker(void *arg)
     (void)arg;
     for (;;) {
         pthread_mutex_lock(&B.mu);
-        if (!B.cmd && B.want_vol < 0) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += POLL_MS / 1000;
-            pthread_cond_timedwait(&B.cv, &B.mu, &ts);
+        if (!B.cmd && B.want_vol < 0 && !B.pcm_dirty) {
+            if (B.mon_pid > 0) {
+                pthread_cond_wait(&B.cv, &B.mu);    /* the monitor, a command or a volume wakes us */
+            } else {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_sec += POLL_MS / 1000;
+                pthread_cond_timedwait(&B.cv, &B.mu, &ts);
+            }
         }
-        int cmd = B.cmd, vol = B.want_vol, on = B.on;
+        int cmd = B.cmd, vol = B.want_vol, on = B.on, look = B.pcm_dirty || B.mon_pid <= 0;
+        B.pcm_dirty = 0;
         char addr[18], pcm[200];
         snprintf(addr, sizeof addr, "%s", B.cmd_addr);
         snprintf(pcm, sizeof pcm, "%s", B.pcm);
@@ -264,7 +288,54 @@ static void *worker(void *arg)
             run(c, NULL, 0);
         }
         if (cmd) do_cmd(cmd, addr);
-        else if (on) poll_pcm();
+        else if (on && look) poll_pcm();
+    }
+    return NULL;
+}
+
+/* While Bluetooth is on: `bluealsa-cli monitor`, each line it prints (a PCM
+ * added or removed, the service starting or stopping) a reason to look again. */
+static void *monitor(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&B.mu);
+        int on = B.on;
+        pthread_mutex_unlock(&B.mu);
+        if (!on) { sleep(1); continue; }
+        int fd[2];
+        if (pipe(fd)) { sleep(5); continue; }
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        posix_spawn_file_actions_adddup2(&fa, fd[1], 1);
+        posix_spawn_file_actions_addclose(&fa, fd[0]);
+        posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+        char *argv[] = {(char *)BT_CLI, (char *)"monitor", NULL};
+        char *envp[] = {(char *)"LD_LIBRARY_PATH=" BT_LIBS, NULL};
+        pid_t pid = 0;
+        int r = posix_spawn(&pid, BT_CLI, &fa, NULL, argv, envp);
+        posix_spawn_file_actions_destroy(&fa);
+        close(fd[1]);
+        if (r) { close(fd[0]); sleep(5); continue; }
+        pthread_mutex_lock(&B.mu);
+        B.mon_pid = pid;
+        pthread_mutex_unlock(&B.mu);
+        FILE *f = fdopen(fd[0], "r");
+        char line[256];
+        while (f && fgets(line, sizeof line, f)) {
+            pthread_mutex_lock(&B.mu);
+            B.pcm_dirty = 1;
+            pthread_cond_broadcast(&B.cv);
+            pthread_mutex_unlock(&B.mu);
+        }
+        if (f) fclose(f); else close(fd[0]);
+        pthread_mutex_lock(&B.mu);
+        B.mon_pid = 0;
+        B.pcm_dirty = 1;                         /* (the worker, waiting on us, polls again) */
+        pthread_cond_broadcast(&B.cv);
+        pthread_mutex_unlock(&B.mu);
+        waitpid(pid, NULL, 0);
+        sleep(2);                                /* (bluez-alsa restarting, or Bluetooth off) */
     }
     return NULL;
 }
@@ -276,6 +347,7 @@ void bt_init(int on, const char *last)
     pthread_t th;
     if (pthread_create(&th, NULL, worker, NULL)) return;
     pthread_detach(th);
+    if (pthread_create(&th, NULL, monitor, NULL) == 0) pthread_detach(th);
     if (on) bt_request(CMD_START, NULL);
     B.seq++;
 }

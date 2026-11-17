@@ -18,6 +18,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -366,11 +367,19 @@ static void cue_sample(void)
         library_list(g_lib, LIB_ALBUM_TRACKS, albums.ids[1], &tracks) > 0) {
         player_cue(g_player, tracks.ids, tracks.n, 0);
         library_list_free(&tracks);
+        if (getenv("FATHOM_SIM_PLAYING")) {      /* showcase pictures: playing, a little way in */
+            player_pause(g_player, 0);
+            usleep(300 * 1000);
+            player_seek_by(g_player, 83000);
+            usleep(300 * 1000);
+            player_tick(g_player);
+        }
     }
     library_list_free(&albums);
 }
 
-/* Library, engine and player. Screenshots use a silent output and a cued (not playing) album. */
+/* Library, engine and player. Screenshots use a silent output and a cued (not playing)
+ * album; with FATHOM_SIM_PLAYING set, it plays (silently, in real time) from 1:23. */
 static void setup_player(const char *music, int silent)
 {
     mkdir("build/sim-data", 0755);
@@ -385,7 +394,8 @@ static void setup_player(const char *music, int silent)
     }
     static audio_output_t out;
     static out_null_stats_t stats;
-    if (silent || out_sdl_create(&out)) out_null_create(&out, &stats);
+    if (silent && getenv("FATHOM_SIM_PLAYING")) out_clock_create(&out);   /* silent, in real time */
+    else if (silent || out_sdl_create(&out)) out_null_create(&out, &stats);
     g_eng = engine_new(&out);
     g_player = g_eng ? player_new(g_lib, g_eng) : NULL;
     if (silent) cue_sample();
