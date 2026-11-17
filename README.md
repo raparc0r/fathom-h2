@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" width="320" alt="Fathom: a drop falling into rippling water"></p>
+
 # Fathom
 
 Fathom is a new firmware for the HiFi Walker H2. I started it as a side project with
