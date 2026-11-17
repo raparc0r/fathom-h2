@@ -1,0 +1,29 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] clk: ingenic: x1000: I2S PLL has no enable, bypass or lock bits
+
+The I2S PLL entry left bypass_bit, enable_bit and stable_bit (s8) and
+bypass_reg at zero, which the generic Ingenic PLL code reads as "bit 0" and
+"register offset 0" rather than "none". Enabling the I2S clock therefore
+cleared bit 0 of CPCCR, the CPU clock divider register, and polled bit 0 of
+I2SCDR for lock. On the HiFi Walker H2 the first audio stream reset the
+SoC instantly.
+
+The divider is gated by the "i2s" mux (I2SCDR bits 30:29), so mark all
+three as absent.
+
+Signed-off-by: Fathom
+---
+diff -Naur a/drivers/clk/ingenic/x1000-cgu.c b/drivers/clk/ingenic/x1000-cgu.c
+--- a/drivers/clk/ingenic/x1000-cgu.c
++++ b/drivers/clk/ingenic/x1000-cgu.c
+@@ -371,6 +371,10 @@
+ 			.n_bits = 13,
+ 			.calc_m_n_od = x1000_i2spll_calc_m_n_od,
+ 			.set_rate_hook = x1000_i2spll_set_rate_hook,
++			/* No enable, bypass or lock bits: the "i2s" mux gates the divider */
++			.bypass_bit = -1,
++			.enable_bit = -1,
++			.stable_bit = -1,
+ 		},
+ 	},
+ 

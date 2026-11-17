@@ -1,0 +1,597 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] drm/tiny: add Ingenic X1000 smart LCD (MIPI-DBI) driver
+
+Command-mode panels on the X1000 SLCD controller, 8-bit 8080 bus. GC9308 and
+ILI9342C init for the HiFi Walker H2 / AIGO Eros Q.
+
+Panel setup goes through the controller's MDATA register (CPU-driven). Pixels
+go by descriptor DMA from a shadow frame (a "write memory start" command
+descriptor, then the frame): an atomic update copies the damaged area into the
+shadow and starts one frame, as Rockbox does. Without a DMA
+buffer the driver falls back to CPU-driven transfers.
+
+Chip select and read strobe are driven as GPIOs (optional cs-gpios and
+rd-gpios), as Rockbox does: with the controller driving them, the panel
+received stray commands. Frame DMA left running by the bootloader is stopped
+before the bus is used, since CPU writes to MDATA are ignored while it runs.
+
+Signed-off-by: Fathom
+---
+diff -Naur a/drivers/gpu/drm/tiny/Kconfig b/drivers/gpu/drm/tiny/Kconfig
+--- a/drivers/gpu/drm/tiny/Kconfig
++++ b/drivers/gpu/drm/tiny/Kconfig
+@@ -153,6 +153,21 @@
+ 
+ 	  If M is selected the module will be called ili9341.
+ 
++config TINYDRM_X1000_SLCD
++	tristate "DRM support for MIPI-DBI panels on the Ingenic X1000 smart LCD controller"
++	depends on DRM && (MACH_X1000 || COMPILE_TEST)
++	select DRM_CLIENT_SELECTION
++	select DRM_KMS_HELPER
++	select DRM_GEM_DMA_HELPER
++	select DRM_MIPI_DBI
++	select BACKLIGHT_CLASS_DEVICE
++	help
++	  DRM driver for command-mode (MIPI-DBI) panels on the X1000's smart
++	  LCD controller, 8-bit 8080 bus: GC9308 and ILI9342C as used by the
++	  HiFi Walker H2 / AIGO Eros Q.
++
++	  If M is selected the module will be called x1000-slcd.
++
+ config TINYDRM_ILI9486
+ 	tristate "DRM support for ILI9486 display panels"
+ 	depends on DRM && SPI
+diff -Naur a/drivers/gpu/drm/tiny/Makefile b/drivers/gpu/drm/tiny/Makefile
+--- a/drivers/gpu/drm/tiny/Makefile
++++ b/drivers/gpu/drm/tiny/Makefile
+@@ -11,6 +11,7 @@
+ obj-$(CONFIG_TINYDRM_ILI9163)		+= ili9163.o
+ obj-$(CONFIG_TINYDRM_ILI9225)		+= ili9225.o
+ obj-$(CONFIG_TINYDRM_ILI9341)		+= ili9341.o
++obj-$(CONFIG_TINYDRM_X1000_SLCD)	+= x1000-slcd.o
+ obj-$(CONFIG_TINYDRM_ILI9486)		+= ili9486.o
+ obj-$(CONFIG_TINYDRM_MI0283QT)		+= mi0283qt.o
+ obj-$(CONFIG_TINYDRM_REPAPER)		+= repaper.o
+diff -Naur a/drivers/gpu/drm/tiny/x1000-slcd.c b/drivers/gpu/drm/tiny/x1000-slcd.c
+--- /dev/null
++++ b/drivers/gpu/drm/tiny/x1000-slcd.c
+@@ -0,0 +1,538 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * DRM driver for MIPI-DBI (command-mode) panels on the Ingenic X1000 smart LCD
++ * controller (SLCDC), 8-bit Intel 8080 bus. Used by the HiFi Walker H2 / AIGO
++ * Eros Q family (GC9308 or ILI9342C panel, 320x240).
++ *
++ * First version: commands and pixels are written through the SLCDC data
++ * register by the CPU (no DMA yet). Controller setup follows the register
++ * descriptions in Rockbox's X1000 port; panel init sequences are the vendor's.
++ */
++
++#include <linux/backlight.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/gpio/consumer.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++
++#include <drm/clients/drm_client_setup.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_damage_helper.h>
++#include <drm/drm_drv.h>
++#include <drm/drm_format_helper.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_fbdev_dma.h>
++#include <drm/drm_gem_atomic_helper.h>
++#include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_mipi_dbi.h>
++#include <drm/drm_modeset_helper.h>
++#include <video/mipi_display.h>
++
++#define SLCD_DAH	0x10
++#define SLCD_DAV	0x14
++#define SLCD_CTRL	0x30
++#define SLCD_STATE	0x34
++#define SLCD_DA		0x40
++#define SLCD_MCFG	0xa0
++#define SLCD_MCTRL	0xa4
++#define SLCD_MSTATE	0xa8
++#define SLCD_MDATA	0xac
++#define SLCD_WTIME	0xb0
++#define SLCD_TASH	0xb4
++#define SLCD_MCFG_NEW	0xb8
++#define SLCD_SMWT	0xbc
++
++#define CTRL_ENABLE		BIT(3)
++#define CTRL_BURST_64WORD	(4u << 28)
++#define CTRL_BPP_16		4u
++#define MCTRL_DMA_START		BIT(1)
++#define MCFG_NEW_FMT_CONV	BIT(0)
++#define MCFG_NEW_DTIMES_2	(1u << 8)	/* 8-bit bus: two transfers per RGB565 pixel */
++
++/* Frame DMA descriptors (X1000 PM 4.9; same layout as Rockbox's lcd-x1000.c) */
++#define DESC_CMD_EOFINT		BIT(30)
++#define DESC_CMD_COMMAND	BIT(29)
++#define DESC_CMD_FRM_EN		BIT(26)
++#define DESC_CNT_BPP_16		(4u << 27)
++
++struct x1000_slcd_desc {
++	u32 da;		/* next descriptor */
++	u32 sa;		/* source */
++	u32 fid;
++	u32 cmd;
++	u32 osz;
++	u32 pw;
++	u32 cnt;	/* command count, or BPP for frames */
++	u32 fsz;	/* frame size (0 for commands) */
++};
++
++/* One coherent buffer: [cmd desc][frame desc][cmd word][pad][shadow frame] */
++#define DMA_OFF_DESC0	0
++#define DMA_OFF_DESC1	32
++#define DMA_OFF_CMD	64
++#define DMA_OFF_FRAME	128
++#define STATE_QD		BIT(7)
++#define STATE_EOF		BIT(5)
++#define MCTRL_DMA_TX_EN		BIT(0)
++#define MCFG_CWIDTH_8BIT	(1 << 8)
++#define MCTRL_NOT_USE_TE	BIT(8)
++#define MCTRL_FAST_MODE		BIT(4)
++#define MCTRL_DMA_MODE		BIT(2)
++#define MSTATE_BUSY		BIT(0)
++#define MDATA_CMD		(1u << 30)
++#define MDATA_DAT		(0u << 30)
++
++#define SLCD_CLOCK_HZ		20000000
++
++enum x1000_slcd_panel { PANEL_GC9308, PANEL_ILI9342C };
++
++struct x1000_slcd {
++	struct mipi_dbi_dev dbidev;	/* first: drm_to_mipi_dbi_dev() */
++	void __iomem *base;
++	struct clk *clk;
++	struct gpio_desc *cs, *rd;	/* driven as GPIOs, as Rockbox does */
++	void *dma_vaddr;		/* descriptors + shadow frame the controller streams from */
++	dma_addr_t dma_phys;
++	bool dma_on;
++	enum x1000_slcd_panel panel;
++};
++
++static struct x1000_slcd *to_slcd(struct mipi_dbi *dbi)
++{
++	return container_of(dbi, struct x1000_slcd, dbidev.dbi);
++}
++
++static int slcd_wait_idle(struct x1000_slcd *s)
++{
++	u32 st;
++
++	return readl_poll_timeout_atomic(s->base + SLCD_MSTATE, st,
++					 !(st & MSTATE_BUSY), 0, 10000);
++}
++
++static int slcd_write(struct x1000_slcd *s, u32 word)
++{
++	int ret = slcd_wait_idle(s);
++
++	if (!ret)
++		writel(word, s->base + SLCD_MDATA);
++	return ret;
++}
++
++/* mipi_dbi bus callback: one command byte, then `num` parameter/pixel bytes. */
++static int x1000_slcd_command(struct mipi_dbi *dbi, u8 *cmd, u8 *par, size_t num)
++{
++	struct x1000_slcd *s = to_slcd(dbi);
++	size_t i;
++	int ret;
++
++	ret = slcd_write(s, MDATA_CMD | *cmd);
++	for (i = 0; !ret && i < num; i++)
++		ret = slcd_write(s, MDATA_DAT | par[i]);
++	if (!ret)
++		ret = slcd_wait_idle(s);
++	if (ret)
++		dev_err_ratelimited(s->dbidev.drm.dev, "SLCD timeout (cmd %02x)\n", *cmd);
++	return ret;
++}
++
++/*
++ * mipi_dbi_command() takes its error-log device from dbi->spi, which is NULL on
++ * this (non-SPI) bus, so send through mipi_dbi_command_stackbuf() directly.
++ */
++#define slcd_cmd(dbi, cmd, seq...) \
++({ \
++	const u8 d_[] = { seq }; \
++	mipi_dbi_command_stackbuf(dbi, cmd, d_, ARRAY_SIZE(d_)); \
++})
++
++/*
++ * Frame DMA, as Rockbox does it: two descriptors in a ring, "write memory
++ * start" then the whole shadow frame. Each MCTRL.DMA_START sends one frame;
++ * an update waits for the previous frame's EOF, copies the damaged area into
++ * the shadow, then starts the next frame (x1000_slcd_update). The panel keeps
++ * the picture in its own memory between frames.
++ */
++static void x1000_slcd_dma_setup(struct x1000_slcd *s, int w, int h)
++{
++	struct x1000_slcd_desc *d0 = s->dma_vaddr + DMA_OFF_DESC0;
++	struct x1000_slcd_desc *d1 = s->dma_vaddr + DMA_OFF_DESC1;
++	u32 *cmd = s->dma_vaddr + DMA_OFF_CMD;
++
++	*cmd = 0x2c2c2c2c;	/* four 8-bit commands: write memory start (the stock firmware's sequence) */
++	*d0 = (struct x1000_slcd_desc){
++		.da = s->dma_phys + DMA_OFF_DESC1,
++		.sa = s->dma_phys + DMA_OFF_CMD,
++		.fid = 0xc0,
++		.cmd = DESC_CMD_COMMAND | 1,	/* one 32-bit word of commands */
++		.cnt = 4,
++	};
++	*d1 = (struct x1000_slcd_desc){
++		.da = s->dma_phys + DMA_OFF_DESC0,
++		.sa = s->dma_phys + DMA_OFF_FRAME,
++		.fid = 0xf0,
++		.cmd = DESC_CMD_EOFINT | DESC_CMD_FRM_EN | (w * h * 2 / 4),
++		.cnt = DESC_CNT_BPP_16,
++		.fsz = (w - 1) | ((h - 1) << 12),
++	};
++	wmb();
++}
++
++static void x1000_slcd_dma_start(struct x1000_slcd *s, int w, int h)
++{
++	u32 st;
++
++	x1000_slcd_dma_setup(s, w, h);
++	writel(w, s->base + SLCD_DAH);
++	writel(h, s->base + SLCD_DAV);
++	writel(MCFG_NEW_FMT_CONV | MCFG_NEW_DTIMES_2, s->base + SLCD_MCFG_NEW);
++	writel(MCTRL_NOT_USE_TE | MCTRL_FAST_MODE | MCTRL_DMA_MODE | MCTRL_DMA_START, s->base + SLCD_MCTRL);
++	readl_poll_timeout_atomic(s->base + SLCD_MSTATE, st, !(st & MSTATE_BUSY), 0, 10000);
++	writel(readl(s->base + SLCD_MCTRL) | MCTRL_DMA_TX_EN, s->base + SLCD_MCTRL);
++	writel(0, s->base + SLCD_STATE);
++	writel(s->dma_phys + DMA_OFF_DESC0, s->base + SLCD_DA);
++	writel(CTRL_BURST_64WORD | CTRL_BPP_16 | CTRL_ENABLE, s->base + SLCD_CTRL);
++	s->dma_on = true;
++}
++
++/* Wait until the frame in flight (if any) is done, so the shadow can be rewritten. */
++static void x1000_slcd_wait_frame(struct x1000_slcd *s)
++{
++	u32 st;
++
++	if (readl_poll_timeout(s->base + SLCD_STATE, st, st & STATE_EOF, 100, 100000) ||
++	    readl_poll_timeout(s->base + SLCD_MSTATE, st, !(st & MSTATE_BUSY), 10, 10000))
++		dev_warn_ratelimited(s->dbidev.drm.dev, "frame DMA timeout\n");
++	writel(readl(s->base + SLCD_STATE) & ~STATE_EOF, s->base + SLCD_STATE);
++}
++
++static void x1000_slcd_send_frame(struct x1000_slcd *s)
++{
++	writel(readl(s->base + SLCD_MCTRL) | MCTRL_DMA_START | MCTRL_DMA_MODE, s->base + SLCD_MCTRL);
++}
++
++static void x1000_slcd_dma_stop(struct x1000_slcd *s)
++{
++	u32 st;
++
++	if (!(readl(s->base + SLCD_CTRL) & CTRL_ENABLE))
++		goto out;
++	writel(readl(s->base + SLCD_CTRL) & ~CTRL_ENABLE, s->base + SLCD_CTRL);
++	writel(readl(s->base + SLCD_MCTRL) & ~MCTRL_DMA_TX_EN, s->base + SLCD_MCTRL);
++	if (readl_poll_timeout(s->base + SLCD_STATE, st, st & STATE_QD, 100, 50000))
++		dev_warn(s->dbidev.drm.dev, "frame DMA did not stop\n");
++out:
++	writel(0, s->base + SLCD_STATE);
++	writel(0, s->base + SLCD_MCFG_NEW);
++	s->dma_on = false;
++}
++
++static void x1000_slcd_init_controller(struct x1000_slcd *s)
++{
++	/*
++	 * Frame DMA (the bootloader's, or ours from a previous enable) must be
++	 * stopped: while it runs, MDATA writes from the CPU never reach the panel.
++	 */
++	x1000_slcd_dma_stop(s);
++	writel(0, s->base + SLCD_CTRL);
++	writel(MCFG_CWIDTH_8BIT, s->base + SLCD_MCFG);
++	/* 8-bit parallel 8080, DC low = command, active-low CS, no format conversion */
++	writel(0, s->base + SLCD_MCFG_NEW);
++	writel(MCTRL_NOT_USE_TE | MCTRL_FAST_MODE | MCTRL_DMA_MODE, s->base + SLCD_MCTRL);
++	writel(0, s->base + SLCD_WTIME);
++	writel(0, s->base + SLCD_TASH);
++	writel(0, s->base + SLCD_SMWT);
++}
++
++static void gc9308_init(struct mipi_dbi *dbi)
++{
++	slcd_cmd(dbi, 0xfe);
++	slcd_cmd(dbi, 0xef);
++	slcd_cmd(dbi, MIPI_DCS_SET_ADDRESS_MODE, 0x90);
++	slcd_cmd(dbi, MIPI_DCS_SET_PIXEL_FORMAT, MIPI_DCS_PIXEL_FMT_16BIT);
++	slcd_cmd(dbi, 0x84, 0x04);
++	slcd_cmd(dbi, 0x86, 0xfb);
++	slcd_cmd(dbi, 0x87, 0x79);
++	slcd_cmd(dbi, 0x89, 0x0b);
++	slcd_cmd(dbi, 0x8a, 0x20);
++	slcd_cmd(dbi, 0x8b, 0x80);
++	slcd_cmd(dbi, 0x8d, 0x3b);
++	slcd_cmd(dbi, 0x8e, 0xcf);
++	slcd_cmd(dbi, 0xec, 0x33, 0x02, 0x4c);
++	slcd_cmd(dbi, 0x98, 0x3e);
++	slcd_cmd(dbi, 0x9c, 0x4b);
++	slcd_cmd(dbi, 0x99, 0x3e);
++	slcd_cmd(dbi, 0x9d, 0x4b);
++	slcd_cmd(dbi, 0x9b, 0x55);
++	slcd_cmd(dbi, 0xe8, 0x11, 0x00);
++	slcd_cmd(dbi, 0xff, 0x62);
++	slcd_cmd(dbi, 0xc3, 0x20);
++	slcd_cmd(dbi, 0xc4, 0x03);
++	slcd_cmd(dbi, 0xc9, 0x2a);
++	slcd_cmd(dbi, 0xf0, 0x4a, 0x10, 0x0a, 0x0a, 0x26, 0x39);
++	slcd_cmd(dbi, 0xf2, 0x4a, 0x10, 0x0a, 0x0a, 0x26, 0x39);
++	slcd_cmd(dbi, 0xf1, 0x50, 0x8f, 0xaf, 0x3b, 0x3f, 0x7f);
++	slcd_cmd(dbi, 0xf3, 0x50, 0x8f, 0xaf, 0x3b, 0x3f, 0x7f);
++	slcd_cmd(dbi, 0xba, 0x0a);
++	slcd_cmd(dbi, MIPI_DCS_ENTER_INVERT_MODE);
++	slcd_cmd(dbi, 0xfe);
++	slcd_cmd(dbi, 0xee);
++}
++
++static void ili9342c_init(struct mipi_dbi *dbi)
++{
++	slcd_cmd(dbi, 0xc8, 0xff, 0x93, 0x42);
++	slcd_cmd(dbi, MIPI_DCS_SET_ADDRESS_MODE, 0xd8);
++	slcd_cmd(dbi, MIPI_DCS_SET_PIXEL_FORMAT, MIPI_DCS_PIXEL_FMT_16BIT);
++	slcd_cmd(dbi, 0xc0, 0x15, 0x15);
++	slcd_cmd(dbi, 0xc1, 0x01);
++	slcd_cmd(dbi, 0xc5, 0xda);
++	slcd_cmd(dbi, 0xb1, 0x00, 0x1b);
++	slcd_cmd(dbi, 0xb4, 0x02);
++	slcd_cmd(dbi, 0xe0, 0x0f, 0x13, 0x17, 0x04, 0x13, 0x07, 0x40, 0x39,
++			 0x4f, 0x06, 0x0d, 0x0a, 0x1f, 0x22, 0x00);
++	slcd_cmd(dbi, 0xe1, 0x00, 0x21, 0x24, 0x03, 0x0f, 0x05, 0x38, 0x32,
++			 0x49, 0x00, 0x09, 0x08, 0x32, 0x35, 0x0f);
++}
++
++/* Copy (and convert, for XRGB8888 clients such as fbcon) a damaged area into the shadow frame. */
++static void x1000_slcd_blit(struct x1000_slcd *s, struct drm_plane_state *state, const struct drm_rect *clip)
++{
++	struct drm_shadow_plane_state *shadow = to_drm_shadow_plane_state(state);
++	struct drm_framebuffer *fb = state->fb;
++	unsigned int pitch = fb->width * 2;
++	struct iosys_map dst = IOSYS_MAP_INIT_VADDR(s->dma_vaddr + DMA_OFF_FRAME);
++
++	iosys_map_incr(&dst, drm_fb_clip_offset(pitch, drm_format_info(DRM_FORMAT_RGB565), clip));
++	drm_fb_blit(&dst, &pitch, DRM_FORMAT_RGB565, &shadow->data[0], fb, clip, &shadow->fmtcnv_state);
++}
++
++static void x1000_slcd_enable(struct drm_simple_display_pipe *pipe,
++			      struct drm_crtc_state *crtc_state,
++			      struct drm_plane_state *plane_state)
++{
++	struct mipi_dbi_dev *dbidev = drm_to_mipi_dbi_dev(pipe->crtc.dev);
++	struct x1000_slcd *s = container_of(dbidev, struct x1000_slcd, dbidev);
++	struct mipi_dbi *dbi = &dbidev->dbi;
++	int idx;
++
++	if (!drm_dev_enter(pipe->crtc.dev, &idx))
++		return;
++
++	x1000_slcd_init_controller(s);
++
++	/* Read strobe idle; chip select cycled, then held for the panel's lifetime */
++	gpiod_set_value_cansleep(s->rd, 0);
++	gpiod_set_value_cansleep(s->cs, 0);
++	mipi_dbi_hw_reset(dbi);		/* pulses reset-gpios */
++	msleep(12);
++	gpiod_set_value_cansleep(s->cs, 1);
++	usleep_range(10, 100);
++
++	if (s->panel == PANEL_ILI9342C)
++		ili9342c_init(dbi);
++	else
++		gc9308_init(dbi);
++
++	slcd_cmd(dbi, MIPI_DCS_EXIT_SLEEP_MODE);
++	msleep(120);
++	slcd_cmd(dbi, MIPI_DCS_SET_DISPLAY_ON);
++	msleep(20);
++
++	if (s->dma_vaddr) {
++		struct drm_framebuffer *fb = plane_state->fb;
++		struct drm_rect all = DRM_RECT_INIT(0, 0, fb->width, fb->height);
++		int w = fb->width, h = fb->height;
++
++		/* Full-screen window: each DMA frame starts with "write memory start" */
++		slcd_cmd(dbi, MIPI_DCS_SET_COLUMN_ADDRESS, 0, 0, (w - 1) >> 8, (w - 1) & 0xff);
++		slcd_cmd(dbi, MIPI_DCS_SET_PAGE_ADDRESS, 0, 0, (h - 1) >> 8, (h - 1) & 0xff);
++		x1000_slcd_blit(s, plane_state, &all);
++		x1000_slcd_dma_start(s, w, h);		/* sends a first (dummy) frame */
++		x1000_slcd_wait_frame(s);
++		x1000_slcd_send_frame(s);
++		backlight_enable(dbidev->backlight);
++	} else {
++		mipi_dbi_enable_flush(dbidev, crtc_state, plane_state);
++	}
++	drm_dev_exit(idx);
++}
++
++static void x1000_slcd_update(struct drm_simple_display_pipe *pipe,
++			      struct drm_plane_state *old_state)
++{
++	struct mipi_dbi_dev *dbidev = drm_to_mipi_dbi_dev(pipe->crtc.dev);
++	struct x1000_slcd *s = container_of(dbidev, struct x1000_slcd, dbidev);
++	struct drm_plane_state *state = pipe->plane.state;
++	struct drm_rect rect;
++	int idx;
++
++	if (!s->dma_on) {
++		mipi_dbi_pipe_update(pipe, old_state);	/* CPU-driven fallback */
++		return;
++	}
++	if (!pipe->crtc.state->active || !state->fb || !drm_dev_enter(pipe->crtc.dev, &idx))
++		return;
++	if (drm_atomic_helper_damage_merged(old_state, state, &rect)) {
++		x1000_slcd_wait_frame(s);	/* don't rewrite the shadow mid-frame */
++		x1000_slcd_blit(s, state, &rect);
++		x1000_slcd_send_frame(s);
++	}
++	drm_dev_exit(idx);
++}
++
++static void x1000_slcd_disable(struct drm_simple_display_pipe *pipe)
++{
++	struct mipi_dbi_dev *dbidev = drm_to_mipi_dbi_dev(pipe->crtc.dev);
++	struct x1000_slcd *s = container_of(dbidev, struct x1000_slcd, dbidev);
++
++	x1000_slcd_dma_stop(s);
++	mipi_dbi_pipe_disable(pipe);
++}
++
++static const struct drm_simple_display_pipe_funcs x1000_slcd_pipe_funcs = {
++	.mode_valid = mipi_dbi_pipe_mode_valid,
++	.enable = x1000_slcd_enable,
++	.disable = x1000_slcd_disable,
++	.update = x1000_slcd_update,
++	.begin_fb_access = mipi_dbi_pipe_begin_fb_access,
++	.end_fb_access = mipi_dbi_pipe_end_fb_access,
++	.reset_plane = mipi_dbi_pipe_reset_plane,
++	.duplicate_plane_state = mipi_dbi_pipe_duplicate_plane_state,
++	.destroy_plane_state = mipi_dbi_pipe_destroy_plane_state,
++};
++
++/* 2.4" 320x240 landscape panel (about 49 x 37 mm) */
++static const struct drm_display_mode x1000_slcd_mode = {
++	DRM_SIMPLE_MODE(320, 240, 49, 37),
++};
++
++DEFINE_DRM_GEM_DMA_FOPS(x1000_slcd_fops);
++
++static const struct drm_driver x1000_slcd_driver = {
++	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
++	.fops			= &x1000_slcd_fops,
++	DRM_GEM_DMA_DRIVER_OPS_VMAP,
++	DRM_FBDEV_DMA_DRIVER_OPS,
++	.debugfs_init		= mipi_dbi_debugfs_init,
++	.name			= "x1000-slcd",
++	.desc			= "Ingenic X1000 smart LCD",
++	.major			= 1,
++	.minor			= 0,
++};
++
++static int x1000_slcd_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct mipi_dbi_dev *dbidev;
++	struct x1000_slcd *s;
++	struct drm_device *drm;
++	const char *panel;
++	int ret;
++
++	s = devm_drm_dev_alloc(dev, &x1000_slcd_driver, struct x1000_slcd, dbidev.drm);
++	if (IS_ERR(s))
++		return PTR_ERR(s);
++	dbidev = &s->dbidev;
++	drm = &dbidev->drm;
++
++	s->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(s->base))
++		return PTR_ERR(s->base);
++
++	s->clk = devm_clk_get_enabled(dev, "lcd");
++	if (IS_ERR(s->clk))
++		return dev_err_probe(dev, PTR_ERR(s->clk), "no LCD clock\n");
++	ret = clk_set_rate(s->clk, SLCD_CLOCK_HZ);
++	if (ret)
++		dev_warn(dev, "cannot set LCD clock: %d\n", ret);
++
++	s->panel = PANEL_GC9308;
++	if (!device_property_read_string(dev, "ingenic,panel", &panel) && !strcmp(panel, "ili9342c"))
++		s->panel = PANEL_ILI9342C;
++
++	/* mipi_dbi convention: logical 1 = running, 0 = held in reset */
++	dbidev->dbi.reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(dbidev->dbi.reset))
++		return dev_err_probe(dev, PTR_ERR(dbidev->dbi.reset), "reset GPIO\n");
++
++	/*
++	 * CS and RD are part of the lcd-8bit pin group, but on this bus the
++	 * controller's own CS/RD handling corrupts the command stream: the panel
++	 * then receives stray commands. Requesting them as GPIOs takes them back
++	 * from the controller (the Ingenic pin controller is not strict).
++	 */
++	s->cs = devm_gpiod_get_optional(dev, "cs", GPIOD_OUT_LOW);
++	if (IS_ERR(s->cs))
++		return dev_err_probe(dev, PTR_ERR(s->cs), "CS GPIO\n");
++	s->rd = devm_gpiod_get_optional(dev, "rd", GPIOD_OUT_LOW);
++	if (IS_ERR(s->rd))
++		return dev_err_probe(dev, PTR_ERR(s->rd), "RD GPIO\n");
++
++	/* Descriptors + one RGB565 frame, streamed by the controller (CMA-backed) */
++	s->dma_vaddr = dmam_alloc_coherent(dev, DMA_OFF_FRAME + x1000_slcd_mode.hdisplay * x1000_slcd_mode.vdisplay * 2,
++					   &s->dma_phys, GFP_KERNEL);
++	if (!s->dma_vaddr)
++		dev_warn(dev, "no DMA buffer: CPU-driven transfers (slow)\n");
++
++	dbidev->backlight = devm_of_find_backlight(dev);
++	if (IS_ERR(dbidev->backlight))
++		return PTR_ERR(dbidev->backlight);
++
++	mutex_init(&dbidev->dbi.cmdlock);	/* mipi_dbi_spi_init() would do this */
++	dbidev->dbi.command = x1000_slcd_command;
++	dbidev->dbi.swap_bytes = true;		/* 8-bit bus: RGB565 high byte first */
++
++	ret = mipi_dbi_dev_init(dbidev, &x1000_slcd_pipe_funcs, &x1000_slcd_mode, 0);
++	if (ret)
++		return ret;
++
++	drm_mode_config_reset(drm);
++	ret = drm_dev_register(drm, 0);
++	if (ret)
++		return ret;
++
++	platform_set_drvdata(pdev, drm);
++	drm_client_setup(drm, NULL);
++	return 0;
++}
++
++static void x1000_slcd_remove(struct platform_device *pdev)
++{
++	struct drm_device *drm = platform_get_drvdata(pdev);
++
++	drm_dev_unplug(drm);
++	drm_atomic_helper_shutdown(drm);
++}
++
++static void x1000_slcd_shutdown(struct platform_device *pdev)
++{
++	drm_atomic_helper_shutdown(platform_get_drvdata(pdev));
++}
++
++static const struct of_device_id x1000_slcd_of_match[] = {
++	{ .compatible = "ingenic,x1000-slcd" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, x1000_slcd_of_match);
++
++static struct platform_driver x1000_slcd_platform_driver = {
++	.driver = {
++		.name = "x1000-slcd",
++		.of_match_table = x1000_slcd_of_match,
++	},
++	.probe = x1000_slcd_probe,
++	.remove = x1000_slcd_remove,
++	.shutdown = x1000_slcd_shutdown,
++};
++module_platform_driver(x1000_slcd_platform_driver);
++
++MODULE_DESCRIPTION("Ingenic X1000 smart LCD (MIPI-DBI) DRM driver");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,36 @@
+# Vendor firmware and anything extracted from it: never commit (not ours to redistribute)
+*.upt
+*.ubi
+uimage.bin
+uboot.bin
+*.hcd
+/vendor-extract/
+/dumps/
+
+# Device backups (contain per-unit factory data such as MAC addresses)
+*.nandbackup
+/backups/
+
+# Build outputs
+/build/
+/dist/
+/out/
+/output/
+*.o
+*.a
+*.so
+*.d
+# ...but not init script directories (e.g. the rootfs overlay's etc/init.d/)
+!init.d/
+
+# OS / editor noise
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Personal library tag exports used to tune shuffle (never published)
+*.library.csv
+/library-export/
+docker/.built
+__pycache__/

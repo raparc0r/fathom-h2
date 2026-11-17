@@ -1,0 +1,583 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] power, ASoC: add AXP2101 read-only battery monitor and ES9018K2M codec
+
+AXP2101: battery voltage, fuel gauge, charging state and VBUS presence. The
+regmap allows exactly one write: the power-off bit, set from a power-off
+prepare handler once every device has shut down. Rails and charger settings stay untouched.
+ES9018K2M: I2C-controlled DAC, I2S consumer, hardware volume (0.5 dB steps),
+filter roll-off, DPLL bandwidth and STOP_DIV init as used on the Eros Q/H2.
+
+Signed-off-by: Fathom
+---
+diff -Naur a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -382,6 +382,14 @@
+ 	  This driver can also be built as a module. If so, the module will be
+ 	  called axp20x_ac_power.
+ 
++config BATTERY_AXP2101_RO
++	tristate "X-Powers AXP2101 battery monitor (read-only)"
++	depends on I2C
++	select REGMAP_I2C
++	help
++	  Battery voltage, fuel-gauge percentage and charging state from an
++	  AXP2101 PMIC, without ever writing to it.
++
+ config BATTERY_AXP20X
+ 	tristate "X-Powers AXP20X battery driver"
+ 	depends on MFD_AXP20X
+diff -Naur a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -125,3 +125,4 @@
+ obj-$(CONFIG_BATTERY_UG3105)	+= ug3105_battery.o
+ obj-$(CONFIG_CHARGER_QCOM_SMB2)	+= qcom_smbx.o
+ obj-$(CONFIG_FUEL_GAUGE_MM8013)	+= mm8013.o
++obj-$(CONFIG_BATTERY_AXP2101_RO)	+= axp2101_battery.o
+diff -Naur a/drivers/power/supply/axp2101_battery.c b/drivers/power/supply/axp2101_battery.c
+--- a/drivers/power/supply/axp2101_battery.c
++++ b/drivers/power/supply/axp2101_battery.c
+@@ -0,0 +1,275 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * X-Powers AXP2101 battery and charger status, READ-ONLY.
++ *
++ * Reports battery voltage, the PMIC's own fuel-gauge percentage, charging
++ * state and USB (VBUS) presence. It never writes to the PMIC: the power rails
++ * stay exactly as the bootloader configured them. Register map from the
++ * AXP2101 datasheet as used by Rockbox's X1000 port.
++ */
++
++#include <linux/delay.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/power_supply.h>
++#include <linux/reboot.h>
++#include <linux/regmap.h>
++
++#define AXP2101_STATUS1		0x00	/* bit 5: VBUS good */
++#define AXP2101_STATUS2		0x01	/* bits 6:5: charge direction */
++#define AXP2101_CHIP_ID		0x03
++#define AXP2101_ADC_EN		0x30
++#define AXP2101_VBAT_H		0x34	/* 14-bit, 1 mV/LSB */
++#define AXP2101_VBUS_H		0x38
++#define AXP2101_DIE_TEMP_H	0x3c
++#define AXP2101_GAUGE_PCT	0xa4	/* 0..100 */
++#define AXP2101_PMU_COMMON	0x10	/* bit 0: power off */
++#define AXP2101_PWRON_STATUS	0x20	/* why it powered on: bit 0 key, 2 VBUS, 3/4 battery */
++#define AXP2101_PWROFF_STATUS	0x21	/* why it last powered off */
++#define AXP2101_POWER_OFF	BIT(0)
++
++#define AXP2101_ID		0x4a
++#define AXP2101_ADC_VBAT	BIT(0)
++
++struct axp2101_batt {
++	struct regmap *regmap;
++	struct power_supply *psy;
++};
++
++static const struct regmap_config axp2101_regmap = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = 0xff,
++	/* The only writeable register is the one holding the power-off bit */
++	.writeable_reg = NULL,
++	.wr_table = &(const struct regmap_access_table){
++		.yes_ranges = &(const struct regmap_range)regmap_reg_range(AXP2101_PMU_COMMON,
++									   AXP2101_PMU_COMMON),
++		.n_yes_ranges = 1,
++	},
++	.cache_type = REGCACHE_NONE,
++};
++
++static int read14(struct regmap *rm, unsigned int reg, int *mv)
++{
++	u8 b[2];
++	int ret = regmap_bulk_read(rm, reg, b, 2);
++
++	if (!ret)
++		*mv = ((b[0] & 0x3f) << 8) | b[1];
++	return ret;
++}
++
++/*
++ * The AXP2101's fuel gauge only reports once battery parameters have been
++ * loaded into it (the stock firmware does that; this driver never writes the
++ * PMIC). Until then register 0xa4 reads 0, so fall back to the open-circuit
++ * voltage curve Rockbox uses on this player: 0%, 10%, ... 100% in mV.
++ */
++static const u16 axp2101_ocv_curve[11] = {
++	3400, 3477, 3540, 3578, 3617, 3674, 3771, 3856, 3936, 4016, 4117
++};
++
++static int axp2101_voltage_to_pct(int mv)
++{
++	int i;
++
++	if (mv <= axp2101_ocv_curve[0])
++		return 0;
++	for (i = 1; i < 11; i++)
++		if (mv < axp2101_ocv_curve[i])
++			return (i - 1) * 10 + (mv - axp2101_ocv_curve[i - 1]) * 10 /
++			       (axp2101_ocv_curve[i] - axp2101_ocv_curve[i - 1]);
++	return 100;
++}
++
++static int axp2101_get_property(struct power_supply *psy, enum power_supply_property psp,
++				union power_supply_propval *val)
++{
++	struct axp2101_batt *b = power_supply_get_drvdata(psy);
++	unsigned int s1, s2, v;
++	int mv, ret;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_PRESENT:
++		val->intval = 1;
++		return 0;
++	case POWER_SUPPLY_PROP_STATUS:
++		ret = regmap_read(b->regmap, AXP2101_STATUS1, &s1);
++		ret = ret ?: regmap_read(b->regmap, AXP2101_STATUS2, &s2);
++		if (ret)
++			return ret;
++		switch ((s2 >> 5) & 3) {
++		case 1:
++			val->intval = POWER_SUPPLY_STATUS_CHARGING;
++			break;
++		case 0:		/* standby: full if plugged in */
++			val->intval = (s1 & BIT(5)) ? POWER_SUPPLY_STATUS_FULL
++						    : POWER_SUPPLY_STATUS_NOT_CHARGING;
++			break;
++		default:
++			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
++		}
++		return 0;
++	case POWER_SUPPLY_PROP_ONLINE:		/* USB power present */
++		ret = regmap_read(b->regmap, AXP2101_STATUS1, &s1);
++		if (!ret)
++			val->intval = !!(s1 & BIT(5));
++		return ret;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		ret = read14(b->regmap, AXP2101_VBAT_H, &mv);
++		if (!ret)
++			val->intval = mv * 1000;
++		return ret;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		ret = regmap_read(b->regmap, AXP2101_GAUGE_PCT, &v);
++		if (ret)
++			return ret;
++		if (v >= 1 && v <= 100) {	/* gauge calibrated */
++			val->intval = v;
++			return 0;
++		}
++		ret = read14(b->regmap, AXP2101_VBAT_H, &mv);
++		if (!ret)
++			val->intval = axp2101_voltage_to_pct(mv);
++		return ret;
++	case POWER_SUPPLY_PROP_TEMP:		/* die temperature, 0.1 degC */
++		ret = read14(b->regmap, AXP2101_DIE_TEMP_H, &mv);
++		if (!ret)
++			val->intval = 220 + (7274 - mv) * 10 / 20;
++		return ret;
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		val->intval = POWER_SUPPLY_TECHNOLOGY_LIPO;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static const enum power_supply_property axp2101_props[] = {
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_TEMP,
++	POWER_SUPPLY_PROP_TECHNOLOGY,
++};
++
++static const struct power_supply_desc axp2101_desc = {
++	.name = "battery",
++	.type = POWER_SUPPLY_TYPE_BATTERY,
++	.properties = axp2101_props,
++	.num_properties = ARRAY_SIZE(axp2101_props),
++	.get_property = axp2101_get_property,
++};
++
++/*
++ * Power off, in two steps. The PMIC bit is set from the POWER_OFF_PREPARE
++ * chain: it runs after every device has shut down, in process context, where
++ * the X1000's I2C driver (no atomic transfers) still works. The POWER_OFF
++ * handler proper only waits for the rails to drop; registering it is also what
++ * makes the kernel power off instead of halting.
++ */
++static int axp2101_power_off_prepare(struct sys_off_data *data)
++{
++	struct axp2101_batt *b = data->cb_data;
++
++	pr_emerg("axp2101: cutting power\n");
++	regmap_update_bits(b->regmap, AXP2101_PMU_COMMON, AXP2101_POWER_OFF, AXP2101_POWER_OFF);
++	return NOTIFY_DONE;
++}
++
++static int axp2101_power_off(struct sys_off_data *data)
++{
++	mdelay(1000);
++	pr_emerg("axp2101: power is still on\n");
++	return NOTIFY_DONE;
++}
++
++/*
++ * Why the PMIC powered the system on this time (read at probe, kept): "key"
++ * (the Power key), "vbus" (USB power plugged in while off: the player starts
++ * in its charging mode), "battery" or "other".
++ */
++static const char *axp2101_on_reason = "other";
++
++static ssize_t power_on_reason_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%s\n", axp2101_on_reason);
++}
++static DEVICE_ATTR_RO(power_on_reason);
++
++static int axp2101_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct power_supply_config cfg = {};
++	struct axp2101_batt *b;
++	unsigned int id, adc;
++	int ret;
++
++	b = devm_kzalloc(dev, sizeof(*b), GFP_KERNEL);
++	if (!b)
++		return -ENOMEM;
++	b->regmap = devm_regmap_init_i2c(client, &axp2101_regmap);
++	if (IS_ERR(b->regmap))
++		return PTR_ERR(b->regmap);
++	i2c_set_clientdata(client, b);
++
++	ret = regmap_read(b->regmap, AXP2101_CHIP_ID, &id);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot read chip ID\n");
++	if (id != AXP2101_ID)
++		return dev_err_probe(dev, -ENODEV, "chip ID %#x is not an AXP2101\n", id);
++
++	if (!regmap_read(b->regmap, AXP2101_ADC_EN, &adc) && !(adc & AXP2101_ADC_VBAT))
++		dev_warn(dev, "battery ADC is off (reg 0x30 = %#x); voltages will read 0\n", adc);
++
++	{
++		unsigned int on = 0, off = 0;
++
++		if (!regmap_read(b->regmap, AXP2101_PWRON_STATUS, &on)) {
++			axp2101_on_reason = on & BIT(0) ? "key" : on & BIT(2) ? "vbus" :
++					    on & (BIT(3) | BIT(4)) ? "battery" : "other";
++		}
++		regmap_read(b->regmap, AXP2101_PWROFF_STATUS, &off);
++		dev_info(dev, "powered on by %s (status %#x); last power off status %#x\n",
++			 axp2101_on_reason, on, off);
++		if (device_create_file(dev, &dev_attr_power_on_reason))
++			dev_warn(dev, "no power_on_reason attribute\n");
++	}
++
++	cfg.drv_data = b;
++	cfg.fwnode = dev_fwnode(dev);
++	b->psy = devm_power_supply_register(dev, &axp2101_desc, &cfg);
++	if (IS_ERR(b->psy))
++		return PTR_ERR(b->psy);
++	ret = devm_register_sys_off_handler(dev, SYS_OFF_MODE_POWER_OFF_PREPARE, SYS_OFF_PRIO_DEFAULT,
++					    axp2101_power_off_prepare, b);
++	if (!ret)
++		ret = devm_register_sys_off_handler(dev, SYS_OFF_MODE_POWER_OFF, SYS_OFF_PRIO_DEFAULT,
++						    axp2101_power_off, b);
++	if (ret)
++		dev_warn(dev, "no power-off handler: %d\n", ret);
++	dev_info(dev, "AXP2101 found (battery monitor; writes only the power-off bit)\n");
++	return 0;
++}
++
++static const struct of_device_id axp2101_of_match[] = {
++	{ .compatible = "x-powers,axp2101-battery-ro" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, axp2101_of_match);
++
++static struct i2c_driver axp2101_driver = {
++	.driver = {
++		.name = "axp2101-battery",
++		.of_match_table = axp2101_of_match,
++	},
++	.probe = axp2101_probe,
++};
++module_i2c_driver(axp2101_driver);
++
++MODULE_DESCRIPTION("X-Powers AXP2101 read-only battery monitor");
++MODULE_LICENSE("GPL");
+diff -Naur a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -1187,6 +1187,13 @@
+ 	depends on ACPI
+ 	tristate
+ 
++config SND_SOC_ES9018K2M
++	tristate "ESS ES9018K2M DAC"
++	depends on I2C
++	select REGMAP_I2C
++	help
++	  ESS ES9018K2M stereo DAC with I2C control (HiFi Walker H2 / AIGO Eros Q).
++
+ config SND_SOC_ES8311
+ 	tristate "Everest Semi ES8311 CODEC"
+ 	depends on I2C
+diff -Naur a/sound/soc/codecs/Makefile b/sound/soc/codecs/Makefile
+--- a/sound/soc/codecs/Makefile
++++ b/sound/soc/codecs/Makefile
+@@ -128,6 +128,7 @@
+ snd-soc-es7241-y := es7241.o
+ snd-soc-es83xx-dsm-common-y := es83xx-dsm-common.o
+ snd-soc-es8311-y := es8311.o
++snd-soc-es9018k2m-y := es9018k2m.o
+ snd-soc-es8316-y := es8316.o
+ snd-soc-es8323-y := es8323.o
+ snd-soc-es8326-y := es8326.o
+@@ -560,6 +561,7 @@
+ obj-$(CONFIG_SND_SOC_ES7241)	+= snd-soc-es7241.o
+ obj-$(CONFIG_SND_SOC_ES83XX_DSM_COMMON)    += snd-soc-es83xx-dsm-common.o
+ obj-$(CONFIG_SND_SOC_ES8311)    += snd-soc-es8311.o
++obj-$(CONFIG_SND_SOC_ES9018K2M)	+= snd-soc-es9018k2m.o
+ obj-$(CONFIG_SND_SOC_ES8316)    += snd-soc-es8316.o
+ obj-$(CONFIG_SND_SOC_ES8323)	+= snd-soc-es8323.o
+ obj-$(CONFIG_SND_SOC_ES8326)    += snd-soc-es8326.o
+diff -Naur a/sound/soc/codecs/es9018k2m.c b/sound/soc/codecs/es9018k2m.c
+--- a/sound/soc/codecs/es9018k2m.c
++++ b/sound/soc/codecs/es9018k2m.c
+@@ -0,0 +1,227 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * ESS ES9018K2M stereo DAC, I2C control, I2S input (codec is the clock consumer).
++ *
++ * Hardware volume in 0.5 dB steps (registers 15/16), filter roll-off, and the
++ * two init writes Rockbox found necessary on the H2/Eros Q: DPLL bandwidth
++ * (reg 12 = 0xDA, fixes dropouts) and STOP_DIV = 0 (reg 10, needed at >= 96 kHz).
++ * Starts at -40 dB. The board's amplifier and output switch are separate
++ * components (e.g. simple-audio-amplifier) switched by DAPM.
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/regmap.h>
++#include <sound/pcm.h>
++#include <sound/soc.h>
++#include <sound/tlv.h>
++
++#define ES_SYSTEM	0
++#define ES_GENERAL	7
++#define ES_MASTER_MODE	10
++#define ES_DPLL		12
++#define ES_VOL_L	15
++#define ES_VOL_R	16
++#define ES_GPIO_INPUT	21
++
++#define ES_GENERAL_FILTER	0x60	/* reg 7 bits 6:5: filter shape */
++#define ES_GENERAL_MUTE		0x03	/* reg 7 bits 1:0: soft mute, both channels */
++
++static const struct reg_default es9018k2m_defaults[] = {
++	{ ES_GENERAL, 0x80 },	/* sharp FIR, PCM IIR, unmuted */
++	{ ES_MASTER_MODE, 0x05 },
++	{ ES_DPLL, 0x5a },
++	{ ES_VOL_L, 0x00 },
++	{ ES_VOL_R, 0x00 },
++	{ ES_GPIO_INPUT, 0x00 },
++};
++
++static bool es_volatile(struct device *dev, unsigned int reg)
++{
++	return reg == ES_SYSTEM || reg > ES_GPIO_INPUT;
++}
++
++static const struct regmap_config es9018k2m_regmap = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = 72,
++	.reg_defaults = es9018k2m_defaults,
++	.num_reg_defaults = ARRAY_SIZE(es9018k2m_defaults),
++	.volatile_reg = es_volatile,
++	.cache_type = REGCACHE_MAPLE,
++};
++
++/* 0x00 = 0 dB ... 0xff = -127.5 dB (attenuation): inverted 0..255, 0.5 dB steps */
++static const DECLARE_TLV_DB_SCALE(es_vol_tlv, -12750, 50, 1);
++
++static const char *const es_filter_texts[] = {
++	"Fast roll-off", "Slow roll-off", "Minimum phase", "Bypass",
++};
++static SOC_ENUM_SINGLE_EXT_DECL(es_filter_enum, es_filter_texts);
++
++struct es9018k2m {
++	struct regmap *regmap;
++	int filter;
++};
++
++static int es_filter_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uc)
++{
++	struct snd_soc_component *c = snd_soc_kcontrol_component(kc);
++	struct es9018k2m *es = snd_soc_component_get_drvdata(c);
++
++	uc->value.enumerated.item[0] = es->filter;
++	return 0;
++}
++
++static int es_filter_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uc)
++{
++	struct snd_soc_component *c = snd_soc_kcontrol_component(kc);
++	struct es9018k2m *es = snd_soc_component_get_drvdata(c);
++	unsigned int f = uc->value.enumerated.item[0];
++	static const u8 shape[] = { 0x00, 0x20, 0x40, 0x00 };	/* reg 7 bits 6:5 */
++
++	if (f > 3)
++		return -EINVAL;
++	if (f == es->filter)
++		return 0;
++	regmap_update_bits(es->regmap, ES_GENERAL, ES_GENERAL_FILTER, shape[f]);
++	regmap_write(es->regmap, ES_GPIO_INPUT, f == 3 ? 0x04 : 0x00);
++	es->filter = f;
++	return 1;
++}
++
++static const struct snd_kcontrol_new es9018k2m_controls[] = {
++	SOC_DOUBLE_R_TLV("Master Playback Volume", ES_VOL_L, ES_VOL_R, 0, 255, 1, es_vol_tlv),
++	SOC_ENUM_EXT("DAC Filter", es_filter_enum, es_filter_get, es_filter_put),
++};
++
++static const struct snd_soc_dapm_widget es9018k2m_widgets[] = {
++	SND_SOC_DAPM_DAC("DAC", "Playback", SND_SOC_NOPM, 0, 0),
++	SND_SOC_DAPM_OUTPUT("OUTL"),
++	SND_SOC_DAPM_OUTPUT("OUTR"),
++};
++
++static const struct snd_soc_dapm_route es9018k2m_routes[] = {
++	{ "OUTL", NULL, "DAC" },
++	{ "OUTR", NULL, "DAC" },
++};
++
++/*
++ * Soft-mute the DAC while no stream runs. ASoC mutes in hw_free, before the
++ * CPU DAI stops the I2S clocks, so the DAC is silent when it loses lock (on
++ * the H2 an unmuted DAC crackles as the clocks stop), and unmutes after
++ * prepare, once the clocks are back.
++ */
++static int es_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
++{
++	struct es9018k2m *es = snd_soc_component_get_drvdata(dai->component);
++
++	return regmap_update_bits(es->regmap, ES_GENERAL, ES_GENERAL_MUTE,
++				  mute ? ES_GENERAL_MUTE : 0);
++}
++
++static int es_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
++{
++	if ((fmt & SND_SOC_DAIFMT_FORMAT_MASK) != SND_SOC_DAIFMT_I2S)
++		return -EINVAL;
++	if ((fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) != SND_SOC_DAIFMT_CBC_CFC)
++		return -EINVAL;	/* the X1000 provides BCLK/LRCK */
++	return 0;
++}
++
++static const struct snd_soc_dai_ops es9018k2m_dai_ops = {
++	.set_fmt = es_set_fmt,
++	.mute_stream = es_mute_stream,
++	.no_capture_mute = 1,
++};
++
++static struct snd_soc_dai_driver es9018k2m_dai = {
++	.name = "es9018k2m-hifi",
++	.playback = {
++		.stream_name = "Playback",
++		.channels_min = 2,
++		.channels_max = 2,
++		.rates = SNDRV_PCM_RATE_8000_192000,
++		.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE |
++			   SNDRV_PCM_FMTBIT_S32_LE,
++	},
++	.ops = &es9018k2m_dai_ops,
++};
++
++static const struct snd_soc_component_driver es9018k2m_component = {
++	.controls = es9018k2m_controls,
++	.num_controls = ARRAY_SIZE(es9018k2m_controls),
++	.dapm_widgets = es9018k2m_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(es9018k2m_widgets),
++	.dapm_routes = es9018k2m_routes,
++	.num_dapm_routes = ARRAY_SIZE(es9018k2m_routes),
++	.endianness = 1,
++};
++
++static int es9018k2m_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct es9018k2m *es;
++	struct gpio_desc *pwr, *apwr;
++	unsigned int sys;
++	int ret;
++
++	es = devm_kzalloc(dev, sizeof(*es), GFP_KERNEL);
++	if (!es)
++		return -ENOMEM;
++	i2c_set_clientdata(client, es);
++
++	/* DAC digital and analog supplies (GPIO-switched on the H2) */
++	pwr = devm_gpiod_get_optional(dev, "power", GPIOD_OUT_HIGH);
++	if (IS_ERR(pwr))
++		return PTR_ERR(pwr);
++	apwr = devm_gpiod_get_optional(dev, "analog-power", GPIOD_OUT_HIGH);
++	if (IS_ERR(apwr))
++		return PTR_ERR(apwr);
++	if (pwr || apwr)
++		msleep(10);
++
++	es->regmap = devm_regmap_init_i2c(client, &es9018k2m_regmap);
++	if (IS_ERR(es->regmap))
++		return PTR_ERR(es->regmap);
++
++	ret = regmap_read(es->regmap, ES_SYSTEM, &sys);
++	if (ret)
++		return dev_err_probe(dev, ret, "no answer on I2C\n");
++	if (sys != 0x00)
++		return dev_err_probe(dev, -ENODEV, "register 0 is %#x, not an ES9018K2M\n", sys);
++
++	regmap_write(es->regmap, ES_MASTER_MODE, 0x00);	/* STOP_DIV = 0 */
++	regmap_write(es->regmap, ES_DPLL, 0xda);	/* wider I2S DPLL bandwidth */
++	/*
++	 * The chip powers up at 0 dB (full scale). Start at -40 dB, a safe level
++	 * for sensitive in-ear monitors; userspace sets the real volume.
++	 */
++	regmap_write(es->regmap, ES_VOL_L, 80);
++	regmap_write(es->regmap, ES_VOL_R, 80);
++	/* Muted until the first stream (es_mute_stream) */
++	regmap_update_bits(es->regmap, ES_GENERAL, ES_GENERAL_MUTE, ES_GENERAL_MUTE);
++
++	return devm_snd_soc_register_component(dev, &es9018k2m_component, &es9018k2m_dai, 1);
++}
++
++static const struct of_device_id es9018k2m_of_match[] = {
++	{ .compatible = "ess,es9018k2m" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, es9018k2m_of_match);
++
++static struct i2c_driver es9018k2m_driver = {
++	.driver = {
++		.name = "es9018k2m",
++		.of_match_table = es9018k2m_of_match,
++	},
++	.probe = es9018k2m_probe,
++};
++module_i2c_driver(es9018k2m_driver);
++
++MODULE_DESCRIPTION("ESS ES9018K2M DAC driver");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,15 @@
+config BR2_PACKAGE_FATHOM_PLAYER
+	bool "fathom-player"
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	depends on !BR2_SHARED_LIBS  # links statically: needs static libraries
+	select BR2_PACKAGE_SQLITE
+	select BR2_PACKAGE_FLAC
+	select BR2_PACKAGE_MPG123
+	select BR2_PACKAGE_JPEG
+	select BR2_PACKAGE_FFMPEG
+	select BR2_PACKAGE_OPUS
+	select BR2_PACKAGE_TREMOR  # Ogg Vorbis, in integers
+	help
+	  The Fathom music player for the HiFi Walker H2: one static
+	  binary, installed to the SD card image (images/sd/fathom/bin)
+	  rather than the root filesystem, with its fonts and themes.

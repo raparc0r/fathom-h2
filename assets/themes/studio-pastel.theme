@@ -1,0 +1,44 @@
+; SPDX-License-Identifier: GPL-3.0-or-later
+; Pixel Pastel's colours with the Studio look: Atkinson, round corners, line icons.
+[theme]
+name    = Studio Pastel
+author  = Fathom
+base    = dark
+
+[color]
+bg          = #17142A
+surface     = #2A2545
+text        = #F1EDFF
+text_muted  = #B4ACD6
+select_bg   = #A9B6F5
+select_fg   = #16203A
+signal      = #A8F0D1
+info        = #A8D8FF
+mode        = #CBB8FF
+battery     = #FFD1A8
+warning     = #FFF0A3
+danger      = #FF8FA3
+artist      = #CBB8FF        ; lavender
+album       = #A8D8FF        ; sky
+chip_bg     = #FFD1A8        ; peach, with dark text
+chip_fg     = #3A2212
+
+[font]
+family      = atkinson
+
+[shape]
+selection   = pill
+corner      = round
+radius      = 10
+shadow      = none
+progress    = bar
+cursor      = none
+playing     = dot
+motion      = smooth
+
+[art]
+style       = normal
+
+[decor]
+header_pattern = none
+icons          = line

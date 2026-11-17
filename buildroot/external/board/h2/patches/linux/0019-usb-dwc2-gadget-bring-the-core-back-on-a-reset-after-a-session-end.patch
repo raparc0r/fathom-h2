@@ -1,0 +1,42 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] usb: dwc2: gadget: bring the core back on a reset after a session end
+
+When the cable comes out, dwc2 sees the session end, reports the disconnect
+and leaves lx_state at L3. On the next connection the host's USB reset only
+re-initialises the core if we were connected, which after a session end we
+never are; ENUMDONE then queues the setup request, ep_queue refuses it
+(-EAGAIN: lx_state != L0), and every control transfer fails. On the HiFi
+Walker H2 (Ingenic X1000, device-only VBUS sensing through the Type-C chip),
+a Mac retried for 15 s and more after each replug, until something else
+re-initialised the core (an OTG role change, or rebinding the gadget).
+
+Treat a reset received at L3, with a gadget driver bound, as the new
+connection it is.
+
+Signed-off-by: Fathom
+---
+--- a/drivers/usb/dwc2/gadget.c
++++ b/drivers/usb/dwc2/gadget.c
+@@ -3778,6 +3778,8 @@
+ 	if (gintsts & (GINTSTS_USBRST | GINTSTS_RESETDET)) {
+ 		u32 usb_status = dwc2_readl(hsotg, GOTGCTL);
+ 		u32 connected = hsotg->connected;
++		/* The cable came out (session end): the core was left off (L3) */
++		bool was_off = hsotg->lx_state == DWC2_L3 && hsotg->driver;
+ 
+ 		dev_dbg(hsotg->dev, "%s: USBRst\n", __func__);
+ 		dev_dbg(hsotg->dev, "GNPTXSTS=%08x\n",
+@@ -3791,7 +3793,12 @@
+ 		/* Reset device address to zero */
+ 		dwc2_clear_bit(hsotg, DCFG, DCFG_DEVADDR_MASK);
+ 
+-		if (usb_status & GOTGCTL_BSESVLD && connected)
++		/*
++		 * A host resetting us after a session end is a new connection:
++		 * bring the core back, or every request fails with -EAGAIN
++		 * (lx_state != L0) and the host retries in vain.
++		 */
++		if ((usb_status & GOTGCTL_BSESVLD && connected) || was_off)
+ 			dwc2_hsotg_core_init_disconnected(hsotg, true);
+ 	}
+ 

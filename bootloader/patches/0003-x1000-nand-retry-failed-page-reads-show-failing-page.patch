@@ -1,0 +1,113 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] x1000: nand: retry failed page reads; installer shows the failing page
+
+A page whose read fails (ECC, I/O or timeout) is read up to NAND_READ_TRIES
+times before nand_read_bytes() gives up. When it does give up, the page,
+error code and status register are kept, and the recovery menu's Install,
+Backup and Restore show them under the error ("page N: err E, status S"),
+or the number of re-reads that succeeded.
+---
+--- a/firmware/target/mips/ingenic/nand-ingenic.h
++++ b/firmware/target/mips/ingenic/nand-ingenic.h
+@@ -37,6 +37,19 @@
+ #define NAND_ERR_IO             (-6)
+ #define NAND_ERR_TIMEOUT        (-7)
+ 
++/* Page reads are tried this many times before nand_read_bytes() fails */
++#define NAND_READ_TRIES         4
++
++/* The last page nand_read_bytes() gave up on: its error and the status
++ * register after the read (-1 if the read never got that far) */
++struct nand_read_err {
++    uint32_t page;
++    int rc;
++    int status;
++};
++extern struct nand_read_err nand_read_err;
++extern unsigned nand_read_retries;   /* re-reads that later succeeded */
++
+ /* keep max page size in sync with the NAND chip table in the .c file */
+ #define NAND_DRV_SCRATCHSIZE 32
+ #define NAND_DRV_MAXPAGESIZE (2048+128)
+--- a/firmware/target/mips/ingenic/nand-ingenic.c
++++ b/firmware/target/mips/ingenic/nand-ingenic.c
+@@ -352,11 +352,16 @@
+     return status & FREG_STATUS_PFAIL ? NAND_ERR_PROGRAM_FAIL : NAND_SUCCESS;
+ }
+ 
++struct nand_read_err nand_read_err;
++unsigned nand_read_retries;
++
+ int nand_page_read(struct nand_drv* drv, nand_page_t page, void* buffer)
+ {
++    nand_read_err.status = -1;
+     if(sfc_exec(drv->chip->cmd_page_read, page, NULL, 0) < 0)
+         return NAND_ERR_IO;
+     int status = nand_wait_busy(drv);
++    nand_read_err.status = status;
+     if(status < 0)
+         return status;
+ 
+@@ -395,9 +400,19 @@
+     nand_page_t page = byte_addr / pg_size;
+     unsigned offset = byte_addr % pg_size;
+     while(1) {
+-        rc = nand_page_read(drv, page, drv->page_buf);
+-        if(rc < 0)
+-            return rc;
++        /* A page that fails to read is read again a few times before giving
++         * up: on-die ECC works on each new read of the array. */
++        for(int tries = 1;; ++tries) {
++            rc = nand_page_read(drv, page, drv->page_buf);
++            if(rc >= 0)
++                break;
++            if(tries == NAND_READ_TRIES) {
++                nand_read_err.page = page;
++                nand_read_err.rc = rc;
++                return rc;
++            }
++            nand_read_retries++;
++        }
+ 
+         memcpy(buffer, &drv->page_buf[offset], MIN(pg_size - offset, byte_len));
+ 
+--- a/bootloader/x1000/install.c
++++ b/bootloader/x1000/install.c
+@@ -23,6 +23,7 @@
+ #include "kernel.h"
+ #include "button.h"
+ #include "installer-ingenic.h"
++#include "nand-ingenic.h"
+ #include <stdio.h>
+ 
+ enum {
+@@ -49,6 +50,7 @@
+     splashf(0, msg);
+ 
+     int rc;
++    nand_read_retries = 0;
+     switch(which) {
+     case INSTALL: rc = install_bootloader("/bootloader." BOOTFILE_EXT); break;
+     case BACKUP:  rc = backup_bootloader(BOOTBACKUP_FILE); break;
+@@ -56,11 +58,19 @@
+     default: return;
+     }
+ 
+-    static char buf[64];
++    static char buf[64], detail[64];
+     snprintf(buf, sizeof(buf), "%s (%d)", installer_strerror(rc), rc);
+     const char* msg1 = rc == 0 ? "Success" : buf;
+     const char* msg2 = "Press " BL_QUIT_NAME " to continue";
+-    splashf(0, "%s\n%s", msg1, msg2);
++    /* Fathom: say which page failed, and how, or how many reads were retried */
++    detail[0] = 0;
++    if(rc == IERR_NAND_READ)
++        snprintf(detail, sizeof(detail), "page %lu: err %d, status %02x",
++                 (unsigned long)nand_read_err.page, nand_read_err.rc,
++                 nand_read_err.status & 0xff);
++    else if(nand_read_retries)
++        snprintf(detail, sizeof(detail), "%u page re-reads", nand_read_retries);
++    splashf(0, "%s\n%s\n%s", msg1, detail, msg2);
+ 
+     while(get_button(TIMEOUT_BLOCK) != BL_QUIT);
+ }

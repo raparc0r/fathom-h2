@@ -1,0 +1,84 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] ASoC: jz4740-i2s: external codecs and MCLK rate on X1000-class SoCs
+
+Two things boards with an external I2S codec need:
+
+- The AIC always selected its internal codec (AIC_CONF.ICDC). An
+  "ingenic,external-codec" DT property leaves it clear, so the I2S pins
+  carry the signal (the X1000 in the HiFi Walker H2, with an ES9018K2M).
+- There was no set_sysclk, so MCLK stayed at whatever rate the I2S clock
+  had and I2SDIV had to approximate 64 fs (up to 5% off). set_sysclk now
+  sets the I2S clock to the requested MCLK; with simple-audio-card's
+  mclk-fs = 256 and the X1000's fractional I2S PLL every standard rate is
+  exact and I2SDIV is 4.
+
+Signed-off-by: Fathom
+---
+diff -Naur a/sound/soc/jz4740/jz4740-i2s.c b/sound/soc/jz4740/jz4740-i2s.c
+--- a/sound/soc/jz4740/jz4740-i2s.c
++++ b/sound/soc/jz4740/jz4740-i2s.c
+@@ -13,6 +13,7 @@
+ #include <linux/module.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/platform_device.h>
++#include <linux/property.h>
+ #include <linux/regmap.h>
+ #include <linux/slab.h>
+ 
+@@ -84,6 +85,7 @@
+ 
+ 	struct clk *clk_aic;
+ 	struct clk *clk_i2s;
++	bool external_codec;
+ 
+ 	struct snd_dmaengine_dai_dma_data playback_dma_data;
+ 	struct snd_dmaengine_dai_dma_data capture_dma_data;
+@@ -317,6 +319,21 @@
+ 	return 0;
+ }
+ 
++/*
++ * The I2S clock is the system clock (MCLK) when the AIC drives it out to an
++ * external codec. Machine drivers ask for it with the codec's MCLK ratio
++ * (e.g. simple-audio-card,mclk-fs), so BCLK = MCLK / I2SDIV stays exact.
++ */
++static int jz4740_i2s_set_sysclk(struct snd_soc_dai *dai, int clk_id,
++				 unsigned int freq, int dir)
++{
++	struct jz4740_i2s *i2s = snd_soc_dai_get_drvdata(dai);
++
++	if (dir != SND_SOC_CLOCK_OUT || !freq)
++		return 0;
++	return clk_set_rate(i2s->clk_i2s, freq);
++}
++
+ static int jz4740_i2s_dai_probe(struct snd_soc_dai *dai)
+ {
+ 	struct jz4740_i2s *i2s = snd_soc_dai_get_drvdata(dai);
+@@ -334,6 +351,7 @@
+ 	.trigger = jz4740_i2s_trigger,
+ 	.hw_params = jz4740_i2s_hw_params,
+ 	.set_fmt = jz4740_i2s_set_fmt,
++	.set_sysclk = jz4740_i2s_set_sysclk,
+ };
+ 
+ #define JZ4740_I2S_FMTS (SNDRV_PCM_FMTBIT_S8 | \
+@@ -463,8 +481,8 @@
+ 	regmap_write(i2s->regmap, JZ_REG_AIC_CONF, JZ_AIC_CONF_RESET);
+ 
+ 	regmap_write(i2s->regmap, JZ_REG_AIC_CONF,
+-		     JZ_AIC_CONF_OVERFLOW_PLAY_LAST |
+-		     JZ_AIC_CONF_I2S | JZ_AIC_CONF_INTERNAL_CODEC);
++		     JZ_AIC_CONF_OVERFLOW_PLAY_LAST | JZ_AIC_CONF_I2S |
++		     (i2s->external_codec ? 0 : JZ_AIC_CONF_INTERNAL_CODEC));
+ 
+ 	regmap_field_write(i2s->field_rx_fifo_thresh, 7);
+ 	regmap_field_write(i2s->field_tx_fifo_thresh, 8);
+@@ -548,6 +566,7 @@
+ 		return -ENOMEM;
+ 
+ 	i2s->soc_info = device_get_match_data(dev);
++	i2s->external_codec = device_property_read_bool(dev, "ingenic,external-codec");
+ 
+ 	regs = devm_platform_get_and_ioremap_resource(pdev, 0, &mem);
+ 	if (IS_ERR(regs))

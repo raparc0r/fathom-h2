@@ -1,0 +1,66 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] x1000: nand: decode the XT26G01C's 4-bit ECC status
+
+The XTX XT26G01C (HiFi Walker H2 / Eros Q hw4) reports on-die ECC status
+as a 4-bit field in status bits 7:4: 0 = no errors, 1-8 = number of bits
+corrected, 0xf = uncorrectable (XTX datasheet, Rev A1.0, table 8).
+
+The driver decoded the generic 2-bit field (bit 5 = uncorrectable,
+bit 4 = bitflips). On this chip bit 5 is ECCS1, so a read that needed
+2, 3, 6 or 7 corrections failed as uncorrectable (seen as an intermittent
+"NAND read error (6)" from Backup), and 8 corrected bits read as clean.
+
+Add NAND_CHIPFLAG_ECC_STATUS_4BIT and set it for the XT26G01C. Other chips
+are unchanged.
+---
+--- a/firmware/target/mips/ingenic/nand-ingenic.h
++++ b/firmware/target/mips/ingenic/nand-ingenic.h
+@@ -48,6 +48,11 @@
+ /* True if the chip has on-die ECC */
+ #define NAND_CHIPFLAG_ON_DIE_ECC    0x0004
+ 
++/* On-die ECC status is a 4-bit count of corrected bits in status bits 7:4,
++ * with 0xf = uncorrectable (e.g. XTX XT26G01C), instead of the usual 2-bit
++ * field in bits 5:4. */
++#define NAND_CHIPFLAG_ECC_STATUS_4BIT 0x0008
++
+ /*                                          cmd   mode             a  d  phase format         has data */
+ #define NANDCMD_RESET               SFC_CMD(0xff, SFC_TMODE_1_1_1, 0, 0, SFC_PFMT_ADDR_FIRST, 0)
+ #define NANDCMD_READID_OPCODE       SFC_CMD(0x9f, SFC_TMODE_1_1_1, 0, 0, SFC_PFMT_ADDR_FIRST, 1)
+--- a/firmware/target/mips/ingenic/nand-ingenic.c
++++ b/firmware/target/mips/ingenic/nand-ingenic.c
+@@ -106,7 +106,7 @@
+                        STA_TYPE_V(1BYTE), CMD_TYPE_V(8BITS),
+                        SMP_DELAY(1)),
+     .flags = NAND_CHIPFLAG_QUAD | NAND_CHIPFLAG_HAS_QE_BIT |
+-             NAND_CHIPFLAG_ON_DIE_ECC,
++             NAND_CHIPFLAG_ON_DIE_ECC | NAND_CHIPFLAG_ECC_STATUS_4BIT,
+     .cmd_page_read = NANDCMD_PAGE_READ,
+     .cmd_program_execute = NANDCMD_PROGRAM_EXECUTE,
+     .cmd_block_erase = NANDCMD_BLOCK_ERASE,
+@@ -361,11 +361,23 @@
+         return status;
+ 
+     if(drv->chip->flags & NAND_CHIPFLAG_ON_DIE_ECC) {
+-        if(status & FREG_STATUS_ECC_UNCOR_ERR) {
++        bool uncorrectable, flips;
++        if(drv->chip->flags & NAND_CHIPFLAG_ECC_STATUS_4BIT) {
++            /* 0 = clean, 1-8 = bits corrected, 0xf = uncorrectable;
++             * 9-14 are reserved, so treat them as failures too */
++            int eccs = (status >> 4) & 0xf;
++            uncorrectable = eccs > 8;
++            flips = eccs != 0;
++        } else {
++            uncorrectable = status & FREG_STATUS_ECC_UNCOR_ERR;
++            flips = status & FREG_STATUS_ECC_HAS_FLIPS;
++        }
++
++        if(uncorrectable) {
+             logf("ecc uncorrectable error on page %08lx", (unsigned long)page);
+             return NAND_ERR_ECC_FAIL;
+         }
+-        if(status & FREG_STATUS_ECC_HAS_FLIPS)
++        if(flips)
+             logf("ecc corrected bitflips on page %08lx", (unsigned long)page);
+     }
+ 

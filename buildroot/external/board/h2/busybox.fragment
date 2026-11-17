@@ -1,0 +1,8 @@
+# Fathom: DHCP server for the USB network link to the computer
+CONFIG_UDHCPD=y
+# Fathom: the clock from the network when Wi-Fi connects (udhcpc hook fathom-ntp)
+CONFIG_NTPD=y
+CONFIG_TIMEOUT=y
+# Fathom: root's password for SSH and the serial console (fathom-ssh)
+CONFIG_CHPASSWD=y
+CONFIG_FEATURE_DEFAULT_PASSWD_ALGO="sha512"

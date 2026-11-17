@@ -1,0 +1,76 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# SSH (Settings > SSH): dropbear on port 22, over the USB link and Wi-Fi, for
+# root with a password, and SFTP (/usr/libexec/sftp-server).
+#   echo PASSWORD | fathom-ssh on    root's password is PASSWORD; SSH started
+#   echo PASSWORD | fathom-ssh off   root's password is PASSWORD; SSH stopped
+#   fathom-ssh boot                  as the settings say (S90fathom, before the player)
+#   fathom-ssh status                on or off
+#
+# The build locks root (no password works) until one is set here, so neither
+# SSH nor the USB serial console lets anyone in before. The host key is kept
+# on the card (fathom/keys), so computers know the H2 again after a restart;
+# so is authorized_keys, if you put one there: public keys that may log in
+# without the password.
+
+K=/mnt/sd/fathom/keys
+SETTINGS=/mnt/sd/fathom/settings.ini
+PID=/var/run/dropbear.pid
+
+say() { echo "ssh: $1" >&2; }
+alive() { [ -f $PID ] && kill -0 "$(cat $PID)" 2>/dev/null; }
+setting() { sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" $SETTINGS 2>/dev/null | tail -1 | tr -d '\r' | sed 's/[[:space:]]*$//'; }
+
+password() {
+    [ -n "$1" ] || { say "no password"; return 2; }
+    printf 'root:%s\n' "$1" | chpasswd > /dev/null 2>&1 || { say "couldn't set the password"; return 1; }
+}
+
+start() {
+    alive && return 0
+    mkdir -p $K
+    if [ ! -s $K/ssh_host_ed25519_key ]; then
+        rm -f $K/ssh_host_ed25519_key
+        dropbearkey -t ed25519 -f $K/ssh_host_ed25519_key > /dev/null 2>&1 || { say "couldn't make a host key"; return 1; }
+    fi
+    mkdir -p /root/.ssh
+    chmod 700 /root /root/.ssh
+    if [ -s $K/authorized_keys ]; then
+        cp $K/authorized_keys /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
+    else
+        rm -f /root/.ssh/authorized_keys
+    fi
+    dropbear -r $K/ssh_host_ed25519_key -p 22 -P $PID
+    for i in $(seq 1 20); do alive && break; sleep 0.1; done
+    alive || { say "dropbear didn't start"; return 1; }
+}
+
+stop() {
+    alive && kill "$(cat $PID)"
+    rm -f $PID
+    return 0
+}
+
+case "$1" in
+on|off)
+    read -r pass
+    password "$pass" || exit $?
+    if [ "$1" = on ]; then start || exit 1; else stop; fi
+    echo "$1"
+    ;;
+boot)
+    pass=$(setting ssh.password)
+    [ -n "$pass" ] || exit 0          # (the player makes one up)
+    password "$pass" || exit $?
+    [ "$(setting ssh.on)" = 1 ] && start
+    exit 0
+    ;;
+status)
+    alive && echo on || echo off
+    ;;
+*)
+    echo "usage: echo PASSWORD | fathom-ssh on|off, or fathom-ssh boot|status" >&2
+    exit 2
+    ;;
+esac

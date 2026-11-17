@@ -1,0 +1,26 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] x1000: h2boot: boot Linux from the SD card by default (Eros Q)
+
+For Fathom on the HiFi Walker H2 / Eros Q hw4: with no key held at power-on,
+boot the "Linux" entry (/uImage and /linux_cmdline.txt from the SD card)
+instead of Rockbox. If that fails, fall through to the recovery menu as
+before. Vol+ (recovery menu) and Play (original firmware) are unchanged, and
+Rockbox can still be started from the recovery menu's Boot select.
+---
+--- a/bootloader/x1000/main.c
++++ b/bootloader/x1000/main.c
+@@ -94,7 +94,14 @@
+             boot_of_recovery();
+ #endif
+         else
++#if defined(EROS_QN)
++            /* h2boot (Fathom): boot Linux from the SD card (/uImage and
++             * /linux_cmdline.txt). Rockbox stays available from the recovery
++             * menu's Boot select. */
++            boot_linux();
++#else
+             boot_rockbox();
++#endif
+     }
+ 
+     /* This function does not return. */

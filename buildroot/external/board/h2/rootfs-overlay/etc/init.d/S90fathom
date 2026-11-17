@@ -1,0 +1,46 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Start the Fathom player from the SD card and restart it if it exits. Exit code
+# 42 asks for USB drive mode (fathom-usbdisk) first.
+# Create /mnt/sd/fathom/no-autostart to boot to the console instead (development).
+# Output goes to /tmp/fathom-player.log (RAM, not the card).
+
+bin=/mnt/sd/fathom/bin/fathom-player
+pidfile=/var/run/fathom.pid
+
+case "$1" in
+start)
+    /usr/sbin/fathom-ssh boot           # root's password, and SSH if it's on (even if the player isn't there)
+    [ -x "$bin" ] || { echo "fathom: $bin not found"; exit 0; }
+    [ -e /mnt/sd/fathom/no-autostart ] && { echo "fathom: autostart disabled"; exit 0; }
+    (
+        cd /                            # not on the card: USB drive mode unmounts it
+        while :; do
+            "$bin" >> /tmp/fathom-player.log 2>&1
+            rc=$?
+            if [ $rc = 42 ]; then           # USB drive mode: lend the card, then carry on
+                /usr/sbin/fathom-usbdisk >> /tmp/fathom-player.log 2>&1
+                continue
+            fi
+            echo "fathom-player exited ($rc), restarting" >> /tmp/fathom-player.log
+            sleep 2
+        done
+    ) &
+    echo $! > "$pidfile"
+    ;;
+stop)
+    [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null   # the restart loop first
+    rm -f "$pidfile"
+    p=$(pidof fathom-player) || exit 0
+    kill $p
+    for i in 1 2 3 4 5 6 7 8 9 10; do       # up to 5 s to close the library cleanly
+        pidof fathom-player >/dev/null || exit 0
+        sleep 0.5
+    done
+    kill -9 $p 2>/dev/null
+    ;;
+restart)
+    "$0" stop; sleep 1; "$0" start
+    ;;
+esac

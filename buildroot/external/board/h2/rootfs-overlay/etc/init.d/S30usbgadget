@@ -1,0 +1,49 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# What the H2 is to a computer (a configfs gadget, one configuration):
+#   acm.GS0         serial console, ttyGS0
+#   ecm.usb0        network: the H2 is 10.42.0.1 (S40usbnet); fixed MACs, so the
+#                   computer keeps one interface
+#   mass_storage.0  a USB drive with no medium: USB drive mode lends it the
+#                   microSD card (fathom-usbdisk)
+
+G=/sys/kernel/config/usb_gadget/fathom
+
+case "$1" in
+start)
+    grep -q " /sys/kernel/config " /proc/mounts || mount -t configfs none /sys/kernel/config
+    [ -d $G ] && exit 0
+    mkdir $G && cd $G || exit 1
+    echo 0x1d6b > idVendor          # Linux Foundation
+    echo 0x0104 > idProduct         # multifunction composite gadget
+    echo 0x0100 > bcdDevice
+    echo 0x0200 > bcdUSB
+    echo 0xef > bDeviceClass        # composite with interface associations
+    echo 0x02 > bDeviceSubClass
+    echo 0x01 > bDeviceProtocol
+    mkdir strings/0x409
+    echo "Fathom" > strings/0x409/manufacturer
+    echo "Fathom H2" > strings/0x409/product
+    echo "fathom-h2" > strings/0x409/serialnumber
+
+    mkdir configs/c.1 configs/c.1/strings/0x409
+    echo "Serial, network and USB drive" > configs/c.1/strings/0x409/configuration
+    echo 500 > configs/c.1/MaxPower
+
+    mkdir functions/acm.GS0
+    mkdir functions/ecm.usb0
+    echo 02:46:41:54:48:01 > functions/ecm.usb0/dev_addr
+    echo 02:46:41:54:48:02 > functions/ecm.usb0/host_addr
+    mkdir functions/mass_storage.0
+    L=functions/mass_storage.0/lun.0
+    echo 1 > $L/removable
+    echo 0 > $L/ro
+    echo "Fathom  H2 microSD" > $L/inquiry_string
+
+    ln -s $G/functions/acm.GS0 configs/c.1/
+    ln -s $G/functions/ecm.usb0 configs/c.1/
+    ln -s $G/functions/mass_storage.0 configs/c.1/
+    ls /sys/class/udc | head -n 1 > UDC
+    ;;
+esac

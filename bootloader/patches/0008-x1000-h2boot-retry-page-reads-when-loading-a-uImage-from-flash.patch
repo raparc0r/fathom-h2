@@ -1,0 +1,50 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] x1000: h2boot: retry page reads when loading a uImage from flash
+
+For Fathom on the HiFi Walker H2 / Eros Q hw4 (XTX XT26G01C SPI NAND).
+Patch 0003 made nand_read_bytes() read a page again when a read fails,
+but booting an image straight from the flash (Boot select > HibyOS
+Recovery, Hiby Player) goes through uimage_nand_reader(), which calls
+nand_page_read() once: on the H2, HibyOS Recovery failed with "uImage
+load failed (-7)" (a read error) while "Dump OF recovery" read the same
+partition, intact, through nand_read_bytes(). Retry there too, the same
+number of times, and say which page failed if it still does.
+---
+--- a/bootloader/x1000/utils.c
++++ b/bootloader/x1000/utils.c
+@@ -182,7 +182,19 @@
+         count = d->count;
+ 
+     while(d->page < d->end_page && read_count < count) {
+-        rc = nand_page_read(ndrv, d->page, ndrv->page_buf);
++        /* Fathom: a page that fails to read is read again a few times, as
++         * nand_read_bytes() does (on-die ECC works on each new read). */
++        for(int tries = 1;; ++tries) {
++            rc = nand_page_read(ndrv, d->page, ndrv->page_buf);
++            if(rc >= 0)
++                break;
++            if(tries == NAND_READ_TRIES) {
++                nand_read_err.page = d->page;
++                nand_read_err.rc = rc;
++                break;
++            }
++            nand_read_retries++;
++        }
+ 
+         /* Ignore ECC errors on the first page of a block. This may
+          * indicate a bad block. */
+@@ -243,9 +255,13 @@
+         goto out;
+     }
+ 
++    nand_read_err.page = 0;
++    nand_read_err.rc = 0;
+     int handle = uimage_load(uh, sizep, uimage_nand_reader, &n);
+     if(handle <= 0) {
+-        splashf(5*HZ, "uImage load failed (%d)", handle);
++        /* Fathom: and which page failed, how */
++        splashf(5*HZ, "uImage load failed (%d)\npage %lu: err %d",
++                handle, (unsigned long)nand_read_err.page, nand_read_err.rc);
+         ret = -3;
+         goto out;
+     }

@@ -1,0 +1,39 @@
+; SPDX-License-Identifier: GPL-3.0-or-later
+[theme]
+name    = Studio Mint
+author  = Fathom
+base    = dark
+
+[color]
+bg          = #0F1413
+surface     = #1F2A27
+text        = #EEF5F2
+text_muted  = #9DB0A9
+select_bg   = #22D492
+select_fg   = #04251A
+signal      = #22D492
+info        = #9DB0A9
+mode        = #22D492
+battery     = #9DB0A9
+warning     = #FFC845
+danger      = #FF6B6B
+
+[font]
+family      = atkinson
+
+[shape]
+selection   = pill
+corner      = round
+radius      = 10
+shadow      = none
+progress    = bar
+cursor      = none
+playing     = dot
+motion      = smooth
+
+[art]
+style       = normal
+
+[decor]
+header_pattern = none
+icons          = line

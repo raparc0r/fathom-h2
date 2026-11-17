@@ -1,0 +1,67 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] x1000: h2boot: copy the Bluetooth and Wi-Fi firmware from the stock system
+
+For Fathom on the HiFi Walker H2 / Eros Q hw4. Fathom can't ship the
+Bluetooth and Wi-Fi chip's firmware, but every H2 has it in the stock
+system that stays in its flash. Whenever it boots Linux (by default, or
+from the menu), h2boot first copies the three files (the Bluetooth patch,
+the Wi-Fi firmware and the board's Wi-Fi calibration) to the card's
+/fathom/firmware/brcm/ when the card is Fathom's and any of them is
+missing; the recovery menu's Advanced > Copy BT/Wi-Fi firmware does it
+on demand. It only reads the flash.
+
+The code is Fathom's bootloader/fathom/fwcopy.c (scanning UBIFS, LZO) and
+fwcopy-h2boot.c, which bootloader/build.sh copies into bootloader/x1000/.
+---
+--- a/bootloader/SOURCES
+--- a/bootloader/SOURCES
++++ b/bootloader/SOURCES
+@@ -80,6 +80,10 @@
+ x1000/main.c
+ x1000/recovery.c
+ x1000/utils.c
++#if defined(EROS_QN)
++x1000/fwcopy.c
++x1000/fwcopy-h2boot.c
++#endif
+ #elif defined(HIBY_R1_NATIVE)
+ ingenic/gui-ingenic.c
+ x1600/boot.c
+--- a/bootloader/x1000/boot.c
++++ b/bootloader/x1000/boot.c
+@@ -130,6 +130,9 @@
+ void boot_linux(void)
+ {
+ #if defined(EROS_QN)
++    /* Fathom: first, the Bluetooth and Wi-Fi firmware onto the card, from
++     * the stock system in the flash, if it isn't there yet */
++    fathom_copy_firmware(false);
+     show_boot_logo();   /* Fathom: on screen while the kernel loads */
+ #endif
+     struct uimage_header uh;
+--- a/bootloader/x1000/recovery.c
++++ b/bootloader/x1000/recovery.c
+@@ -60,6 +60,9 @@
+     {MENUITEM_ACTION,       "Backup",               &bootloader_backup},
+     {MENUITEM_ACTION,       "Restore",              &bootloader_restore},
+     {MENUITEM_HEADING,  "Advanced",                 NULL},
++#if defined(EROS_QN)
++    {MENUITEM_ACTION,       "Copy BT/Wi-Fi firmware", &fathom_copy_firmware_menu},
++#endif
+     {MENUITEM_ACTION,       "Debug tools",          &to_debug_menu},
+ };
+ 
+--- a/bootloader/x1000/x1000bootloader.h
++++ b/bootloader/x1000/x1000bootloader.h
+@@ -195,4 +195,11 @@
+ 
+ void recovery_menu(void) __attribute__((noreturn));
+ 
++#if defined(EROS_QN)
++/* h2boot (Fathom): the Bluetooth and Wi-Fi firmware from the stock system in
++ * the flash onto the card (fwcopy-h2boot.c); asked: from the menu */
++void fathom_copy_firmware(bool asked);
++void fathom_copy_firmware_menu(void);
++#endif
++
+ #endif /* __X1000BOOTLOADER_H__ */

@@ -1,0 +1,54 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# USB drive mode: lend the microSD card to the computer until it's ejected
+# there or the cable is unplugged, then mount it again. S90fathom runs this when
+# the player exits for it (exit code 42), so nothing has the card open.
+# Leaves /tmp/fathom-rescan for the player (new music), or a message in
+# /tmp/fathom-usbdisk.msg if the card couldn't be lent.
+
+LUN=/sys/kernel/config/usb_gadget/fathom/functions/mass_storage.0/lun.0
+DEV=/dev/mmcblk0p1
+udc=$(ls /sys/class/udc | head -n 1)
+STATE=/sys/class/udc/$udc/state
+MSG=/tmp/fathom-usbdisk.msg
+
+say() { echo "usbdisk: $1"; }
+
+[ -d $LUN ] || { say "no USB drive function"; echo "USB drive mode isn't available" > $MSG; exit 1; }
+[ "$(cat $STATE 2>/dev/null)" = configured ] || { say "not connected"; exit 0; }
+
+sync
+fathom-bt stop > /dev/null 2>&1   # Bluetooth runs from the card
+fathom-share off > /dev/null 2>&1 # the network drive (it has the card open)
+fathom-wifi off > /dev/null 2>&1  # so does Wi-Fi
+if ! umount /mnt/sd 2>/dev/null; then
+    say "card busy:"; fuser -m /mnt/sd 2>&1
+    echo "The card is in use: try again" > $MSG
+    exit 1
+fi
+if ! echo $DEV > $LUN/file; then
+    say "cannot lend $DEV"
+    mount -t vfat -o rw,noatime $DEV /mnt/sd
+    echo "Couldn't start USB drive mode" > $MSG
+    exit 1
+fi
+say "card lent to the computer"
+
+# Until it's ejected (the file goes empty) or the cable stays unplugged for 3 s.
+# A computer resets the USB link when the drive appears (macOS does), and the
+# link is "suspended" while it sleeps: neither ends drive mode.
+gone=0
+while [ -n "$(cat $LUN/file)" ]; do
+    if [ "$(cat $STATE 2>/dev/null)" = "not attached" ]; then gone=$((gone + 1)); else gone=0; fi
+    [ $gone -ge 3 ] && break
+    sleep 1
+done
+echo 1 > $LUN/forced_eject 2>/dev/null
+say "card back ($(cat $STATE 2>/dev/null))"
+
+for i in 1 2 3; do
+    mount -t vfat -o rw,noatime $DEV /mnt/sd && break
+    sleep 1
+done
+touch /tmp/fathom-rescan

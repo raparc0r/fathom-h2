@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Fathom for the HiFi Walker H2 (X1000, hw4).:
+# kernel + small initramfs, booted from the SD card by the Rockbox bootloader.
+
+# CPU: Ingenic X1000 (XBurst, MIPS32r2 with FPU; Buildroot adds the FPU erratum flags)
+BR2_mipsel=y
+BR2_mips_xburst=y
+
+# Toolchain. Static libraries too: the player is one static binary on the SD card.
+BR2_TOOLCHAIN_BUILDROOT_MUSL=y
+BR2_SHARED_STATIC_LIBS=y
+BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_6_18=y
+BR2_CCACHE=y
+BR2_CCACHE_DIR="/cache/ccache"
+
+# System
+BR2_TARGET_GENERIC_HOSTNAME="fathom-h2"
+BR2_TARGET_GENERIC_ISSUE="Fathom bring-up"
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_FATHOM_PATH)/board/h2/rootfs-overlay"
+# Development access over USB: login on the gadget serial port, SSH over the gadget
+# network. Root has no password: development images only.
+BR2_TARGET_GENERIC_GETTY_PORT="ttyGS0"
+BR2_TARGET_GENERIC_ROOT_PASSWD=""
+BR2_PACKAGE_DROPBEAR=y
+BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_FATHOM_PATH)/board/h2/busybox.fragment"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_FATHOM_PATH)/board/h2/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_FATHOM_PATH)/board/h2/post-image.sh"
+
+# Kernel: mainline 6.18 LTS + the H2 board patch
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION_VALUE="6.18.63"
+BR2_LINUX_KERNEL_PATCH="$(BR2_EXTERNAL_FATHOM_PATH)/board/h2/patches/linux"
+# Patches to Buildroot packages: package-patches/<package>/
+BR2_GLOBAL_PATCH_DIR="$(BR2_EXTERNAL_FATHOM_PATH)/board/h2/package-patches"
+BR2_LINUX_KERNEL_DEFCONFIG="cu1000-neo"
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_FATHOM_PATH)/board/h2/linux.fragment"
+# Raw kernel binary; post-image.sh wraps it in a legacy gzip uImage (the generic
+# MIPS platform's own uImage target makes a FIT image the bootloader can't read).
+BR2_LINUX_KERNEL_VMLINUX_BIN=y
+BR2_PACKAGE_HOST_UBOOT_TOOLS=y
+BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SUPPORT=y
+
+# Root filesystem: built into the kernel as an initramfs for now
+BR2_TARGET_ROOTFS_CPIO=y
+BR2_TARGET_ROOTFS_INITRAMFS=y
+# BR2_TARGET_ROOTFS_TAR is not set
+
+# The player (static, installed to the SD card image, not the initramfs)
+BR2_PACKAGE_FATHOM_PLAYER=y
+BR2_PACKAGE_JPEG_TURBO=y
+
+# Audio bring-up tools (tinyplay, tinymix, tinypcminfo)
+BR2_PACKAGE_TINYALSA=y
+BR2_PACKAGE_TINYALSA_TOOLS=y
+# Formats beyond FLAC and MP3, for the player (app/audio/ff_util.c): FFmpeg with
+# only integer decoders (the X1000 has no FPU) and the demuxers they need; Opus
+# through libopus built fixed-point. No programs, encoders or filters. (Vorbis:
+# Tremor, below.)
+BR2_PACKAGE_FFMPEG=y
+# BR2_PACKAGE_FFMPEG_FFMPEG is not set
+BR2_PACKAGE_FFMPEG_ENCODERS=""
+BR2_PACKAGE_FFMPEG_DECODERS="alac aac_fixed libopus wavpack ape tta pcm_s16le pcm_s16be pcm_s24le pcm_s24be pcm_s32le pcm_s32be pcm_u8 pcm_f32le pcm_f32be mp3 flac"
+BR2_PACKAGE_FFMPEG_MUXERS=""
+# hls and mpegts: HLS radio (.m3u8; its segments are MPEG-TS, raw AAC/MP3, or MP4 for mov)
+BR2_PACKAGE_FFMPEG_DEMUXERS="mov aac wav w64 aiff wv ape tta ogg mp3 flac hls mpegts"
+BR2_PACKAGE_FFMPEG_PARSERS="aac opus mpegaudio flac"
+BR2_PACKAGE_FFMPEG_BSFS=""
+# internet radio: http(s), through a proxy for tests over USB (httpproxy); crypto
+# for HLS segments in AES-128
+BR2_PACKAGE_FFMPEG_PROTOCOLS="file http https tcp tls httpproxy crypto"
+BR2_PACKAGE_FFMPEG_FILTERS=""
+# BR2_PACKAGE_FFMPEG_INDEVS is not set
+# BR2_PACKAGE_FFMPEG_OUTDEVS is not set
+# mbedTLS for https (external.mk): Apache-2.0, so FFmpeg is LGPL-3 (--enable-version3)
+BR2_PACKAGE_FFMPEG_EXTRACONF="--disable-avdevice --disable-avfilter --disable-swscale --disable-swresample --disable-iconv --disable-pixelutils --enable-mbedtls --enable-version3"
+BR2_PACKAGE_MBEDTLS=y
+BR2_PACKAGE_OPUS=y
+BR2_PACKAGE_OPUS_FIXED_POINT=y
+# Ogg Vorbis through Tremor (libvorbisidec: fixed point; FFmpeg's decoder is float)
+BR2_PACKAGE_TREMOR=y
+# Bluetooth audio: D-Bus, BlueZ and bluez-alsa. post-build.sh moves them and the
+# libraries only they use to the card (fathom/bt), out of the initramfs.
+BR2_PACKAGE_DBUS=y
+BR2_PACKAGE_BLUEZ5_UTILS=y
+BR2_PACKAGE_BLUEZ5_UTILS_CLIENT=y
+BR2_PACKAGE_BLUEZ5_UTILS_PLUGINS_AUDIO=y
+BR2_PACKAGE_BLUEZ_ALSA=y
+# aptX (classic) through libfreeaptx: external.mk
+BR2_PACKAGE_LIBFREEAPTX=y
+# Wi-Fi: wpa_supplicant (nl80211, internal crypto, wpa_cli) and iw, run from the
+# card (fathom/wifi, staged by post-build.sh) like Bluetooth
+BR2_PACKAGE_WPA_SUPPLICANT=y
+BR2_PACKAGE_WPA_SUPPLICANT_NL80211=y
+BR2_PACKAGE_WPA_SUPPLICANT_CLI=y
+BR2_PACKAGE_IW=y
+# The network drive (fathom/share, staged by post-build.sh): lighttpd's WebDAV
+# over HTTPS (mbedTLS, as for the radio), Bonjour, and SFTP for SSH logins
+BR2_PACKAGE_LIGHTTPD=y
+BR2_PACKAGE_LIGHTTPD_WEBDAV=y
+BR2_PACKAGE_LIGHTTPD_MBEDTLS=y
+BR2_PACKAGE_GESFTPSERVER=y
+# The authorities radio streams over HTTPS are checked against (the bundle goes to fathom/share)
+BR2_PACKAGE_CA_CERTIFICATES=y
+BR2_PACKAGE_UTIL_LINUX=y
+BR2_PACKAGE_UTIL_LINUX_LIBUUID=y
+BR2_PACKAGE_MDNSD=y
+# BR2_PACKAGE_MDNSD_SSH_SERVICE is not set

@@ -1,0 +1,39 @@
+; SPDX-License-Identifier: GPL-3.0-or-later
+[theme]
+name    = Studio Ember
+author  = Fathom
+base    = dark
+
+[color]
+bg          = #121214
+surface     = #2A2A2F
+text        = #F4F4F2
+text_muted  = #A3A3A8
+select_bg   = #FF8A3D
+select_fg   = #1E0F04
+signal      = #FF8A3D
+info        = #A3A3A8
+mode        = #FF8A3D
+battery     = #A3A3A8
+warning     = #FFC845
+danger      = #FF6B6B
+
+[font]
+family      = atkinson
+
+[shape]
+selection   = pill
+corner      = round
+radius      = 10
+shadow      = none
+progress    = bar
+cursor      = none
+playing     = dot
+motion      = smooth
+
+[art]
+style       = normal
+
+[decor]
+header_pattern = none
+icons          = line

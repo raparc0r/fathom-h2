@@ -1,0 +1,25 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] usb: dwc2: descriptor DMA in host mode on Ingenic SoCs
+
+The Ingenic X1000's dwc2 has descriptor DMA (GHWCFG4.DESC_DMA), but dwc2
+only uses it in host mode when the platform asks for it. Without it every
+isochronous transfer is set up from the interrupt handler, once per
+microframe for a high-speed USB audio device (8000 a second), and on the
+HiFi Walker H2 the stream to a USB DAC drops out, worse at higher rates.
+
+Enable host descriptor DMA for the Ingenic parameter set when the core
+has it (dwc2_check_params() clears it otherwise).
+
+Signed-off-by: Fathom
+---
+diff -Naur a/drivers/usb/dwc2/params.c b/drivers/usb/dwc2/params.c
+--- a/drivers/usb/dwc2/params.c
++++ b/drivers/usb/dwc2/params.c
+@@ -56,6 +56,7 @@
+ 	p->speed = DWC2_SPEED_PARAM_HIGH;
+ 	p->phy_type = DWC2_PHY_TYPE_PARAM_UTMI;
+ 	p->phy_utmi_width = 16;
++	p->dma_desc_enable = true;
+ 	p->activate_ingenic_overcurrent_detection =
+ 		!device_property_read_bool(hsotg->dev, "disable-over-current");
+ }

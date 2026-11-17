@@ -1,0 +1,44 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] usb: dwc2: set the PHY mode for peripheral-only and OTG ports
+
+dwc2 initialises and powers on its generic PHY but never tells it which
+role the port has. Some PHYs only assert VBUS valid when told they are in
+device mode: the Ingenic X1000 PHY sets VBUSVLDEXT/VBUSVLDEXTSEL and
+OTG_DISABLE in its set_mode callback. On boards where VBUS is not wired to
+the SoC (the HiFi Walker H2 senses the cable through its PMIC), the
+controller therefore never sees a session and never connects to the host.
+
+After powering the PHY on, call phy_set_mode(PHY_MODE_USB_DEVICE) for a
+peripheral-only port (dr_mode = "peripheral") and PHY_MODE_USB_OTG for an
+OTG port, where the X1000 PHY also enables OTG and follows the ID pin. PHYs
+without a set_mode callback are unaffected.
+
+Signed-off-by: Fathom
+---
+diff -Naur a/drivers/usb/dwc2/platform.c b/drivers/usb/dwc2/platform.c
+--- a/drivers/usb/dwc2/platform.c
++++ b/drivers/usb/dwc2/platform.c
+@@ -124,6 +124,23 @@
+ 			if (ret)
+ 				phy_exit(hsotg->phy);
+ 		}
++		/*
++		 * A port may have no VBUS sense line to the PHY (the board
++		 * detects the cable elsewhere, e.g. in a PMIC). Tell the PHY
++		 * the port's mode so it can assert VBUS valid itself and, for
++		 * an OTG port, follow the ID pin.
++		 */
++		if (ret == 0 && hsotg->phy) {
++			enum usb_dr_mode dr = usb_get_dr_mode(hsotg->dev);
++			int err = 0;
++
++			if (dr == USB_DR_MODE_PERIPHERAL)
++				err = phy_set_mode(hsotg->phy, PHY_MODE_USB_DEVICE);
++			else if (dr == USB_DR_MODE_OTG)
++				err = phy_set_mode(hsotg->phy, PHY_MODE_USB_OTG);
++			if (err && err != -EOPNOTSUPP)
++				dev_warn(hsotg->dev, "failed to set PHY mode: %d\n", err);
++		}
+ 	}
+ 
+ 	if (ret)

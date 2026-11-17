@@ -1,0 +1,85 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] usb: dwc2: gadget: start isochronous IN without NAK interrupts in DDMA
+
+To start an isochronous IN endpoint, dwc2 unmasks DIEPMSK.NAK and waits for
+the first NAK to learn the current (micro)frame. DIEPMSK is shared by all IN
+endpoints, so from then on every IN token the host sends to an idle bulk IN
+endpoint raises an interrupt, too. On the HiFi Walker H2 (Ingenic X1000), with
+a UAC2 function (whose feedback endpoint is isochronous IN) next to ECM and
+ACM, that is some 180,000 interrupts a second as soon as the computer starts
+playing: the audio drops out after a fraction of a second, the network and
+serial functions stop, and the watchdog resets the board.
+
+In descriptor DMA mode the NAK is only used to pick the first target frame,
+which the frame number register gives as well. Start the endpoint from
+ep_queue, one interval ahead of the current frame, and again after a BNA
+when requests are waiting; leave DIEPMSK.NAK masked. Buffer DMA and slave
+modes are unchanged.
+
+Signed-off-by: Fathom
+---
+--- a/drivers/usb/dwc2/gadget.c
++++ b/drivers/usb/dwc2/gadget.c
+@@ -1399,6 +1399,26 @@
+ 	return 0;
+ }
+ 
++/*
++ * In descriptor DMA mode, start an isochronous IN endpoint at once, one
++ * interval ahead of the current (micro)frame, instead of waiting for a NAK
++ * interrupt: DIEPMSK.NAK is shared by every IN endpoint, and with it unmasked
++ * each IN token the host sends to an idle bulk endpoint raises an interrupt.
++ */
++static void dwc2_gadget_start_isoc_in_now(struct dwc2_hsotg_ep *hs_ep)
++{
++	struct dwc2_hsotg *hsotg = hs_ep->parent;
++
++	hs_ep->target_frame = dwc2_hsotg_read_frameno(hsotg);
++	dwc2_gadget_incr_frame_num(hs_ep);
++	if (hsotg->params.service_interval) {
++		hs_ep->target_frame &= ~hs_ep->interval + 1;
++		dwc2_gadget_incr_frame_num(hs_ep);
++		dwc2_gadget_dec_frame_num_by_one(hs_ep);
++	}
++	dwc2_gadget_start_isoc_ddma(hs_ep);
++}
++
+ static int dwc2_hsotg_ep_queue(struct usb_ep *ep, struct usb_request *req,
+ 			       gfp_t gfp_flags)
+ {
+@@ -1492,6 +1512,8 @@
+ 			}
+ 			dwc2_gadget_fill_isoc_desc(hs_ep, dma_addr,
+ 						   hs_req->req.length);
++		} else if (hs_ep->dir_in) {
++			dwc2_gadget_start_isoc_in_now(hs_ep);
+ 		}
+ 		return 0;
+ 	}
+@@ -2248,6 +2270,10 @@
+ 	hs_ep->target_frame = TARGET_FRAME_INITIAL;
+ 	hs_ep->next_desc = 0;
+ 	hs_ep->compl_desc = 0;
++
++	/* Requests queued meanwhile: carry on (no NAK interrupt in DDMA) */
++	if (hs_ep->dir_in && !list_empty(&hs_ep->queue))
++		dwc2_gadget_start_isoc_in_now(hs_ep);
+ }
+ 
+ /**
+@@ -4125,9 +4151,12 @@
+ 		hs_ep->compl_desc = 0;
+ 		if (dir_in) {
+ 			hs_ep->periodic = 1;
+-			mask = dwc2_readl(hsotg, DIEPMSK);
+-			mask |= DIEPMSK_NAKMSK;
+-			dwc2_writel(hsotg, mask, DIEPMSK);
++			/* DDMA starts iso IN from ep_queue, without NAK */
++			if (!using_desc_dma(hsotg)) {
++				mask = dwc2_readl(hsotg, DIEPMSK);
++				mask |= DIEPMSK_NAKMSK;
++				dwc2_writel(hsotg, mask, DIEPMSK);
++			}
+ 		} else {
+ 			epctrl |= DXEPCTL_SNAK;
+ 			mask = dwc2_readl(hsotg, DOEPMSK);

@@ -1,0 +1,60 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Fathom bring-up: write a boot report to the microSD card, then turn the blue
+# LED solid. LED heartbeat = kernel running; solid = report saved.
+# Writes only to /fathom/ on the card.
+
+case "$1" in
+    start) ;;
+    *) exit 0 ;;
+esac
+
+mkdir -p /mnt/sd
+mount -t debugfs none /sys/kernel/debug 2>/dev/null
+mount -t pstore pstore /sys/fs/pstore 2>/dev/null
+
+# Why the SoC started: X1000 CPM.RSR bit 0 = power-on, bit 1 = restart (reboot,
+# panic, watchdog). The PMIC's own reason survives a restart, so a crash while
+# plugged in would otherwise look like "switched on by USB power" (charging
+# mode). Cleared here, so the next start-up sees only its own cause.
+rsr=$(busybox devmem 0x10000008 32 2>/dev/null)
+busybox devmem 0x10000008 32 0 2>/dev/null
+if [ $(( ${rsr:-0} & 3 )) -eq 2 ]; then echo restart; else echo power-on; fi > /tmp/fathom-reset
+
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -b /dev/mmcblk0p1 ] && break
+    sleep 1
+done
+
+if mount -t vfat -o rw,noatime /dev/mmcblk0p1 /mnt/sd 2>/dev/null ||
+   mount -t vfat -o rw,noatime /dev/mmcblk0 /mnt/sd 2>/dev/null; then
+    mkdir -p /mnt/sd/fathom
+    # The last five start-ups: boot-1.log is this one, boot-5.log the oldest
+    for f in /mnt/sd/fathom/boot-*.log; do
+        n=${f##*/boot-}; n=${n%.log}
+        [ "$n" -ge 5 ] 2>/dev/null && rm -f "$f"
+    done
+    for n in 4 3 2 1; do
+        [ -e "/mnt/sd/fathom/boot-$n.log" ] && mv "/mnt/sd/fathom/boot-$n.log" "/mnt/sd/fathom/boot-$((n + 1)).log"
+    done
+    log=/mnt/sd/fathom/boot-1.log
+    {
+        echo "== Fathom start-up log (boot-1.log is the newest)"
+        uname -a
+        echo "cmdline: $(cat /proc/cmdline)"
+        echo "start: $(cat /tmp/fathom-reset) (RSR ${rsr:-?})"
+        echo; echo "== dmesg"; dmesg
+        echo; echo "== cpuinfo"; cat /proc/cpuinfo
+        echo; echo "== meminfo"; cat /proc/meminfo
+        echo; echo "== interrupts"; cat /proc/interrupts
+        echo; echo "== platform devices"; ls /sys/bus/platform/devices
+        echo; echo "== clocks"; cat /sys/kernel/debug/clk/clk_summary
+        echo; echo "== gpio"; cat /sys/kernel/debug/gpio
+        for f in /sys/fs/pstore/*; do [ -f "$f" ] && { echo; echo "== pstore: $f"; cat "$f"; }; done
+    } > "$log" 2>&1
+    sync
+    # The card stays mounted: the player runs from /mnt/sd/fathom (S90fathom).
+    echo none > /sys/class/leds/blue/trigger
+    echo 1 > /sys/class/leds/blue/brightness
+fi

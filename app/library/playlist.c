@@ -1,0 +1,201 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#include "library/playlist.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+#define M3U_MAX_BYTES (1 << 20)   /* a playlist bigger than this is not a playlist */
+
+int m3u_supported(const char *path)
+{
+    const char *dot = strrchr(path, '.');
+    return dot && (!strcasecmp(dot, ".m3u") || !strcasecmp(dot, ".m3u8"));
+}
+
+void path_normalize(char *p)
+{
+    for (char *c = p; *c; c++)
+        if (*c == '\\') *c = '/';
+    int abs = p[0] == '/';
+    /* split into components, drop "" and ".", let ".." eat the one before */
+    char *comp[256];
+    int n = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(p, "/", &save); tok; tok = strtok_r(NULL, "/", &save)) {
+        if (!strcmp(tok, ".")) continue;
+        if (!strcmp(tok, "..") && n > 0 && strcmp(comp[n - 1], "..")) { n--; continue; }
+        if (n < 256) comp[n++] = tok;
+    }
+    char out[4096];
+    size_t w = 0;
+    if (abs) out[w++] = '/';
+    for (int i = 0; i < n && w < sizeof out - 1; i++) {
+        size_t l = strlen(comp[i]);
+        if (w + l + 2 > sizeof out) break;
+        if (i) out[w++] = '/';
+        memcpy(out + w, comp[i], l);
+        w += l;
+    }
+    out[w] = '\0';
+    strcpy(p, out);   /* never longer than the input */
+}
+
+/* U+00C0..U+00FF as base letters ('_' = no letter: ×, ÷) */
+static const char LATIN1[] = "aaaaaaaceeeeiiiidnooooo_ouuuuytsaaaaaaaceeeeiiiidnooooo_ouuuuyty";
+
+void path_loose_key(const char *path, int tail, char *out, size_t cap)
+{
+    const char *start = path + strlen(path);
+    for (int k = 0; k < tail && start > path; ) {
+        start--;
+        if (*start == '/' && ++k == tail) { start++; break; }
+    }
+    size_t w = 0;
+    for (const unsigned char *c = (const unsigned char *)start; *c && w + 1 < cap; c++) {
+        if ((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9')) out[w++] = (char)*c;
+        else if (*c >= 'A' && *c <= 'Z') out[w++] = (char)(*c + 32);
+        else if (*c == '/') out[w++] = '/';
+        else if (*c == 0xC3 && c[1] >= 0x80 && c[1] <= 0xBF) {   /* U+00C0..U+00FF */
+            char b = LATIN1[c[1] - 0x80];
+            if (b != '_') out[w++] = b;
+            c++;
+        }
+        /* everything else, combining marks included, is dropped */
+    }
+    out[w] = '\0';
+}
+
+void text_search_fold(const char *s, char *out, size_t cap)
+{
+    size_t w = 0;
+    int space = 1;                                   /* suppress leading and repeated spaces */
+    for (const unsigned char *c = (const unsigned char *)s; c && *c && w + 1 < cap; c++) {
+        char ch = 0;
+        if ((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9')) ch = (char)*c;
+        else if (*c >= 'A' && *c <= 'Z') ch = (char)(*c + 32);
+        else if (*c == '\'') continue;
+        else if (*c == 0xE2 && c[1] == 0x80 && c[2] == 0x99) { c += 2; continue; }   /* ’ */
+        else if (*c == 0xC3 && c[1] >= 0x80 && c[1] <= 0xBF) {
+            ch = LATIN1[c[1] - 0x80];
+            c++;
+            if (ch == '_') ch = 0;
+        } else if (*c >= 0x80) {                      /* other characters: skip the whole sequence */
+            while ((c[1] & 0xC0) == 0x80) c++;
+        }
+        if (ch) { out[w++] = ch; space = 0; }
+        else if (!space) { out[w++] = ' '; space = 1; }
+    }
+    while (w && out[w - 1] == ' ') w--;
+    out[w] = '\0';
+}
+
+void text_loose_key(const char *s, char *out, size_t cap)
+{
+    path_loose_key(s, 1 << 30, out, cap);
+}
+
+static int push(m3u_t *m, int *cap, const char *p, const char *info, int secs)
+{
+    if (m->n == *cap) {
+        int nc = *cap ? *cap * 2 : 64;
+        char **np = realloc(m->paths, (size_t)nc * sizeof *np);
+        if (np) m->paths = np;
+        char **ni = realloc(m->infos, (size_t)nc * sizeof *ni);
+        if (ni) m->infos = ni;
+        int *ns = realloc(m->secs, (size_t)nc * sizeof *ns);
+        if (ns) m->secs = ns;
+        if (!np || !ni || !ns) return -1;
+        *cap = nc;
+    }
+    m->paths[m->n] = strdup(p);
+    m->infos[m->n] = info && *info ? strdup(info) : NULL;
+    m->secs[m->n] = secs;
+    return m->paths[m->n] ? (m->n++, 0) : -1;
+}
+
+int m3u_parse(const char *text, size_t len, const char *dir, const char *fallback_name, m3u_t *out)
+{
+    memset(out, 0, sizeof *out);
+    snprintf(out->name, sizeof out->name, "%s", fallback_name ? fallback_name : "");
+    int cap = 0;
+    size_t i = 0;
+    if (len >= 3 && !memcmp(text, "\xEF\xBB\xBF", 3)) i = 3;   /* UTF-8 BOM */
+    char line[4096], path[8192], info[512] = "";
+    int secs = -1;
+    while (i < len) {
+        size_t e = i;
+        while (e < len && text[e] != '\n' && text[e] != '\r') e++;
+        size_t l = e - i < sizeof line - 1 ? e - i : sizeof line - 1;
+        memcpy(line, text + i, l);
+        line[l] = '\0';
+        i = e + 1;
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        size_t sl = strlen(s);
+        while (sl && (s[sl - 1] == ' ' || s[sl - 1] == '\t')) s[--sl] = '\0';
+        if (!*s) continue;
+        if (*s == '#') {
+            if (!strncmp(s, "#PLAYLIST:", 10) && s[10]) snprintf(out->name, sizeof out->name, "%s", s + 10);
+            if (!strncmp(s, "#EXTINF:", 8)) {          /* #EXTINF:277,Artist - Title */
+                secs = atoi(s + 8);
+                const char *comma = strchr(s + 8, ',');
+                snprintf(info, sizeof info, "%s", comma ? comma + 1 : "");
+            }
+            continue;
+        }
+        if (strstr(s, "://")) continue;                         /* streams */
+        if (!strncmp(s, "file:", 5)) continue;                  /* rare; would need %-decoding */
+        int absolute = s[0] == '/' || s[0] == '\\' ||
+                       (((s[0] | 32) >= 'a' && (s[0] | 32) <= 'z') && s[1] == ':');   /* C:\... */
+        if (absolute || !dir || !*dir) snprintf(path, sizeof path, "%s", s);
+        else snprintf(path, sizeof path, "%s/%s", dir, s);
+        path_normalize(path);
+        if (push(out, &cap, path, info, secs)) { m3u_free(out); return -1; }
+        info[0] = '\0';                             /* #EXTINF belongs to one entry */
+        secs = -1;
+    }
+    return 0;
+}
+
+int m3u_read(const char *path, m3u_t *out)
+{
+    memset(out, 0, sizeof *out);
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    char *buf = malloc(M3U_MAX_BYTES);
+    size_t n = buf ? fread(buf, 1, M3U_MAX_BYTES, f) : 0;
+    fclose(f);
+    if (!buf) return -1;
+
+    char dir[4096], name[256];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *slash = strrchr(dir, '/');
+    const char *base = slash ? slash + 1 : dir;
+    snprintf(name, sizeof name, "%.255s", base);
+    char *dot = strrchr(name, '.');
+    if (dot) *dot = '\0';
+    for (char *c = name; *c; c++)
+        if (*c == '_') *c = ' ';
+    if (slash) *slash = '\0';
+    else dir[0] = '\0';
+
+    int rc = m3u_parse(buf, n, dir, name, out);
+    free(buf);
+    return rc;
+}
+
+void m3u_free(m3u_t *m)
+{
+    for (int i = 0; i < m->n; i++) {
+        free(m->paths[i]);
+        if (m->infos) free(m->infos[i]);
+    }
+    free(m->paths);
+    free(m->infos);
+    free(m->secs);
+    m->paths = m->infos = NULL;
+    m->secs = NULL;
+    m->n = 0;
+}

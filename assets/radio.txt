@@ -1,0 +1,17 @@
+# Fathom's internet radio stations: fathom/radio.txt on the card.
+# (This example comes with Fathom as fathom/assets/radio.txt and is used until
+# there's a fathom/radio.txt: copy it there to make the list your own.)
+#
+# One station per line:   Name = stream URL
+# Lines starting with # are notes. The order here is the order on the H2.
+#
+# What's playing comes from the stream itself when the station sends it (most
+# Icecast/Shoutcast streams do). For stations that don't, add after the URL
+#   | info: radiofrance:N     Radio France's live API, station N (FIP is 7)
+#
+# Streams can be MP3, AAC, Ogg FLAC, Ogg Vorbis... over http or https.
+
+FIP = https://icecast.radiofrance.fr/fip-hifi.aac?id=radiofrance | info: radiofrance:7
+Radio Paradise = https://stream.radioparadise.com/flacm
+Djam Radio = https://stream10.xdevel.com/audio15s976748-2280/stream/icecast.audio
+EHFM = https://ehfm.out.airtime.pro/ehfm_a

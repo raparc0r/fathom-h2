@@ -1,0 +1,22 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] phy: ingenic: usb: don't disable the VCC regulator in exit
+
+The VCC supply is enabled in .power_on and disabled in .power_off. .exit
+disabled it a second time, so the usual phy_power_off() + phy_exit()
+sequence (dwc2 does this in probe for peripheral-only ports) triggers
+"unbalanced disables for regulator-dummy". Leave the regulator to the
+power callbacks; .exit only stops the clock that .init started.
+
+Signed-off-by: Fathom
+---
+diff -Naur a/drivers/phy/ingenic/phy-ingenic-usb.c b/drivers/phy/ingenic/phy-ingenic-usb.c
+--- a/drivers/phy/ingenic/phy-ingenic-usb.c
++++ b/drivers/phy/ingenic/phy-ingenic-usb.c
+@@ -124,7 +124,6 @@
+ 	struct ingenic_usb_phy *priv = phy_get_drvdata(phy);
+ 
+ 	clk_disable_unprepare(priv->clk);
+-	regulator_disable(priv->vcc_supply);
+ 
+ 	return 0;
+ }

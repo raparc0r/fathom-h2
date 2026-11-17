@@ -1,0 +1,10 @@
+config BR2_PACKAGE_LIBFREEAPTX
+	bool "libfreeaptx"
+	depends on !BR2_STATIC_LIBS  # builds a shared library
+	help
+	  An aptX encoder and decoder (LGPL-2.1-or-later), forked from
+	  libopenaptx 0.2.0 before that project added terms of its own
+	  to its licence. Fathom's bluez-alsa uses it for aptX
+	  (external.mk).
+
+	  https://github.com/iamthehorker/libfreeaptx

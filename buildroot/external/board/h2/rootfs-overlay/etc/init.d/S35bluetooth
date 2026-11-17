@@ -1,0 +1,15 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Bluetooth is the player's to start (Settings > Bluetooth, through fathom-bt):
+# at boot the chip stays powered down; at shutdown the stack stops, which also
+# saves the pairings to the card.
+
+case "$1" in
+start)
+    fathom-bluetooth off > /dev/null 2>&1
+    ;;
+stop)
+    fathom-bt stop > /dev/null 2>&1
+    ;;
+esac

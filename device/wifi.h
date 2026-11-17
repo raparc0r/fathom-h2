@@ -1,0 +1,22 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Wi-Fi for the player (see wifi.c). All of it is safe from the UI thread. */
+#ifndef FATHOM_WIFI_H
+#define FATHOM_WIFI_H
+
+#include <stddef.h>
+#include "ui/ui.h"
+
+int  wifi_available(void);                    /* fathom-wifi, its programs and the firmware are there */
+void wifi_init(int on);                       /* on: start now */
+
+/* For ui_hooks_t */
+int  wifi_ui_state(char *busy, size_t cap, ui_wifi_status_t *st);
+int  wifi_ui_networks(ui_wifi_net_t *out, int max);
+void wifi_ui_do(int what, const char *ssid, const char *password);
+
+unsigned wifi_seq(void);                      /* changes when anything above does */
+int  wifi_on(void);
+int  wifi_connected(void);                    /* joined, with an address */
+int  wifi_take_message(char *out, size_t cap);
+
+#endif

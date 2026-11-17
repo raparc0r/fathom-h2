@@ -1,0 +1,45 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# The Bluetooth chip (BCM4343A1 on UART0, kernel driver hci_uart_bcm):
+#   fathom-bluetooth on       power it up and load its firmware patch: hci0
+#   fathom-bluetooth off      power it down (the default: it draws current while on)
+#   fathom-bluetooth status
+#
+# The kernel binds the driver at boot, before the card is mounted, so the chip
+# starts without its firmware patch; "on" binds it again once the patch can be
+# read from the card (firmware_class.path=/mnt/sd/fathom/firmware). The patch
+# is the stock firmware's, copied there by the user: Fathom doesn't ship it.
+
+DRV=/sys/bus/serial/drivers/hci_uart_bcm
+DEV=serial0-0
+FW=/mnt/sd/fathom/firmware/brcm/BCM43430A1.hcd
+
+say() { echo "bluetooth: $1"; }
+
+case "$1" in
+on)
+    [ -d $DRV ] || { say "no driver"; exit 1; }
+    [ -f $FW ] || say "no firmware patch at $FW: starting without it"
+    [ -e $DRV/$DEV ] && echo $DEV > $DRV/unbind
+    echo $DEV > $DRV/bind || { say "cannot start"; exit 1; }
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        [ -e /sys/class/bluetooth/hci0 ] && break
+        sleep 1
+    done
+    [ -e /sys/class/bluetooth/hci0 ] || { say "no hci0"; exit 1; }
+    sleep 2                              # the firmware patch loads (about 1 s)
+    say "on (hci0)"
+    ;;
+off)
+    [ -e $DRV/$DEV ] && echo $DEV > $DRV/unbind
+    say "off"
+    ;;
+status)
+    [ -e /sys/class/bluetooth/hci0 ] && echo on || echo off
+    ;;
+*)
+    echo "usage: $0 on|off|status" >&2
+    exit 2
+    ;;
+esac

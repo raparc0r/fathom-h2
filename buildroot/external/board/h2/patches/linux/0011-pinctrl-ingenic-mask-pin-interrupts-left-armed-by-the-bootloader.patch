@@ -1,0 +1,61 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] pinctrl: ingenic: mask pin interrupts left armed by the bootloader
+
+On the HiFi Walker H2 (X1000), plugging or unplugging the USB cable hung
+the system at once, with or without the USB driver bound. The Rockbox
+bootloader leaves PD3 (USB detect) as an unmasked edge interrupt. Linux
+never requests it, but port D's parent interrupt is enabled for another
+pin, so the first edge on PD3 sets a flag that nothing clears and the
+chained handler runs forever.
+
+Add an init_hw callback that masks every pin interrupt the hardware has
+armed (INT set, MSK clear) and clears its flag before the chip is
+registered. Pins requested later are unmasked as before. JZ4770 and newer
+only; older SoCs have a different register layout.
+
+Signed-off-by: Fathom
+---
+--- a/drivers/pinctrl/pinctrl-ingenic.c
++++ b/drivers/pinctrl/pinctrl-ingenic.c
+@@ -3774,6 +3774,33 @@
+ 	struct ingenic_gpio_chip *jzgc = gpiochip_get_data(gc);
+ 
+ 	return irq_set_irq_wake(jzgc->irq, on);
++}
++
++/*
++ * A bootloader may leave pins in interrupt mode and unmasked (the HiFi Walker
++ * H2's Rockbox bootloader does this with its USB detect pin). If no driver
++ * claims such a pin, its flag is never cleared and the parent interrupt
++ * fires forever as soon as the pin changes. Mask and clear every pin
++ * interrupt before the chip is registered; requesting one unmasks it again.
++ */
++static int ingenic_gpio_irq_init_hw(struct gpio_chip *gc)
++{
++	struct ingenic_gpio_chip *jzgc = gpiochip_get_data(gc);
++	u32 armed;
++
++	if (!is_soc_or_above(jzgc->jzpc, ID_JZ4770))
++		return 0;
++
++	armed = ingenic_gpio_read_reg(jzgc, JZ4770_GPIO_INT) &
++		~ingenic_gpio_read_reg(jzgc, GPIO_MSK);
++	if (!armed)
++		return 0;
++
++	regmap_write(jzgc->jzpc->map, jzgc->reg_base + REG_SET(GPIO_MSK), armed);
++	regmap_write(jzgc->jzpc->map, jzgc->reg_base + REG_CLEAR(JZ4770_GPIO_FLAG), armed);
++	dev_info(gc->parent, "%s: masked interrupts left armed by the bootloader: %#x\n",
++		 gc->label, armed);
++	return 0;
+ }
+ 
+ static void ingenic_gpio_irq_handler(struct irq_desc *desc)
+@@ -4475,6 +4502,7 @@
+ 	girq->parents[0] = jzgc->irq;
+ 	girq->default_type = IRQ_TYPE_NONE;
+ 	girq->handler = handle_level_irq;
++	girq->init_hw = ingenic_gpio_irq_init_hw;
+ 
+ 	err = devm_gpiochip_add_data(dev, &jzgc->gc, jzgc);
+ 	if (err)

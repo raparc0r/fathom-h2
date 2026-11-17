@@ -1,0 +1,92 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] x1000: h2boot: show Fathom's boot logo while Linux loads (Eros Q)
+
+The Linux entry used to leave the screen dark (backlight off) until the
+kernel's display driver started. Now boot_linux() draws Fathom's logo first
+(fathom-logo.h: palette + run lengths, generated from assets/logo.png by
+bootloader/build.sh), then turns the backlight on, and keeps it on screen
+while the kernel loads from the SD card. Before jumping to the kernel the
+LCD's DMA is stopped (the kernel is copied over memory it reads); the panel
+stays awake with the logo until Linux re-initialises it.
+---
+--- a/bootloader/x1000/boot.c	2026-11-15 20:27:01
++++ b/bootloader/x1000/boot.c	2026-11-15 20:27:01
+@@ -129,6 +129,9 @@
+  */
+ void boot_linux(void)
+ {
++#if defined(EROS_QN)
++    show_boot_logo();   /* Fathom: on screen while the kernel loads */
++#endif
+     struct uimage_header uh;
+     size_t img_length;
+     int handle = load_uimage_file("/uImage", &uh, &img_length);
+@@ -141,6 +144,13 @@
+         return;
+     }
+ 
++#if defined(EROS_QN)
++    /* Stop the LCD's DMA (the kernel is copied over memory it reads) but
++     * leave the panel awake and the backlight on: the logo stays on screen
++     * until the kernel's display driver takes over. */
++    if(lcd_active())
++        lcd_dma_stop(MODE_INIT);
++#endif
+     x1000_boot_linux(core_get_data(handle), img_length,
+                      (void*)uimage_get_load(&uh),
+                      (void*)uimage_get_ep(&uh),
+--- a/bootloader/x1000/gui.c	2026-11-15 20:27:01
++++ b/bootloader/x1000/gui.c	2026-11-15 20:27:01
+@@ -46,6 +46,39 @@
+     lcd_inited = true;
+ }
+ 
++#if defined(EROS_QN)
++/* Fathom's boot logo (fathom-logo.h, made from assets/logo.png by
++ * bootloader/build.sh): drawn before the backlight comes on, so the first
++ * thing on the screen is the logo, which stays while the kernel loads. */
++#include "fathom-logo.h"
++
++void show_boot_logo(void)
++{
++    if(!lcd_inited) {
++        lcd_init();
++        font_init();
++        lcd_setfont(FONT_SYSFIXED);
++    }
++
++    fb_data pal[sizeof(fathom_logo_palette) / sizeof(fathom_logo_palette[0])];
++    for(unsigned i = 0; i < sizeof(pal) / sizeof(pal[0]); i++) {
++        unsigned long c = fathom_logo_palette[i];
++        pal[i] = LCD_RGBPACK((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
++    }
++    fb_data* fb = FBADDR(0, 0);
++    fb_data* end = fb + LCD_WIDTH * LCD_HEIGHT;
++    for(unsigned i = 0; i + 1 < sizeof(fathom_logo_rle) && fb < end; i += 2)
++        for(int n = fathom_logo_rle[i]; n > 0 && fb < end; n--)
++            *fb++ = pal[fathom_logo_rle[i + 1]];
++    lcd_update();
++
++    if(!lcd_inited) {
++        backlight_init();
++        lcd_inited = true;
++    }
++}
++#endif
++
+ void gui_shutdown(void)
+ {
+     if(!lcd_inited)
+--- a/bootloader/x1000/x1000bootloader.h	2026-11-15 20:27:01
++++ b/bootloader/x1000/x1000bootloader.h	2026-11-15 20:27:01
+@@ -157,6 +157,10 @@
+ void boot_of_player(void);
+ void boot_of_recovery(void);
+ void boot_linux(void);
++#if defined(EROS_QN)
++/* Fathom: the boot logo, full screen, while Linux loads (gui.c) */
++void show_boot_logo(void);
++#endif
+ void shutdown(void);
+ void reboot(void);
+ 

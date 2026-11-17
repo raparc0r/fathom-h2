@@ -1,0 +1,31 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] dmaengine: jz4780: fix NULL dereference in tx_status after terminate
+
+jz4780_dma_tx_status() compares the cookie with jzchan->desc without
+checking that a descriptor is active. After the channel has been stopped
+(terminate_all on an ALSA stop/xrun), desc is NULL, and ALSA's prepare ->
+sync_stop -> dmaengine_tx_status() path then oopses:
+
+  Unable to handle kernel paging request at virtual address 00000000
+  epc : jz4780_dma_tx_status+0x144
+    snd_dmaengine_pcm_sync_stop
+    snd_soc_pcm_component_sync_stop
+    snd_pcm_do_prepare
+
+Seen on the X1000 (HiFi Walker H2) whenever a playback stream underran
+and was re-prepared. Check desc before dereferencing it.
+
+Signed-off-by: Fathom
+---
+diff -Naur a/drivers/dma/dma-jz4780.c b/drivers/dma/dma-jz4780.c
+--- a/drivers/dma/dma-jz4780.c
++++ b/drivers/dma/dma-jz4780.c
+@@ -658,7 +658,7 @@
+ 		/* On the issued list, so hasn't been processed yet */
+ 		residue = jz4780_dma_desc_residue(jzchan,
+ 					to_jz4780_dma_desc(vdesc), 0);
+-	} else if (cookie == jzchan->desc->vdesc.tx.cookie) {
++	} else if (jzchan->desc && cookie == jzchan->desc->vdesc.tx.cookie) {
+ 		residue = jz4780_dma_desc_residue(jzchan, jzchan->desc,
+ 					jzchan->curr_hwdesc + 1);
+ 	}

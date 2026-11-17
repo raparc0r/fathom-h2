@@ -1,0 +1,9 @@
+[submodule "bootloader/rockbox"]
+	path = bootloader/rockbox
+	url = https://github.com/Rockbox/rockbox.git
+	shallow = true
+[submodule "buildroot/buildroot"]
+	path = buildroot/buildroot
+	url = https://gitlab.com/buildroot.org/buildroot.git
+	shallow = true
+	branch = 2026.02.x

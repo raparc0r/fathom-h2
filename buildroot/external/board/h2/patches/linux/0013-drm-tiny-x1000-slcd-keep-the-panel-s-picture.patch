@@ -1,0 +1,220 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] drm/tiny: x1000-slcd: keep the panel's picture
+
+The panel only needs a reset and its init sequence once: when the
+controller is already set up at probe (h2boot draws the boot logo), or
+after the first enable, the panel is left alone.
+
+- Disabling only stops the frame DMA: the panel stays lit with its last
+  picture (the screen is switched off with the backlight's own control).
+- A later enable touches nothing until a picture comes; the controller
+  and the window are set up just before the first frame.
+- Plane updates outside enable/disable leave the panel alone: a commit
+  updates planes before it enables the CRTC, and the CPU fallback used to
+  write fbcon's black frame there when the DRM master exited.
+- An all-black frame is never sent: it is fbcon with nothing on it (at
+  boot, and whenever the DRM master exits) or a client's freshly cleared
+  buffer, never a picture. After a skipped frame the next one is sent
+  whole.
+
+So the panel keeps the boot logo until the player's start-up screen (the
+same logo), and the logo the player draws as it exits until it runs
+again.
+---
+--- a/drivers/gpu/drm/tiny/x1000-slcd.c
++++ b/drivers/gpu/drm/tiny/x1000-slcd.c
+@@ -29,6 +29,7 @@
+ #include <drm/drm_framebuffer.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_fbdev_dma.h>
++#include <drm/drm_fb_dma_helper.h>
+ #include <drm/drm_gem_atomic_helper.h>
+ #include <drm/drm_gem_dma_helper.h>
+ #include <drm/drm_mipi_dbi.h>
+@@ -102,6 +103,23 @@
+ 	dma_addr_t dma_phys;
+ 	bool dma_on;
+ 	enum x1000_slcd_panel panel;
++	/*
++	 * The panel is set up and awake (by the bootloader, which leaves the
++	 * boot logo on it, or by an earlier enable): an enable keeps it as it
++	 * is (no reset, no init sequence) and sends nothing until a frame that
++	 * isn't all black (below). Disabling only stops the frame DMA.
++	 */
++	bool panel_up;
++	bool enabled;			/* between enable and disable */
++	bool first_frame_pending;
++	/*
++	 * An all-black frame is never sent: it's fbcon with nothing on it (at
++	 * boot, and when the player exits) or a client's freshly cleared
++	 * buffer, never a picture. The panel keeps what it shows (the boot
++	 * logo, or the logo the player draws as it exits). After a skipped
++	 * frame the next one is sent whole.
++	 */
++	bool skipped;
+ };
+ 
+ static struct x1000_slcd *to_slcd(struct mipi_dbi *dbi)
+@@ -314,6 +332,13 @@
+ 	drm_fb_blit(&dst, &pitch, DRM_FORMAT_RGB565, &shadow->data[0], fb, clip, &shadow->fmtcnv_state);
+ }
+ 
++/* Full-screen window: each DMA frame starts with "write memory start" */
++static void x1000_slcd_window(struct mipi_dbi *dbi, int w, int h)
++{
++	slcd_cmd(dbi, MIPI_DCS_SET_COLUMN_ADDRESS, 0, 0, (w - 1) >> 8, (w - 1) & 0xff);
++	slcd_cmd(dbi, MIPI_DCS_SET_PAGE_ADDRESS, 0, 0, (h - 1) >> 8, (h - 1) & 0xff);
++}
++
+ static void x1000_slcd_enable(struct drm_simple_display_pipe *pipe,
+ 			      struct drm_crtc_state *crtc_state,
+ 			      struct drm_plane_state *plane_state)
+@@ -321,15 +346,32 @@
+ 	struct mipi_dbi_dev *dbidev = drm_to_mipi_dbi_dev(pipe->crtc.dev);
+ 	struct x1000_slcd *s = container_of(dbidev, struct x1000_slcd, dbidev);
+ 	struct mipi_dbi *dbi = &dbidev->dbi;
++	bool keep = s->panel_up && s->dma_vaddr;
+ 	int idx;
+ 
+ 	if (!drm_dev_enter(pipe->crtc.dev, &idx))
+ 		return;
+ 
+-	x1000_slcd_init_controller(s);
++	s->first_frame_pending = false;
++	s->skipped = false;
++	s->enabled = true;
++	if (keep) {
++		/*
++		 * Awake and set up as below (the bootloader uses the same address
++		 * mode and pixel format), showing its last picture: touch nothing.
++		 * The controller is set up when the first picture comes
++		 * (x1000_slcd_update).
++		 */
++		gpiod_set_value_cansleep(s->rd, 0);
++		gpiod_set_value_cansleep(s->cs, 1);
++		s->first_frame_pending = true;
++		backlight_enable(dbidev->backlight);	/* on already, unless it was off */
++		goto out;
++	}
+ 
+-	/* Read strobe idle; chip select cycled, then held for the panel's lifetime */
+-	gpiod_set_value_cansleep(s->rd, 0);
++	x1000_slcd_init_controller(s);
++	gpiod_set_value_cansleep(s->rd, 0);	/* read strobe idle */
++	/* Chip select cycled, then held for the panel's lifetime */
+ 	gpiod_set_value_cansleep(s->cs, 0);
+ 	mipi_dbi_hw_reset(dbi);		/* pulses reset-gpios */
+ 	msleep(12);
+@@ -345,15 +387,14 @@
+ 	msleep(120);
+ 	slcd_cmd(dbi, MIPI_DCS_SET_DISPLAY_ON);
+ 	msleep(20);
++	s->panel_up = true;
+ 
+ 	if (s->dma_vaddr) {
+ 		struct drm_framebuffer *fb = plane_state->fb;
+ 		struct drm_rect all = DRM_RECT_INIT(0, 0, fb->width, fb->height);
+ 		int w = fb->width, h = fb->height;
+ 
+-		/* Full-screen window: each DMA frame starts with "write memory start" */
+-		slcd_cmd(dbi, MIPI_DCS_SET_COLUMN_ADDRESS, 0, 0, (w - 1) >> 8, (w - 1) & 0xff);
+-		slcd_cmd(dbi, MIPI_DCS_SET_PAGE_ADDRESS, 0, 0, (h - 1) >> 8, (h - 1) & 0xff);
++		x1000_slcd_window(dbi, w, h);
+ 		x1000_slcd_blit(s, plane_state, &all);
+ 		x1000_slcd_dma_start(s, w, h);		/* sends a first (dummy) frame */
+ 		x1000_slcd_wait_frame(s);
+@@ -362,9 +403,26 @@
+ 	} else {
+ 		mipi_dbi_enable_flush(dbidev, crtc_state, plane_state);
+ 	}
++out:
+ 	drm_dev_exit(idx);
+ }
+ 
++/* True if the framebuffer has nothing on it yet (all zero, i.e. black) */
++static bool x1000_slcd_all_black(struct drm_framebuffer *fb)
++{
++	struct drm_gem_dma_object *obj = drm_fb_dma_get_gem_obj(fb, 0);
++	const u32 *p, *end;
++
++	if (!obj || !obj->vaddr)
++		return false;
++	p = obj->vaddr + fb->offsets[0];
++	end = p + fb->pitches[0] * fb->height / 4;
++	while (p < end)
++		if (*p++)
++			return false;
++	return true;
++}
++
+ static void x1000_slcd_update(struct drm_simple_display_pipe *pipe,
+ 			      struct drm_plane_state *old_state)
+ {
+@@ -374,13 +432,37 @@
+ 	struct drm_rect rect;
+ 	int idx;
+ 
+-	if (!s->dma_on) {
++	if (!s->dma_vaddr) {
+ 		mipi_dbi_pipe_update(pipe, old_state);	/* CPU-driven fallback */
+ 		return;
+ 	}
++	/*
++	 * Not between enable and disable: a commit updates planes before it
++	 * enables the CRTC (fbcon taking the screen back when the DRM master
++	 * exits), and the panel, selected and showing a picture, would get
++	 * that frame written by the CPU. Leave it alone: enable sees to it.
++	 */
++	if (!s->enabled)
++		return;
+ 	if (!pipe->crtc.state->active || !state->fb || !drm_dev_enter(pipe->crtc.dev, &idx))
+ 		return;
+-	if (drm_atomic_helper_damage_merged(old_state, state, &rect)) {
++	if (x1000_slcd_all_black(state->fb)) {
++		s->skipped = true;	/* nothing to show: the panel keeps its picture */
++	} else if (s->first_frame_pending) {
++		/* After a hand-off: the first picture, whole, starts the frame DMA */
++		struct drm_rect all = DRM_RECT_INIT(0, 0, state->fb->width, state->fb->height);
++
++		s->first_frame_pending = false;
++		x1000_slcd_init_controller(s);
++		x1000_slcd_window(&dbidev->dbi, state->fb->width, state->fb->height);
++		x1000_slcd_blit(s, state, &all);
++		x1000_slcd_dma_start(s, state->fb->width, state->fb->height);
++		x1000_slcd_wait_frame(s);
++		x1000_slcd_send_frame(s);
++	} else if (s->skipped || drm_atomic_helper_damage_merged(old_state, state, &rect)) {
++		if (s->skipped)		/* the shadow is older than the last frame: all of it */
++			rect = DRM_RECT_INIT(0, 0, state->fb->width, state->fb->height);
++		s->skipped = false;
+ 		x1000_slcd_wait_frame(s);	/* don't rewrite the shadow mid-frame */
+ 		x1000_slcd_blit(s, state, &rect);
+ 		x1000_slcd_send_frame(s);
+@@ -393,8 +475,15 @@
+ 	struct mipi_dbi_dev *dbidev = drm_to_mipi_dbi_dev(pipe->crtc.dev);
+ 	struct x1000_slcd *s = container_of(dbidev, struct x1000_slcd, dbidev);
+ 
++	/*
++	 * The panel is left as it is, lit, showing its last picture (the DRM
++	 * master's exit logo, until the next client draws): only the frame DMA
++	 * stops. The screen is switched off with the backlight's own control.
++	 */
++	s->enabled = false;
+ 	x1000_slcd_dma_stop(s);
+-	mipi_dbi_pipe_disable(pipe);
++	if (!s->dma_vaddr)
++		mipi_dbi_pipe_disable(pipe);
+ }
+ 
+ static const struct drm_simple_display_pipe_funcs x1000_slcd_pipe_funcs = {
+@@ -450,6 +539,10 @@
+ 	s->clk = devm_clk_get_enabled(dev, "lcd");
+ 	if (IS_ERR(s->clk))
+ 		return dev_err_probe(dev, PTR_ERR(s->clk), "no LCD clock\n");
++	/* A controller already set up means the bootloader drew on the panel */
++	s->panel_up = readl(s->base + SLCD_MCFG) != 0;
++	if (s->panel_up)
++		dev_info(dev, "panel left on by the bootloader: keeping its picture\n");
+ 	ret = clk_set_rate(s->clk, SLCD_CLOCK_HZ);
+ 	if (ret)
+ 		dev_warn(dev, "cannot set LCD clock: %d\n", ret);

@@ -1,0 +1,103 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# The network drive: the card's music folder as a WebDAV share over Wi-Fi,
+# for Finder's "Connect to Server" and Windows' "Map network drive":
+#   echo PASSWORD | fathom-share on [DIR]   serve DIR (/mnt/sd/Music) at https://fathom-h2.local/
+#                                     (user "fathom"), and announce it by
+#                                     Bonjour (mdnsd, on wlan0)
+# Over HTTPS only, with the H2's own certificate (fathom/keys/drive.crt and
+# drive.key, made by the player: device/tlscert.c), so the password and the
+# files never cross the network in the clear.
+#   fathom-share off
+#   fathom-share status               on or off
+#
+# lighttpd and mdnsd and their libraries are in fathom/share (post-build.sh),
+# started only while the drive is on. Everything they write goes to RAM
+# (/var/run/fathom-share) except the files themselves: an upload is received
+# into fathom/share/upload on the card and then renamed into place, so a big
+# file never sits in memory. The player reads the access log (methods and
+# status codes only) to notice new music, and empties it as it goes.
+
+S=/mnt/sd/fathom/share
+W=/mnt/sd/fathom/wifi
+BT=/mnt/sd/fathom/bt
+RUN=/var/run/fathom-share
+MUSIC=${2:-/mnt/sd/Music}
+UP=$S/upload
+CRT=/mnt/sd/fathom/keys/drive.crt
+KEY=/mnt/sd/fathom/keys/drive.key
+USER=fathom
+REALM="Fathom H2"
+export LD_LIBRARY_PATH=$S/usr/lib:$S/lib:$W/usr/lib:$W/lib:$BT/usr/lib:$BT/lib
+
+say() { echo "share: $1" >&2; }
+alive() { [ -f "$RUN/$1.pid" ] && kill -0 "$(cat "$RUN/$1.pid")" 2>/dev/null; }
+
+case "$1" in
+on)
+    alive lighttpd && { echo on; exit 0; }
+    [ -x $S/usr/sbin/lighttpd ] || { say "no lighttpd in $S"; exit 1; }
+    [ -d $MUSIC ] || { say "no music folder ($MUSIC)"; exit 1; }
+    [ -s $CRT ] && [ -s $KEY ] || { say "no certificate ($CRT)"; exit 1; }
+    read -r pass
+    [ -n "$pass" ] || { say "no password"; exit 2; }
+    mkdir -p $RUN/mdns.d
+    rm -rf $UP && mkdir -p $UP                       # (pieces of an upload cut short)
+    umask 077
+    printf '%s:%s\n' "$USER" "$pass" > $RUN/users          # (RAM, root's only; TLS keeps it off the network)
+    : > $RUN/access.log
+    cat > $RUN/lighttpd.conf <<CONF
+server.modules = ("mod_mbedtls", "mod_auth", "mod_authn_file", "mod_webdav", "mod_accesslog")
+server.document-root = "$MUSIC"
+server.port = 443
+ssl.engine = "enable"
+ssl.pemfile = "$CRT"
+ssl.privkey = "$KEY"
+server.tag = "Fathom"
+server.pid-file = "$RUN/lighttpd.pid"
+server.errorlog = "$RUN/error.log"
+server.upload-dirs = ("$UP")
+server.max-connections = 16
+server.max-request-size = 4194303
+server.feature-flags = ("server.graceful-shutdown-timeout" => 2)
+mimetype.assign = ("" => "application/octet-stream")
+auth.backend = "plain"
+auth.backend.plain.userfile = "$RUN/users"
+auth.require = ("/" => ("method" => "basic", "realm" => "$REALM", "require" => "valid-user"))
+webdav.activate = "enable"
+webdav.is-readonly = "disable"
+webdav.sqlite-db-name = "$RUN/webdav.db"
+accesslog.filename = "$RUN/access.log"
+accesslog.format = "%m %s"
+CONF
+    $S/usr/sbin/lighttpd -f $RUN/lighttpd.conf -m $S/usr/lib/lighttpd || { say "lighttpd didn't start ($(tail -1 $RUN/error.log 2>/dev/null))"; exit 1; }
+    for i in $(seq 1 20); do alive lighttpd && break; sleep 0.1; done
+    alive lighttpd || { say "lighttpd didn't start ($(tail -1 $RUN/error.log 2>/dev/null))"; exit 1; }
+    # (mdnsd answers for the service's name as the host: fathom-h2.local)
+    printf 'name fathom-h2\ntype _webdavs._tcp\nport 443\ntxt path=/\n' > $RUN/mdns.d/webdav.service
+    if [ -x $S/usr/sbin/mdnsd ]; then
+        $S/usr/sbin/mdnsd -n -i wlan0 $RUN/mdns.d > /dev/null 2>&1 &
+        echo $! > $RUN/mdnsd.pid
+    fi
+    echo on
+    ;;
+off)
+    for p in mdnsd lighttpd; do
+        alive $p && kill "$(cat $RUN/$p.pid)"
+    done
+    for i in $(seq 1 30); do alive lighttpd || break; sleep 0.1; done
+    alive lighttpd && kill -9 "$(cat $RUN/lighttpd.pid 2>/dev/null)" 2>/dev/null   # (it may just have gone)
+    rm -f $RUN/*.pid
+    rm -rf $UP
+    sync
+    echo off
+    ;;
+status)
+    alive lighttpd && echo on || echo off
+    ;;
+*)
+    echo "usage: echo PASSWORD | fathom-share on | fathom-share off|status" >&2
+    exit 2
+    ;;
+esac

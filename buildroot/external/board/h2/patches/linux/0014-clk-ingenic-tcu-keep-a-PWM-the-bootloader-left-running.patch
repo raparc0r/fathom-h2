@@ -1,0 +1,39 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] clk: ingenic: tcu: keep a PWM the bootloader left running
+
+Every timer channel was reset (control register cleared, clock stopped)
+when its clock was registered, very early in boot. A backlight PWM the
+bootloader left on (h2boot shows its boot logo) went dark there and stayed
+dark until the display driver enabled the backlight, most of a second
+later. Leave a channel that is running with its PWM output enabled as it is.
+---
+--- a/drivers/clk/ingenic/tcu.c
++++ b/drivers/clk/ingenic/tcu.c
+@@ -282,10 +282,25 @@
+ 	tcu_clk->info = info;
+ 	tcu_clk->tcu = tcu;
+ 
+-	/* Reset channel and clock divider, set default parent */
+-	ingenic_tcu_enable_regs(&tcu_clk->hw);
++	/*
++	 * Reset channel and clock divider, set default parent. Except for a
++	 * channel the bootloader left running as a PWM (a backlight showing its
++	 * boot logo): reset, the light would go out until its driver starts it
++	 * again. Its parent and divider are then read back as they are.
++	 */
++	if (ingenic_tcu_enable_regs(&tcu_clk->hw) && idx < tcu->soc_info->num_channels) {
++		unsigned int ter = 0, tcsr = 0;
++
++		regmap_read(tcu->map, TCU_REG_TER, &ter);
++		regmap_read(tcu->map, info->tcsr_reg, &tcsr);
++		if ((ter & BIT(idx)) && (tcsr & TCU_TCSR_PWM_EN)) {
++			pr_info("ingenic-tcu: timer %u left running by the bootloader as a PWM: kept\n", idx);
++			goto keep;
++		}
++	}
+ 	regmap_update_bits(tcu->map, info->tcsr_reg, 0xffff, BIT(parent));
+ 	ingenic_tcu_disable_regs(&tcu_clk->hw);
++keep:
+ 
+ 	err = clk_hw_register(NULL, &tcu_clk->hw);
+ 	if (err) {

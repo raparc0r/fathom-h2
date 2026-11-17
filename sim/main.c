@@ -1,0 +1,441 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/*
+ * fathom-sim: the Fathom UI on the desktop.
+ *
+ *   fathom-sim [--theme N] [--zoom Z] [--music DIR]
+ *                                              interactive SDL window; --music scans DIR
+ *                                              (read-only) into build/sim-data first
+ *   fathom-sim --screenshots DIR               headless: write DIR/<theme>-<screen>.bmp
+ *   fathom-sim --motion DIR [--theme N]        headless: frames captured mid-animation
+ *
+ * Keys: Up/Down = wheel, Enter = centre (OK), Esc/Backspace = Back,
+ *       N = long-press Back (Now Playing), Space = play/pause,
+ *       Left/Right = previous/next, M = Menu (context menu), H = hold Menu (quick settings),
+ *       [ / ] = hold Menu + wheel (brightness), , / . = hold Prev / Next (seek),
+ *       T = next theme, Q = quit.
+ */
+#include <SDL.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+#include "core/lang.h"
+#include "core/settings.h"
+#include "audio/engine.h"
+#include "audio/output.h"
+#include "library/library.h"
+#include "lvgl.h"
+#include "player/player.h"
+#include "ui/theme.h"
+#include "ui/assets.h"
+#include "ui/fonts.h"
+#include "ui/ui.h"
+
+#define DB_PATH  "build/sim-data/library.db"
+#define ART_DIR  "build/sim-data/art"
+
+static library_t *g_lib;
+static engine_t *g_eng;
+static player_t *g_player;
+
+static int g_n_themes;      /* built-in themes, then any in build/sim-data/themes */
+/* Home > Radio: the example stations (the simulator can't play them: no FFmpeg) */
+static int sim_radio(radio_station_t *out, int max) { return radio_load("assets/radio.txt", out, max); }
+/* Settings > Network drive, as on an H2 serving over Wi-Fi */
+static int sim_share_state(ui_share_t *st)
+{
+    *st = (ui_share_t){.state = UI_SHARE_ON, .host = "fathom-h2.local", .ip = "192.168.1.23",
+                       .user = "fathom", .password = "k7mq2p9x", .cert = "3F 2A 91 0C 77 AB"};
+    return 1;
+}
+static void sim_share_do(int what) { (void)what; }
+/* Settings > SSH, on, with Wi-Fi connected */
+static int sim_ssh_state(ui_ssh_t *st)
+{
+    *st = (ui_ssh_t){.state = UI_SSH_ON, .usb_ip = "10.42.0.1", .wifi_ip = "192.168.1.23", .password = "r4tw8nce"};
+    return 1;
+}
+static void sim_ssh_do(int what) { (void)what; }
+/* Sound > Balance and Volume limit, as on the headphone jack (balance on the engine) */
+static int g_sim_bal, g_sim_limit;
+static void sim_sound_value(int what, char *out, size_t cap)
+{
+    if (what == UI_SOUND_BALANCE && !g_sim_bal) snprintf(out, cap, "Centre");
+    else if (what == UI_SOUND_BALANCE) snprintf(out, cap, "%d dB %s", abs(g_sim_bal), g_sim_bal < 0 ? "left" : "right");
+    else if (!g_sim_limit) snprintf(out, cap, "Off");
+    else snprintf(out, cap, "%d dB", g_sim_limit);
+}
+static int sim_sound_adjust(int what, int dir)
+{
+    if (what == UI_SOUND_BALANCE) {
+        g_sim_bal = g_sim_bal + dir < -12 ? -12 : g_sim_bal + dir > 12 ? 12 : g_sim_bal + dir;
+        float g = (float)pow(10.0, -abs(g_sim_bal) / 20.0);
+        if (g_eng) engine_set_balance(g_eng, g_sim_bal > 0 ? g : 1.0f, g_sim_bal < 0 ? g : 1.0f);
+    } else {
+        g_sim_limit = g_sim_limit + dir * 3 < -30 ? -30 : g_sim_limit + dir * 3 > 0 ? 0 : g_sim_limit + dir * 3;
+    }
+    return 0;
+}
+/* Sound > Pure mode and the signal path, as for a FLAC on the headphone jack */
+static int g_sim_pure;
+static void sim_pure_toggle(void) { g_sim_pure = !g_sim_pure; ui_set_pure(g_sim_pure, g_sim_pure); }
+static int sim_signal_path(int i, char *label, size_t lc, char *value, size_t vc)
+{
+    static const char *const rows[][2] = {
+        {"File", "FLAC 24-bit 96 kHz"}, {"Levelling", "Off"}, {"EQ", "Off"}, {"Balance", "Centre"},
+        {"Volume", "In the DAC -32.0 dB"}, {"Output", "ES9018K2M headphones"}, {"Sent as", "32-bit 96 kHz"},
+        {"Result", "Bit-perfect"}};
+    if (i < 0 || i >= (int)(sizeof rows / sizeof rows[0])) return -1;
+    snprintf(label, lc, "%s", rows[i][0]);
+    snprintf(value, vc, "%s", g_sim_pure && (i == 1 || i == 2 || i == 3) ? "Bypassed" : rows[i][1]);
+    return 0;
+}
+static void sim_transport_toggle(void) { settings_set_int("sound.transport", !settings_get_int("sound.transport", 0)); }
+static void sim_battery_info(char *out, size_t cap) { snprintf(out, cap, "86 %%, charging"); }
+/* Settings > Display > Language: build/sim-data/lang */
+static int sim_languages(char names[][64], int max) { return lang_list("build/sim-data/lang", names, max); }
+static void sim_language_set(const char *name)
+{
+    char path[300];
+    snprintf(path, sizeof path, "build/sim-data/lang/%s.txt", name ? name : "");
+    lang_load(name && name[0] ? path : NULL);
+}
+static const ui_hooks_t g_hooks = {.fonts = ui_theme_fonts, .icon = ui_theme_icon, .radio_stations = sim_radio,
+                                   .share_state = sim_share_state, .share_do = sim_share_do,
+                                   .ssh_state = sim_ssh_state, .ssh_do = sim_ssh_do,
+                                   .sound_value = sim_sound_value, .sound_adjust = sim_sound_adjust,
+                                   .pure_toggle = sim_pure_toggle, .signal_path = sim_signal_path,
+                                   .transport_toggle = sim_transport_toggle, .battery_info = sim_battery_info,
+                                   .languages = sim_languages, .language_set = sim_language_set};
+
+static void cue_sample(void);
+
+/* ---- headless screenshots ---- */
+
+static uint8_t g_fb[UI_W * UI_H * 2];
+
+static void null_flush(lv_display_t *d, const lv_area_t *a, uint8_t *px)
+{
+    (void)a; (void)px;
+    lv_display_flush_ready(d);
+}
+
+static int write_bmp(const char *path, const lv_draw_buf_t *buf)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    int w = buf->header.w, h = buf->header.h;
+    int row = (w * 3 + 3) & ~3;
+    uint32_t size = 54 + (uint32_t)row * h;
+    uint8_t hdr[54] = {'B', 'M'};
+    #define PUT32(o, v) do { hdr[o] = (uint8_t)(v); hdr[o+1] = (uint8_t)((v) >> 8); \
+                             hdr[o+2] = (uint8_t)((v) >> 16); hdr[o+3] = (uint8_t)((v) >> 24); } while (0)
+    PUT32(2, size); PUT32(10, 54); PUT32(14, 40); PUT32(18, w); PUT32(22, h);
+    hdr[26] = 1; hdr[28] = 24;
+    PUT32(34, (uint32_t)row * h);
+    fwrite(hdr, 1, 54, f);
+    uint8_t pad[3] = {0};
+    for (int y = h - 1; y >= 0; y--) {
+        fwrite(buf->data + (size_t)y * buf->header.stride, 1, (size_t)w * 3, f);  /* LVGL RGB888 is B,G,R */
+        fwrite(pad, 1, (size_t)(row - w * 3), f);
+    }
+    fclose(f);
+    return 0;
+}
+
+static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts)
+{
+    lv_display_t *d = lv_display_create(UI_W, UI_H);
+    lv_display_set_buffers(d, g_fb, NULL, sizeof g_fb, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(d, null_flush);
+    ui_init(lv_screen_active(), themes, g_n_themes, fonts, 1, g_lib, g_player);
+    ui_set_hooks(&g_hooks);
+    ui_set_battery(86, 1);   /* the desktop has no H2 battery: a fixed sample value, charging (two icons) */
+    ui_set_bt_link(UI_BT_LINK_CONNECTED);   /* and headphones, so the header shows every kind of icon */
+
+    static const char *const screens[] = {"home", "albums", "tracks", "playlists", "playlist", "nowplaying", "themes",
+                                          "quick", "context", "info", "queue", "glyphs", "search",
+                                          "artists", "artist", "artistsongs", "albumartists", "homeedit",
+                                          "usbask", "usbdrive", "scrub", "sound", "radio", "radionp", "share", "ssh", "toast", "genres", "folders", "folder", "years", "homeend", "homeall", "signal", "purenp"};
+    static const char *const slug[] = {"studio-mint", "studio-ember", "studio-pastel", "pixel-pastel"};
+    for (int t = 0; t < 4 && t < g_n_themes; t++) {   /* the built-in themes */
+        ui_set_theme(t);
+        for (size_t s = 0; s < sizeof screens / sizeof screens[0]; s++) {
+            lv_obj_t *sample = NULL;
+            if (!strcmp(screens[s], "glyphs")) {    /* digits vs letters, and the fallback font */
+                ui_show("home");
+                const ui_fonts_t *ff = ui_theme_fonts(&themes[t]);
+                sample = lv_label_create(lv_screen_active());
+                lv_obj_set_style_bg_color(sample, lv_color_hex(themes[t].surface), 0);
+                lv_obj_set_style_bg_opa(sample, LV_OPA_COVER, 0);
+                lv_obj_set_style_text_color(sample, lv_color_hex(themes[t].text), 0);
+                if (ff) lv_obj_set_style_text_font(sample, ff->body, 0);
+                lv_obj_set_style_pad_all(sample, 8, 0);
+                lv_obj_set_width(sample, UI_W);
+                lv_label_set_text(sample, "0258 OZSB 1lI7 :09\n\xC5\x8Csaka \xC4\x88u \xC5\x9Cveti\n"
+                                          "\xD0\x9C\xD0\xBE\xD1\x81\xD0\xBA\xD0\xB2\xD0\xB0 "
+                                          "\xCE\x95\xCE\xBB\xCE\xBB\xCE\xAC\xCE\xB4\xCE\xB1 \xC5\x81\xC3\xB3" "d\xC5\xBA\n"
+                                          "Ti\xE1\xBA\xBFng Vi\xE1\xBB\x87t \xC4\x91\xC6\xB0\xE1\xBB\xA3" "c");
+                lv_obj_align(sample, LV_ALIGN_BOTTOM_MID, 0, 0);
+            } else if (!strcmp(screens[s], "radionp")) {    /* a station, as it connects */
+                radio_station_t st[4];
+                int n = radio_load("assets/radio.txt", st, 4);
+                if (g_player && n > 0) {
+                    player_radio_play(g_player, st, n, 0);
+                    player_radio_set_info(g_player, "Some Artist", "A song on the radio", NULL);
+                }
+                ui_show("nowplaying");
+            } else if (!strcmp(screens[s], "purenp")) {    /* Pure mode: the badge */
+                sim_pure_toggle();
+                ui_show("nowplaying");
+            } else if (!strcmp(screens[s], "usbdrive")) {
+                ui_show("nowplaying");
+                sample = ui_message_screen("USB drive",
+                                           "Eject the H2 on your computer, or unplug the cable, to go back to your music.");
+            } else if (!strcmp(screens[s], "toast")) {    /* a long one: it wraps */
+                ui_show("ssh");
+                ui_toast("Over USB and Wi-Fi, with the password", 3000);
+            } else {
+                ui_show(screens[s]);
+            }
+            int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast");
+            lv_obj_t *what = on_top ? lv_layer_top() : lv_screen_active();
+            lv_obj_update_layout(what);
+            lv_draw_buf_t *img = lv_snapshot_take(what, LV_COLOR_FORMAT_RGB888);
+            if (!img) { fprintf(stderr, "snapshot failed\n"); return 1; }
+            char path[1024];
+            snprintf(path, sizeof path, "%s/%s-%s.bmp", dir, slug[t], screens[s]);
+            if (write_bmp(path, img)) { fprintf(stderr, "cannot write %s\n", path); return 1; }
+            lv_draw_buf_destroy(img);
+            if (sample) lv_obj_delete(sample);
+            if (!strcmp(screens[s], "radionp")) cue_sample();   /* off the radio for the next theme */
+            if (!strcmp(screens[s], "purenp")) sim_pure_toggle();   /* (off again) */
+            if (!strcmp(screens[s], "toast"))      /* (gone before the next screens) */
+                for (uint32_t c = 0; c < lv_obj_get_child_count(lv_layer_top()); c++)
+                    lv_obj_add_flag(lv_obj_get_child(lv_layer_top(), (int32_t)c), LV_OBJ_FLAG_HIDDEN);
+            printf("%s\n", path);
+        }
+    }
+    /* contributed themes (build/sim-data/themes): the home screen, to check fonts and colours */
+    for (int t = 4; t < g_n_themes; t++) {
+        if (themes[t].status == THEME_ERROR) continue;
+        ui_set_theme(t);
+        ui_show("home");
+        lv_obj_update_layout(lv_screen_active());
+        lv_draw_buf_t *img = lv_snapshot_take(lv_screen_active(), LV_COLOR_FORMAT_RGB888);
+        if (!img) return 1;
+        char path[1024];
+        snprintf(path, sizeof path, "%s/user-%d-home.bmp", dir, t);
+        if (write_bmp(path, img)) return 1;
+        lv_draw_buf_destroy(img);
+        printf("%s (%s: %s)\n", path, themes[t].name, themes[t].note[0] ? themes[t].note : "ok");
+    }
+    return 0;
+}
+
+/* ---- headless motion test: fake clock, frames captured mid-animation ---- */
+
+static uint32_t g_fake_ms;
+static uint32_t fake_tick(void) { return g_fake_ms; }
+
+static void advance(uint32_t ms)
+{
+    for (uint32_t t = 0; t < ms; t += 5) { g_fake_ms += 5; lv_timer_handler(); }
+}
+
+static int frame(const char *dir, const char *name)
+{
+    lv_obj_update_layout(lv_screen_active());
+    lv_draw_buf_t *img = lv_snapshot_take(lv_screen_active(), LV_COLOR_FORMAT_RGB888);
+    if (!img) return -1;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s.bmp", dir, name);
+    int r = write_bmp(path, img);
+    lv_draw_buf_destroy(img);
+    printf("%s\n", path);
+    return r;
+}
+
+static int motion(const char *dir, theme_t *themes, const ui_fonts_t *fonts, int theme)
+{
+    lv_tick_set_cb(fake_tick);
+    lv_display_t *d = lv_display_create(UI_W, UI_H);
+    lv_display_set_buffers(d, g_fb, NULL, sizeof g_fb, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(d, null_flush);
+    ui_init(lv_screen_active(), themes, g_n_themes, fonts, 1, g_lib, g_player);
+    ui_set_hooks(&g_hooks);
+    ui_set_battery(86, 0);   /* the desktop has no H2 battery: a fixed sample value */
+    ui_set_theme(theme);
+    ui_show("home");
+    advance(300);
+    char n[32];
+    /* 1. pill slides from Albums to Artists */
+    ui_key(UI_KEY_DOWN);
+    for (int i = 0; i < 4; i++) { snprintf(n, sizeof n, "m%d-a%d", theme, i); frame(dir, n); advance(30); }
+    advance(300);
+    /* 2. open Albums: the new level slides over Home */
+    ui_key(UI_KEY_UP);
+    advance(300);
+    ui_key(UI_KEY_OK);
+    for (int i = 0; i < 4; i++) { snprintf(n, sizeof n, "m%d-b%d", theme, i); advance(i ? 45 : 15); frame(dir, n); }
+    advance(300);
+    /* 3. scroll past the bottom */
+    for (int i = 0; i < 5; i++) { ui_key(UI_KEY_DOWN); advance(i < 4 ? 20 : 0); }
+    for (int i = 0; i < 4; i++) { snprintf(n, sizeof n, "m%d-c%d", theme, i); frame(dir, n); advance(30); }
+    advance(300);
+    /* 4. back to Home: Albums slides away to the right */
+    ui_key(UI_KEY_BACK);
+    for (int i = 0; i < 4; i++) { snprintf(n, sizeof n, "m%d-d%d", theme, i); advance(i ? 45 : 15); frame(dir, n); }
+    advance(300);
+    /* 5. Now Playing slides up, then back down */
+    ui_key(UI_KEY_BACK_LONG);
+    for (int i = 0; i < 4; i++) { snprintf(n, sizeof n, "m%d-e%d", theme, i); advance(i ? 55 : 15); frame(dir, n); }
+    advance(300);
+    ui_key(UI_KEY_BACK);
+    for (int i = 0; i < 4; i++) { snprintf(n, sizeof n, "m%d-f%d", theme, i); advance(i ? 55 : 15); frame(dir, n); }
+    advance(300);
+    /* 6. scrolling text: a playlist's long rows, re-rendered once a second as the
+     * app does; frames every 1.5 s through two back-and-forth cycles */
+    ui_show("playlist");
+    for (int i = 0; i < 64; i++) {                 /* every 250 ms for 16 s */
+        snprintf(n, sizeof n, "m%d-g%02d", theme, i);
+        frame(dir, n);
+        advance(250);
+        if (i % 4 == 3) ui_tick_1s();
+    }
+    /* 7. fast scrolling: 40 wheel steps 20 ms apart through Songs */
+    ui_show("songs");
+    advance(300);
+    for (int i = 0; i < 40; i++) { ui_key(UI_KEY_DOWN); advance(20); }
+    advance(200);
+    snprintf(n, sizeof n, "m%d-h0", theme);
+    frame(dir, n);
+    return 0;
+}
+
+/* ---- interactive ---- */
+
+static uint32_t sdl_ticks(void) { return SDL_GetTicks(); }
+
+static int g_theme;  /* theme shown now; T cycles from here */
+
+static void on_key(lv_event_t *e)
+{
+    uint32_t k = lv_event_get_key(e);
+    switch (k) {
+    case LV_KEY_UP: ui_key(UI_KEY_UP); break;
+    case LV_KEY_DOWN: ui_key(UI_KEY_DOWN); break;
+    case LV_KEY_ENTER: ui_key(UI_KEY_OK); break;
+    case LV_KEY_ESC: case LV_KEY_BACKSPACE: ui_key(UI_KEY_BACK); break;
+    case LV_KEY_LEFT: ui_key(UI_KEY_PREV); break;
+    case LV_KEY_RIGHT: ui_key(UI_KEY_NEXT); break;
+    case 'n': case 'N': ui_key(UI_KEY_BACK_LONG); break;
+    case 'm': case 'M': ui_key(UI_KEY_MENU); break;
+    case 'h': case 'H': ui_key(UI_KEY_MENU_LONG); break;
+    case '[': ui_key(UI_KEY_DIMMER); break;
+    case ',': ui_key(UI_KEY_SEEK_BACK); break;
+    case '.': ui_key(UI_KEY_SEEK_FWD); break;
+    case ']': ui_key(UI_KEY_BRIGHTER); break;
+    case ' ': ui_key(UI_KEY_PLAY); break;
+    case 't': case 'T':
+        g_theme = (g_theme + 1) % ui_theme_count();
+        ui_set_theme(g_theme);
+        break;
+    case 'q': case 'Q': exit(0);
+    default: break;
+    }
+}
+
+static void every_second(lv_timer_t *t) { (void)t; ui_tick_1s(); }
+static void every_100ms(lv_timer_t *t) { (void)t; ui_tick(); }
+
+static void scan_progress(int done, int total, const char *path, void *ctx)
+{
+    (void)ctx;
+    if (total > 0) fprintf(stderr, "\rscanning %d/%d  %-50.50s", done, total, path);
+}
+
+/* Screenshots: the second album, cued (not playing) */
+static void cue_sample(void)
+{
+    if (!g_player || !g_lib) return;
+    lib_list_t albums, tracks;
+    if (library_list(g_lib, LIB_ALBUMS, 0, &albums) > 1 &&
+        library_list(g_lib, LIB_ALBUM_TRACKS, albums.ids[1], &tracks) > 0) {
+        player_cue(g_player, tracks.ids, tracks.n, 0);
+        library_list_free(&tracks);
+    }
+    library_list_free(&albums);
+}
+
+/* Library, engine and player. Screenshots use a silent output and a cued (not playing) album. */
+static void setup_player(const char *music, int silent)
+{
+    mkdir("build/sim-data", 0755);
+    settings_load(silent ? "" : "build/sim-data/settings.ini");   /* screenshots: defaults, never saved */
+    sim_language_set(settings_get("display.language", ""));
+    g_lib = library_open(DB_PATH, ART_DIR);
+    if (!g_lib) return;
+    library_set_playlist_dir(g_lib, "build/sim-data/playlists");
+    if (music) {
+        int n = library_scan(g_lib, music, scan_progress, NULL);
+        fprintf(stderr, "\nlibrary: %d tracks\n", n);
+    }
+    static audio_output_t out;
+    static out_null_stats_t stats;
+    if (silent || out_sdl_create(&out)) out_null_create(&out, &stats);
+    g_eng = engine_new(&out);
+    g_player = g_eng ? player_new(g_lib, g_eng) : NULL;
+    if (silent) cue_sample();
+}
+
+int main(int argc, char **argv)
+{
+    const char *shots = NULL, *motion_dir = NULL, *music = NULL;
+    int theme = 0, zoom = 3;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--screenshots") && i + 1 < argc) shots = argv[++i];
+        else if (!strcmp(argv[i], "--motion") && i + 1 < argc) motion_dir = argv[++i];
+        else if (!strcmp(argv[i], "--theme") && i + 1 < argc) theme = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--zoom") && i + 1 < argc) zoom = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--music") && i + 1 < argc) music = argv[++i];
+        else { fprintf(stderr, "usage: %s [--theme N] [--zoom Z] [--music DIR] | --screenshots DIR | --motion DIR\n", argv[0]); return 2; }
+    }
+
+    lv_init();
+    static theme_t themes[UI_MAX_THEMES];
+    g_n_themes = ui_load_themes(FATHOM_ASSETS_DIR, "build/sim-data/themes", themes, UI_MAX_THEMES);
+    const ui_fonts_t *fonts = g_n_themes > 0 ? ui_theme_fonts(&themes[0]) : NULL;
+    if (!fonts) return 1;
+    setup_player(music, shots || motion_dir);
+    if (shots) return screenshots(shots, themes, fonts);
+    if (motion_dir) return motion(motion_dir, themes, fonts, theme);
+
+    lv_tick_set_cb(sdl_ticks);
+    lv_display_t *disp = lv_sdl_window_create(UI_W, UI_H);
+    lv_sdl_window_set_zoom(disp, (uint8_t)(zoom < 1 ? 1 : zoom));
+    lv_indev_t *kb = lv_sdl_keyboard_create();
+    lv_group_t *g = lv_group_create();
+    lv_indev_set_group(kb, g);
+
+    ui_init(lv_screen_active(), themes, g_n_themes, fonts, 1, g_lib, g_player);
+    ui_set_hooks(&g_hooks);
+    ui_set_battery(86, 0);   /* the desktop has no H2 battery: a fixed sample value */
+    g_theme = theme >= 0 && theme < g_n_themes ? theme : 0;
+    ui_set_theme(g_theme);
+
+    lv_obj_t *sink = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(sink);
+    lv_obj_set_size(sink, 0, 0);
+    lv_group_add_obj(g, sink);
+    lv_obj_add_event_cb(sink, on_key, LV_EVENT_KEY, NULL);
+    lv_timer_create(every_second, 1000, NULL);
+    lv_timer_create(every_100ms, 100, NULL);
+
+    for (;;) {
+        uint32_t wait = lv_timer_handler();
+        SDL_Delay(wait < 5 ? 5 : wait > 16 ? 16 : wait);
+    }
+}

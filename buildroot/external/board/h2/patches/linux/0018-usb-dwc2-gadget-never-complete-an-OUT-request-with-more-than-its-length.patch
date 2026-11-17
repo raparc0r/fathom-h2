@@ -1,0 +1,28 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] usb: dwc2: gadget: never complete an OUT request with more than its length
+
+With DMA, an OUT transfer is loaded in whole packets, so a request of 1534
+bytes (u_ether's receive size for a 1500-byte MTU) is set up for 1536, and
+dwc2 reports what the controller moved. When the receive FIFO's contents get
+out of step (on the HiFi Walker H2, while a UAC2 stream was being stopped
+with network traffic waiting), that is the full 1536, and u_ether's skb_put()
+panics the kernel in interrupt context. Clamp actual to length and warn: the
+transfer is garbage either way, and the function can drop it.
+
+Signed-off-by: Fathom
+---
+--- a/drivers/usb/dwc2/gadget.c
++++ b/drivers/usb/dwc2/gadget.c
+@@ -2453,6 +2453,12 @@
+ 		size_done += hs_ep->last_load;
+ 
+ 		req->actual = size_done;
++		if (req->actual > req->length) {
++			/* DMA is set up for whole packets: never hand more than asked for */
++			dev_warn_ratelimited(hsotg->dev, "%s: ep%d: %u bytes for a %u-byte request\n",
++					     __func__, epnum, req->actual, req->length);
++			req->actual = req->length;
++		}
+ 	}
+ 
+ 	/* if there is more request to do, schedule new transfer */

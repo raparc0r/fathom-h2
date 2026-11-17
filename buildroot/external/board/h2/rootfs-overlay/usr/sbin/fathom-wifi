@@ -1,0 +1,164 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Wi-Fi: the BCM43438 on SDIO (MSC1), driver brcmfmac, run from the card:
+#   fathom-wifi on                load the driver, power the chip, start
+#                                 wpa_supplicant (it joins a saved network) and DHCP
+#   fathom-wifi off               all of it stopped, the chip unpowered, the driver
+#                                 unloaded (its memory back)
+#   fathom-wifi status            STATE|SSID|IP|SIGNAL (STATE: off, scanning,
+#                                 connecting, connected)
+#   fathom-wifi scan              SSID|DBM|SECURED|SAVED per network in range, best first
+#   fathom-wifi saved             the saved networks' names
+#   fathom-wifi connect SSID [PASSWORD]   join (and save) a network; no password: open
+#   fathom-wifi forget SSID
+#
+# The programs and modules are in fathom/wifi (post-build.sh), the chip's firmware
+# in fathom/firmware/brcm (the user's own, from flash.img: extract-firmware.py
+# --wifi). Saved networks: fathom/wifi/networks.conf (wpa_supplicant's format; on
+# FAT, readable by anyone holding the card).
+
+W=/mnt/sd/fathom/wifi
+BT=/mnt/sd/fathom/bt
+CONF=$W/networks.conf
+RUN=/var/run/fathom-wifi
+CTRL=/var/run/wpa_supplicant
+MMC=/sys/bus/platform/drivers/jz4740-mmc
+DEV=13460000.mmc
+FW=/mnt/sd/fathom/firmware/brcm/brcmfmac43430-sdio.bin
+export LD_LIBRARY_PATH=$W/usr/lib:$W/lib:$BT/usr/lib:$BT/lib
+
+say() { echo "wifi: $1" >&2; }
+cli() { $W/usr/sbin/wpa_cli -p $CTRL -i wlan0 "$@" 2>/dev/null; }
+running() { [ -f $RUN/wpa.pid ] && kill -0 "$(cat $RUN/wpa.pid)" 2>/dev/null; }
+hex() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
+
+# The network id of a saved SSID, or ""
+net_id() { cli list_networks | tail -n +2 | awk -F'\t' -v s="$1" '$2 == s { print $1; exit }'; }
+
+case "$1" in
+on)
+    running && { echo on; exit 0; }
+    [ -f $FW ] || { say "no firmware at $FW (extract-firmware.py --wifi)"; exit 1; }
+    # brcmfmac-wcc: the BCM43430's vendor code, which brcmfmac would ask modprobe
+    # for (there's none): loaded first, it's found registered
+    for m in cfg80211 brcmutil brcmfmac brcmfmac-wcc; do
+        grep -q "^$(echo $m | tr - _) " /proc/modules || insmod $W/modules/$m.ko || { say "can't load $m"; exit 1; }
+    done
+    # The firmware goes to the chip in 32 KB pieces, each needing 32 KB of
+    # contiguous memory: with the player running that can be missing until the
+    # page cache is dropped and memory compacted. A start takes 10-20 s. Only
+    # when the driver says it failed is the chip unpowered for a second try:
+    # unbinding MSC1 while brcmfmac is still starting deadlocks the two.
+    for try in 1 2; do
+        sync
+        echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+        [ -w /proc/sys/vm/compact_memory ] && echo 1 > /proc/sys/vm/compact_memory
+        mark=$(dmesg | wc -l)
+        [ -e $MMC/$DEV ] || echo $DEV > $MMC/bind || { say "can't power the chip"; exit 1; }
+        failed=
+        for i in $(seq 1 90); do
+            [ -e /sys/class/net/wlan0 ] && break
+            dmesg | tail -n +$((mark + 1)) | grep -q -E "download failed|brcmf_attach failed|firmware_callback" && { failed=1; break; }
+            sleep 0.5
+        done
+        [ -e /sys/class/net/wlan0 ] && break
+        [ -n "$failed" ] || { say "the chip didn't start in 45 s"; exit 1; }
+        echo $DEV > $MMC/unbind
+    done
+    [ -e /sys/class/net/wlan0 ] || { say "no wlan0 (firmware?)"; exit 1; }
+    mkdir -p $RUN $CTRL
+    [ -f $CONF ] || printf 'ctrl_interface=%s\nupdate_config=1\n' $CTRL > $CONF
+    ifconfig wlan0 up
+    rm -f $CTRL/wlan0 $RUN/wpa.pid                     # a socket left by an earlier one
+    $W/usr/sbin/wpa_supplicant -B -i wlan0 -c $CONF -P $RUN/wpa.pid >/dev/null 2>&1
+    for i in $(seq 1 20); do running && break; sleep 0.1; done   # (it writes its pid once in the background)
+    running || { say "wpa_supplicant didn't start"; exit 1; }
+    for i in $(seq 1 20); do [ -S $CTRL/wlan0 ] && break; sleep 0.2; done
+    cli set ap_scan 1 > /dev/null
+    # DHCP: tries in the background until a network is joined, renews after
+    udhcpc -i wlan0 -b -S -x hostname:fathom-h2 -p $RUN/udhcpc.pid > /dev/null 2>&1
+    echo on
+    ;;
+off)
+    [ -f $RUN/udhcpc.pid ] && kill "$(cat $RUN/udhcpc.pid)" 2>/dev/null
+    if running; then
+        pid=$(cat $RUN/wpa.pid)
+        cli terminate > /dev/null
+        sleep 0.5
+        kill "$pid" 2>/dev/null
+    fi
+    rm -f $RUN/*.pid $CTRL/wlan0
+    [ -e /sys/class/net/wlan0 ] && ifconfig wlan0 down 2>/dev/null
+    [ -e $MMC/$DEV ] && echo $DEV > $MMC/unbind
+    for m in brcmfmac_wcc brcmfmac brcmutil cfg80211; do grep -q "^$m " /proc/modules && rmmod $m 2>/dev/null; done
+    echo off
+    ;;
+status)
+    running || { echo "off|||"; exit 0; }
+    st=$(cli status)
+    state=$(echo "$st" | sed -n 's/^wpa_state=//p')
+    ssid=$(echo "$st" | sed -n 's/^ssid=//p')
+    ip=$(echo "$st" | sed -n 's/^ip_address=//p')
+    [ -z "$ip" ] && ip=$(ifconfig wlan0 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p')
+    sig=$(cli signal_poll | sed -n 's/^RSSI=//p')
+    case "$state" in
+    COMPLETED) [ -n "$ip" ] && s=connected || s=connecting ;;
+    SCANNING) s=scanning ;;
+    ASSOCIATING|ASSOCIATED|AUTHENTICATING|4WAY_HANDSHAKE|GROUP_HANDSHAKE) s=connecting ;;
+    *) s=on ;;
+    esac
+    echo "$s|$ssid|$ip|$sig"
+    ;;
+scan)
+    running || exit 1
+    cli scan > /dev/null                               # (busy with its own scan: its results do)
+    sleep ${2:-3}
+    [ "$(cli scan_results | wc -l)" -gt 1 ] || sleep 2
+    saved=$(cli list_networks | tail -n +2 | cut -f2)
+    # bssid freq signal flags ssid -> the best of each SSID, strongest first
+    cli scan_results | tail -n +2 | awk -F'\t' '$5 != "" && $5 !~ /^\\x00/ {
+        sec = ($4 ~ /WPA|WEP|SAE/) ? 1 : 0
+        if (!($5 in best) || $3 > best[$5]) { best[$5] = $3; s[$5] = sec }
+    } END { for (n in best) print best[n] "\t" n "\t" s[n] }' | sort -rn | \
+    while IFS="$(printf '\t')" read -r dbm ssid sec; do
+        sv=0
+        echo "$saved" | grep -qxF -- "$ssid" && sv=1
+        echo "$ssid|$dbm|$sec|$sv"
+    done
+    ;;
+saved)
+    running || exit 1
+    cli list_networks | tail -n +2 | cut -f2
+    ;;
+connect)
+    running || exit 1
+    [ -n "$2" ] || exit 2
+    id=$(net_id "$2")
+    if [ -z "$id" ]; then
+        id=$(cli add_network | tail -1)
+        cli set_network "$id" ssid "$(hex "$2")" > /dev/null
+        cli set_network "$id" scan_ssid 1 > /dev/null       # hidden networks too
+    fi
+    if [ -n "$3" ]; then
+        cli set_network "$id" key_mgmt WPA-PSK > /dev/null
+        cli set_network "$id" psk "\"$3\"" | grep -q OK || { say "the password isn't valid (8 to 63 characters)"; exit 3; }
+    elif [ -z "$(cli get_network "$id" psk | grep -v FAIL)" ]; then
+        cli set_network "$id" key_mgmt NONE > /dev/null
+    fi
+    cli enable_network "$id" > /dev/null
+    cli select_network "$id" > /dev/null
+    cli save_config > /dev/null
+    sync
+    echo "$id"
+    ;;
+forget)
+    running || exit 1
+    id=$(net_id "$2")
+    [ -n "$id" ] && cli remove_network "$id" > /dev/null && cli save_config > /dev/null && sync
+    ;;
+*)
+    echo "usage: fathom-wifi on|off|status|scan|saved|connect SSID [PASSWORD]|forget SSID" >&2
+    exit 2
+    ;;
+esac

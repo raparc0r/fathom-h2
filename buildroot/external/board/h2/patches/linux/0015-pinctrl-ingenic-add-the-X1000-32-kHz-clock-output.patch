@@ -1,0 +1,43 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] pinctrl: ingenic: add the X1000's 32 kHz clock output (PB26)
+
+PB26 in function 0 puts out the RTC's 32.768 kHz clock (the RTC's CLK32K,
+enabled through its CKPCR register: the rtc driver's clk32k clock). Boards
+use it as the sleep clock (LPO) of a Bluetooth/WiFi module; the HiFi
+Walker H2's BCM4343A1 doesn't answer without it. The stock kernel requests
+the same pin as "rtc32k".
+---
+--- a/drivers/pinctrl/pinctrl-ingenic.c
++++ b/drivers/pinctrl/pinctrl-ingenic.c
+@@ -2102,6 +2102,7 @@
+ static int x1000_pwm_pwm2_pins[] = { 0x5b, };
+ static int x1000_pwm_pwm3_pins[] = { 0x26, };
+ static int x1000_pwm_pwm4_pins[] = { 0x58, };
++static int x1000_rtc32k_pins[] = { 0x3a, };
+ static int x1000_mac_pins[] = {
+ 	0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x26,
+ };
+@@ -2164,6 +2165,7 @@
+ 	INGENIC_PIN_GROUP("pwm3", x1000_pwm_pwm3, 2),
+ 	INGENIC_PIN_GROUP("pwm4", x1000_pwm_pwm4, 0),
+ 	INGENIC_PIN_GROUP("mac", x1000_mac, 1),
++	INGENIC_PIN_GROUP("rtc32k", x1000_rtc32k, 0),
+ };
+ 
+ static const char *x1000_uart0_groups[] = { "uart0-data", "uart0-hwflow", };
+@@ -2207,6 +2209,7 @@
+ static const char *x1000_pwm3_groups[] = { "pwm3", };
+ static const char *x1000_pwm4_groups[] = { "pwm4", };
+ static const char *x1000_mac_groups[] = { "mac", };
++static const char *x1000_rtc32k_groups[] = { "rtc32k", };
+ 
+ static const struct pinfunction x1000_functions[] = {
+ 	INGENIC_PIN_FUNCTION("uart0", x1000_uart0),
+@@ -2232,6 +2235,7 @@
+ 	INGENIC_PIN_FUNCTION("pwm3", x1000_pwm3),
+ 	INGENIC_PIN_FUNCTION("pwm4", x1000_pwm4),
+ 	INGENIC_PIN_FUNCTION("mac", x1000_mac),
++	INGENIC_PIN_FUNCTION("rtc32k", x1000_rtc32k),
+ };
+ 
+ static const struct regmap_range x1000_access_ranges[] = {

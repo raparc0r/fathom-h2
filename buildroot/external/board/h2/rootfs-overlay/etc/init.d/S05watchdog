@@ -1,0 +1,9 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Hardware watchdog: busybox feeds it every second; if userspace stops running
+# for 8 s (a kernel hang), the X1000 resets. RAM survives a watchdog reset, so
+# pstore still has the console log. Stopping the daemon disarms it.
+case "$1" in
+    start) [ -c /dev/watchdog ] && watchdog -t 1 -T 8 /dev/watchdog ;;
+    stop)  killall watchdog 2>/dev/null ;;
+esac

@@ -1,0 +1,39 @@
+; SPDX-License-Identifier: GPL-3.0-or-later
+[theme]
+name    = Pixel Pastel
+author  = Fathom
+base    = dark
+
+[color]
+bg          = #17142A
+surface     = #2A2545
+text        = #F1EDFF
+text_muted  = #B4ACD6
+select_bg   = #A9B6F5
+select_fg   = #16203A
+signal      = #A8F0D1
+info        = #A8D8FF
+mode        = #CBB8FF
+battery     = #FFD1A8
+warning     = #FFF0A3
+danger      = #FF8FA3
+
+[font]
+family      = arkpixel        ; Ark Pixel 10 px proportional, 2x
+
+[shape]
+selection   = pill
+corner      = stepped
+radius      = 0
+shadow      = hard
+progress    = segments
+cursor      = arrow
+playing     = equalizer
+motion      = stepped
+
+[art]
+style       = normal
+
+[decor]
+header_pattern = dots
+icons          = pixel

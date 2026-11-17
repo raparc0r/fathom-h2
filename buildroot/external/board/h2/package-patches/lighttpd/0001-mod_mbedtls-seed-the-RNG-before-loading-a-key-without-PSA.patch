@@ -1,0 +1,25 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] mod_mbedtls: seed the RNG before loading a key, without PSA too
+
+network_mbedtls_load_pemfile() ran mod_mbedtls_init_once_mbedtls() only when
+MBEDTLS_USE_PSA_CRYPTO is defined. Without it, mbedtls_pk_parse_key() and
+mbedtls_pk_check_pair() are handed a CTR_DRBG that hasn't been seeded yet:
+RSA keys don't use it there, but an EC key does, and lighttpd crashes
+(NULL read) as soon as ssl.pemfile names an ECDSA certificate. Seed it first
+in both builds.
+
+Upstream-Status: Pending
+
+--- a/src/mod_mbedtls.c
++++ b/src/mod_mbedtls.c
+@@ -1230,10 +1230,8 @@
+ network_mbedtls_load_pemfile (server *srv, const buffer *pemfile, const buffer *privkey)
+ {
+-  #if defined(MBEDTLS_USE_PSA_CRYPTO)
+     if (!mod_mbedtls_init_once_mbedtls(srv))
+         return NULL;
+-  #endif
+ 
+     mod_mbedtls_kp * const kp = mod_mbedtls_kp_init();
+     int rc;
+ 

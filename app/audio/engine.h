@@ -1,0 +1,87 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/*
+ * Playback engine: one thread decodes and writes to an audio output.
+ * Gapless: a queued next track is opened when the current one ends; if the
+ * format is the same, the output is never reopened, so there is no gap.
+ * At gain 1.0 and with no EQ, samples pass through untouched (bit-perfect).
+ */
+#ifndef FATHOM_ENGINE_H
+#define FATHOM_ENGINE_H
+
+#include <stdint.h>
+
+#include "audio/decoder.h"
+#include "audio/eq.h"
+#include "audio/output.h"
+
+typedef enum { ENG_STOPPED, ENG_PLAYING, ENG_PAUSED } eng_state_t;
+
+typedef struct {
+    eng_state_t    state;
+    uint32_t       seq;          /* +1 whenever a new track starts (play or gapless) */
+    int64_t        track_id;     /* id passed with the track that is playing */
+    uint32_t       pos_ms;       /* heard position (output delay subtracted) */
+    uint32_t       len_ms;
+    audio_format_t fmt;          /* source format */
+    int            next_queued;  /* a gapless successor is lined up */
+    int            ended;        /* playback ran out (no successor) */
+    int            error;        /* last track failed to open */
+    int            output_lost;  /* a write failed (device gone); the engine paused */
+    int            starting;     /* a track is about to start (engine_play not yet taken up) */
+    int            start_paused; /* ...and it will start paused */
+    int            eq;           /* the EQ is on for this track */
+    int            eq_in_output; /* ...run by the output (Bluetooth: at the link's rate) */
+    int            stream;       /* the track is an internet stream (no length, no seeking) */
+    int            connecting;   /* ...and it is still connecting */
+    unsigned       meta_seq;     /* changes with meta */
+    char           meta[256];    /* what the stream says is playing ("Artist - Title") */
+    char           meta_url[512];/* ...and the URL it gives with it (a cover on some stations) */
+    /* The signal path: */
+    audio_format_t out_fmt;      /* what the output was opened for */
+    float          gain;         /* the volume's gain (a USB DAC's software volume), 1 = none */
+    float          track_gain;   /* the track's levelling, 1 = none */
+    float          balance[2];   /* left, right; 1, 1 = centred (or not stereo) */
+    int            untouched;    /* the samples reach the output as decoded (no gain, EQ or balance) */
+} eng_status_t;
+
+typedef struct engine engine_t;
+
+engine_t *engine_new(const audio_output_t *out);
+void      engine_free(engine_t *e);
+
+/* start now; an http(s):// path is a stream, opened without holding up the
+ * caller (eng_status_t.connecting) */
+void engine_play(engine_t *e, const char *path, int64_t id);
+void engine_queue_next(engine_t *e, const char *path, int64_t id);  /* gapless successor */
+/* The same with the track's own gain (volume levelling; 1.0 = bit-perfect), which
+ * takes effect at the track's first sample, so gapless joins stay seamless. */
+void engine_play_gain(engine_t *e, const char *path, int64_t id, float gain);
+void engine_queue_next_gain(engine_t *e, const char *path, int64_t id, float gain);
+void engine_pause(engine_t *e, int on);
+void engine_stop(engine_t *e);                                      /* a stream disconnects */
+void engine_seek_ms(engine_t *e, uint32_t ms);
+void engine_set_gain(engine_t *e, float gain);                      /* 1.0 = bit-perfect */
+/* The balance: a gain (0..1) on each channel of a stereo track; 1, 1 = none. */
+void engine_set_balance(engine_t *e, float left, float right);
+/* The parametric EQ (copied; NULL = off, bit-perfect). From the next chunk of
+ * audio on; with it on, a 16-bit track opens the output at 24 bits. */
+void engine_set_eq(engine_t *e, const eq_profile_t *p);
+/* DSD as DoP (1) for an output whose DAC takes it, or converted to PCM (0, the
+ * default). On from the next track; off at once (a DoP track carries on as
+ * PCM). DoP is only used while the gain is 1 (the DAC's own volume): the EQ,
+ * balance, levelling and fade are bypassed for it. engine_switch_output()
+ * turns it off: say so again for the new output if it takes DoP too. */
+void engine_set_dop(engine_t *e, int on);
+/* A fade (0..1) applied on top of the gain: the sleep timer's. 1.0 = none. */
+void engine_set_fade(engine_t *e, float fade);
+void engine_status(engine_t *e, eng_status_t *st);
+/* What the output runs at now (its describe(); "" when it's closed). */
+void engine_describe_output(engine_t *e, char *out, int cap);
+
+/* Move playback to another device: waits for the write in progress, closes the
+ * output, calls change(output ctx, arg) (e.g. out_alsa_set_device), and reopens
+ * it for the current track. Audio still queued on the old device is dropped;
+ * the play/pause state is kept. */
+void engine_switch_output(engine_t *e, void (*change)(void *out_ctx, void *arg), void *arg);
+
+#endif

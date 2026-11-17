@@ -1,0 +1,149 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Bluetooth audio: D-Bus, BlueZ and bluez-alsa, all run from the card
+# (fathom/bt), the chip through fathom-bluetooth. The player calls this:
+#
+#   fathom-bt start | stop | status       the stack (and the chip) on or off
+#   fathom-bt scan SECONDS                audio devices nearby: ADDR|NAME|ICON|PAIRED
+#   fathom-bt paired                      paired devices: ADDR|NAME|ICON|CONNECTED
+#   fathom-bt pair ADDR                   pair, trust and connect
+#   fathom-bt connect ADDR | disconnect ADDR | forget ADDR
+#   fathom-bt pcm                         the connected device's playback PCM (D-Bus path)
+#   fathom-bt codec                       the connected device's codec (SBC, AAC)
+#
+# Pairings live in /var/lib/bluetooth (RAM): BlueZ names files after device
+# addresses, and FAT has no ':' in names. They're kept on the card as one
+# archive, saved whenever they change and restored at start.
+
+BT=/mnt/sd/fathom/bt
+STATE=/mnt/sd/fathom/bluetooth-pairings.tar
+RUN=/var/run/fathom-bt
+export LD_LIBRARY_PATH=$BT/usr/lib:$BT/lib
+export DBUS_SYSTEM_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket
+
+# --timeout makes bluetoothctl wait that long even when it's done: only for
+# what must take time (a scan); D-Bus bounds the rest (25 s)
+ctl() { $BT/usr/bin/bluetoothctl ${T:+--timeout $T} "$@" 2>/dev/null; }
+say() { echo "bt: $1" >&2; }
+running() { [ -f $RUN/bluetoothd.pid ] && kill -0 "$(cat $RUN/bluetoothd.pid)" 2>/dev/null; }
+save() { [ -d /var/lib/bluetooth ] && tar -cf $STATE.new -C /var/lib bluetooth 2>/dev/null && mv $STATE.new $STATE && sync; }
+# AAC: a bluez-alsa with Fraunhofer's FDK AAC, built by the user for their own H2
+# (tools/bluetooth-aac), in fathom/bt-aac; never part of a release
+AAC=/mnt/sd/fathom/bt-aac
+bluealsa() {
+    if [ -x $AAC/bluealsa ] && [ -f $AAC/libfdk-aac.so.2 ]; then echo "env LD_LIBRARY_PATH=$AAC:$LD_LIBRARY_PATH $AAC/bluealsa"
+    elif [ -x $BT/usr/bin/bluealsad ]; then echo $BT/usr/bin/bluealsad
+    else echo $BT/usr/bin/bluealsa; fi
+}
+
+# ADDR|NAME|ICON for every known device that plays audio
+audio_devices() {
+    ctl devices $1 | sed -n 's/^Device \([0-9A-F:]\{17\}\) \(.*\)/\1|\2/p' |
+    while IFS='|' read -r addr name; do
+        info=$(ctl info "$addr")
+        echo "$info" | grep -q -E "Audio Sink|Icon: audio-" || continue
+        icon=$(echo "$info" | sed -n 's/^\s*Icon: //p')
+        echo "$addr|$name|${icon:-audio}"
+    done
+}
+
+case "$1" in
+start)
+    running && { echo on; exit 0; }
+    [ -x $BT/usr/libexec/bluetooth/bluetoothd ] || { say "not on the card ($BT)"; exit 1; }
+    # (just after a stop the chip may still be going down: one more try)
+    fathom-bluetooth on >/dev/null || { sleep 2; fathom-bluetooth on >/dev/null; } || exit 1
+    mkdir -p $RUN /var/run/dbus /var/lib/bluetooth
+    [ -f $STATE ] && tar -xf $STATE -C /var/lib 2>/dev/null
+    cd /
+    $BT/usr/bin/dbus-daemon --config-file=/etc/fathom/dbus-system.conf --fork --print-pid > $RUN/dbus.pid || exit 1
+    # only what audio needs: no input, network, SIM access, MIDI, ...
+    $BT/usr/libexec/bluetooth/bluetoothd -n -f /etc/fathom/bluetooth.conf \
+        -P sap,input,hog,network,midi,neard,wiimote,bap,bass,vcp,mcp,ccp,csip,micp,tmap,gmap,asha \
+        > /tmp/bluetoothd.log 2>&1 &
+    echo $! > $RUN/bluetoothd.pid
+    for i in 1 2 3 4 5 6 7 8 9 10; do ctl show | grep -q "Controller" && break; sleep 0.5; done
+    # 44.1 kHz for the whole link (most music; the player converts the rest:
+    # changing the rate mid-link drops many headphones), and the headphones'
+    # own volume (AVRCP absolute volume) where they have one. aptX is off unless
+    # asked for (an AAC add-on built before Fathom had aptX lacks it)
+    ba=$(bluealsa)
+    codecs=
+    $ba -h 2>&1 | grep -q "a2dp-source:.*aptX" && codecs="-c aptX"
+    $ba -p a2dp-source $codecs --a2dp-force-audio-cd --a2dp-volume > /tmp/bluealsa.log 2>&1 &
+    echo $! > $RUN/bluealsa.pid
+    ctl power on > /dev/null
+    ctl pairable on > /dev/null              # bonding: pairings keep their keys
+    # the player as the headphones see it (AVRCP: state, track; their buttons)
+    if [ -x /mnt/sd/fathom/bin/fathom-avrcp ]; then
+        /mnt/sd/fathom/bin/fathom-avrcp > /tmp/fathom-avrcp.log 2>&1 &
+        echo $! > $RUN/avrcp.pid
+    fi
+    echo on
+    ;;
+stop)
+    running && save
+    for d in avrcp bluealsa bluetoothd dbus; do
+        [ -f $RUN/$d.pid ] && kill "$(cat $RUN/$d.pid)" 2>/dev/null
+        rm -f $RUN/$d.pid
+    done
+    rm -f /var/run/dbus/system_bus_socket
+    fathom-bluetooth off > /dev/null
+    echo off
+    ;;
+status)
+    running && echo on || echo off
+    ;;
+scan)
+    running || exit 1
+    T=${2:-8} ctl scan on > /dev/null
+    paired=$(ctl devices Paired | cut -d' ' -f2)
+    audio_devices | while IFS='|' read -r a n i; do
+        case " $(echo $paired) " in *" $a "*) p=1 ;; *) p=0 ;; esac
+        echo "$a|$n|$i|$p"
+    done
+    ;;
+paired)
+    running || exit 1
+    connected=$(ctl devices Connected | cut -d' ' -f2)
+    audio_devices Paired | while IFS='|' read -r a n i; do
+        case " $(echo $connected) " in *" $a "*) c=1 ;; *) c=0 ;; esac
+        echo "$a|$n|$i|$c"
+    done
+    ;;
+pair)
+    running && [ -n "$2" ] || exit 1
+    # headphones pair without a code ("just works"); the agent says so
+    ctl --agent NoInputNoOutput pair "$2" | grep -q -E "Pairing successful|AlreadyExists" || { say "pairing failed"; exit 1; }
+    ctl trust "$2" > /dev/null
+    save
+    ctl connect "$2" | grep -q "Connection successful" || { say "paired, not connected"; exit 2; }
+    ;;
+connect)
+    running && [ -n "$2" ] || exit 1
+    ctl connect "$2" | grep -q "Connection successful"
+    ;;
+disconnect)
+    running && [ -n "$2" ] || exit 1
+    ctl disconnect "$2" > /dev/null
+    ;;
+forget)
+    running && [ -n "$2" ] || exit 1
+    ctl remove "$2" > /dev/null
+    save
+    ;;
+pcm)
+    running || exit 1
+    $BT/usr/bin/bluealsa-cli list-pcms 2>/dev/null | grep -m1 "a2dpsrc/sink"
+    ;;
+codec)
+    running || exit 1
+    p=$($BT/usr/bin/bluealsa-cli list-pcms 2>/dev/null | grep -m1 "a2dpsrc/sink") || exit 1
+    $BT/usr/bin/bluealsa-cli info "$p" 2>/dev/null | sed -n 's/^Selected codec: \([^:]*\).*/\1/p'
+    ;;
+*)
+    echo "usage: $0 start|stop|status|scan [s]|paired|pair|connect|disconnect|forget ADDR|pcm" >&2
+    exit 2
+    ;;
+esac

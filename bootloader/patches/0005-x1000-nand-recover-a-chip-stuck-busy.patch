@@ -1,0 +1,114 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] x1000: nand: recover a chip stuck busy; say how it was stuck
+
+Booted from flash (not over USB), the recovery menu's Install and Backup
+fail on the very first page: after the page read command the chip reports
+busy for the whole second nand_wait_busy() allows. A read that times out
+now resets the chip and sets its registers up again before it is tried
+again. The busy wait records the status at its first and last poll and how
+long it waited, and the installer shows them with the number of resets
+("page N: busy XX..YY, T ms, R resets"), or how many re-reads and resets a
+successful run needed.
+---
+--- a/bootloader/x1000/install.c
++++ b/bootloader/x1000/install.c
+@@ -51,6 +51,7 @@
+ 
+     int rc;
+     nand_read_retries = 0;
++    nand_read_resets = 0;
+     switch(which) {
+     case INSTALL: rc = install_bootloader("/bootloader." BOOTFILE_EXT); break;
+     case BACKUP:  rc = backup_bootloader(BOOTBACKUP_FILE); break;
+@@ -58,18 +59,24 @@
+     default: return;
+     }
+ 
+-    static char buf[64], detail[64];
++    static char buf[64], detail[96];
+     snprintf(buf, sizeof(buf), "%s (%d)", installer_strerror(rc), rc);
+     const char* msg1 = rc == 0 ? "Success" : buf;
+     const char* msg2 = "Press " BL_QUIT_NAME " to continue";
+     /* Fathom: say which page failed, and how, or how many reads were retried */
+     detail[0] = 0;
+-    if(rc == IERR_NAND_READ)
++    if(rc == IERR_NAND_READ && nand_read_err.rc == NAND_ERR_TIMEOUT)
++        snprintf(detail, sizeof(detail), "page %lu: busy %02x..%02x, %u ms, %u resets",
++                 (unsigned long)nand_read_err.page, nand_busy_diag.first & 0xff,
++                 nand_busy_diag.last & 0xff, nand_busy_diag.us / 1000, nand_read_resets);
++    else if(rc == IERR_NAND_READ)
+         snprintf(detail, sizeof(detail), "page %lu: err %d, status %02x",
+                  (unsigned long)nand_read_err.page, nand_read_err.rc,
+                  nand_read_err.status & 0xff);
+     else if(nand_read_retries)
+-        snprintf(detail, sizeof(detail), "%u page re-reads", nand_read_retries);
++        snprintf(detail, sizeof(detail), "%u re-reads, %u resets (busy %02x, %u ms)",
++                 nand_read_retries, nand_read_resets,
++                 nand_busy_diag.last & 0xff, nand_busy_diag.us / 1000);
+     splashf(0, "%s\n%s\n%s", msg1, detail, msg2);
+ 
+     while(get_button(TIMEOUT_BLOCK) != BL_QUIT);
+--- a/firmware/target/mips/ingenic/nand-ingenic.c
++++ b/firmware/target/mips/ingenic/nand-ingenic.c
+@@ -314,15 +314,26 @@
+                  enable ? FREG_CFG_OTP_ENABLE : 0);
+ }
+ 
++struct nand_busy_diag nand_busy_diag;
++unsigned nand_read_resets;
++
+ static int nand_wait_busy(struct nand_drv* drv)
+ {
+     /* No scheduler dependency: also used by the SPL. */
++    uint32_t t0 = __ost_read32();
++    int first = -1, status = -1;
+     for(int i = 0; i < 10000; ++i) {
+-        int status = nand_get_reg(drv, FREG_STATUS);
++        status = nand_get_reg(drv, FREG_STATUS);
++        if(i == 0)
++            first = status;
+         if(status < 0 || !(status & FREG_STATUS_BUSY))
+             return status;
+         udelay(100);
+     }
++    nand_busy_diag.first = first;
++    nand_busy_diag.last = status;
++    nand_busy_diag.polls = 10000;
++    nand_busy_diag.us = (__ost_read32() - t0) / OST_TICKS_PER_US;
+     return NAND_ERR_TIMEOUT;
+ }
+ 
+@@ -412,6 +423,14 @@
+                 return rc;
+             }
+             nand_read_retries++;
++            if(rc == NAND_ERR_TIMEOUT) {
++                /* Stuck busy (seen after booting from flash): reset the
++                 * chip and set it up again before the next try. */
++                sfc_exec(NANDCMD_RESET, 0, NULL, 0);
++                mdelay(10);
++                setup_chip_registers(drv);
++                nand_read_resets++;
++            }
+         }
+ 
+         memcpy(buffer, &drv->page_buf[offset], MIN(pg_size - offset, byte_len));
+--- a/firmware/target/mips/ingenic/nand-ingenic.h
++++ b/firmware/target/mips/ingenic/nand-ingenic.h
+@@ -50,6 +50,16 @@
+ extern struct nand_read_err nand_read_err;
+ extern unsigned nand_read_retries;   /* re-reads that later succeeded */
+ 
++/* The last busy wait that timed out: the status register at its first and
++ * last poll, how many polls, and how long it waited (microseconds); and how
++ * many times a stuck chip was reset and set up again to recover. */
++struct nand_busy_diag {
++    int first, last;
++    unsigned polls, us;
++};
++extern struct nand_busy_diag nand_busy_diag;
++extern unsigned nand_read_resets;
++
+ /* keep max page size in sync with the NAND chip table in the .c file */
+ #define NAND_DRV_SCRATCHSIZE 32
+ #define NAND_DRV_MAXPAGESIZE (2048+128)
