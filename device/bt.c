@@ -13,6 +13,8 @@
  * (radio stuttered). */
 #include "bt.h"
 
+#include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
@@ -320,15 +322,19 @@ static void *monitor(void *arg)
         pthread_mutex_lock(&B.mu);
         B.mon_pid = pid;
         pthread_mutex_unlock(&B.mu);
-        FILE *f = fdopen(fd[0], "r");
-        char line[256];
-        while (f && fgets(line, sizeof line, f)) {
+        /* read(), not stdio: a FILE blocked in fgets() holds its lock, and the
+         * C library's exit() takes every FILE's lock to flush it, so the
+         * player would hang on its way out. Any output is a reason to look. */
+        char buf[256];
+        ssize_t n;
+        while ((n = read(fd[0], buf, sizeof buf)) > 0 || (n < 0 && errno == EINTR)) {
+            if (n <= 0) continue;
             pthread_mutex_lock(&B.mu);
             B.pcm_dirty = 1;
             pthread_cond_broadcast(&B.cv);
             pthread_mutex_unlock(&B.mu);
         }
-        if (f) fclose(f); else close(fd[0]);
+        close(fd[0]);
         pthread_mutex_lock(&B.mu);
         B.mon_pid = 0;
         B.pcm_dirty = 1;                         /* (the worker, waiting on us, polls again) */
@@ -340,6 +346,32 @@ static void *monitor(void *arg)
     return NULL;
 }
 
+/* The monitor is a separate process: stopped when the player exits, and any
+ * left by a player that crashed are stopped when the next one starts. */
+static void monitor_kill(void)
+{
+    if (B.mon_pid > 0) kill(B.mon_pid, SIGTERM);
+}
+
+static void monitor_kill_strays(void)
+{
+    DIR *d = opendir("/proc");
+    struct dirent *e;
+    while (d && (e = readdir(d))) {
+        int pid = atoi(e->d_name);
+        if (pid <= 1) continue;
+        char path[64], cmd[128] = "";
+        snprintf(path, sizeof path, "/proc/%d/cmdline", pid);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        size_t n = fread(cmd, 1, sizeof cmd - 1, f);
+        fclose(f);
+        for (size_t i = 0; i < n; i++) if (!cmd[i]) cmd[i] = ' ';
+        if (strstr(cmd, "bluealsa-cli monitor")) kill(pid, SIGTERM);
+    }
+    if (d) closedir(d);
+}
+
 void bt_init(int on, const char *last)
 {
     if (access(FATHOM_BT, X_OK) || access("/mnt/sd/fathom/bt", F_OK)) return;
@@ -347,6 +379,8 @@ void bt_init(int on, const char *last)
     pthread_t th;
     if (pthread_create(&th, NULL, worker, NULL)) return;
     pthread_detach(th);
+    monitor_kill_strays();
+    atexit(monitor_kill);
     if (pthread_create(&th, NULL, monitor, NULL) == 0) pthread_detach(th);
     if (on) bt_request(CMD_START, NULL);
     B.seq++;
