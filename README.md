@@ -62,8 +62,8 @@ You'll need a microSD card formatted FAT32 (exFAT won't work), and the latest
    inside it are fine). Fathom only looks there: music anywhere else on the card won't
    show up in the library. If your music is at the top of the card or in a folder with
    another name, move it into `Music` first.
-2. Copy everything inside the release's `sd/` folder, plus `update.upt`, to the top of the
-   microSD card.
+2. Copy everything inside the release's `sd/` folder to the top of the microSD card. The
+   release's other folders are for recovery (`recovery/`) and reference (`about/`).
 3. Put the card in the H2, turn it on as usual and go to System Settings → Firmware Update.
    The H2 installs Fathom's bootloader and restarts into Fathom, which then reads your
    library (a few minutes the first time). That's the only thing that's written to the H2
@@ -128,18 +128,19 @@ holding it can read them.
 ## If something goes wrong
 
 If the H2 won't start, you can always load the bootloader from a Mac or Linux computer
-with Rockbox's `jztool` (included in the release for macOS; on Linux, build it with
-`make -C utils/jztool` from [Rockbox's source](https://github.com/Rockbox/rockbox) and run
-it with `sudo`):
+with Rockbox's `jztool` (in the release's `recovery/` folder for macOS; on Linux, build it
+with `make -C utils/jztool` from [Rockbox's source](https://github.com/Rockbox/rockbox) and
+run it with `sudo`):
 
 1. Turn the H2 fully off (hold Power for 10 seconds) with the card in.
 2. Plug a USB-C data cable into the H2, hold Menu, plug the other end into the computer,
    and let go. The screen stays black.
-3. Run `./jztool erosq load bootloader.erosq`. On a Mac, if it's blocked as coming from an
-   unknown developer, run `xattr -d com.apple.quarantine jztool` first.
+3. In the release's `recovery/` folder, run `./jztool erosq load bootloader.erosq`. On a
+   Mac, if it's blocked as coming from an unknown developer, run
+   `xattr -d com.apple.quarantine jztool` first.
 4. The bootloader's menu appears. Boot select → Hiby Player starts the stock firmware,
    Boot select → Linux starts Fathom, and Bootloader → Install or update reinstalls the
-   bootloader.
+   bootloader (copy `recovery/bootloader.erosq` to the top of the card first).
 
 If Bluetooth and Wi-Fi ever say their firmware is missing, hold Vol+ while turning the H2
 on and choose Advanced → Copy BT/Wi-Fi firmware.
