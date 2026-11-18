@@ -20,8 +20,8 @@ uboot.bin
 *.a
 *.so
 *.d
-# ...but not init script directories (e.g. the rootfs overlay's etc/init.d/)
-!init.d/
+# ...but not directories (the rootfs overlay's etc/init.d/, etc/sysctl.d/, udhcpc's hooks)
+!*.d/
 
 # OS / editor noise
 .DS_Store

@@ -1,0 +1,22 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# The H2 has no running clock: each time Wi-Fi gets an address (bound, renew),
+# the time is fetched once by NTP (busybox ntpd -q: set, then exit), from the
+# network's own server when DHCP names one, else pool.ntp.org. The player keeps
+# it (clock.last) for the next start without Wi-Fi.
+case "$1" in bound|renew) ;; *) exit 0 ;; esac
+[ "$interface" = wlan0 ] || exit 0
+pidof ntpd > /dev/null && exit 0
+peers=
+for s in $ntpsrv; do peers="$peers -p $s"; done
+[ -n "$peers" ] || peers="-p 0.pool.ntp.org -p 1.pool.ntp.org"
+(
+    if timeout 30 ntpd -n -q $peers > /dev/null 2>&1; then
+        logger -t fathom-ntp "clock set: $(date)"
+        date +%s > /var/run/fathom-clock     # the player saves it (clock.last)
+    else
+        logger -t fathom-ntp "no answer from$peers"
+    fi
+) < /dev/null > /dev/null 2>&1 &
+exit 0

@@ -12,6 +12,7 @@
 #   fathom-wifi saved             the saved networks' names
 #   fathom-wifi connect SSID [PASSWORD]   join (and save) a network; no password: open
 #   fathom-wifi forget SSID
+#   fathom-wifi ssid              the network joined now (for udhcpc's hook)
 #
 # The programs and modules are in fathom/wifi (post-build.sh), the chip's firmware
 # in fathom/firmware/brcm (the user's own, from flash.img: extract-firmware.py
@@ -32,6 +33,12 @@ say() { echo "wifi: $1" >&2; }
 cli() { $W/usr/sbin/wpa_cli -p $CTRL -i wlan0 "$@" 2>/dev/null; }
 running() { [ -f $RUN/wpa.pid ] && kill -0 "$(cat $RUN/wpa.pid)" 2>/dev/null; }
 hex() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
+
+# Saved with every network enabled. Picking one makes wpa_supplicant disable all
+# the others, which is meant for now only: saved as it is, the H2 would never
+# rejoin them by itself (home, after a hotspot elsewhere).
+save() { cli save_config > /dev/null; sed -i '/^[[:space:]]*disabled=1$/d' $CONF; sync; }
+uptime_s() { cut -d. -f1 /proc/uptime; }
 
 # The network id of a saved SSID, or ""
 net_id() { cli list_networks | tail -n +2 | awk -F'\t' -v s="$1" '$2 == s { print $1; exit }'; }
@@ -72,6 +79,9 @@ on)
     [ -e /sys/class/net/wlan0 ] || { say "no wlan0 (firmware?)"; exit 1; }
     mkdir -p $RUN $CTRL
     [ -f $CONF ] || printf 'ctrl_interface=%s\nupdate_config=1\n' $CTRL > $CONF
+    # (cards saved by 0.8.4 and earlier: every network the H2 last left disabled)
+    grep -q '^[[:space:]]*disabled=1$' $CONF && sed -i '/^[[:space:]]*disabled=1$/d' $CONF
+    rm -f $RUN/lease-ssid $RUN/seen
     ifconfig wlan0 up
     rm -f $CTRL/wlan0 $RUN/wpa.pid                     # a socket left by an earlier one
     $W/usr/sbin/wpa_supplicant -B -i wlan0 -c $CONF -P $RUN/wpa.pid >/dev/null 2>&1
@@ -107,6 +117,25 @@ status)
     ip=$(echo "$st" | sed -n 's/^ip_address=//p')
     [ -z "$ip" ] && ip=$(ifconfig wlan0 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p')
     sig=$(cli signal_poll | sed -n 's/^RSSI=//p')
+    if [ "$state" = COMPLETED ]; then
+        # Joined a different network from the one the address came from
+        # (wpa_supplicant moved on; udhcpc keeps its lease until it's due):
+        # let that address go and ask this network for one
+        if [ -f $RUN/lease-ssid ] && [ "$(cat $RUN/lease-ssid)" != "$ssid" ] && [ -f $RUN/udhcpc.pid ]; then
+            p=$(cat $RUN/udhcpc.pid)
+            rm -f $RUN/lease-ssid
+            # release, then a fresh discover: apart, as two signals pending at once
+            # arrive lowest first (USR1, renew, would come before the release)
+            kill -USR2 "$p" 2>/dev/null; sleep 0.3; kill -USR1 "$p" 2>/dev/null
+            logger -t fathom-wifi "joined another network: a new address"
+            ip=
+        fi
+        uptime_s > $RUN/seen
+    elif cli list_networks | grep -q "\[DISABLED\]"; then
+        # The network picked can't be joined (out of range, wrong password): after
+        # a minute without a connection, any saved network will do again
+        [ $(( $(uptime_s) - $(cat $RUN/seen 2>/dev/null || echo 0) )) -ge 60 ] && cli enable_network all > /dev/null
+    fi
     case "$state" in
     COMPLETED) [ -n "$ip" ] && s=connected || s=connecting ;;
     SCANNING) s=scanning ;;
@@ -152,18 +181,21 @@ connect)
         cli set_network "$id" key_mgmt NONE > /dev/null
     fi
     cli enable_network "$id" > /dev/null
-    cli select_network "$id" > /dev/null
-    cli save_config > /dev/null
-    sync
+    cli select_network "$id" > /dev/null               # (the others off while it's joined; status: a minute without it, back on)
+    uptime_s > $RUN/seen
+    save
     echo "$id"
     ;;
 forget)
     running || exit 1
     id=$(net_id "$2")
-    [ -n "$id" ] && cli remove_network "$id" > /dev/null && cli save_config > /dev/null && sync
+    [ -n "$id" ] && cli remove_network "$id" > /dev/null && save
+    ;;
+ssid)
+    running && cli status | sed -n 's/^ssid=//p'
     ;;
 *)
-    echo "usage: fathom-wifi on|off|status|scan|saved|connect SSID [PASSWORD]|forget SSID" >&2
+    echo "usage: fathom-wifi on|off|status|scan|saved|connect SSID [PASSWORD]|forget SSID|ssid" >&2
     exit 2
     ;;
 esac

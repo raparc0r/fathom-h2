@@ -1,0 +1,13 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Which Wi-Fi network the address came from: fathom-wifi status compares it with
+# the network joined now, and asks for a new address when wpa_supplicant has
+# moved to another one (udhcpc alone would keep the old one until it's due).
+[ "$interface" = wlan0 ] || exit 0
+RUN=/var/run/fathom-wifi
+case "$1" in
+bound|renew) s=$(/usr/sbin/fathom-wifi ssid); [ -n "$s" ] && printf '%s\n' "$s" > $RUN/lease-ssid ;;
+deconfig|leasefail|nak) rm -f $RUN/lease-ssid ;;
+esac
+exit 0
