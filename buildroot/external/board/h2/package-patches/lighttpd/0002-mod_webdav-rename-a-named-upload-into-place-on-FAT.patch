@@ -1,0 +1,103 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] mod_webdav: rename a named upload into place on FAT
+
+A PUT's body is written to a temporary file in the target's folder, which is
+then linked into place: O_TMPFILE plus linkat() on Linux. FAT has neither, so
+the file was created with mkostemp() and unlinked at once, and at the end
+linkat() failed and mod_webdav copied the whole body into a second temporary
+file before renaming that: every upload was written to the card twice, and
+the server stalled while the copy ran (uploads at about half the speed).
+
+When O_TMPFILE isn't available, keep the mkostemp() file's name in the chunk
+(c->mem, with is_temp, so a failed upload is unlinked when the chunk is
+reset as before) and rename it into place when the body is complete. Falls
+back to the copy if the rename fails.
+
+Upstream-Status: Pending
+
+--- a/src/mod_webdav.c
++++ b/src/mod_webdav.c
+@@ -4677,6 +4677,8 @@
+      * While this might result in extra copying, it is simple and robust. */
+     int fd;
+     size_t len = buffer_clen(&r->physical.path);
++    char named[PATH_MAX];
++    named[0] = '\0';
+   #if (defined(__linux__) || defined(__CYGWIN__)) && defined(O_TMPFILE)
+     char *slash = memrchr(r->physical.path.ptr, '/', len);
+     if (slash == r->physical.path.ptr) slash = NULL;
+@@ -4687,9 +4689,21 @@
+     if (fd < 0)
+   #endif
+     {
++        /* Fathom: on a file system with neither O_TMPFILE nor link() (FAT)
++         * the temporary file keeps its name, so that a complete upload is
++         * renamed into place (mod_webdav_put_named_rename()) rather than
++         * copied: the copy wrote every upload twice and paused the server
++         * while it ran. The name is in the chunk (c->mem, is_temp), so a
++         * failed upload is unlinked when the chunk is reset. */
+         buffer_append_string_len(&r->physical.path, CONST_STR_LEN("-XXXXXX"));
+         fd = fdevent_mkostemp(r->physical.path.ptr, 0);
+-        if (fd >= 0) unlink(r->physical.path.ptr);
++        if (fd >= 0) {
++            if (buffer_clen(&r->physical.path) < sizeof(named))
++                memcpy(named, r->physical.path.ptr,
++                       buffer_clen(&r->physical.path) + 1);
++            else
++                unlink(r->physical.path.ptr);
++        }
+         buffer_truncate(&r->physical.path, len);
+     }
+     if (fd < 0) {
+@@ -4737,7 +4751,10 @@
+      * and that is handled above, so cq->last is never NULL here */
+     force_assert(cq->last);
+   #endif
+-    buffer_clear(cq->last->mem); /* file already unlink()ed */
++    if (named[0])  /*(Fathom: kept, see above)*/
++        buffer_copy_string(cq->last->mem, named);
++    else
++        buffer_clear(cq->last->mem); /* file already unlink()ed */
+     cq->upload_temp_file_size = (off_t)((1uLL << (sizeof(off_t)*8-1))-1);
+     cq->last->file.is_temp = 1;
+ 
+@@ -4797,6 +4814,29 @@
+ 
+     return 0;
+ }
++
++
++/* Fathom: the request body is in a named temporary file in the target's
++ * folder (mod_webdav_put_prep() on FAT): rename it into place. 0 if that
++ * fails, for the copy below to try (and report) as before. */
++static int
++mod_webdav_put_named_rename (request_st * const r)
++{
++    chunkqueue * const cq = &r->reqbody_queue;
++    chunk * const c = cq->first;
++    struct stat st;
++    const int replaced = (0 == lstat(r->physical.path.ptr, &st));
++    if (0 != rename(c->mem->ptr, r->physical.path.ptr))
++        return 0;
++    buffer_clear(c->mem); /*(it is the file now: not to be unlinked)*/
++    http_status_set_fin(r, replaced ? 204 : 201); /* No Content : Created */
++    if (!replaced)
++        webdav_parent_modified(&r->physical.path);
++    if (0 != r->conf.etag_flags && 0 == fstat(c->file.fd, &st))
++        webdav_response_etag(r, &st);
++    chunkqueue_mark_written(cq, c->file.length); /*(c->offset == 0)*/
++    return 1;
++}
+ #endif
+ 
+ 
+@@ -5027,6 +5067,9 @@
+             if (!mod_webdav_write_single_file_chunk(r, cq))
+                 return HANDLER_FINISHED;
+         }
++        if (c->file.is_temp && !buffer_is_blank(c->mem)
++            && mod_webdav_put_named_rename(r))
++            return HANDLER_FINISHED;
+         if (mod_webdav_put_linkat_rename(r, pathtemp))
+             return HANDLER_FINISHED;
+         /* attempt traditional copy (below) if linkat() failed for any reason */
