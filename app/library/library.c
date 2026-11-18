@@ -264,6 +264,11 @@ library_t *library_open(const char *db_path, const char *art_dir)
     return lib;
 }
 
+void library_release_memory(library_t *lib)
+{
+    if (lib) sqlite3_db_release_memory(lib->db);
+}
+
 void library_close(library_t *lib)
 {
     if (!lib) return;

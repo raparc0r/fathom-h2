@@ -5,10 +5,12 @@
 #   docker/run.sh                 interactive shell
 #   docker/run.sh make -C ...     run a command
 # Downloads and ccache live in the named volume "fathom-cache" so rebuilds are fast.
+# FATHOM_CACHE_VOLUME names another (a copy, for a second build that mustn't share it).
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/.." && pwd)
 image=fathom-build:latest
+volume=${FATHOM_CACHE_VOLUME:-fathom-cache}
 
 # Docker Desktop's CLI may not be on PATH yet (e.g. a shell started before it was installed).
 if ! command -v docker >/dev/null 2>&1 && [ -x /Applications/Docker.app/Contents/Resources/bin/docker ]; then
@@ -24,13 +26,13 @@ if ! docker image inspect "$image" >/dev/null 2>&1 || [ "$here/Dockerfile" -nt "
     touch "$here/.built"
 fi
 
-docker volume create fathom-cache >/dev/null
+docker volume create "$volume" >/dev/null
 # The cache volume is created root-owned; hand it to the build user once.
-docker run --rm -v fathom-cache:/cache -u 0 "$image" sh -c "mkdir -p /cache/dl /cache/ccache && chown -R $(id -u):$(id -g) /cache"
+docker run --rm -v "$volume":/cache -u 0 "$image" sh -c "mkdir -p /cache/dl /cache/ccache && chown -R $(id -u):$(id -g) /cache"
 
 tty_flag=""
 [ -t 0 ] && tty_flag="-it"
 exec docker run --rm $tty_flag \
     -v "$repo":/work \
-    -v fathom-cache:/cache \
+    -v "$volume":/cache \
     "$image" "${@:-bash}"

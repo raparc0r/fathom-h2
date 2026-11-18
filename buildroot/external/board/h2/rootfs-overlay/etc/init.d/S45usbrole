@@ -1,8 +1,8 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
 # USB-C port role: sink for computers and chargers, dual role to find USB DACs.
+# (it logs to syslog itself: no shell or logger kept running for it)
 case "$1" in
-    start) start-stop-daemon -S -b -m -p /var/run/usbrole.pid -x /bin/sh -- -c \
-               'exec /usr/sbin/fathom-usbrole 2>&1 | logger -t usbrole' ;;
+    start) start-stop-daemon -S -b -m -p /var/run/usbrole.pid -x /usr/sbin/fathom-usbrole ;;
     stop)  killall fathom-usbrole 2>/dev/null ;;
 esac

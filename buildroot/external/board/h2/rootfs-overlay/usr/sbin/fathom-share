@@ -18,6 +18,13 @@
 # into fathom/share/upload on the card and then renamed into place, so a big
 # file never sits in memory. The player reads the access log (methods and
 # status codes only) to notice new music, and empties it as it goes.
+#
+# Music playing comes first: both run at nice 19, what lighttpd reads from
+# the card leaves the page cache once sent (fathom-nocache.so: a 65 MB
+# download otherwise evicts the player's code, and the audio stutters while
+# it's read back). With the player's audio thread at real-time priority and
+# its deeper buffers, downloads need no speed limit: at full speed (about
+# 1.2 MB/s) radio played without a gap on the H2, wired and over Bluetooth.
 
 S=/mnt/sd/fathom/share
 W=/mnt/sd/fathom/wifi
@@ -58,7 +65,9 @@ server.tag = "Fathom"
 server.pid-file = "$RUN/lighttpd.pid"
 server.errorlog = "$RUN/error.log"
 server.upload-dirs = ("$UP")
-server.max-connections = 16
+# (each TLS connection holds about 40 KB of buffers; Finder opens a few)
+server.max-connections = 8
+server.max-fds = 64
 server.max-request-size = 4194303
 server.feature-flags = ("server.graceful-shutdown-timeout" => 2)
 mimetype.assign = ("" => "application/octet-stream")
@@ -71,13 +80,14 @@ webdav.sqlite-db-name = "$RUN/webdav.db"
 accesslog.filename = "$RUN/access.log"
 accesslog.format = "%m %s"
 CONF
-    $S/usr/sbin/lighttpd -f $RUN/lighttpd.conf -m $S/usr/lib/lighttpd || { say "lighttpd didn't start ($(tail -1 $RUN/error.log 2>/dev/null))"; exit 1; }
+    nc=; [ -f $S/usr/lib/fathom-nocache.so ] && nc=$S/usr/lib/fathom-nocache.so
+    LD_PRELOAD=$nc nice -n 19 $S/usr/sbin/lighttpd -f $RUN/lighttpd.conf -m $S/usr/lib/lighttpd || { say "lighttpd didn't start ($(tail -1 $RUN/error.log 2>/dev/null))"; exit 1; }
     for i in $(seq 1 20); do alive lighttpd && break; sleep 0.1; done
     alive lighttpd || { say "lighttpd didn't start ($(tail -1 $RUN/error.log 2>/dev/null))"; exit 1; }
     # (mdnsd answers for the service's name as the host: fathom-h2.local)
     printf 'name fathom-h2\ntype _webdavs._tcp\nport 443\ntxt path=/\n' > $RUN/mdns.d/webdav.service
     if [ -x $S/usr/sbin/mdnsd ]; then
-        $S/usr/sbin/mdnsd -n -i wlan0 $RUN/mdns.d > /dev/null 2>&1 &
+        nice -n 19 $S/usr/sbin/mdnsd -n -i wlan0 $RUN/mdns.d > /dev/null 2>&1 &
         echo $! > $RUN/mdnsd.pid
     fi
     echo on

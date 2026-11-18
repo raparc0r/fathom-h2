@@ -5,9 +5,22 @@
 # 42 asks for USB drive mode (fathom-usbdisk) first.
 # Create /mnt/sd/fathom/no-autostart to boot to the console instead (development).
 # Output goes to /tmp/fathom-player.log (RAM, not the card).
+#
+# Logs in RAM would grow for as long as the H2 runs: while the player runs,
+# this loop looks once a minute, and a log in /tmp over 256 KB keeps its last
+# 128 KB (cut in place: whoever writes it appends, so carries on at its end).
 
 bin=/mnt/sd/fathom/bin/fathom-player
 pidfile=/var/run/fathom.pid
+log=/tmp/fathom-player.log
+
+trim_logs() {
+    for f in /tmp/*.log /var/run/fathom-share/error.log; do
+        [ -f "$f" ] && [ "$(wc -c < "$f")" -gt 262144 ] || continue
+        tail -c 131072 "$f" > "$f.cut" && cat "$f.cut" > "$f"
+        rm -f "$f.cut"
+    done
+}
 
 case "$1" in
 start)
@@ -17,13 +30,28 @@ start)
     (
         cd /                            # not on the card: USB drive mode unmounts it
         while :; do
-            "$bin" >> /tmp/fathom-player.log 2>&1
+            "$bin" >> $log 2>&1 &
+            p=$!
+            # Until it exits, a look at the logs each minute. The player's exit
+            # ends the minute's sleep at once (busybox's wait -n waits for the
+            # newest job only, so it can't be used for this).
+            s=
+            trap '[ -n "$s" ] && kill $s 2>/dev/null' CHLD
+            while kill -0 $p 2>/dev/null; do
+                sleep 60 &
+                s=$!
+                wait $s
+                kill -0 $p 2>/dev/null && trim_logs
+            done
+            trap - CHLD
+            wait $p
             rc=$?
             if [ $rc = 42 ]; then           # USB drive mode: lend the card, then carry on
-                /usr/sbin/fathom-usbdisk >> /tmp/fathom-player.log 2>&1
+                /usr/sbin/fathom-usbdisk >> $log 2>&1
                 continue
             fi
-            echo "fathom-player exited ($rc), restarting" >> /tmp/fathom-player.log
+            echo "fathom-player exited ($rc), restarting" >> $log
+            trim_logs
             sleep 2
         done
     ) &

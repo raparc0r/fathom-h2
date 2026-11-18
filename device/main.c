@@ -155,6 +155,7 @@ static int read_int_file(const char *path, char *buf, size_t cap)
 /* Clean power off: init stops the player (S90fathom), unmounts the card, and the
  * battery driver sets the PMIC's power-off bit at the end. */
 static void screen_set(int on);
+static library_t *g_lib;
 static void queue_save(void);
 
 /* ---- a clock that never goes back ----
@@ -273,7 +274,23 @@ static void poll_battery(lv_timer_t *t)
         low_count = 0;
     }
 }
-static void every_100ms(lv_timer_t *t) { (void)t; ui_tick(); }
+/* The player followed 10 times a second while it has something to follow
+ * (playing, starting, the sleep timer, a stream reconnecting); otherwise once a
+ * second, until a key (fast_tick_now()). Paused, that's 9 wakeups a second fewer. */
+static lv_timer_t *g_fast;
+static uint32_t g_fast_ms = 100;
+static void every_100ms(lv_timer_t *t)
+{
+    uint32_t ms = ui_tick() ? 100 : 1000;
+    if (ms != g_fast_ms) lv_timer_set_period(t, g_fast_ms = ms);
+}
+static void fast_tick_now(void)
+{
+    if (g_fast && g_fast_ms != 100) {
+        lv_timer_set_period(g_fast, g_fast_ms = 100);
+        lv_timer_ready(g_fast);
+    }
+}
 
 /* ---- volume and output routing ----
  *
@@ -1326,6 +1343,7 @@ static void screen_apply(void)
 static void screen_set(int on)
 {
     if (on != g_screen_on) ui_set_awake(on);
+    if (!on && g_screen_on) library_release_memory(g_lib);   /* the database's cache: nothing browses meanwhile */
     g_screen_on = on;
     g_dimmed = 0;
     g_last_input = ms_now();
@@ -1442,7 +1460,6 @@ static void dac_filter_next(void)
     if (mixer_enum_set("/dev/snd/controlC0", DAC_FILTER, next) == 0) settings_set_int("sound.dac_filter", next);
 }
 
-static library_t *g_lib;
 static const char *g_music;
 static const theme_t *g_scan_theme;
 static const ui_fonts_t *g_scan_fonts;
@@ -1947,6 +1964,38 @@ static void queue_timer(lv_timer_t *t)
     if (n.playing || player_seq(g_player) != g_queue_saved_seq) queue_save();
 }
 
+/* ---- the polls: one timer ----
+ * Everything the player polls, on one 250 ms timer: LVGL's timers drift apart,
+ * so a dozen of them (250, 300, 500 ms, 1, 10, 30 s) woke the CPU 30 to 40 times
+ * a second at rest. Each poll keeps its period (the EQ's: 250 ms, was 300). */
+static void polls(lv_timer_t *t)
+{
+    (void)t;
+    static unsigned k;
+    k++;
+    screen_timer(NULL);
+    usb_poll(NULL);            /* the prompt soon after plugging in */
+    bt_poll(NULL);
+    wifi_poll(NULL);
+    eq_poll(NULL);
+    if (k % 2 == 0) {          /* 500 ms */
+        usb_dac_poll(NULL);
+        usb_dac_mode_poll(NULL);
+        radio_poll(NULL);
+        net_poll(NULL);
+        scan_poll(NULL);
+    }
+    if (k % 4 == 0) {          /* 1 s */
+        every_second(NULL);
+        now_publish(NULL);
+        charge_poll(NULL);
+        rg_poll(NULL);
+    }
+    if (k % 40 == 0) poll_battery(NULL);   /* 10 s */
+    if (k % 40 == 20) queue_timer(NULL);   /* 10 s */
+    if (k % 120 == 0) idle_timer(NULL);    /* 30 s */
+}
+
 /* ---- first-run scan, with progress on screen ---- */
 
 typedef struct { lv_obj_t *count, *path; uint32_t last; } scan_ui_t;
@@ -2167,29 +2216,15 @@ int main(int argc, char **argv)
     g_scan_fonts = theme_fonts;
     int filter = settings_get_int("sound.dac_filter", -1);   /* the DAC filter chosen last time */
     if (filter >= 0) mixer_enum_set("/dev/snd/controlC0", DAC_FILTER, filter);
-    lv_timer_create(idle_timer, 30000, NULL);
     ui_set_hooks(&hooks);
     route_apply(0);                    /* the output's name: the first route_apply() came before the UI */
     ui_set_theme(theme);
     screen_set(1);
-    lv_timer_create(screen_timer, 250, NULL);
-    lv_timer_create(every_second, 1000, NULL);
-    lv_timer_create(every_100ms, 100, NULL);
+    g_fast = lv_timer_create(every_100ms, 100, NULL);
     poll_battery(NULL);
-    lv_timer_create(poll_battery, 10000, NULL);
     usb_dac_poll(NULL);
-    lv_timer_create(usb_dac_poll, 500, NULL);
     g_usb_was = usb_on_computer();   /* already plugged in at start: don't ask */
-    lv_timer_create(usb_poll, 250, NULL);    /* the prompt soon after plugging in */
-    lv_timer_create(usb_dac_mode_poll, 500, NULL);
-    lv_timer_create(bt_poll, 250, NULL);
-    lv_timer_create(wifi_poll, 250, NULL);
-    lv_timer_create(now_publish, 1000, NULL);
-    lv_timer_create(radio_poll, 500, NULL);
-    lv_timer_create(net_poll, 500, NULL);
     eq_apply();
-    lv_timer_create(eq_poll, 300, NULL);
-    lv_timer_create(queue_timer, 10000, NULL);
     if (resumed) ui_show("nowplaying");
     {
         char why[32];
@@ -2198,10 +2233,8 @@ int main(int argc, char **argv)
         g_charge_mode = !strncmp(why, "vbus", 4) && g_charging;
         fprintf(stderr, "power on: %s%s\n", why, g_charge_mode ? " (charging mode)" : "");
         if (g_charge_mode) charge_screen_show();
-        lv_timer_create(charge_poll, 1000, NULL);
     }
-    lv_timer_create(scan_poll, 500, NULL);
-    lv_timer_create(rg_poll, 1000, NULL);
+    lv_timer_create(polls, 250, NULL);
     levelling_apply();                   /* (off in Pure mode) */
     if (take_tmp_file("/tmp/fathom-usbdisk.msg", usb_msg, sizeof usb_msg) == 0) ui_toast(usb_msg, 3000);
     else if (access(music, F_OK) != 0) {
@@ -2219,6 +2252,7 @@ int main(int argc, char **argv)
     while (!g_quit) {
         input_event_t ev;
         while (input_next(&ev, ms_now())) {
+            fast_tick_now();                         /* a key may start something to follow */
             if (ev.kind == IN_JACKS) {
                 jacks_changed(ev.hp, ev.lo);
             } else if (ev.kind == IN_VOLUME) {
@@ -2262,8 +2296,10 @@ int main(int argc, char **argv)
             else if (!strcmp(m, "normal")) usb_dac_mode_end("USB DAC mode ended");
             else usb_drive();
         }
+        /* Asleep until the next timer or a key (input_timeout(): long presses,
+         * repeats); other threads' news is polled by the timers. */
         int lp = input_timeout(ms_now());
-        int timeout = wait > 50 ? 50 : (int)wait;
+        int timeout = wait > 1000 ? 1000 : (int)wait;
         if (lp >= 0 && lp < timeout) timeout = lp;
         int npfd = input_pollfds(pfd, INPUT_MAX_POLL);   /* devices come and go (headphones) */
         poll(pfd, (nfds_t)npfd, timeout);

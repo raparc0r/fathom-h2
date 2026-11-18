@@ -36,7 +36,11 @@
 #include <unistd.h>
 
 #define LINK_DELAY_MS 150     /* bluez-alsa's buffer and the headphones' (typical SBC) */
-#define PIPE_BYTES (32 * 1024)
+/* What bluez-alsa has queued from us: ~740 ms at 44.1 kHz, so a stall on our
+ * side (a page fault re-read from the card, the network) doesn't reach the
+ * headphones. 32 kernel pages while Bluetooth plays; a skip or seek drops them
+ * (Drop), a pause keeps them. */
+#define PIPE_BYTES (128 * 1024)
 #define STALL_MS 2000         /* the link took nothing for this long: it's stuck */
 #define START_MS 6000         /* the same when a stream starts (connect, resume):
                                * headphones can take seconds to start one (AirPods: >2 s) */
@@ -424,7 +428,13 @@ int out_bt_create(audio_output_t *out, const char *bt_dir)
     snprintf(o->helper, sizeof o->helper, "%s/../bin/fathom-avrcp", bt_dir);
     snprintf(o->libs, sizeof o->libs, "%s/usr/lib:%s/lib", bt_dir, bt_dir);
     o->fd = o->ctrl = -1;
-    pthread_mutex_init(&o->mu, NULL);
+    pthread_mutexattr_t ma;                    /* priority inheritance: the playback thread waits on it (engine.c) */
+    pthread_mutexattr_init(&ma);
+#if defined(__linux__) && defined(PTHREAD_PRIO_INHERIT)
+    pthread_mutexattr_setprotocol(&ma, PTHREAD_PRIO_INHERIT);
+#endif
+    if (pthread_mutex_init(&o->mu, &ma)) pthread_mutex_init(&o->mu, NULL);
+    pthread_mutexattr_destroy(&ma);
     signal(SIGPIPE, SIG_IGN);                  /* a dropped link is a write error, not a kill */
     *out = (audio_output_t){bt_open, bt_write, bt_delay, bt_drain, bt_flush, bt_pause,
                             bt_close, bt_describe, o, bt_set_eq};

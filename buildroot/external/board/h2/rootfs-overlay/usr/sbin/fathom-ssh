@@ -13,8 +13,15 @@
 # on the card (fathom/keys), so computers know the H2 again after a restart;
 # so is authorized_keys, if you put one there: public keys that may log in
 # without the password.
+#
+# dropbear is kept on the card (fathom/ssh), out of the RAM disk; while SSH is
+# on it runs from a copy in RAM, so logins stay quick when memory is short and
+# USB drive mode can still lend the card. It runs at nice 10, and so does
+# everything started from a login (SFTP included): audio comes first.
 
 K=/mnt/sd/fathom/keys
+DB=/mnt/sd/fathom/ssh/dropbearmulti
+RUN=/var/run/fathom-ssh
 SETTINGS=/mnt/sd/fathom/settings.ini
 PID=/var/run/dropbear.pid
 
@@ -29,10 +36,11 @@ password() {
 
 start() {
     alive && return 0
-    mkdir -p $K
+    [ -x $DB ] || { say "dropbear isn't on the card ($DB)"; return 1; }
+    mkdir -p $K $RUN
     if [ ! -s $K/ssh_host_ed25519_key ]; then
         rm -f $K/ssh_host_ed25519_key
-        dropbearkey -t ed25519 -f $K/ssh_host_ed25519_key > /dev/null 2>&1 || { say "couldn't make a host key"; return 1; }
+        $DB dropbearkey -t ed25519 -f $K/ssh_host_ed25519_key > /dev/null 2>&1 || { say "couldn't make a host key"; return 1; }
     fi
     mkdir -p /root/.ssh
     chmod 700 /root /root/.ssh
@@ -41,14 +49,18 @@ start() {
     else
         rm -f /root/.ssh/authorized_keys
     fi
-    dropbear -r $K/ssh_host_ed25519_key -p 22 -P $PID
+    # (by a new name, then renamed: sessions may still run the last copy; run
+    # by its full path, each login starts it afresh, as dropbear prefers)
+    cp $DB $RUN/dropbear.new && chmod 755 $RUN/dropbear.new && mv $RUN/dropbear.new $RUN/dropbear ||
+        { say "couldn't copy dropbear to RAM"; return 1; }
+    nice -n 10 $RUN/dropbear -r $K/ssh_host_ed25519_key -p 22 -P $PID
     for i in $(seq 1 20); do alive && break; sleep 0.1; done
     alive || { say "dropbear didn't start"; return 1; }
 }
 
 stop() {
     alive && kill "$(cat $PID)"
-    rm -f $PID
+    rm -f $PID $RUN/dropbear           # (its RAM goes once the last session ends)
     return 0
 }
 

@@ -77,6 +77,34 @@ static void hp_int_set(struct snd_pcm_hw_params *p, int n, unsigned v)
 
 /* ---- the output ---- */
 
+static int format_bytes(int f)
+{
+    return f == SNDRV_PCM_FORMAT_S16_LE ? 2 : f == SNDRV_PCM_FORMAT_S24_3LE ? 3 : 4;
+}
+
+/* Files: ~25 ms periods, 8 of them, about 200 ms at every rate (a gapless
+ * change of track reaches the screen that much before it's heard, so not
+ * more). Internet streams have no gapless, and the network, a busy card or a
+ * page fault re-read from it can hold playback up for longer than 200 ms: up
+ * to 1 s for them, in 8 periods. The H2's own DAC has 512 KiB of DMA memory set
+ * aside at boot (the kernel's dmaengine PCM), so that costs it nothing up to
+ * there; a USB DAC's buffer is allocated as it opens, so less there. */
+#define STREAM_BUFFER_MS 1000
+#define OWN_DAC "/dev/snd/pcmC0D0p"
+#define OWN_DAC_BYTES (448 * 1024)
+#define OTHER_BYTES (192 * 1024)
+
+static unsigned period_frames(const alsa_out_t *a, const audio_format_t *fmt, int format, int deep)
+{
+    unsigned small = ((fmt->rate / 40) + 31) & ~31u;
+    if (!deep) return small;
+    unsigned frame = (unsigned)fmt->channels * (unsigned)format_bytes(format);
+    unsigned cap = (strcmp(a->dev, OWN_DAC) ? OTHER_BYTES : OWN_DAC_BYTES) / frame;
+    unsigned want = fmt->rate * STREAM_BUFFER_MS / 1000;
+    unsigned p = (want < cap ? want : cap) / 8 & ~31u;
+    return p > small ? p : small;
+}
+
 static void a_close(void *ctx)
 {
     alsa_out_t *a = ctx;
@@ -96,9 +124,6 @@ static int a_open(void *ctx, const audio_format_t *fmt)
 
     a->fmt = *fmt;
     unsigned rate = fmt->rate;
-    /* ~25 ms periods, 8 of them: about 200 ms of buffer at every rate */
-    unsigned period = rate / 40;
-    period = (period + 31) & ~31u;
 
     /* Lossy sources decode deeper than 16 bits, so only a known 16-bit source
      * goes out as S16_LE first; 16 bits is also the last resort. */
@@ -112,8 +137,12 @@ static int a_open(void *ctx, const audio_format_t *fmt)
     const int *try = fmt->bits && fmt->bits <= 16 ? shallow : fmt->bits > 24 ? full : deep;
     struct snd_pcm_hw_params hp;
     int ok = 0;
-    for (int i = 0; i < 4 && !ok; i++) {
+    /* a stream: the deep buffer, else (a device that won't) the usual one */
+    for (int k = 0; k < 8 && !ok; k++) {
+        int i = k % 4, deep = fmt->stream && k < 4;
+        if (k >= 4 && !fmt->stream) break;
         if (fmt->dop && try[i] == SNDRV_PCM_FORMAT_S16_LE) continue;   /* DoP needs 24 bits */
+        unsigned period = period_frames(a, fmt, try[i], deep);
         hp_any(&hp);
         hp_mask_set(&hp, SNDRV_PCM_HW_PARAM_ACCESS, SNDRV_PCM_ACCESS_RW_INTERLEAVED);
         hp_mask_set(&hp, SNDRV_PCM_HW_PARAM_FORMAT, (unsigned)try[i]);
@@ -132,7 +161,7 @@ static int a_open(void *ctx, const audio_format_t *fmt)
         a_close(a);
         return -1;
     }
-    a->sample_bytes = a->format == SNDRV_PCM_FORMAT_S16_LE ? 2 : a->format == SNDRV_PCM_FORMAT_S24_3LE ? 3 : 4;
+    a->sample_bytes = format_bytes(a->format);
     a->period = hp_int(&hp, SNDRV_PCM_HW_PARAM_PERIOD_SIZE)->min;
     a->buffer = hp_int(&hp, SNDRV_PCM_HW_PARAM_BUFFER_SIZE)->min;
 
@@ -141,7 +170,10 @@ static int a_open(void *ctx, const audio_format_t *fmt)
     sp.tstamp_mode = SNDRV_PCM_TSTAMP_NONE;
     sp.period_step = 1;
     sp.avail_min = a->period;
-    sp.start_threshold = a->period * 2;       /* start once 50 ms are queued */
+    /* Files start once 50 ms are queued. A stream comes in at about its own
+     * pace after the first burst, so what's queued at the start is all the
+     * slack it has: half the buffer (a station takes seconds to connect anyway). */
+    sp.start_threshold = fmt->stream && a->buffer >= rate / 2 ? a->buffer / 2 : a->period * 2;
     sp.stop_threshold = a->buffer;            /* underrun = stop (recovered in write) */
     sp.xfer_align = 1;
     unsigned long boundary = a->buffer;
@@ -216,6 +248,8 @@ static long a_write(void *ctx, const int32_t *frames, long n)
         }
         if (errno == EINTR) continue;
         if (errno == EPIPE || errno == ESTRPIPE) {      /* underrun: start again */
+            static unsigned underruns;               /* (a gap you hear: logged, to find them) */
+            fprintf(stderr, "alsa: underrun %u\n", ++underruns);
             if (ioctl(a->fd, SNDRV_PCM_IOCTL_PREPARE) == 0) continue;
         }
         fprintf(stderr, "alsa: write: %s\n", strerror(errno));

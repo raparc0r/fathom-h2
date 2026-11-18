@@ -242,7 +242,17 @@ static struct {
 #define HDR_SLOTS 6
     lv_obj_t *h_slot_img[HDR_SLOTS], *h_slot_sym[HDR_SLOTS];
     lv_obj_t *h_pulse;      /* the charging icon, pulsing (NULL: none) */
-    int asleep;             /* the screen is off: no animations */
+    int asleep;             /* the screen is off: no animations, nothing drawn */
+    int theme_gen;          /* +1 at each apply_theme() (the header lays itself out again) */
+    render_mode_t wake_mode;   /* the render put off while asleep: R_SNAP if a level or view changed */
+    int ticking;            /* rendering for ui_tick_1s (nothing asked for it) */
+    unsigned lib_gen;       /* +1 when the library changed (rows read again) */
+    struct fill_sig {       /* a library list's rows as last filled */
+        const level_t *l; list_kind_t kind; int64_t parent, parent2, track, album;
+        const int64_t *ids; int n, top, sel, active, moving, theme_gen; unsigned lib_gen;
+    } fill_sig;
+    int64_t next_id; unsigned next_gen;   /* Now Playing's "Next:", as last read */
+    char next_text[256];
     /* Settings > Bluetooth, as of the last look */
     ui_bt_dev_t bt[16];
     int bt_n, bt_on, bt_link, wifi_link;
@@ -294,14 +304,19 @@ static lv_obj_t *label(lv_obj_t *parent)
     return l;
 }
 
+/* fill() and show() change an object only when it differs: LVGL redraws an
+ * object on every style or flag call, even one that changes nothing, and the
+ * screens are rendered again every second (a whole screen redrawn and sent
+ * to the panel once a second, at rest). */
 static void fill(lv_obj_t *o, uint32_t rgb)
 {
-    lv_obj_set_style_bg_color(o, C(rgb), 0);
-    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+    if (!lv_color_eq(lv_obj_get_style_bg_color(o, 0), C(rgb))) lv_obj_set_style_bg_color(o, C(rgb), 0);
+    if (lv_obj_get_style_bg_opa(o, 0) != LV_OPA_COVER) lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
 }
 
 static void show(lv_obj_t *o, int on)
 {
+    if (!on == lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN)) return;
     if (on) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
 }
@@ -309,10 +324,23 @@ static void show(lv_obj_t *o, int on)
 /* Change a label only when something really differs: any text or style update
  * makes LVGL lay the label out again, which restarts a scrolling label from
  * its start (the screens re-render every second). */
+static void text_copy_free(lv_event_t *e) { free(lv_obj_get_user_data(lv_event_get_target(e))); }
+
+/* The comparison is with a copy of what was set (the label's user data): a
+ * label cut short with "..." holds its text with the dots in, so it never
+ * compares equal, and was laid out and redrawn every second. (Labels set
+ * here are set only here, once they have been.) */
 static void set_text(lv_obj_t *l, const char *s)
 {
-    const char *cur = lv_label_get_text(l);
-    if (!cur || strcmp(cur, s)) lv_label_set_text(l, s);
+    char *had = lv_obj_get_user_data(l);
+    if (had ? !strcmp(had, s) : !strcmp(lv_label_get_text(l) ? lv_label_get_text(l) : "", s)) return;
+    lv_label_set_text(l, s);
+    size_t n = strlen(s) + 1;
+    char *copy = realloc(had, n);
+    if (!copy) { free(had); lv_obj_set_user_data(l, NULL); return; }
+    memcpy(copy, s, n);
+    if (!had) lv_obj_add_event_cb(l, text_copy_free, LV_EVENT_DELETE, NULL);
+    lv_obj_set_user_data(l, copy);
 }
 
 static void set_pos_width(lv_obj_t *o, int x, int y, int w)
@@ -1247,6 +1275,7 @@ static void apply_theme(void)
         if (own) S.f = own;
     }
 
+    S.theme_gen++;
     fill(S.scr, t->bg);
     fill(S.list, t->bg);   /* opaque: a snapshot may sit underneath during transitions */
     fill(S.np, t->bg);
@@ -1687,7 +1716,28 @@ static void render_list(render_mode_t mode)
     int top_delta = l->top - S.last_top;
     int target = (l->sel - l->top) * ROW_PITCH;
 
-    fill_slots(l, n);
+    /* Once a second a library list that shows the same rows needs none read
+     * again: that's SQLite's code and the card, every second. (What a key or a
+     * change asks for is always read.) */
+    struct fill_sig sig;
+    memset(&sig, 0, sizeof sig);
+    sig.l = l;                      /* (field by field: memcmp sees the padding too) */
+    sig.kind = l->kind;
+    sig.parent = l->parent;
+    sig.parent2 = l->parent2;
+    sig.track = S.now.track.id;
+    sig.album = S.now.track.album_id;
+    sig.ids = l->items.ids;
+    sig.n = n;
+    sig.top = l->top;
+    sig.sel = l->sel;
+    sig.active = S.now.active;
+    sig.moving = S.moving;
+    sig.theme_gen = S.theme_gen;
+    sig.lib_gen = S.lib_gen;
+    int same = S.ticking && library_backed(l->kind) && !memcmp(&sig, &S.fill_sig, sizeof sig);
+    if (!same) fill_slots(l, n);
+    S.fill_sig = sig;
     show(S.pill, n > 0);
     show(S.empty, n == 0);
     if (n == 0) {
@@ -1699,7 +1749,7 @@ static void render_list(render_mode_t mode)
                         : l->kind == L_RADIO ? (S.radio_n < 0 ? "No stations: put radio.txt in the card's fathom folder"
                                                               : "No stations in fathom/radio.txt")
                         : library_backed(l->kind) ? "No music found" : "Nothing here";
-        lv_label_set_text(S.empty, tr(msg));
+        set_text(S.empty, tr(msg));
     }
 
     if (mode == R_CONTENT && !new_level) {
@@ -1782,7 +1832,7 @@ static void render_np_radio(void)
         char g[5];
         utf8_of(HOME_ICON[H_RADIO], g);
         set_text(S.np_radio, g);
-        lv_obj_center(S.np_radio);
+        if (lv_obj_get_style_align(S.np_radio, 0) != LV_ALIGN_CENTER) lv_obj_center(S.np_radio);   /* (once: it redraws) */
     }
     set_text(S.h_left, tr("Radio"));
     set_text(S.np_title, t->title);
@@ -1820,7 +1870,10 @@ static void render_np_radio(void)
 
 static void render_np(void)
 {
-    set_text(S.h_left, tr("Now playing"));
+    /* (the header's title is set once per render: setting it to one text and
+     * then another redraws it, every second) */
+    if (!S.now.active || S.now.radio || !(S.now.count > 1 && S.now.index >= 0 && S.now.index < S.now.count))
+        set_text(S.h_left, tr(S.now.active && S.now.radio ? "Radio" : "Now playing"));
     if (!S.now.active) {
         set_text(S.np_title, tr("Nothing playing"));
         set_text(S.np_artist, tr("Choose an album, or Shuffle all songs"));
@@ -1891,9 +1944,15 @@ static void render_np(void)
     char nx[300] = "";
     if (S.now.stop_after) snprintf(nx, sizeof nx, "%s", tr("Stops after this track"));
     else if (S.player && player_queue_len(S.player) > 0 && S.lib) {
-        char m[256], meta[32];
-        if (library_row(S.lib, LIB_PLAYLIST_TRACKS, player_queue_at(S.player, 0), m, sizeof m, meta, sizeof meta) == 0)
-            snprintf(nx, sizeof nx, "%s %s", tr("Next:"), m);
+        char meta[32];
+        int64_t id = player_queue_at(S.player, 0);   /* read once per track, not every second */
+        if (id != S.next_id || S.next_gen != S.lib_gen) {
+            S.next_id = id;
+            S.next_gen = S.lib_gen;
+            if (library_row(S.lib, LIB_PLAYLIST_TRACKS, id, S.next_text, sizeof S.next_text, meta, sizeof meta))
+                S.next_text[0] = '\0';
+        }
+        if (S.next_text[0]) snprintf(nx, sizeof nx, "%s %s", tr("Next:"), S.next_text);
     }
     set_text(S.np_next, nx);
 
@@ -1947,9 +2006,16 @@ static void charge_pulse(lv_obj_t *o)
 
 /* Right side of the header: [play/pause/stop] [shuffle] [repeat] [Bluetooth] [charging]
  * battery %. The Bluetooth icon is dimmed while it connects. */
+typedef struct { int icon; const char *sym; const lv_image_dsc_t *own; int dim; } hdr_want_t;
+typedef struct {
+    hdr_want_t want[HDR_SLOTS];
+    int n, pct, charging, asleep, theme_gen;
+} hdr_state_t;
+
 static void render_header_status(void)
 {
-    struct { int icon; const char *sym; const lv_image_dsc_t *own; int dim; } want[HDR_SLOTS] = {0};
+    hdr_want_t want[HDR_SLOTS];
+    memset(want, 0, sizeof want);
     int n = 0;
     /* always one of: playing, paused, stopped (nothing loaded or the queue ended) */
     if (S.now.playing) { want[n].icon = THEME_ICON_PLAY; want[n++].sym = LV_SYMBOL_PLAY; }
@@ -1971,6 +2037,22 @@ static void render_header_status(void)
         want[n++].sym = LV_SYMBOL_WIFI;
     }
     if (S.charging) { want[n].icon = THEME_ICON_CHARGE; want[n++].sym = LV_SYMBOL_CHARGE; }
+
+    /* As it was: nothing to do (every render comes here, once a second at
+     * least; laying the header out again redraws it). A theme counts as a change. */
+    static hdr_state_t last;
+    static int drawn;
+    hdr_state_t now;
+    memset(&now, 0, sizeof now);
+    memcpy(now.want, want, sizeof want);
+    now.n = n;
+    now.pct = S.battery_pct;
+    now.charging = S.charging;
+    now.asleep = S.asleep;
+    now.theme_gen = S.theme_gen;
+    if (drawn && !memcmp(&now, &last, sizeof now)) return;
+    last = now;
+    drawn = 1;
 
     for (int i = 0; i < HDR_SLOTS; i++) {
         const lv_image_dsc_t *img = i < n && S.hooks.icon ? S.hooks.icon(T(), want[i].icon) : NULL;
@@ -2175,6 +2257,11 @@ static void render(render_mode_t mode)
 {
     int np_changed = S.now_playing_view != S.last_np;
     if (S.player) player_now(S.player, &S.now);
+    if (S.asleep) {                 /* drawn when the screen comes on (no animations meanwhile) */
+        if (mode != R_CONTENT) S.wake_mode = R_SNAP;
+        pending_free();
+        return;
+    }
     show(S.list, !S.now_playing_view);
     show(S.np, S.now_playing_view);
     render_header_status();
@@ -3093,8 +3180,10 @@ static void marquee_set(int on)
     for (int r = 0; r < SLOTS; r++)
         if (lv_label_get_long_mode(S.row_lbl[r]) != LV_LABEL_LONG_DOT) lv_label_set_long_mode(S.row_lbl[r], LV_LABEL_LONG_DOT);
     if (lv_label_get_long_mode(S.h_left) != m) lv_label_set_long_mode(S.h_left, m);
-    if (lv_label_get_long_mode(S.np_artist) != m) lv_label_set_long_mode(S.np_artist, m);
-    if (lv_label_get_long_mode(S.np_album) != m) lv_label_set_long_mode(S.np_album, m);
+    /* Now Playing's lines only while it shows: hidden, they'd scroll on unseen, 60 times a second */
+    lv_label_long_mode_t nm = S.now_playing_view ? m : LV_LABEL_LONG_DOT;
+    if (lv_label_get_long_mode(S.np_artist) != nm) lv_label_set_long_mode(S.np_artist, nm);
+    if (lv_label_get_long_mode(S.np_album) != nm) lv_label_set_long_mode(S.np_album, nm);
     if (on && !S.now_playing_view && list_count(&S.stack[S.depth - 1]) > 0) {
         int slot = slot_under_pill();
         if (slot >= 0 && slot < SLOTS) lv_label_set_long_mode(S.row_lbl[slot], LV_LABEL_LONG_SCROLL);
@@ -3122,6 +3211,7 @@ void ui_library_changed(void)
 {
     /* Refreshed in place (a background scan may finish while you listen or
      * browse): every open list is read again, keeping its place where it can. */
+    S.lib_gen++;
     finish_transition();
     pending_free();
     for (int d = 0; d < S.depth; d++) {
@@ -3193,11 +3283,28 @@ void ui_set_eq(const char *profile, const char *output)
     if (S.depth > 0) render(R_CONTENT);
 }
 
+/* With the screen off nothing is drawn or sent to the panel (LVGL takes no
+ * invalidations, renders are put off, scrolling text stops): keys and the
+ * player carry on as usual. Woken, the screen is drawn whole, as it is now. */
 void ui_set_awake(int on)
 {
     if (S.asleep == !on) return;
     S.asleep = !on;
-    if (S.h_right) render_header_status();
+    if (!S.h_right) return;
+    if (!on) {
+        render_header_status();               /* (the charging pulse stops) */
+        marquee_set(0);
+        if (S.marquee_timer) lv_timer_pause(S.marquee_timer);
+        lv_display_enable_invalidation(NULL, false);
+        return;
+    }
+    lv_display_enable_invalidation(NULL, true);
+    render_mode_t m = S.wake_mode;
+    S.wake_mode = R_CONTENT;
+    render(m);
+    lv_obj_invalidate(lv_screen_active());
+    lv_obj_invalidate(lv_layer_top());
+    marquee_arm();
 }
 
 void ui_set_pure(int pure, int bitperfect)
@@ -3447,9 +3554,9 @@ void ui_key(ui_key_t k)
 
 #define SCRUB_IDLE_MS 3000
 
-void ui_tick(void)
+int ui_tick(void)
 {
-    if (!S.player) return;
+    if (!S.player) return 0;
     uint32_t seq = player_seq(S.player);
     player_tick(S.player);
     /* scrubbing: cancelled after a pause in turning, or when the track changes */
@@ -3458,11 +3565,14 @@ void ui_tick(void)
         render(R_CONTENT);
     }
     if (player_seq(S.player) != seq) render(R_CONTENT);   /* gapless track change */
+    return S.scrubbing || !player_idle(S.player);
 }
 
 void ui_tick_1s(void)
 {
+    S.ticking = 1;
     render(R_CONTENT);
+    S.ticking = 0;
     settings_autosave(lv_tick_get(), 1500);
 }
 

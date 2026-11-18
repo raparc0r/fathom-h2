@@ -159,7 +159,7 @@ typedef struct {
 void ui_init(lv_obj_t *screen, const theme_t *themes, int n_themes,
              const ui_fonts_t *fonts, int n_fonts, library_t *lib, player_t *player);
 void ui_key(ui_key_t k);
-void ui_tick(void);             /* ~10x per second: follows the player */
+int ui_tick(void);              /* ~10x per second: follows the player; 0 when it needn't until a key */
 void ui_tick_1s(void);          /* refreshes position and progress */
 void ui_set_theme(int index);
 void ui_set_hooks(const ui_hooks_t *h);

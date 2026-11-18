@@ -20,7 +20,11 @@
  *     device, and stay there until the cable comes out.
  *
  * Inputs: the PMIC's VBUS-present bit (battery "online") and our own VBUS
- * regulator's state, so our own 5 V never counts as someone else's.
+ * regulator's state, so our own 5 V never counts as someone else's. Neither
+ * tells anyone when it changes, so they're read once a second, and four
+ * times a second while a device on the port is being placed.
+ *
+ * Messages go to syslog ("usbrole"; to stderr too when run from a terminal).
  */
 #include <dirent.h>
 #include <fcntl.h>
@@ -30,10 +34,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <syslog.h>
 #include <time.h>
 #include <unistd.h>
 
-#define TICK_MS       250
+#define TICK_MS       250       /* while placing a device as the host */
+#define IDLE_MS       1000      /* otherwise: nothing here needs to be quicker */
 #define NO_VBUS_MS    2000      /* sink -> DRP */
 #define AFTER_PC_MS   6000      /* the same, after a computer: a quick replug finds us a sink */
 #define HANDOVER_MS   8000      /* after handing a computer the host role: time to supply VBUS */
@@ -43,13 +49,20 @@ static int g_cfg1 = -1, g_cfg0 = -1;
 static char g_vbus_state[300];   /* /sys/class/regulator/regulator.N/state of "usb-vbus" */
 static volatile sig_atomic_t g_quit;
 
-static void say(const char *fmt, const char *a)
+static long now_ms(void)
 {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
-    fprintf(stderr, "[%ld.%02ld] usbrole: ", (long)t.tv_sec, t.tv_nsec / 10000000);
-    fprintf(stderr, fmt, a);
-    fputc('\n', stderr);
+    return (long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* (with the time since boot: the clock may not be set yet) */
+static void say(const char *fmt, const char *a)
+{
+    char msg[300];
+    snprintf(msg, sizeof msg, fmt, a);
+    long t = now_ms();
+    syslog(LOG_INFO, "[%ld.%02ld] %s", t / 1000, t % 1000 / 10, msg);
 }
 
 static int line_request(const char *chip_label, unsigned line, int value, const char *consumer)
@@ -179,10 +192,11 @@ static void on_signal(int s) { (void)s; g_quit = 1; }
 
 int main(void)
 {
+    openlog("usbrole", isatty(2) ? LOG_PERROR : 0, LOG_DAEMON);
     /* Start as the bootloader leaves the chip: sink. */
     g_cfg1 = line_request("GPIOB", 30, 0, "tcs1421-cfg1");
     g_cfg0 = line_request("GPIOD", 5, 0, "tcs1421-cfg0");
-    if (g_cfg1 < 0 || g_cfg0 < 0) { perror("usbrole: CFG pins"); return 1; }
+    if (g_cfg1 < 0 || g_cfg0 < 0) { syslog(LOG_ERR, "CFG pins: %m"); return 1; }
     find_vbus_regulator();
     if (!g_vbus_state[0]) say("%s", "no usb-vbus regulator: host detection off");
     signal(SIGTERM, on_signal);
@@ -192,9 +206,15 @@ int main(void)
     int wait_ms = NO_VBUS_MS;        /* how long without VBUS before DRP */
     int pc_seen = 0;                 /* in DRP, someone else supplied VBUS */
     say("%s", "sink only");
+    long last = now_ms();
+    int tick = IDLE_MS;
     while (!g_quit) {
-        struct timespec ts = {0, TICK_MS * 1000000L};
+        struct timespec ts = {tick / 1000, (tick % 1000) * 1000000L};
         nanosleep(&ts, NULL);
+        long t = now_ms();
+        int dt = (int)(t - last);      /* (timers count what really went by) */
+        last = t;
+        tick = IDLE_MS;
         if (!drp) {
             if (other_source()) {        /* a computer or charger supplies VBUS */
                 if (no_vbus_ms || wait_ms != AFTER_PC_MS) say("%s", "VBUS from the other side");
@@ -202,7 +222,7 @@ int main(void)
                 wait_ms = AFTER_PC_MS;
                 continue;
             }
-            no_vbus_ms += TICK_MS;
+            no_vbus_ms += dt;
             if (no_vbus_ms >= wait_ms) { set_drp(1); drp = 1; host_ms = 0; wait_ms = NO_VBUS_MS; }
             continue;
         }
@@ -218,9 +238,10 @@ int main(void)
             }
             continue;
         }
-        host_ms += TICK_MS;
+        host_ms += dt;
         int bus = bus_contents();
         if (bus == 2) { host_ms = 0; continue; }                 /* a DAC: stay the host */
+        tick = TICK_MS;
         if (bus == 3 || (bus == 1 && host_ms >= NOT_AUDIO_MS)) { /* a computer, most likely */
             say("%s", "host, but no audio interface on the port: a computer?");
             set_drp(0);

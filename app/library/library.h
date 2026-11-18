@@ -64,6 +64,9 @@ typedef void (*lib_progress_cb)(int done, int total, const char *path, void *ctx
 
 library_t *library_open(const char *db_path, const char *art_dir);
 void       library_close(library_t *lib);
+/* Hands back the database cache's memory (read again from the card as needed):
+ * with the screen off, nothing browses for a while. */
+void       library_release_memory(library_t *lib);
 
 /* Scan `root` (read-only): add new/changed files, drop missing ones, rebuild albums,
  * artists, playlists and the art cache. Returns the number of tracks, or -1 on error. */

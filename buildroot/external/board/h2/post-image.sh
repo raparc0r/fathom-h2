@@ -18,7 +18,7 @@ gzip -9 -n -c "$BINARIES_DIR/vmlinux.bin" > "$BINARIES_DIR/vmlinux.bin.gz"
     -n "Fathom $(date -u +%Y%m%d-%H%M)" -d "$BINARIES_DIR/vmlinux.bin.gz" "$sd/uImage" >/dev/null
 
 # Console on the USB gadget's serial port only: the screen shows the boot logo,
-# centred, with no cursor (kernel messages are still in /var/log/messages).
+# centred, with no cursor (kernel messages are still in dmesg and pstore).
 printf '%s\n' "loglevel=7 panic=10 console=ttyGS0,115200 fbcon=logo-pos:center vt.global_cursor_default=0 snd_usb_audio.lowlatency=0 firmware_class.path=/mnt/sd/fathom/firmware" > "$sd/linux_cmdline.txt"
 
 # The player and its assets, run from the card (see S90fathom): fathom/bin, fathom/assets
@@ -54,7 +54,19 @@ if [ -d "$BINARIES_DIR/share" ]; then
     rm -rf "$sd/fathom/share"
     mkdir -p "$sd/fathom"
     cp -rL "$BINARIES_DIR/share" "$sd/fathom/share"
+    # (fathom-system's: keeps what the drive and SFTP read out of the page cache)
+    [ -f "$BINARIES_DIR/fathom-nocache.so" ] && cp "$BINARIES_DIR/fathom-nocache.so" "$sd/fathom/share/usr/lib/"
 fi
+
+# SSH's dropbear and the ALSA bring-up tools, out of the initramfs: fathom/ssh,
+# fathom/tools (run through /usr/libexec/fathom-card)
+for d in ssh tools; do
+    if [ -d "$BINARIES_DIR/$d" ]; then
+        rm -rf "$sd/fathom/$d"
+        mkdir -p "$sd/fathom"
+        cp -rL "$BINARIES_DIR/$d" "$sd/fathom/$d"
+    fi
+done
 
 echo "uImage: load $load, entry $entry"
 ls -lR "$sd"

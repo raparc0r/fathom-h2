@@ -16,6 +16,7 @@ typedef struct {
     uint8_t  channels;
     uint8_t  bits;          /* source resolution (16, 24...); 0 = lossy/float source, or DSD made PCM */
     uint8_t  dop;           /* DSD over PCM: must reach the DAC untouched, at 24 bits or more */
+    uint8_t  stream;        /* for the output: an internet stream (no gapless: it may buffer more) */
     uint64_t total_frames;  /* 0 if unknown */
     char     codec[8];      /* "FLAC", ..., "DSD64" */
 } audio_format_t;

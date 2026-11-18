@@ -176,7 +176,7 @@ static void poll_pcm(void)
         B.vol = vol;
         if (vol > B.max) {                       /* above the limit: down to it */
             B.vol = B.want_vol = B.max;
-            pthread_cond_signal(&B.cv);
+            pthread_cond_broadcast(&B.cv);   /* (the worker and the monitor wait on it) */
         }
         for (int i = 0; i < B.n_dev; i++) B.dev[i].connected = addr[0] && !strcmp(B.dev[i].addr, addr);
         changed_locked();
@@ -193,6 +193,7 @@ static void do_cmd(int cmd, const char *addr)
         int ok = run(FATHOM_BT " start 2>/dev/null", out, sizeof out) == 0;
         pthread_mutex_lock(&B.mu);
         B.on = ok;
+        pthread_cond_broadcast(&B.cv);          /* (the monitor waits for it) */
         char last[18];
         snprintf(last, sizeof last, "%s", B.last);
         changed_locked();
@@ -267,8 +268,8 @@ static void *worker(void *arg)
     for (;;) {
         pthread_mutex_lock(&B.mu);
         if (!B.cmd && B.want_vol < 0 && !B.pcm_dirty) {
-            if (B.mon_pid > 0) {
-                pthread_cond_wait(&B.cv, &B.mu);    /* the monitor, a command or a volume wakes us */
+            if (B.mon_pid > 0 || !B.on) {
+                pthread_cond_wait(&B.cv, &B.mu);    /* the monitor, a command or a volume wakes us (off: only a command) */
             } else {
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);
@@ -304,7 +305,12 @@ static void *monitor(void *arg)
         pthread_mutex_lock(&B.mu);
         int on = B.on;
         pthread_mutex_unlock(&B.mu);
-        if (!on) { sleep(1); continue; }
+        if (!on) {                               /* until Bluetooth is on (no wakeups meanwhile) */
+            pthread_mutex_lock(&B.mu);
+            while (!B.on) pthread_cond_wait(&B.cv, &B.mu);
+            pthread_mutex_unlock(&B.mu);
+            continue;
+        }
         int fd[2];
         if (pipe(fd)) { sleep(5); continue; }
         posix_spawn_file_actions_t fa;
@@ -393,7 +399,7 @@ void bt_request(int cmd, const char *addr)
     pthread_mutex_lock(&B.mu);
     B.cmd = cmd;
     snprintf(B.cmd_addr, sizeof B.cmd_addr, "%s", addr && addr_ok(addr) ? addr : "");
-    pthread_cond_signal(&B.cv);
+    pthread_cond_broadcast(&B.cv);   /* (the worker and the monitor wait on it) */
     pthread_mutex_unlock(&B.mu);
 }
 
@@ -495,7 +501,7 @@ int bt_volume_step(int dir)
     v = v < 0 ? 0 : v > 127 ? 127 : v;
     B.vol = v;
     B.want_vol = v;
-    pthread_cond_signal(&B.cv);
+    pthread_cond_broadcast(&B.cv);   /* (the worker and the monitor wait on it) */
     pthread_mutex_unlock(&B.mu);
     return v;
 }
@@ -506,7 +512,7 @@ void bt_volume_limit(int max)
     B.max = max < 0 ? 0 : max > 127 ? 127 : max;
     if (B.vol > B.max) {
         B.vol = B.want_vol = B.max;
-        pthread_cond_signal(&B.cv);
+        pthread_cond_broadcast(&B.cv);   /* (the worker and the monitor wait on it) */
     }
     pthread_mutex_unlock(&B.mu);
 }

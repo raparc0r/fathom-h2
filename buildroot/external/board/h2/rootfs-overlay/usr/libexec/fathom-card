@@ -1,0 +1,20 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Programs kept on the card instead of the RAM disk (post-build.sh), run by
+# the name they're called by: these are links to this script.
+#   dropbear, dropbearkey, dropbearconvert, dbclient, ssh, scp   fathom/ssh
+#   tinyplay, tinymix, tinycap, tinypcminfo                      fathom/tools
+# (fathom-ssh runs the SSH server from a copy in RAM, not through here)
+n=${0##*/}
+case "$n" in
+dropbear|dropbearkey|dropbearconvert|dbclient|ssh|scp)
+    p=/mnt/sd/fathom/ssh/dropbearmulti
+    [ -x $p ] || { echo "$n: not on the card ($p)" >&2; exit 127; }
+    exec $p "$n" "$@" ;;
+tiny*)
+    T=/mnt/sd/fathom/tools
+    [ -x $T/usr/bin/$n ] || { echo "$n: not on the card ($T)" >&2; exit 127; }
+    LD_LIBRARY_PATH=$T/usr/lib exec $T/usr/bin/$n "$@" ;;
+*)
+    echo "fathom-card: $n?" >&2; exit 127 ;;
+esac

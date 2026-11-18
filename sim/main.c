@@ -7,6 +7,7 @@
  *                                              (read-only) into build/sim-data first
  *   fathom-sim --screenshots DIR               headless: write DIR/<theme>-<screen>.bmp
  *   fathom-sim --motion DIR [--theme N]        headless: frames captured mid-animation
+ *   fathom-sim --bench [SECONDS]               headless: the UI's wakeups, redraws and CPU per second
  *
  * Keys: Up/Down = wheel, Enter = centre (OK), Esc/Backspace = Back,
  *       N = long-press Back (Now Playing), Space = play/pause,
@@ -18,6 +19,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -38,6 +40,7 @@
 #define ART_DIR  "build/sim-data/art"
 
 static library_t *g_lib;
+static int g_bench;         /* --bench: the clock output, for real-time playing */
 static engine_t *g_eng;
 static player_t *g_player;
 
@@ -316,6 +319,151 @@ static int motion(const char *dir, theme_t *themes, const ui_fonts_t *fonts, int
     return 0;
 }
 
+/* ---- headless bench: what the UI costs at rest and while playing ----
+ * The H2's loop (device/main.c) in real time: the UI's timers, a display in
+ * direct mode like the H2's, and a poll that sleeps until the next timer.
+ * For each case: loop wakeups, flushes and pixels sent to the panel per second,
+ * and the process's CPU (the engine's thread too). */
+
+static unsigned long g_flushes, g_flush_px, g_still_px;   /* still: drawn with no animation running (scrolling text) */
+static void every_second(lv_timer_t *t);
+static void every_100ms(lv_timer_t *t);
+
+static void count_flush(lv_display_t *d, const lv_area_t *a, uint8_t *px)
+{
+    (void)px;
+    g_flushes++;
+    g_flush_px += (unsigned long)lv_area_get_size(a);
+    if (!lv_anim_count_running()) g_still_px += (unsigned long)lv_area_get_size(a);
+    if (getenv("FATHOM_BENCH_AREAS")) printf("  flush %d,%d %dx%d\n", (int)a->x1, (int)a->y1, (int)lv_area_get_width(a), (int)lv_area_get_height(a));
+    lv_display_flush_ready(d);
+}
+
+static double cpu_s(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
+    return (double)t.tv_sec + t.tv_nsec / 1e9;
+}
+
+static uint32_t mono_ms_sim(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint32_t)(t.tv_sec * 1000 + t.tv_nsec / 1000000);
+}
+
+static unsigned long bench_case(const char *name, int seconds, int max_wait)
+{
+    unsigned long wakeups = 0;
+    uint32_t w0 = mono_ms_sim();                  /* the change of screen first, not counted */
+    while (mono_ms_sim() - w0 < 1500) { uint32_t w = lv_timer_handler(); usleep((w > 50 ? 50 : w) * 1000); }
+    g_flushes = g_flush_px = g_still_px = 0;
+    double c0 = cpu_s();
+    uint32_t t0 = mono_ms_sim();
+    while (mono_ms_sim() - t0 < (uint32_t)seconds * 1000) {
+        uint32_t wait = lv_timer_handler();
+        int timeout = wait > (uint32_t)max_wait ? max_wait : (int)wait;
+        wakeups++;
+        if (timeout > 0) usleep((useconds_t)timeout * 1000);
+    }
+    double c = cpu_s() - c0;
+    printf("%-28s %6.1f wakeups/s %6.1f flushes/s %8.0f px/s  cpu %5.2f %%\n", name, wakeups / (double)seconds,
+           g_flushes / (double)seconds, g_flush_px / (double)seconds, 100.0 * c / seconds);
+    return g_still_px;
+}
+
+static uint16_t g_bench_fb[UI_W * UI_H];
+
+/* The panel's pixels (only the parts redrawn since) against the screen drawn
+ * whole: anything a render changed without LVGL redrawing it shows here. */
+static int bench_fb_check(const char *name)
+{
+    lv_obj_update_layout(lv_screen_active());
+    lv_draw_buf_t *img = lv_snapshot_take(lv_screen_active(), LV_COLOR_FORMAT_RGB565);
+    if (!img) return -1;
+    long bad = 0;
+    for (int y = 0; y < UI_H; y++)
+        if (memcmp(img->data + (size_t)y * img->header.stride, g_bench_fb + (size_t)y * UI_W, UI_W * 2)) bad++;
+    lv_draw_buf_destroy(img);
+    if (bad) printf("%-28s %ld rows on the panel differ from the screen\n", name, bad);
+    return bad ? 1 : 0;
+}
+
+static void bench_scroll(const char *name, int seconds, int max_wait)
+{
+    unsigned long wakeups = 0, steps = 0;
+    g_flushes = g_flush_px = g_still_px = 0;
+    double c0 = cpu_s();
+    uint32_t t0 = mono_ms_sim(), next = t0;
+    while (mono_ms_sim() - t0 < (uint32_t)seconds * 1000) {
+        uint32_t now = mono_ms_sim();
+        if ((int32_t)(now - next) >= 0) {          /* down for 2 s, up for 2 s */
+            ui_key((now - t0) / 2000 % 2 ? UI_KEY_UP : UI_KEY_DOWN);
+            next += 60;
+            steps++;
+        }
+        uint32_t wait = lv_timer_handler();
+        int32_t until = (int32_t)(next - mono_ms_sim());
+        int timeout = wait > (uint32_t)max_wait ? max_wait : (int)wait;
+        if (until < timeout) timeout = until < 0 ? 0 : until;
+        wakeups++;
+        if (timeout > 0) usleep((useconds_t)timeout * 1000);
+    }
+    uint32_t w0 = mono_ms_sim();                   /* the last animation ends */
+    while (mono_ms_sim() - w0 < 600) { uint32_t w = lv_timer_handler(); usleep((w > 20 ? 20 : w) * 1000); }
+    double c = cpu_s() - c0;
+    printf("%-28s %6.1f wakeups/s %6.1f flushes/s %8.0f px/s  cpu %5.2f %%  (%lu steps)\n", name,
+           wakeups / (double)seconds, g_flushes / (double)seconds, g_flush_px / (double)seconds,
+           100.0 * c / seconds, steps);
+}
+
+static int bench(theme_t *themes, const ui_fonts_t *fonts, int seconds)
+{
+    uint16_t *fb = g_bench_fb;
+    lv_tick_set_cb(mono_ms_sim);
+    lv_display_t *d = lv_display_create(UI_W, UI_H);
+    lv_display_set_color_format(d, LV_COLOR_FORMAT_RGB565);
+    lv_display_set_buffers(d, fb, NULL, sizeof g_bench_fb, LV_DISPLAY_RENDER_MODE_DIRECT);
+    lv_display_set_flush_cb(d, count_flush);
+    ui_init(lv_screen_active(), themes, g_n_themes, fonts, 1, g_lib, g_player);
+    ui_set_hooks(&g_hooks);
+    ui_set_battery(86, 0);
+    ui_set_theme(0);
+    lv_timer_create(every_second, 1000, NULL);
+    lv_timer_create(every_100ms, 100, NULL);
+    int max_wait = getenv("FATHOM_BENCH_MAX_WAIT") ? atoi(getenv("FATHOM_BENCH_MAX_WAIT")) : 1000;
+    int bad = 0;
+
+    ui_show("home");
+    bad += bench_case("home, paused", seconds, max_wait) != 0;   /* at rest: nothing redrawn */
+    bad += bench_fb_check("home, paused");
+    ui_show("albums");
+    bad += bench_case("albums, paused", seconds, max_wait) != 0;   /* at rest: nothing redrawn */
+    bad += bench_fb_check("albums, paused");
+    ui_show("nowplaying");
+    bad += bench_case("now playing, paused", seconds, max_wait) != 0;   /* at rest: nothing redrawn */
+    bad += bench_fb_check("now playing, paused");
+    if (g_player) player_pause(g_player, 0);
+    bench_case("now playing, playing", seconds, max_wait);
+    bad += bench_fb_check("now playing, playing");
+    ui_show("albums");
+    bad += bench_case("albums, playing", seconds, max_wait) != 0;   /* a list while music plays: nothing either */
+    bad += bench_fb_check("albums, playing");
+    ui_show("nowplaying");
+    ui_set_awake(0);
+    bad += bench_case("screen off, playing", seconds, max_wait) != 0;   /* at rest: nothing redrawn */
+    if (g_player) player_pause(g_player, 1);
+    bad += bench_case("screen off, paused", seconds, max_wait) != 0;   /* at rest: nothing redrawn */
+    ui_set_awake(1);
+    bench_case("woken, paused", 2, max_wait);
+    bad += bench_fb_check("woken, paused");
+    ui_show("songs");                              /* the wheel turned, a step every 60 ms */
+    bench_scroll("songs, scrolling", seconds, max_wait);
+    bad += bench_fb_check("songs, scrolling");
+    return bad ? 1 : 0;
+}
+
 /* ---- interactive ---- */
 
 static uint32_t sdl_ticks(void) { return SDL_GetTicks(); }
@@ -350,7 +498,7 @@ static void on_key(lv_event_t *e)
 }
 
 static void every_second(lv_timer_t *t) { (void)t; ui_tick_1s(); }
-static void every_100ms(lv_timer_t *t) { (void)t; ui_tick(); }
+static void every_100ms(lv_timer_t *t) { (void)t; (void)ui_tick(); }
 
 static void scan_progress(int done, int total, const char *path, void *ctx)
 {
@@ -394,7 +542,7 @@ static void setup_player(const char *music, int silent)
     }
     static audio_output_t out;
     static out_null_stats_t stats;
-    if (silent && getenv("FATHOM_SIM_PLAYING")) out_clock_create(&out);   /* silent, in real time */
+    if (silent && (getenv("FATHOM_SIM_PLAYING") || g_bench)) out_clock_create(&out);   /* silent, in real time */
     else if (silent || out_sdl_create(&out)) out_null_create(&out, &stats);
     g_eng = engine_new(&out);
     g_player = g_eng ? player_new(g_lib, g_eng) : NULL;
@@ -404,14 +552,15 @@ static void setup_player(const char *music, int silent)
 int main(int argc, char **argv)
 {
     const char *shots = NULL, *motion_dir = NULL, *music = NULL;
-    int theme = 0, zoom = 3;
+    int theme = 0, zoom = 3, bench_s = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--screenshots") && i + 1 < argc) shots = argv[++i];
         else if (!strcmp(argv[i], "--motion") && i + 1 < argc) motion_dir = argv[++i];
         else if (!strcmp(argv[i], "--theme") && i + 1 < argc) theme = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--zoom") && i + 1 < argc) zoom = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--music") && i + 1 < argc) music = argv[++i];
-        else { fprintf(stderr, "usage: %s [--theme N] [--zoom Z] [--music DIR] | --screenshots DIR | --motion DIR\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--bench")) { bench_s = i + 1 < argc && atoi(argv[i + 1]) > 0 ? atoi(argv[++i]) : 5; g_bench = 1; }
+        else { fprintf(stderr, "usage: %s [--theme N] [--zoom Z] [--music DIR] | --screenshots DIR | --motion DIR | --bench [S]\n", argv[0]); return 2; }
     }
 
     lv_init();
@@ -419,7 +568,8 @@ int main(int argc, char **argv)
     g_n_themes = ui_load_themes(FATHOM_ASSETS_DIR, "build/sim-data/themes", themes, UI_MAX_THEMES);
     const ui_fonts_t *fonts = g_n_themes > 0 ? ui_theme_fonts(&themes[0]) : NULL;
     if (!fonts) return 1;
-    setup_player(music, shots || motion_dir);
+    setup_player(music, shots || motion_dir || bench_s);
+    if (bench_s) return bench(themes, fonts, bench_s);
     if (shots) return screenshots(shots, themes, fonts);
     if (motion_dir) return motion(motion_dir, themes, fonts, theme);
 

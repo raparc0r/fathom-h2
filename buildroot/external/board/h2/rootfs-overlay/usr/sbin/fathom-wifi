@@ -42,8 +42,11 @@ on)
     [ -f $FW ] || { say "no firmware at $FW (extract-firmware.py --wifi)"; exit 1; }
     # brcmfmac-wcc: the BCM43430's vendor code, which brcmfmac would ask modprobe
     # for (there's none): loaded first, it's found registered
+    # cfg80211 keeps up to 1000 networks heard in scans, in memory the kernel
+    # can't give back: 40 is plenty here (the one joined is never dropped)
     for m in cfg80211 brcmutil brcmfmac brcmfmac-wcc; do
-        grep -q "^$(echo $m | tr - _) " /proc/modules || insmod $W/modules/$m.ko || { say "can't load $m"; exit 1; }
+        opt=; [ $m = cfg80211 ] && opt=bss_entries_limit=40
+        grep -q "^$(echo $m | tr - _) " /proc/modules || insmod $W/modules/$m.ko $opt || { say "can't load $m"; exit 1; }
     done
     # The firmware goes to the chip in 32 KB pieces, each needing 32 KB of
     # contiguous memory: with the player running that can be missing until the
@@ -76,6 +79,8 @@ on)
     running || { say "wpa_supplicant didn't start"; exit 1; }
     for i in $(seq 1 20); do [ -S $CTRL/wlan0 ] && break; sleep 0.2; done
     cli set ap_scan 1 > /dev/null
+    # wpa_supplicant's own list of networks heard: 40, not 200 (saved ones are kept first)
+    cli set bss_max_count 40 > /dev/null
     # DHCP: tries in the background until a network is joined, renews after
     udhcpc -i wlan0 -b -S -x hostname:fathom-h2 -p $RUN/udhcpc.pid > /dev/null 2>&1
     echo on

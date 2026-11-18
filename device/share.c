@@ -30,6 +30,7 @@ static struct {
     pthread_cond_t cv;
     char music[512];
     int want, wifi, restart;
+    unsigned kick;              /* +1 with each of the above changed: the worker looks */
     char password[32];
     /* what the UI sees */
     int state;                  /* UI_SHARE_* */
@@ -158,12 +159,18 @@ static void *worker(void *arg)
 {
     (void)arg;
     int running = 0, failed = 0;
+    unsigned seen = ~0u;
     for (;;) {
         pthread_mutex_lock(&S.mu);
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += 1;
-        pthread_cond_timedwait(&S.cv, &S.mu, &ts);
+        if (running) {                       /* its log, once a second */
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 1;
+            pthread_cond_timedwait(&S.cv, &S.mu, &ts);
+        } else {                             /* off: nothing to look at until something changes */
+            while (S.kick == seen) pthread_cond_wait(&S.cv, &S.mu);
+        }
+        seen = S.kick;
         int want = S.want, wifi = S.wifi, restart = S.restart;
         char pass[32], music[512];
         snprintf(pass, sizeof pass, "%s", S.password);
@@ -222,7 +229,7 @@ void share_init(const char *music, int on, const char *password)
 void share_set_wifi(int connected)
 {
     pthread_mutex_lock(&S.mu);
-    if (S.wifi != connected) { S.wifi = connected; pthread_cond_signal(&S.cv); }
+    if (S.wifi != connected) { S.wifi = connected; S.kick++; pthread_cond_signal(&S.cv); }
     pthread_mutex_unlock(&S.mu);
 }
 
@@ -235,6 +242,7 @@ void share_set(int on, const char *password)
     }
     S.want = on;
     S.seq++;
+    S.kick++;
     pthread_cond_signal(&S.cv);
     pthread_mutex_unlock(&S.mu);
 }

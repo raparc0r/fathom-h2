@@ -217,7 +217,9 @@ static void *worker(void *arg)
     (void)arg;
     for (;;) {
         pthread_mutex_lock(&W.mu);
-        if (!W.cmd) {
+        if (!W.cmd && !W.on) {
+            pthread_cond_wait(&W.cv, &W.mu);     /* off: nothing to poll until a command */
+        } else if (!W.cmd) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_sec += (W.st.state == UI_WIFI_CONNECTED ? POLL_CONNECTED_MS : POLL_MS) / 1000;

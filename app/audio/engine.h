@@ -77,6 +77,9 @@ void engine_set_fade(engine_t *e, float fade);
 void engine_status(engine_t *e, eng_status_t *st);
 /* What the output runs at now (its describe(); "" when it's closed). */
 void engine_describe_output(engine_t *e, char *out, int cap);
+/* The calling thread first in line for the CPU (1: audio's playback threads)
+ * or back to normal (0). Linux only; quietly does nothing without permission. */
+void audio_thread_priority(int on);
 
 /* Move playback to another device: waits for the write in progress, closes the
  * output, calls change(output ctx, arg) (e.g. out_alsa_set_device), and reopens

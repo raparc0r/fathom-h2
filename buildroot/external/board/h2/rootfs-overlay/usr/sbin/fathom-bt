@@ -58,26 +58,32 @@ start)
     [ -f $STATE ] && tar -xf $STATE -C /var/lib 2>/dev/null
     cd /
     $BT/usr/bin/dbus-daemon --config-file=/etc/fathom/dbus-system.conf --fork --print-pid > $RUN/dbus.pid || exit 1
-    # only what audio needs: no input, network, SIM access, MIDI, ...
+    # only what audio needs: no input, network, SIM access, MIDI, admin policy,
+    # nor the LE services (GATT battery, device info, ...: the link is BR/EDR only)
     $BT/usr/libexec/bluetooth/bluetoothd -n -f /etc/fathom/bluetooth.conf \
-        -P sap,input,hog,network,midi,neard,wiimote,bap,bass,vcp,mcp,ccp,csip,micp,tmap,gmap,asha \
-        > /tmp/bluetoothd.log 2>&1 &
+        -P sap,input,hog,network,midi,neard,wiimote,bap,bass,vcp,mcp,ccp,csip,micp,tmap,gmap,asha,battery,deviceinfo,gap,scanparam,sixaxis,health,admin \
+        >> /tmp/bluetoothd.log 2>&1 &
     echo $! > $RUN/bluetoothd.pid
     for i in 1 2 3 4 5 6 7 8 9 10; do ctl show | grep -q "Controller" && break; sleep 0.5; done
     # 44.1 kHz for the whole link (most music; the player converts the rest:
     # changing the rate mid-link drops many headphones), and the headphones'
     # own volume (AVRCP absolute volume) where they have one. aptX is off unless
     # asked for (an AAC add-on built before Fathom had aptX lacks it)
+    # The threads that encode and send the audio run real-time (SCHED_FIFO
+    # 10), so a busy network drive or SSH can't starve them (heard as gaps in
+    # the headphones); they only ever work as fast as the music comes
     ba=$(bluealsa)
-    codecs=
-    $ba -h 2>&1 | grep -q "a2dp-source:.*aptX" && codecs="-c aptX"
-    $ba -p a2dp-source $codecs --a2dp-force-audio-cd --a2dp-volume > /tmp/bluealsa.log 2>&1 &
+    help=$($ba -h 2>&1)
+    codecs= rt=
+    echo "$help" | grep -q "a2dp-source:.*aptX" && codecs="-c aptX"
+    echo "$help" | grep -q -- "--io-rt-priority" && rt="--io-rt-priority=10"
+    $ba -p a2dp-source $codecs $rt --a2dp-force-audio-cd --a2dp-volume >> /tmp/bluealsa.log 2>&1 &
     echo $! > $RUN/bluealsa.pid
     ctl power on > /dev/null
     ctl pairable on > /dev/null              # bonding: pairings keep their keys
     # the player as the headphones see it (AVRCP: state, track; their buttons)
     if [ -x /mnt/sd/fathom/bin/fathom-avrcp ]; then
-        /mnt/sd/fathom/bin/fathom-avrcp > /tmp/fathom-avrcp.log 2>&1 &
+        /mnt/sd/fathom/bin/fathom-avrcp >> /tmp/fathom-avrcp.log 2>&1 &
         echo $! > $RUN/avrcp.pid
     fi
     echo on

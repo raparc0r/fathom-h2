@@ -26,3 +26,9 @@ define FATHOM_LINUX_LOGO
 		$(LINUX_DIR)/drivers/video/logo/logo_linux_clut224.ppm
 endef
 LINUX_PRE_BUILD_HOOKS += FATHOM_LINUX_LOGO
+
+# musl's libc.so is in the initramfs (RAM for good): built for size, musl's
+# own default without Buildroot's -O2 (which musl keeps only for its malloc
+# and string code; memcpy and memset are assembly on MIPS either way).
+# (Changing this needs musl-dirclean.)
+MUSL_EXTRA_CFLAGS += -Os

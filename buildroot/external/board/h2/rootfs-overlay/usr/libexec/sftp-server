@@ -1,7 +1,10 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SFTP for SSH logins (dropbear runs this): the Green End SFTP server, from the
-# card with the network drive's programs (post-build.sh).
+# card with the network drive's programs (post-build.sh). Behind the music:
+# nice 19 (dropbear's 10, plus 9), and what it reads leaves the page cache once
+# sent (fathom-nocache.so, as for the network drive).
 S=/mnt/sd/fathom/share
 export LD_LIBRARY_PATH=$S/usr/lib:$S/lib:/mnt/sd/fathom/wifi/usr/lib:/mnt/sd/fathom/wifi/lib:/mnt/sd/fathom/bt/usr/lib:/mnt/sd/fathom/bt/lib
-exec $S/usr/libexec/gesftpserver "$@"
+[ -f $S/usr/lib/fathom-nocache.so ] && export LD_PRELOAD=$S/usr/lib/fathom-nocache.so
+exec nice -n 9 $S/usr/libexec/gesftpserver "$@"

@@ -110,6 +110,9 @@ const radio_station_t *player_radio_station(const player_t *p);   /* NULL off th
 void player_radio_set_info(player_t *p, const char *artist, const char *title, const char *art_url);
 
 void player_tick(player_t *p);
+/* Nothing for player_tick() to follow until a command (a key) starts
+ * something: not playing or starting, no sleep timer, no stream to reconnect. */
+int player_idle(player_t *p);
 void player_now(player_t *p, player_now_t *now);
 uint32_t player_seq(const player_t *p);     /* changes when the track changes */
 

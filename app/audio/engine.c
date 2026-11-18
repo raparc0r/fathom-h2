@@ -2,12 +2,19 @@
 #include "engine.h"
 #include "gain.h"
 
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #define CHUNK_FRAMES 2048
 #define STALL_MS 1500   /* a stream read waiting this long: "connecting" (it reconnects or buffers) */
@@ -88,7 +95,8 @@ static int depth_class(const audio_format_t *f)
  * shallower track on a deeper output is exact, and stays gapless.) */
 static int same_out_format(const audio_format_t *a, const audio_format_t *b)
 {
-    return a->rate == b->rate && a->channels == b->channels && depth_class(b) <= depth_class(a);
+    return a->rate == b->rate && a->channels == b->channels && depth_class(b) <= depth_class(a) &&
+           a->stream == b->stream;    /* (a stream's output buffers more) */
 }
 
 /* What the output opens for, for a track of format f: when the samples are
@@ -98,6 +106,7 @@ static int same_out_format(const audio_format_t *a, const audio_format_t *b)
 static audio_format_t out_format(const engine_t *e, const audio_format_t *f)
 {
     audio_format_t o = *f;
+    o.stream = (uint8_t)e->dec_net;
     if (f->dop) return o;                      /* DoP: never changed, 24 bits already */
     int changed = (e->eq_on && !e->eq_in_out) || e->gain * e->track_gain != 1.0f ||
                   (f->channels == 2 && (e->bal[0] != 1.0f || e->bal[1] != 1.0f));
@@ -182,9 +191,41 @@ static int start_track(engine_t *e, const pending_t *p, int gapless, decoder_t *
 }
 
 
+/* Playback first in line for the CPU: decoding and writing a chunk takes a
+ * few ms, but on a busy H2 (the UI scrolling, the network drive serving a
+ * download) a thread among the others can wait longer than the output's
+ * buffer lasts, and that's a gap. SCHED_FIFO at a modest priority (below the
+ * kernel's interrupt threads, 50); the kernel's real-time throttling leaves the
+ * rest of the system 5 % of every second whatever happens. Without the right
+ * to it, nice -10; without that either, as it was. Per thread: never the UI's,
+ * and not for what it starts (bluealsa-cli, fathom-avrcp: SCHED_RESET_ON_FORK). */
+void audio_thread_priority(int on)
+{
+#ifdef __linux__
+    static int said;
+    struct sched_param sp = {.sched_priority = on ? 10 : 0};
+#ifndef SCHED_RESET_ON_FORK
+#define SCHED_RESET_ON_FORK 0x40000000
+#endif
+    int err = pthread_setschedparam(pthread_self(), on ? SCHED_FIFO | SCHED_RESET_ON_FORK : SCHED_OTHER, &sp);
+    if (!err) {
+        if (on && !said++) fprintf(stderr, "engine: playback thread at SCHED_FIFO %d\n", sp.sched_priority);
+        if (on) return;
+    }
+    if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), on ? -10 : 0) == 0) {
+        if (on && !said++) fprintf(stderr, "engine: playback thread at nice -10 (no SCHED_FIFO: %s)\n", strerror(err));
+    } else if (on && !said++) {
+        fprintf(stderr, "engine: playback thread at normal priority (%s)\n", strerror(errno));
+    }
+#else
+    (void)on;
+#endif
+}
+
 static void *run(void *arg)
 {
     engine_t *e = arg;
+    audio_thread_priority(1);
     pthread_mutex_lock(&e->mu);
     while (!e->quit) {
         if (e->cmd_play.valid) {
@@ -207,7 +248,11 @@ static void *run(void *arg)
                 e->meta[0] = e->meta_url[0] = '\0';
                 e->meta_seq++;
                 pthread_mutex_unlock(&e->mu);
+                /* Connecting (TLS, probing the stream) is seconds of CPU with
+                 * nothing to play yet: not ahead of the UI. */
+                audio_thread_priority(0);
                 nd = decoder_open_ex(p.path, &nf, &e->net_abort);
+                audio_thread_priority(1);
                 pthread_mutex_lock(&e->mu);
                 e->connecting = 0;
                 if (e->cmd_play.valid || e->net_abort || e->quit) {   /* replaced or stopped meanwhile */
@@ -328,7 +373,16 @@ engine_t *engine_new(const audio_output_t *out)
     e->fade = 1.0f;
     e->track_gain = 1.0f;
     e->bal[0] = e->bal[1] = 1.0f;
-    pthread_mutex_init(&e->mu, NULL);
+    /* Priority inheritance: the UI thread holding the lock (engine_status)
+     * runs at the playback thread's priority until it lets go, so a busy H2
+     * can't hold playback up behind it. */
+    pthread_mutexattr_t ma;
+    pthread_mutexattr_init(&ma);
+#if defined(__linux__) && defined(PTHREAD_PRIO_INHERIT)
+    pthread_mutexattr_setprotocol(&ma, PTHREAD_PRIO_INHERIT);
+#endif
+    if (pthread_mutex_init(&e->mu, &ma)) pthread_mutex_init(&e->mu, NULL);
+    pthread_mutexattr_destroy(&ma);
     pthread_cond_init(&e->cv, NULL);
     if (pthread_create(&e->thread, NULL, run, e)) { free(e); return NULL; }
     return e;

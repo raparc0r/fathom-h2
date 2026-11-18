@@ -25,6 +25,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -323,16 +325,42 @@ int main(int argc, char **argv)
     static const DBusObjectPathVTable vt = {.message_function = on_message};
     dbus_connection_register_object_path(c, OBJ, &vt, NULL);
 
+    /* The player's state is looked at when it's renamed into place (or goes),
+     * not polled: no wakeups while nothing plays. Without inotify, twice a
+     * second as before. */
+    int in = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (in >= 0 && inotify_add_watch(in, "/tmp", IN_MOVED_TO | IN_DELETE) < 0) { close(in); in = -1; }
+    int dfd = -1;
+    dbus_connection_get_unix_fd(c, &dfd);
+
     read_now(&cur);
     cur_at = ms_now();
     int registered = 0;
     uint32_t tried = 0;
-    while (dbus_connection_read_write_dispatch(c, 500)) {
+    for (;;) {
+        while (dbus_connection_dispatch(c) == DBUS_DISPATCH_DATA_REMAINS) {}
+        dbus_connection_flush(c);
+        if (!dbus_connection_get_is_connected(c)) break;
+        struct pollfd p[2] = {{.fd = dfd, .events = POLLIN}, {.fd = in, .events = POLLIN}};
+        int r = poll(p, in >= 0 ? 2 : 1, !registered ? (tried ? 2000 : 0) : in < 0 ? 500 : -1);
+        if (r < 0 && errno != EINTR) break;
+        if (r > 0 && p[0].revents && !dbus_connection_read_write(c, 0)) break;
+        int look = in < 0;
+        if (r > 0 && in >= 0 && p[1].revents) {
+            char ev[1024] __attribute__((aligned(__alignof__(struct inotify_event))));
+            ssize_t len;
+            while ((len = read(in, ev, sizeof ev)) > 0)
+                for (char *e = ev; e < ev + len; e += sizeof(struct inotify_event) + ((struct inotify_event *)e)->len) {
+                    const struct inotify_event *ie = (const struct inotify_event *)e;
+                    if (ie->len && !strcmp(ie->name, NOW_FILE + 5)) look = 1;   /* (past "/tmp/") */
+                }
+        }
         uint32_t t = ms_now();
         if (!registered) {
             if (t - tried >= 2000 || !tried) { tried = t; registered = register_player(c); }
             if (!registered) { read_now(&cur); cur_at = t; continue; }
         }
+        if (!look) continue;
         now_t n;
         read_now(&n);
         int which = 0;

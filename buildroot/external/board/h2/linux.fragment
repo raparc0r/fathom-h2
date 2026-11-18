@@ -13,7 +13,7 @@ CONFIG_COMPACTION=y
 CONFIG_CMA=y
 CONFIG_DMA_CMA=y
 CONFIG_CMA_SIZE_MBYTES=2
-CONFIG_LOG_BUF_SHIFT=17
+
 CONFIG_PRINTK_TIME=y
 CONFIG_PANIC_TIMEOUT=10
 
@@ -177,3 +177,35 @@ CONFIG_WLAN_VENDOR_BROADCOM=y
 CONFIG_BRCMUTIL=m
 CONFIG_BRCMFMAC=m
 CONFIG_BRCMFMAC_SDIO=y
+
+# ---- Memory: the H2 has 32 MiB and the kernel's code and data never come back ----
+# (Measured 2026-11-17: 6.4 MiB of kernel code; everything here was unused.)
+# No symbol table: oopses print addresses (System.map from the build names them).
+# CONFIG_KALLSYMS is not set
+# The kernel log buffer: 64 KiB (pstore keeps its own copy).
+CONFIG_LOG_BUF_SHIFT=16
+# The card's FAT needs 437, ISO 8859-1 and UTF-8 only.
+# CONFIG_NLS_CODEPAGE_936 is not set
+# CONFIG_NLS_CODEPAGE_950 is not set
+# CONFIG_NLS_ASCII is not set
+# The initramfs is gzip: no other decompressors.
+# CONFIG_RD_BZIP2 is not set
+# CONFIG_RD_LZMA is not set
+# CONFIG_RD_XZ is not set
+# CONFIG_RD_LZO is not set
+# CONFIG_RD_LZ4 is not set
+# CONFIG_RD_ZSTD is not set
+# No Ethernet: no USB network adapters, PHYs or ethtool netlink.
+# CONFIG_USB_NET_DRIVERS is not set
+# CONFIG_PHYLIB is not set
+# CONFIG_ETHTOOL_NETLINK is not set
+# No BPF, no Bluetooth debugfs.
+# CONFIG_BPF_SYSCALL is not set
+# CONFIG_BT_DEBUGFS is not set
+# Crypto nobody uses (Bluetooth needs AES, CMAC, SHA-256, ECDH; Wi-Fi's regdb RSA).
+# CONFIG_CRYPTO_KRB5 is not set
+# CONFIG_CRYPTO_KRB5ENC is not set
+# CONFIG_CRYPTO_CAMELLIA is not set
+# CONFIG_CRYPTO_SHA3 is not set
+# CONFIG_CRYPTO_CTS is not set
+# CONFIG_CRYPTO_DEFLATE is not set

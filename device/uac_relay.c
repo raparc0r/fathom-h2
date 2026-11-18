@@ -35,6 +35,7 @@
 
 #include <sound/asound.h>
 
+#include "audio/engine.h"   /* audio_thread_priority */
 #include "audio/output.h"
 
 #define PITCH_NOMINAL 1000000
@@ -313,6 +314,7 @@ static void steer(relay_state_t *s)
 static void *relay_main(void *arg)
 {
     uac_relay_t *r = arg;
+    audio_thread_priority(1);           /* the computer's audio, ahead of the UI like playback */
     relay_state_t s = {.card = -1, .ctl = -1, .cap = -1};
     s.out_ok = out_alsa_create(&s.out, r->dac_dev) == 0;
     if (!s.out_ok) fprintf(stderr, "usb dac: no DAC at %s\n", r->dac_dev);

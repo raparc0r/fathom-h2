@@ -30,3 +30,7 @@ if(ZLIB_FOUND)
   target_include_directories(make-logo PRIVATE ${lvgl_SOURCE_DIR}/src/libs/tiny_ttf)
   target_link_libraries(make-logo PRIVATE ZLIB::ZLIB m)
 endif()
+
+# The UI redraws only what changed: nothing at rest or with the screen off, and
+# the panel (direct mode, as on the H2) always matches the screen drawn whole.
+add_test(NAME ui_redraw COMMAND fathom-sim --bench 1 WORKING_DIRECTORY ${CMAKE_BINARY_DIR})

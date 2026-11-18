@@ -1,0 +1,7 @@
+config BR2_PACKAGE_FATHOM_SYSTEM
+	bool "fathom-system"
+	help
+	  Fathom's small system helpers, built from the repository's
+	  device/ folder: fathom-usbrole (the USB-C port's role, in the
+	  root filesystem) and fathom-nocache.so (keeps the network
+	  drive's and SFTP's reads out of the page cache; on the card).

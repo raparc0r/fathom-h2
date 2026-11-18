@@ -764,6 +764,14 @@ void player_tick(player_t *p)
     }
 }
 
+int player_idle(player_t *p)
+{
+    if (p->sleep_at || (p->radio && p->r_want)) return 0;
+    eng_status_t st;
+    engine_status(p->eng, &st);
+    return st.state != ENG_PLAYING && !st.starting && st.seq == p->eng_seq;
+}
+
 void player_now(player_t *p, player_now_t *now)
 {
     memset(now, 0, sizeof *now);

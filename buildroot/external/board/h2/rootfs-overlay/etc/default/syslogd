@@ -1,0 +1,4 @@
+# The system log (/tmp/messages, i.e. RAM): 64 KB, then one older 64 KB
+# (/tmp/messages.0), and a line repeated at once is kept only once. Kernel
+# messages aren't copied here (no klogd): dmesg has them.
+SYSLOGD_ARGS="-s 64 -b 1 -D"

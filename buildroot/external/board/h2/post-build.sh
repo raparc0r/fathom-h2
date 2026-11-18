@@ -65,7 +65,7 @@ if [ -n "$progs_in" ]; then
         next=
         for f in $todo; do
             for n in $(needed "$new/$f"); do
-                case "$n" in libc.so|ld-musl*|libgcc_s.so*) continue ;; esac
+                case "$n" in libc.so|ld-musl*) continue ;; esac
                 l=$(staged "$n")
                 [ -n "$l" ] || { echo "post-build: $f needs $n, not in staging" >&2; exit 1; }
                 case " $libs " in *" $l "*) continue ;; esac
@@ -159,7 +159,7 @@ for p in usr/sbin/wpa_supplicant usr/sbin/wpa_cli usr/sbin/iw; do
     "$strip" --strip-unneeded "$wnew/$p" 2>/dev/null || true
     wprogs_in="$wprogs_in $p"
 done
-mods=$(find "$t/lib/modules" -name '*.ko' 2>/dev/null)
+mods=$(find "$t/lib/modules" -name '*.ko' 2>/dev/null || true)   # (none once an earlier run removed the folder)
 if [ -n "$mods" ]; then
     mkdir -p "$wnew/modules"
     for m in $mods; do cp "$m" "$wnew/modules/"; done
@@ -172,7 +172,7 @@ if [ -n "$wprogs_in" ]; then
         next=
         for f in $todo; do
             for n in $(needed "$wnew/$f"); do
-                case "$n" in libc.so|ld-musl*|libgcc_s.so*) continue ;; esac
+                case "$n" in libc.so|ld-musl*) continue ;; esac
                 [ -e "$bt/usr/lib/$n" ] || [ -e "$bt/lib/$n" ] && continue   # Bluetooth's stage has it
                 l=$(staged "$n")
                 [ -n "$l" ] || { echo "post-build: $f needs $n, not in staging" >&2; exit 1; }
@@ -212,7 +212,10 @@ if [ -d "$wifi" ]; then
         rm -f "$t"/usr/lib/$b.so* "$t"/lib/$b.so*
     done
 fi
-rm -f "$t"/etc/init.d/S*wpa_supplicant
+rm -f "$t"/etc/init.d/S*wpa_supplicant "$t"/etc/network/if-*.d/wpasupplicant "$t"/etc/wpa_supplicant.conf
+# The modules went to the card, and insmod is given their paths there: the
+# kernel's module index (modinfo, aliases, symbols: 170 KB) serves nothing
+rm -rf "$t"/lib/modules
 for l in libnl-route-3 libnl-nf-3 libnl-xfrm-3 libnl-idiag-3 libnl-cli-3; do   # libnl's, unused
     rm -f "$t"/usr/lib/$l.so*
 done
@@ -260,7 +263,7 @@ if [ -n "$sprogs_in" ]; then
         next=
         for f in $todo; do
             for n in $(needed "$snew/$f"); do
-                case "$n" in libc.so|ld-musl*|libgcc_s.so*) continue ;; esac
+                case "$n" in libc.so|ld-musl*) continue ;; esac
                 [ -e "$bt/usr/lib/$n" ] || [ -e "$bt/lib/$n" ] && continue
                 [ -e "$wifi/usr/lib/$n" ] || [ -e "$wifi/lib/$n" ] && continue
                 # (from staging; libmdnsd is only installed to the target, or
@@ -321,6 +324,87 @@ rm -f "$t"/usr/lib/libxxhash.so* "$t"/usr/lib/libuuid.so* "$t"/lib/libuuid.so*
 # one the H2 shows, for SSH and the serial console alike.
 rm -f "$t"/etc/init.d/S50dropbear "$t"/etc/default/dropbear
 sed -i 's/^root:[^:]*:/root:*:/' "$t"/etc/shadow
+
+# Programs that boot doesn't need go to the card too, each with its own stage,
+# and leave the initramfs (every byte of which is RAM for good). In their
+# place a link to /usr/libexec/fathom-card, which runs them from the card.
+#   ssh    dropbear (server, key generator, scp and the client: one program,
+#          554 KB): fathom-ssh runs a copy in RAM while SSH is on, so logins
+#          stay quick when memory is short and USB drive mode can lend the card
+#   tools  tinyalsa's tinyplay, tinymix, tinycap, tinypcminfo (bring-up tools)
+# (a program from the target, never a link: those are fathom-card's; or from
+# the last stage, once an earlier run moved it)
+stage_from() { # TARGET-PATH LAST-STAGE-FILE
+    if [ -f "$t/$1" ] && [ ! -L "$t/$1" ]; then echo "$t/$1"
+    elif [ -f "$2" ]; then echo "$2"; fi
+}
+ssh="$BINARIES_DIR/ssh"
+src=$(stage_from usr/sbin/dropbear "$ssh/dropbearmulti")
+if [ -n "$src" ]; then
+    rm -rf "$ssh.new" && mkdir -p "$ssh.new/LICENSES"
+    cp "$src" "$ssh.new/dropbearmulti"
+    for n in $(needed "$ssh.new/dropbearmulti"); do
+        case "$n" in libc.so|ld-musl*) ;; *) echo "post-build: dropbear needs $n" >&2; exit 1 ;; esac
+    done
+    dir=$(ls -d "$BUILD_DIR"/dropbear-[0-9]* | head -1)
+    cp "$dir/LICENSE" "$ssh.new/LICENSES/"
+    printf '%s: MIT, BSD-2-Clause, public domain (LICENSE)\n' "${dir##*/}" > "$ssh.new/LICENSES/README.txt"
+    rm -rf "$ssh" && mv "$ssh.new" "$ssh"
+fi
+tools="$BINARIES_DIR/tools"
+tnew="$tools.new"
+rm -rf "$tnew"
+for p in usr/bin/tinyplay usr/bin/tinymix usr/bin/tinycap usr/bin/tinypcminfo; do
+    src=$(stage_from $p "$tools/$p")
+    [ -n "$src" ] || continue
+    mkdir -p "$tnew/usr/bin"
+    cp "$src" "$tnew/$p"
+    for n in $(needed "$tnew/$p"); do
+        case "$n" in libc.so|ld-musl*) continue ;; esac
+        l=$(staged "$n")
+        [ -n "$l" ] || { echo "post-build: $p needs $n, not in staging" >&2; exit 1; }
+        mkdir -p "$tnew/usr/lib"
+        cp -L "$STAGING_DIR/$l" "$tnew/usr/lib/$n"           # (by its soname: FAT has no links)
+        "$strip" --strip-unneeded "$tnew/usr/lib/$n" 2>/dev/null || true
+    done
+done
+if [ -d "$tnew" ]; then
+    dir=$(ls -d "$BUILD_DIR"/tinyalsa-[0-9]* | head -1)
+    mkdir -p "$tnew/LICENSES"
+    cp "$dir/NOTICE" "$tnew/LICENSES/"
+    printf '%s: BSD-3-Clause (NOTICE)\n' "${dir##*/}" > "$tnew/LICENSES/README.txt"
+    rm -rf "$tools" && mv "$tnew" "$tools"
+fi
+rm -f "$t"/usr/lib/libtinyalsa.so*
+for p in usr/sbin/dropbear usr/bin/dropbearkey usr/bin/dropbearconvert usr/bin/dbclient usr/bin/ssh \
+         usr/bin/scp usr/bin/tinyplay usr/bin/tinymix usr/bin/tinycap usr/bin/tinypcminfo; do
+    ln -sf ../libexec/fathom-card "$t/$p"
+done
+
+# Nothing in the initramfs needs these (the card's stages carry their own
+# copy if one of theirs ever does): GCC's runtime and atomics libraries,
+# xxHash's checksum tool (lighttpd only uses its header), D-Bus's DTDs,
+# libnl's tables, readline's settings, Buildroot's note
+rm -f "$t"/lib/libgcc_s.so* "$t"/lib/libatomic.so* "$t"/usr/bin/xxh*sum "$t"/etc/inputrc \
+      "$t"/THIS_IS_NOT_YOUR_ROOT_FILESYSTEM
+rm -rf "$t"/usr/share/xml "$t"/etc/libnl
+# A random seed kept in RAM is gone at every start: no use (the X1000's RNG
+# seeds the kernel's)
+rm -f "$t"/etc/init.d/S01seedrng
+
+# busybox (busybox.fragment): links to applets it no longer has, left in the
+# target by an earlier build, go; so do the scripts of the daemons it lost
+# (crond, klogd). The kernel has no swap: inittab doesn't try it.
+bbl=$(ls "$BUILD_DIR"/busybox-[0-9]*/busybox.links 2>/dev/null | head -1)
+if [ -n "$bbl" ]; then
+    for l in $(cd "$t" && find bin sbin usr/bin usr/sbin -type l 2>/dev/null); do
+        case "$(readlink "$t/$l")" in */busybox|busybox) ;; *) continue ;; esac
+        grep -qx "/$l" "$bbl" || rm -f "$t/$l"
+    done
+fi
+grep -qx /usr/sbin/crond "$bbl" 2>/dev/null || rm -rf "$t"/etc/init.d/S50crond "$t"/etc/cron
+grep -qx /sbin/klogd "$bbl" 2>/dev/null || rm -f "$t"/etc/init.d/S02klogd
+sed -i '/swapon\|swapoff/d' "$t"/etc/inittab
 # mbedTLS: linked into the player (FFmpeg's https), and in fathom/share for lighttpd
 rm -f "$t"/usr/lib/libmbedtls.so* "$t"/usr/lib/libmbedx509.so* "$t"/usr/lib/libmbedcrypto.so*
 

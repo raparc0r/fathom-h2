@@ -1,3 +1,4 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 source "$BR2_EXTERNAL_FATHOM_PATH/package/fathom-player/Config.in"
+source "$BR2_EXTERNAL_FATHOM_PATH/package/fathom-system/Config.in"
 source "$BR2_EXTERNAL_FATHOM_PATH/package/libfreeaptx/Config.in"

@@ -25,6 +25,8 @@ FetchContent_Declare(lvgl
   # our fixes (patches/lvgl)
   PATCH_COMMAND sh ${ROOT}/patches/lvgl/apply.sh)
 FetchContent_MakeAvailable(lvgl)
+# Each function in its own section, so the link keeps only those used (--gc-sections)
+target_compile_options(lvgl PRIVATE -ffunction-sections -fdata-sections)
 
 find_package(PkgConfig REQUIRED)
 # vorbisidec: Tremor, the integer Vorbis decoder (app/audio/vorbis.c)
@@ -40,7 +42,7 @@ endif()
 set(FATHOM_BOARD_SOURCES disp_drm.c audio_route.c)
 
 add_executable(fathom-player
-  main.c input.c uac_relay.c bt.c wifi.c share.c ssh.c tlscert.c radiometa.c out_router.c ${ROOT}/app/audio/out_bt.c ${FATHOM_BOARD_SOURCES}
+  main.c input.c uac_relay.c bt.c wifi.c share.c ssh.c tlscert.c radiometa.c out_router.c ff_trim.c ${ROOT}/app/audio/out_bt.c ${FATHOM_BOARD_SOURCES}
   ${ROOT}/app/core/rng.c
   ${ROOT}/app/core/settings.c
   ${ROOT}/app/core/lang.c
@@ -90,9 +92,9 @@ target_compile_definitions(fathom-player PRIVATE
   FATHOM_JPEG_MAX_MEMORY=4194304L
   FATHOM_ART_MAX_FILE=4194304L
   "FATHOM_SQLITE_CACHE=\"-512\"")
-target_compile_options(fathom-player PRIVATE -Wall -Wextra -Wno-unused-parameter)
+target_compile_options(fathom-player PRIVATE -Wall -Wextra -Wno-unused-parameter -ffunction-sections -fdata-sections)
 set_source_files_properties(${ROOT}/app/library/stb_impl.c PROPERTIES COMPILE_OPTIONS "-w")
-target_link_options(fathom-player PRIVATE -static)
+target_link_options(fathom-player PRIVATE -static -Wl,--gc-sections)
 target_link_libraries(fathom-player PRIVATE lvgl ${DEPS_STATIC_LDFLAGS} pthread m)
 install(TARGETS fathom-player RUNTIME DESTINATION bin)
 
