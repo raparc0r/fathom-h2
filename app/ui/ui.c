@@ -2062,6 +2062,7 @@ static void render_np(void)
         set_text(S.np_t0, "");
         set_text(S.np_t1, "");
         set_text(S.np_next, "");
+        set_text(S.np_out, "");          /* (or LVGL's placeholder "Text" shows until something plays) */
         show(S.np_pause, 0);
         lv_obj_set_width(S.np_fill, 0);
         for (int i = 0; i < SEGMENTS; i++) fill(S.np_seg[i], T()->surface);
@@ -2371,6 +2372,7 @@ static void update_overlay(void)
         lv_obj_set_style_bg_color(S.upd_bar, C(t->surface), LV_PART_MAIN);
         lv_obj_set_style_bg_opa(S.upd_bar, LV_OPA_COVER, LV_PART_MAIN);
         lv_obj_set_style_bg_color(S.upd_bar, C(t->signal), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(S.upd_bar, LV_OPA_COVER, LV_PART_INDICATOR);   /* (no theme to set it) */
         lv_bar_set_range(S.upd_bar, 0, 1000);
         S.upd_detail = lv_label_create(col);
         style_label(S.upd_detail, S.f->body, t->text);
@@ -2556,6 +2558,7 @@ void ui_level(const char *text, int value, int max, const char *value_text)
     lv_obj_set_style_bg_color(S.lvl_bar, C(t->bg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(S.lvl_bar, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_bg_color(S.lvl_bar, C(t->signal), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(S.lvl_bar, LV_OPA_COVER, LV_PART_INDICATOR);   /* (no theme to set it) */
     lv_bar_set_range(S.lvl_bar, 0, max);
     lv_bar_set_value(S.lvl_bar, value, LV_ANIM_OFF);
     if (value_text) lv_label_set_text_fmt(S.lvl_lbl, "%s  %s", text, value_text);

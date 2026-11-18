@@ -25,8 +25,16 @@ FetchContent_Declare(lvgl
   # our fixes (patches/lvgl)
   PATCH_COMMAND sh ${ROOT}/patches/lvgl/apply.sh)
 FetchContent_MakeAvailable(lvgl)
+# MIPS code for an executable: GCC's default, -mshared, is code fit for a shared
+# library, every call and global reached through the GOT ($gp, $t9) with $gp
+# set up again around calls. The player is static: -mno-shared -mplt gives direct
+# calls (jal) and absolute addresses, about a sixth smaller and fewer loads.
+# (Not for fathom-avrcp, which is dynamic.)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^mips")
+  set(FATHOM_EXE_CODE -mno-shared -mplt)
+endif()
 # Each function in its own section, so the link keeps only those used (--gc-sections)
-target_compile_options(lvgl PRIVATE -ffunction-sections -fdata-sections)
+target_compile_options(lvgl PRIVATE -ffunction-sections -fdata-sections ${FATHOM_EXE_CODE})
 
 find_package(PkgConfig REQUIRED)
 # vorbisidec: Tremor, the integer Vorbis decoder (app/audio/vorbis.c)
@@ -42,7 +50,7 @@ endif()
 set(FATHOM_BOARD_SOURCES disp_drm.c audio_route.c)
 
 add_executable(fathom-player
-  main.c input.c uac_relay.c bt.c wifi.c share.c ssh.c tlscert.c radiometa.c out_router.c ff_trim.c updater.c ${ROOT}/app/audio/out_bt.c ${FATHOM_BOARD_SOURCES}
+  main.c input.c uac_relay.c bt.c wifi.c share.c ssh.c tlscert.c radiometa.c out_router.c ff_trim.c jpeg_trim.c updater.c ${ROOT}/app/audio/out_bt.c ${FATHOM_BOARD_SOURCES}
   ${ROOT}/app/core/rng.c
   ${ROOT}/app/core/settings.c
   ${ROOT}/app/core/lang.c
@@ -98,9 +106,28 @@ target_compile_definitions(fathom-player PRIVATE
   FATHOM_JPEG_MAX_MEMORY=4194304L
   FATHOM_ART_MAX_FILE=4194304L
   "FATHOM_SQLITE_CACHE=\"-512\"")
-target_compile_options(fathom-player PRIVATE -Wall -Wextra -Wno-unused-parameter -ffunction-sections -fdata-sections)
+target_compile_options(fathom-player PRIVATE -Wall -Wextra -Wno-unused-parameter -ffunction-sections -fdata-sections ${FATHOM_EXE_CODE})
 set_source_files_properties(${ROOT}/app/library/stb_impl.c PROPERTIES COMPILE_OPTIONS "-w")
-target_link_options(fathom-player PRIVATE -static -Wl,--gc-sections)
+# The player's cold code built for size: start-up, settings, the network, the
+# updater, Wi-Fi, Bluetooth and SSH control, radio lists and metadata, tags,
+# cue sheets and playlists, themes, fonts and icons, and the screens (ui.c
+# builds and fills them, a little work per key; LVGL draws them). Decoding,
+# the engine and outputs, the display, input, the scan's walk and cover
+# scaling, and image decoding stay at -O2.
+set_property(SOURCE main.c bt.c wifi.c share.c ssh.c tlscert.c radiometa.c updater.c
+  ${ROOT}/app/core/settings.c ${ROOT}/app/core/lang.c
+  ${ROOT}/app/library/tags.c ${ROOT}/app/library/cue.c ${ROOT}/app/library/playlist.c
+  ${ROOT}/app/shuffle/shuffle.c
+  ${ROOT}/app/net/http.c ${ROOT}/app/net/json.c ${ROOT}/app/net/radiodir.c
+  ${ROOT}/app/net/unzip.c ${ROOT}/app/net/update.c
+  ${ROOT}/app/player/player.c ${ROOT}/app/player/radio.c ${ROOT}/app/player/rfmeta.c
+  ${ROOT}/app/ui/theme.c ${ROOT}/app/ui/fonts.c ${ROOT}/app/ui/assets.c ${ROOT}/app/ui/ui.c
+  APPEND PROPERTY COMPILE_OPTIONS -Os)
+# Link-time optimisation of the player's own code (the libraries are plain
+# objects): calls across its files inlined or dropped, 22 KB less. Each file
+# keeps its -O level.
+target_compile_options(fathom-player PRIVATE -flto)
+target_link_options(fathom-player PRIVATE -static -Wl,--gc-sections -flto=auto)
 # The certificate bundle parsed once for all of FFmpeg's HTTPS connections
 # (app/net/tls_wrap.c: FFmpeg's calls to mbedTLS are redirected to it)
 if(MBEDTLS_FOUND)
@@ -158,6 +185,27 @@ target_include_directories(fathom-scan PRIVATE ${ROOT}/app ${ROOT}/third_party $
 target_compile_definitions(fathom-scan PRIVATE FATHOM_HAVE_FFMPEG FATHOM_HAVE_LIBJPEG FATHOM_HAVE_VORBIS FATHOM_VORBIS_TREMOR)
 target_link_options(fathom-scan PRIVATE -static)
 target_link_libraries(fathom-scan PRIVATE ${DEPS_STATIC_LDFLAGS} pthread m)
+
+# Levelling's loudness measurement, timed, against 0.8.3's (tools/rg-bench).
+# Not installed; copied by hand.
+add_executable(fathom-rg-bench
+  ${ROOT}/tools/rg-bench/main.c
+  ${ROOT}/tools/rg-bench/loudness_v1.c
+  ${ROOT}/tools/rg-bench/loudness_ref.c
+  ${ROOT}/app/audio/loudness.c
+  ${ROOT}/app/library/cue.c
+  ${ROOT}/app/audio/decoder.c
+  ${ROOT}/app/audio/dsd.c
+  ${ROOT}/app/audio/vorbis.c
+  ${ROOT}/app/audio/streamlist.c
+  ${ROOT}/app/audio/ff_util.c
+  ${ROOT}/app/net/http.c
+  ${ROOT}/app/net/json.c)
+target_include_directories(fathom-rg-bench PRIVATE ${ROOT}/app ${DEPS_STATIC_INCLUDE_DIRS})
+target_compile_options(fathom-rg-bench PRIVATE -Wall -Wextra -Wno-unused-parameter)
+target_compile_definitions(fathom-rg-bench PRIVATE FATHOM_HAVE_FFMPEG FATHOM_HAVE_VORBIS FATHOM_VORBIS_TREMOR)
+target_link_options(fathom-rg-bench PRIVATE -static)
+target_link_libraries(fathom-rg-bench PRIVATE ${DEPS_STATIC_LDFLAGS} pthread m)
 
 # fatwalk check (tools/fatcheck): lists a folder by reading the FAT directly and
 # through the kernel, and compares. Not installed; copied by hand.

@@ -56,14 +56,17 @@ start() {
     # -W: a 512 KB receive window (dropbear's default is 24 KB): copying to
     # the H2 over Wi-Fi waited on round trips at 1.1 MB/s; now 1.9 MB/s (and
     # 2.8 to 3.6 MB/s over USB). A session stays about 1.1 MB: the card keeps up.
-    nice -n 10 $RUN/dropbear -r $K/ssh_host_ed25519_key -p 22 -P $PID -W 524288
+    # The host key from RAM too: dropbear reads it again for each login, and
+    # in USB drive mode the card is lent to the computer (logins were refused).
+    (umask 077; cp $K/ssh_host_ed25519_key $RUN/host_key) || { say "couldn't copy the host key"; return 1; }
+    nice -n 10 $RUN/dropbear -r $RUN/host_key -p 22 -P $PID -W 524288
     for i in $(seq 1 20); do alive && break; sleep 0.1; done
     alive || { say "dropbear didn't start"; return 1; }
 }
 
 stop() {
     alive && kill "$(cat $PID)"
-    rm -f $PID $RUN/dropbear           # (its RAM goes once the last session ends)
+    rm -f $PID $RUN/dropbear $RUN/host_key   # (its RAM goes once the last session ends)
     return 0
 }
 

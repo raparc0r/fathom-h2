@@ -79,9 +79,22 @@ static FLAC__StreamDecoderWriteStatus flac_write(const FLAC__StreamDecoder *dec,
         d->buf = nb;
         d->buf_cap = n;
     }
-    for (unsigned i = 0; i < n; i++)
-        for (unsigned c = 0; c < ch; c++)
-            d->buf[i * ch + c] = (int32_t)((uint32_t)buffer[c][i] << shift);
+    /* stereo and mono on their own: the general loop took 11 MIPS instructions a
+     * sample, a tenth of decoding (levelling reads whole tracks) */
+    int32_t *o = d->buf;
+    if (ch == 2) {
+        const FLAC__int32 *l = buffer[0], *r = buffer[1];
+        for (unsigned i = 0; i < n; i++) {
+            o[2 * i] = (int32_t)((uint32_t)l[i] << shift);
+            o[2 * i + 1] = (int32_t)((uint32_t)r[i] << shift);
+        }
+    } else if (ch == 1) {
+        const FLAC__int32 *m = buffer[0];
+        for (unsigned i = 0; i < n; i++) o[i] = (int32_t)((uint32_t)m[i] << shift);
+    } else {
+        for (unsigned i = 0; i < n; i++)
+            for (unsigned c = 0; c < ch; c++) o[i * ch + c] = (int32_t)((uint32_t)buffer[c][i] << shift);
+    }
     d->buf_frames = n;
     d->buf_pos = 0;
     return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;

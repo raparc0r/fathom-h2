@@ -49,8 +49,9 @@ if mount -t vfat -o rw,noatime /dev/mmcblk0p1 /mnt/sd 2>/dev/null ||
         echo; echo "== meminfo"; cat /proc/meminfo
         echo; echo "== interrupts"; cat /proc/interrupts
         echo; echo "== platform devices"; ls /sys/bus/platform/devices
-        echo; echo "== clocks"; cat /sys/kernel/debug/clk/clk_summary
-        echo; echo "== gpio"; cat /sys/kernel/debug/gpio
+        # (clocks and GPIO need debugfs, off since 2026-11-18 for its memory)
+        [ -r /sys/kernel/debug/clk/clk_summary ] && { echo; echo "== clocks"; cat /sys/kernel/debug/clk/clk_summary; }
+        [ -r /sys/kernel/debug/gpio ] && { echo; echo "== gpio"; cat /sys/kernel/debug/gpio; }
         for f in /sys/fs/pstore/*; do [ -f "$f" ] && { echo; echo "== pstore: $f"; cat "$f"; }; done
     } > "$log" 2>&1
     sync

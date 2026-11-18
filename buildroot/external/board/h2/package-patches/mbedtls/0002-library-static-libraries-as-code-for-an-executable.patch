@@ -1,0 +1,30 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] library: static libraries as code for an executable
+
+Fathom links mbedTLS's static libraries only into its player, a static
+program, and lighttpd uses the shared ones. GCC's MIPS default (-mshared)
+is code fit for a shared library, every call and global reached through
+the GOT; the static libraries get -mno-shared -mplt (direct calls,
+absolute addresses) and a section per function, so the player's
+--gc-sections leaves out what it never calls. The shared libraries are
+built as before.
+
+Upstream-Status: Inappropriate [Fathom's build choice]
+
+--- a/library/CMakeLists.txt
++++ b/library/CMakeLists.txt
+@@ -306,6 +306,14 @@
+     add_library(${mbedtls_static_target} STATIC ${src_tls})
+     set_target_properties(${mbedtls_static_target} PROPERTIES OUTPUT_NAME mbedtls)
+     target_link_libraries(${mbedtls_static_target} PUBLIC ${libs} ${mbedx509_static_target})
++
++    # The static libraries are linked only into Fathom's player, a static
++    # program: code for an executable (direct calls, absolute addresses
++    # instead of the GOT), one function per section for its --gc-sections.
++    # The shared ones (lighttpd's) stay as they were.
++    foreach(target ${mbedcrypto_static_target} ${mbedx509_static_target} ${mbedtls_static_target})
++        target_compile_options(${target} PRIVATE -mno-shared -mplt -ffunction-sections -fdata-sections)
++    endforeach()
+
+     if(GEN_FILES)
+         add_dependencies(${mbedcrypto_static_target}

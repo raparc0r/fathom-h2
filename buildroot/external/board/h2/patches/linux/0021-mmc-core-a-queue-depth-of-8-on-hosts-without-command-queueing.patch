@@ -1,0 +1,23 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] mmc: core: a queue depth of 8 on hosts without command queueing
+
+Each request the block layer pre-allocates for an MMC queue carries its own
+scatterlist (max_segs entries: 2 KiB on the X1000's controller), for the
+hardware queue (64 tags) and again for the I/O scheduler's (2 x 64 = 128):
+386 KiB of kernel memory that never goes back, on a player with 24 MiB. A
+plain SD card takes one request at a time; 8 in flight (16 for the
+scheduler, which still merges and sorts) keep it busy. 48 KiB instead.
+
+Upstream-Status: Inappropriate [board-specific memory trade-off]
+
+--- a/drivers/mmc/core/queue.c
++++ b/drivers/mmc/core/queue.c
+@@ -419,7 +419,7 @@
+ }
+ 
+ /* Set queue depth to get a reasonable value for q->nr_requests */
+-#define MMC_QUEUE_DEPTH 64
++#define MMC_QUEUE_DEPTH 8
+ 
+ /**
+  * mmc_init_queue - initialise a queue structure.

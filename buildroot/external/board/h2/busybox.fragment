@@ -8,6 +8,8 @@ CONFIG_CHPASSWD=y
 CONFIG_FEATURE_DEFAULT_PASSWD_ALGO="sha512"
 # Repeated lines are dropped from the RAM log (syslogd -D, /etc/default/syslogd)
 CONFIG_FEATURE_SYSLOGD_DUP=y
+# Fathom: the kernel's uevents, for the card taken out and put back (S10sdcard)
+CONFIG_UEVENT=y
 
 # busybox lives in the initramfs, so all of it is RAM all the time. Left out:
 # what the H2 has no use for. Kept: everything Fathom's scripts, Buildroot's
@@ -123,7 +125,6 @@ CONFIG_FEATURE_SYSLOGD_DUP=y
 # CONFIG_SWAPON is not set
 # CONFIG_SWAPOFF is not set
 # CONFIG_SWITCH_ROOT is not set
-# CONFIG_UEVENT is not set
 # kernel modules are loaded by path (fathom-wifi): no module index, no modprobe
 # CONFIG_MODPROBE is not set
 # CONFIG_FEATURE_MODUTILS_ALIAS is not set

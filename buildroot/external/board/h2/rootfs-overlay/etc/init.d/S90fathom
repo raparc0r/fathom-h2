@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # Start the Fathom player from the SD card and restart it if it exits. Exit code
-# 42 asks for USB drive mode (fathom-usbdisk) first.
+# 42 asks for USB drive mode (fathom-usbdisk) first. While the card is out,
+# fathom-sdcard stops all this and starts it again once the card is back.
 # Create /mnt/sd/fathom/no-autostart to boot to the console instead (development).
 # Output goes to /tmp/fathom-player.log (RAM, not the card).
 #
@@ -30,6 +31,7 @@ start)
     (
         cd /                            # not on the card: USB drive mode unmounts it
         while :; do
+            [ -e /var/run/fathom-card-out ] && break   # (fathom-sdcard starts this again)
             "$bin" >> $log 2>&1 &
             p=$!
             # Until it exits, a look at the logs each minute. The player's exit

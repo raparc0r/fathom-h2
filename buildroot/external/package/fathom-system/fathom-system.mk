@@ -5,6 +5,9 @@
 #   fathom-usbrole      the USB-C port's role (S45usbrole), in the root
 #                       filesystem; linked with the C library there, not
 #                       statically: the initramfs is RAM, and libc is in it anyway
+#   fathom-cardout      the screen while the microSD card is out
+#                       (fathom-sdcard), in the root filesystem: the card's
+#                       programs can't be run then
 #   fathom-nocache.so   LD_PRELOADed into lighttpd and the SFTP server
 #                       (device/nocache.c), installed to the card with the
 #                       network drive (post-image.sh: fathom/share)
@@ -22,12 +25,15 @@ FATHOM_SYSTEM_INSTALL_IMAGES = YES
 define FATHOM_SYSTEM_BUILD_CMDS
 	$(TARGET_CC) $(TARGET_CFLAGS) -Os -Wall -Wextra $(TARGET_LDFLAGS) \
 		-o $(@D)/fathom-usbrole $(@D)/usbrole.c
+	$(TARGET_CC) $(TARGET_CFLAGS) -Os -Wall -Wextra $(TARGET_LDFLAGS) \
+		-o $(@D)/fathom-cardout $(@D)/cardout.c
 	$(TARGET_CC) $(TARGET_CFLAGS) -Os -Wall -Wextra -shared -fPIC $(TARGET_LDFLAGS) \
 		-o $(@D)/fathom-nocache.so $(@D)/nocache.c
 endef
 
 define FATHOM_SYSTEM_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(@D)/fathom-usbrole $(TARGET_DIR)/usr/sbin/fathom-usbrole
+	$(INSTALL) -D -m 0755 $(@D)/fathom-cardout $(TARGET_DIR)/usr/sbin/fathom-cardout
 endef
 
 define FATHOM_SYSTEM_INSTALL_IMAGES_CMDS

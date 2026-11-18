@@ -1,0 +1,128 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# The microSD card taken out and put back while the H2 runs. busybox's uevent
+# (S10sdcard) runs this for every kernel uevent, one at a time, with the
+# event's fields in the environment; only the card's disk on MSC0 matters:
+#
+#   remove   everything that runs from the card stops (the player, Bluetooth,
+#            Wi-Fi, the network drive), the card is unmounted (lazily: what
+#            still has it open lets go as it ends), and fathom-cardout shows
+#            "Card removed" until it's back
+#   add      the card is mounted as at boot and the player started as at boot
+#            (S90fathom); it brings back Bluetooth, Wi-Fi and the network
+#            drive as their settings say
+#
+#   fathom-sdcard check    at start-up (S10sdcard): no card mounted, the screen says so
+#
+# Why it's needed: the player and its helpers run from the card. With the
+# card gone their code can't be read back once evicted, so they can't notice
+# or stop by themselves, and /mnt/sd would stay on the old, dead device (every
+# read an I/O error) when the card comes back as a new one.
+#
+# USB drive mode (fathom-usbdisk) unmounts the card without removing it:
+# no uevent, so nothing here; if the card is pulled out while lent, the
+# computer's drive goes with it.
+#
+# Log: syslog ("sdcard", /tmp/messages), and a line in the player's log.
+
+# (first, and cheap: most events are something else's)
+[ "$1" = check ] || [ "$SUBSYSTEM/$DEVTYPE" = block/disk ] || exit 0
+
+MNT=/mnt/sd
+OUT=/var/run/fathom-card-out          # (exists while the card is out or unreadable)
+CARDOUT=/var/run/fathom-cardout.pid
+LUN=/sys/kernel/config/usb_gadget/fathom/functions/mass_storage.0/lun.0
+
+say() { logger -t sdcard "$1"; echo "sdcard: $1" >> /tmp/fathom-player.log; }
+mounted() { grep -q " $MNT " /proc/mounts; }
+show() { start-stop-daemon -S -q -b -m -p $CARDOUT -x /usr/sbin/fathom-cardout; }
+
+# fathom-cardout gone (it gives the screen up as it exits: the player needs it)
+hide() {
+    [ -f $CARDOUT ] || return 0
+    p=$(cat $CARDOUT)
+    rm -f $CARDOUT
+    kill "$p" 2>/dev/null || return 0
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$p" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    kill -9 "$p" 2>/dev/null
+}
+
+stop_all() {
+    touch $OUT
+    # the restart loop first, so nothing starts again from the card; then the
+    # card unmounted, so what's stopped below finds nothing there (rather
+    # than I/O errors: Bluetooth's pairings can't be saved to a card that's gone)
+    [ -f /var/run/fathom.pid ] && kill "$(cat /var/run/fathom.pid)" 2>/dev/null
+    umount -l $MNT 2>/dev/null
+    if [ -n "$(cat $LUN/file 2>/dev/null)" ]; then     # lent to a computer (USB drive mode)
+        killall fathom-usbdisk 2>/dev/null
+        echo 1 > $LUN/forced_eject
+        sysctl -q -p /etc/sysctl.d/10-fathom.conf        # (drive mode's bigger write-back)
+    fi
+    /etc/init.d/S90fathom stop          # the player
+    # USB DAC mode ends with the player: the computer gets its drive back
+    [ -L /sys/kernel/config/usb_gadget/fathom/configs/c.1/uac2.0 ] && fathom-usbgadget normal > /dev/null 2>&1
+    fathom-share off > /dev/null 2>&1
+    fathom-bt stop > /dev/null 2>&1
+    fathom-wifi off > /dev/null 2>&1
+}
+
+# Mount the card on disk $1 (its first partition, or the whole disk) as at
+# boot (S01bootlog)
+mount_card() {
+    for d in /dev/${1}p1 /dev/$1; do
+        [ -b "$d" ] && mount -t vfat -o rw,noatime "$d" $MNT 2>/dev/null && { echo "$d"; return 0; }
+    done
+    return 1
+}
+
+if [ "$1" = check ]; then
+    mounted && exit 0
+    # a card that came after S01bootlog stopped waiting for it (S90fathom starts the player)
+    for b in /sys/block/mmcblk*; do
+        case "$(readlink -f "$b")" in */13450000.mmc/*) mount_card "${b##*/}" > /dev/null && exit 0 ;; esac
+    done
+    touch $OUT
+    say "no card at start-up"
+    show
+    exit 0
+fi
+
+case "$DEVPATH" in */13450000.mmc/*) ;; *) exit 0 ;; esac   # MSC0, the card slot (MSC1 is Wi-Fi)
+
+case "$ACTION" in
+remove)
+    say "card removed ($DEVNAME)"
+    stop_all
+    say "stopped; waiting for the card"
+    show
+    ;;
+add)
+    # a new disk while one is mounted: the old one's removal was missed
+    if mounted; then
+        say "card added ($DEVNAME) while one was mounted: unmounting that first"
+        stop_all
+    fi
+    # (the disk's uevent comes after its partitions are read: their nodes are there)
+    if ! dev=$(mount_card "$DEVNAME"); then
+        say "card added ($DEVNAME), but it can't be mounted (not FAT?)"
+        show
+        exit 0
+    fi
+    rm -f $OUT
+    if [ ! -x $MNT/fathom/bin/fathom-player ]; then
+        say "card back ($dev), but without Fathom (fathom/bin/fathom-player)"
+        exit 0                          # (the screen still asks for the card)
+    fi
+    say "card back ($dev): starting Fathom"
+    hide
+    # As at boot, with init's environment rather than this event's
+    env -i HOME=/ PATH=/sbin:/usr/sbin:/bin:/usr/bin SHELL=/bin/sh USER=root TERM=linux \
+        /etc/init.d/S90fathom start > /dev/null 2>&1
+    ;;
+esac
+exit 0

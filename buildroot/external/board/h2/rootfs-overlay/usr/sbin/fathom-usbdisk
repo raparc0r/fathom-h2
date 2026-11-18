@@ -8,7 +8,9 @@
 # /tmp/fathom-usbdisk.msg if the card couldn't be lent.
 
 LUN=/sys/kernel/config/usb_gadget/fathom/functions/mass_storage.0/lun.0
-DEV=/dev/mmcblk0p1
+# (the card mounted: after it's been out and back it may be another mmcblk)
+DEV=$(awk '$2 == "/mnt/sd" { print $1; exit }' /proc/mounts)
+DEV=${DEV:-/dev/mmcblk0p1}
 udc=$(ls /sys/class/udc | head -n 1)
 STATE=/sys/class/udc/$udc/state
 MSG=/tmp/fathom-usbdisk.msg
@@ -35,6 +37,14 @@ if ! echo $DEV > $LUN/file; then
 fi
 say "card lent to the computer"
 
+# Nothing else runs now (the player has exited, Bluetooth and Wi-Fi are off):
+# let the computer's writes gather in RAM and reach the card in big pieces,
+# instead of the 1 MB at most that keeps memory free for music (sysctl.d).
+VM=/proc/sys/vm
+dbg=$(cat $VM/dirty_background_bytes) dlim=$(cat $VM/dirty_bytes)
+echo 2097152 > $VM/dirty_background_bytes
+echo 8388608 > $VM/dirty_bytes
+
 # Until it's ejected (the file goes empty) or the cable stays unplugged for 3 s.
 # A computer resets the USB link when the drive appears (macOS does), and the
 # link is "suspended" while it sleeps: neither ends drive mode.
@@ -45,6 +55,9 @@ while [ -n "$(cat $LUN/file)" ]; do
     sleep 1
 done
 echo 1 > $LUN/forced_eject 2>/dev/null
+sync
+echo $dlim > $VM/dirty_bytes
+echo $dbg > $VM/dirty_background_bytes
 say "card back ($(cat $STATE 2>/dev/null))"
 
 for i in 1 2 3; do

@@ -2054,6 +2054,7 @@ static int scan_with_progress(library_t *lib, const char *music, const theme_t *
 {
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, lv_color_hex(t->bg), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);   /* (no theme to set it) */
     lv_obj_t *title = lv_label_create(scr);
     lv_obj_set_style_text_font(title, f->title, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(t->text), 0);

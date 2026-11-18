@@ -53,7 +53,7 @@ BR2_TARGET_ROOTFS_INITRAMFS=y
 
 # The player (static, installed to the SD card image, not the initramfs)
 BR2_PACKAGE_FATHOM_PLAYER=y
-# fathom-usbrole (root filesystem) and fathom-nocache.so (card)
+# fathom-usbrole and fathom-cardout (root filesystem), fathom-nocache.so (card)
 BR2_PACKAGE_FATHOM_SYSTEM=y
 BR2_PACKAGE_JPEG_TURBO=y
 

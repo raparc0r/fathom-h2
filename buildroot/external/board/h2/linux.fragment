@@ -41,7 +41,9 @@ CONFIG_NLS_UTF8=y
 CONFIG_TMPFS=y
 CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
-CONFIG_DEBUG_FS=y
+# No debugfs (it was for bring-up: clocks, GPIO): its 1,200 files took 420 KiB
+# of kernel memory that never goes back. 2026-11-18.
+# CONFIG_DEBUG_FS is not set
 CONFIG_BLK_DEV_INITRD=y
 
 # Size: a music player on 32 MiB doesn't need these (mainline's reference board does)
@@ -81,6 +83,9 @@ CONFIG_USB_CONFIGFS=y
 CONFIG_USB_CONFIGFS_ACM=y
 CONFIG_USB_CONFIGFS_ECM=y
 CONFIG_USB_CONFIGFS_MASS_STORAGE=y
+# USB drive mode: 8 buffers of 16 KB instead of 2, so receiving from the
+# computer and writing to the card overlap rather than take turns.
+CONFIG_USB_GADGET_STORAGE_NUM_BUFFERS=8
 CONFIG_USB_CONFIGFS_F_UAC2=y
 CONFIG_USB_CONFIGFS_F_HID=y
 CONFIG_U_SERIAL_CONSOLE=y
