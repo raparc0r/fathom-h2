@@ -53,7 +53,10 @@ start() {
     # by its full path, each login starts it afresh, as dropbear prefers)
     cp $DB $RUN/dropbear.new && chmod 755 $RUN/dropbear.new && mv $RUN/dropbear.new $RUN/dropbear ||
         { say "couldn't copy dropbear to RAM"; return 1; }
-    nice -n 10 $RUN/dropbear -r $K/ssh_host_ed25519_key -p 22 -P $PID
+    # -W: a 512 KB receive window (dropbear's default is 24 KB): copying to
+    # the H2 over Wi-Fi waited on round trips at 1.1 MB/s; now 1.9 MB/s (and
+    # 2.8 to 3.6 MB/s over USB). A session stays about 1.1 MB: the card keeps up.
+    nice -n 10 $RUN/dropbear -r $K/ssh_host_ed25519_key -p 22 -P $PID -W 524288
     for i in $(seq 1 20); do alive && break; sleep 0.1; done
     alive || { say "dropbear didn't start"; return 1; }
 }
