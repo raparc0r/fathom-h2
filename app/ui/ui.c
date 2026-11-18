@@ -2008,9 +2008,13 @@ static void render_np_radio(void)
         if (lv_obj_get_style_align(S.np_radio, 0) != LV_ALIGN_CENTER) lv_obj_center(S.np_radio);   /* (once: it redraws) */
     }
     set_text(S.h_left, tr("Radio"));
-    set_text(S.np_title, t->title);
-    set_text(S.np_artist, t->artist);
-    set_text(S.np_album, t->album);
+    /* The station in the big title (what's on is the question when listening to
+     * radio), then the song and its artist, when the station says. (The player
+     * gives the station as the album, and as the title when there's no song.) */
+    int song = t->title[0] && strcmp(t->title, t->album);
+    set_text(S.np_title, t->album);
+    set_text(S.np_artist, song ? t->title : "");
+    set_text(S.np_album, song ? t->artist : "");
     char b[32], r[16];
     if (t->sample_rate && t->codec[0]) {
         fmt_rate(r, sizeof r, t->sample_rate);

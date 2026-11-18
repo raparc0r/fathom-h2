@@ -100,7 +100,8 @@ Most of it should feel familiar. A few things worth knowing:
 - For the network drive, turn it on in Settings, then connect to `https://fathom-h2.local`
   with the user and password the screen shows. The H2 makes its own certificate, so the
   first time your computer will ask whether to trust it; check the fingerprint matches the
-  one on the screen. On a Mac it's Finder → Go → Connect to Server. On Windows you need to
+  one on the screen. On a Mac it's Finder → Go → Connect to Server (Finder fills in your
+  Mac's name as the user: change it to `fathom`). On Windows you need to
   install the certificate first (open the address in a browser and save it into "Trusted
   Root Certification Authorities"), then Map network drive.
 - Fathom doesn't contact anything on the internet by itself, except a time server when
