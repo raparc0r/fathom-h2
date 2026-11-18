@@ -32,3 +32,17 @@ LINUX_PRE_BUILD_HOOKS += FATHOM_LINUX_LOGO
 # and string code; memcpy and memset are assembly on MIPS either way).
 # (Changing this needs musl-dirclean.)
 MUSL_EXTRA_CFLAGS += -Os
+
+# SQLite and mbedTLS for size: about 1.7 MB of the player's code, nearly all
+# cold (the player runs a few dozen kinds of query; TLS mostly sits in its
+# record layer), and the player's code is page cache that competes with
+# everything else in 24.5 MB. -Os takes 340 KB off the player; on a computer a
+# scan and browsing were 0-6 % slower and AES-GCM faster, while ChaCha20 stays
+# at -O2 (package-patches/mbedtls: at -Os it ran at half the speed). SQLite's
+# flags are expanded when configure runs, so this, coming last, wins over
+# Buildroot's -O2. mbedTLS's CMakeLists sets its own Release flags (-O2, after
+# ours); its MinSizeRel is CMake's "-Os -DNDEBUG" (Release's NDEBUG too).
+# lighttpd's mbedTLS (the network drive) is this build too.
+# (Changing these needs sqlite-dirclean / mbedtls-dirclean.)
+SQLITE_CFLAGS += -Os
+MBEDTLS_CONF_OPTS += -DCMAKE_BUILD_TYPE=MinSizeRel

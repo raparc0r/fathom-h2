@@ -35,7 +35,8 @@ extern char **environ;
 #define BT_LIBS "/mnt/sd/fathom/bt/usr/lib"
 #define BT_CLI "/mnt/sd/fathom/bt/usr/bin/bluealsa-cli"
 
-enum { CMD_NONE, CMD_START, CMD_STOP, CMD_SCAN, CMD_PAIR, CMD_CONNECT, CMD_DISCONNECT, CMD_FORGET, CMD_VOLUME };
+enum { CMD_NONE, CMD_START, CMD_STOP, CMD_SCAN, CMD_PAIR, CMD_CONNECT, CMD_DISCONNECT, CMD_FORGET, CMD_VOLUME,
+       CMD_RESTART };
 
 static struct {
     pthread_mutex_t mu;
@@ -188,6 +189,10 @@ static void do_cmd(int cmd, const char *addr)
 {
     char c[160], out[256];
     switch (cmd) {
+    case CMD_RESTART:                            /* new audio settings: stop, start, reconnect */
+        do_cmd(CMD_STOP, addr);
+        do_cmd(CMD_START, addr);
+        break;
     case CMD_START: {
         set_busy("Starting");
         int ok = run(FATHOM_BT " start 2>/dev/null", out, sizeof out) == 0;
@@ -434,6 +439,7 @@ void bt_ui_do(int what, const char *addr)
     switch (what) {
     case UI_BT_TOGGLE: bt_request(on ? CMD_STOP : CMD_START, NULL); break;
     case UI_BT_SCAN: bt_request(CMD_SCAN, NULL); break;
+    case UI_BT_RANGE: if (on) bt_request(CMD_RESTART, NULL); break;   /* (off: used at the next start) */
     case UI_BT_PRESS:
         if (!d.addr[0]) break;
         bt_request(!d.paired ? CMD_PAIR : d.connected ? CMD_DISCONNECT : CMD_CONNECT, d.addr);

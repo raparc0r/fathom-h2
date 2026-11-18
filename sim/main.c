@@ -29,6 +29,7 @@
 #include "audio/engine.h"
 #include "audio/output.h"
 #include "library/library.h"
+#include "net/radiodir.h"
 #include "lvgl.h"
 #include "player/player.h"
 #include "ui/theme.h"
@@ -45,8 +46,46 @@ static engine_t *g_eng;
 static player_t *g_player;
 
 static int g_n_themes;      /* built-in themes, then any in build/sim-data/themes */
-/* Home > Radio: the example stations (the simulator can't play them: no FFmpeg) */
-static int sim_radio(radio_station_t *out, int max) { return radio_load("assets/radio.txt", out, max); }
+/* Home > Radio: the example stations (the simulator can't play them: no FFmpeg),
+ * or once one is added from Find stations, build/sim-data/radio.txt (never in
+ * screenshots: they show the example) */
+#define SIM_RADIO "build/sim-data/radio.txt"
+static int g_shots;
+static int sim_radio(radio_station_t *out, int max)
+{
+    int n = g_shots ? -1 : radio_load(SIM_RADIO, out, max);
+    return n >= 0 ? n : radio_load("assets/radio.txt", out, max);
+}
+static int sim_radio_add(const radio_station_t *st) { return g_shots ? 1 : radio_add(SIM_RADIO, "assets/radio.txt", st); }
+static int sim_radio_remove(const char *url) { return g_shots ? 0 : radio_remove(SIM_RADIO, "assets/radio.txt", url); }
+/* Find stations: the directory's answers saved in tests/fixtures/radiodir (no
+ * network here); g_dir_fail: as if no server answered, g_dir_slow: one that
+ * takes its time (until the request is dropped) */
+static int g_dir_fail, g_dir_slow;
+static long sim_dir_fetch(const char *url, char *buf, size_t cap, const volatile int *abort)
+{
+    while (g_dir_slow && !(abort && *abort)) {
+        struct timespec t = {0, 20 * 1000 * 1000L};
+        nanosleep(&t, NULL);
+    }
+    if (g_dir_fail || g_dir_slow) return -1;
+    const char *name = strstr(url, "/json/countries") ? "countries"
+                     : strstr(url, "tag=jazz") && strstr(url, "order=random") ? "stations-jazz-random"
+                     : strstr(url, "tag=jazz") ? "stations-jazz"
+                     : strstr(url, "countrycode=GB") ? "stations-gb"
+                     : strstr(url, "name=") ? "stations-fip"
+                     : strstr(url, "/json/url/") ? NULL : "stations-popular";
+    if (!name) return 0;                              /* a play counted */
+    char path[256];
+    snprintf(path, sizeof path, "tests/fixtures/radiodir/%s.json", name);
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    size_t n = fread(buf, 1, cap - 1, f);
+    int more = fgetc(f) != EOF;
+    fclose(f);
+    buf[n] = '\0';
+    return more ? -2 : (long)n;
+}
 /* Settings > Network drive, as on an H2 serving over Wi-Fi */
 static int sim_share_state(ui_share_t *st)
 {
@@ -106,13 +145,25 @@ static void sim_language_set(const char *name)
     snprintf(path, sizeof path, "build/sim-data/lang/%s.txt", name ? name : "");
     lang_load(name && name[0] ? path : NULL);
 }
+/* Settings > About > Check for updates: a newer release on offer; the steps
+ * go by at a press (the simulator has no network) */
+static ui_update_t g_sim_upd = {.state = UI_UPD_IDLE, .current = "v0.7.0", .latest = "v0.8.0", .size = 16234567};
+static void sim_update_state(ui_update_t *st) { *st = g_sim_upd; }
+static void sim_update_do(int what)
+{
+    int next[] = {[UI_UPD_CHECK] = UI_UPD_AVAILABLE, [UI_UPD_START] = UI_UPD_READY,
+                  [UI_UPD_CANCEL] = UI_UPD_AVAILABLE, [UI_UPD_INSTALL] = UI_UPD_INSTALLING};
+    g_sim_upd.state = next[what];
+}
 static const ui_hooks_t g_hooks = {.fonts = ui_theme_fonts, .icon = ui_theme_icon, .radio_stations = sim_radio,
+                                   .radio_add = sim_radio_add, .radio_remove = sim_radio_remove,
                                    .share_state = sim_share_state, .share_do = sim_share_do,
                                    .ssh_state = sim_ssh_state, .ssh_do = sim_ssh_do,
                                    .sound_value = sim_sound_value, .sound_adjust = sim_sound_adjust,
                                    .pure_toggle = sim_pure_toggle, .signal_path = sim_signal_path,
                                    .transport_toggle = sim_transport_toggle, .battery_info = sim_battery_info,
-                                   .languages = sim_languages, .language_set = sim_language_set};
+                                   .languages = sim_languages, .language_set = sim_language_set,
+                                   .update_state = sim_update_state, .update_do = sim_update_do};
 
 static void cue_sample(void);
 
@@ -162,7 +213,11 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
     static const char *const screens[] = {"home", "albums", "tracks", "playlists", "playlist", "nowplaying", "themes",
                                           "quick", "context", "info", "queue", "glyphs", "search",
                                           "artists", "artist", "artistsongs", "albumartists", "homeedit",
-                                          "usbask", "usbdrive", "scrub", "sound", "radio", "radionp", "share", "ssh", "toast", "genres", "folders", "folder", "years", "homeend", "homeall", "signal", "purenp"};
+                                          "usbask", "usbdrive", "scrub", "sound", "radio", "radionp", "share", "ssh", "toast", "genres", "folders", "folder", "years", "homeend", "homeall", "signal", "purenp",
+                                          "rdir", "rdirgenres", "rdirresults", "rdirbusy", "rdircountries", "rdirsearch",
+                                          "rdirctx", "rdirerror", "rdirnp", "rdirnpmenu", "rdirrandom",
+                                          "about", "update", "updatelatest", "updatefailed", "updateprogress",
+                                          "updateready", "updateinstall"};
     static const char *const slug[] = {"studio-mint", "studio-ember", "studio-pastel", "pixel-pastel"};
     for (int t = 0; t < 4 && t < g_n_themes; t++) {   /* the built-in themes */
         ui_set_theme(t);
@@ -191,6 +246,21 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                     player_radio_set_info(g_player, "Some Artist", "A song on the radio", NULL);
                 }
                 ui_show("nowplaying");
+            } else if (!strcmp(screens[s], "rdirbusy") || !strcmp(screens[s], "rdirerror")) {   /* still asking; no answer */
+                g_dir_slow = !strcmp(screens[s], "rdirbusy");
+                g_dir_fail = !g_dir_slow;
+                ui_show(screens[s]);
+            } else if (!strncmp(screens[s], "rdirnp", 6) || !strcmp(screens[s], "rdirrandom")) {
+                /* with the keys: a station of the list played (and Menu on it), or Random station */
+                ui_show(strcmp(screens[s], "rdirrandom") ? "rdirresults" : "rdir");
+                ui_key(UI_KEY_OK);
+                for (int i = 0; i < 100 && !strcmp(screens[s], "rdirrandom"); i++) {   /* the answer comes in */
+                    struct timespec ts = {0, 5 * 1000 * 1000L};
+                    nanosleep(&ts, NULL);
+                    ui_tick();
+                }
+                if (!strcmp(screens[s], "rdirnpmenu")) ui_key(UI_KEY_MENU);
+                ui_set_theme(t);                            /* (the slide finished) */
             } else if (!strcmp(screens[s], "purenp")) {    /* Pure mode: the badge */
                 sim_pure_toggle();
                 ui_show("nowplaying");
@@ -198,13 +268,32 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 ui_show("nowplaying");
                 sample = ui_message_screen("USB drive",
                                            "Eject the H2 on your computer, or unplug the cable, to go back to your music.");
+            } else if (!strncmp(screens[s], "update", 6)) {   /* the update's screens, in each state */
+                static const struct { const char *name; ui_update_t u; } st[] = {
+                    {"update", {.state = UI_UPD_AVAILABLE}},
+                    {"updatelatest", {.state = UI_UPD_LATEST}},
+                    {"updatefailed", {.state = UI_UPD_FAILED, .message = "Not enough space on the card: 63 MB needed"}},
+                    {"updateprogress", {.state = UI_UPD_DOWNLOADING, .done = 6815744, .total = 16234567}},
+                    {"updateready", {.state = UI_UPD_READY}},
+                    {"updateinstall", {.state = UI_UPD_INSTALLING}},
+                };
+                for (size_t k = 0; k < sizeof st / sizeof st[0]; k++)
+                    if (!strcmp(st[k].name, screens[s])) {
+                        ui_update_t u = st[k].u;
+                        snprintf(u.current, sizeof u.current, "%s", g_sim_upd.current);
+                        snprintf(u.latest, sizeof u.latest, "%s", g_sim_upd.latest);
+                        u.size = g_sim_upd.size;
+                        g_sim_upd = u;
+                    }
+                ui_show("update");
             } else if (!strcmp(screens[s], "toast")) {    /* a long one: it wraps */
                 ui_show("ssh");
                 ui_toast("Over USB and Wi-Fi, with the password", 3000);
             } else {
                 ui_show(screens[s]);
             }
-            int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast");
+            int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast") ||
+                         (g_sim_upd.state >= UI_UPD_DOWNLOADING && g_sim_upd.state <= UI_UPD_RESTARTING);   /* (the update's progress screen) */
             lv_obj_t *what = on_top ? lv_layer_top() : lv_screen_active();
             lv_obj_update_layout(what);
             lv_draw_buf_t *img = lv_snapshot_take(what, LV_COLOR_FORMAT_RGB888);
@@ -214,8 +303,15 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
             if (write_bmp(path, img)) { fprintf(stderr, "cannot write %s\n", path); return 1; }
             lv_draw_buf_destroy(img);
             if (sample) lv_obj_delete(sample);
-            if (!strcmp(screens[s], "radionp")) cue_sample();   /* off the radio for the next theme */
+            if (!strcmp(screens[s], "radionp") || !strncmp(screens[s], "rdirnp", 6) || !strcmp(screens[s], "rdirrandom"))
+                cue_sample();   /* off the radio for the next theme */
             if (!strcmp(screens[s], "purenp")) sim_pure_toggle();   /* (off again) */
+            g_dir_fail = 0;
+            if (g_dir_slow) { g_dir_slow = 0; ui_show("home"); }   /* (the request dropped) */
+            if (g_sim_upd.state != UI_UPD_IDLE) {               /* (the progress screen goes) */
+                g_sim_upd.state = UI_UPD_IDLE;
+                ui_update_changed();
+            }
             if (!strcmp(screens[s], "toast"))      /* (gone before the next screens) */
                 for (uint32_t c = 0; c < lv_obj_get_child_count(lv_layer_top()); c++)
                     lv_obj_add_flag(lv_obj_get_child(lv_layer_top(), (int32_t)c), LV_OBJ_FLAG_HIDDEN);
@@ -570,6 +666,8 @@ int main(int argc, char **argv)
     if (!fonts) return 1;
     setup_player(music, shots || motion_dir || bench_s);
     if (bench_s) return bench(themes, fonts, bench_s);
+    rdir_set_fetch(sim_dir_fetch);
+    g_shots = shots != NULL;
     if (shots) return screenshots(shots, themes, fonts);
     if (motion_dir) return motion(motion_dir, themes, fonts, theme);
 

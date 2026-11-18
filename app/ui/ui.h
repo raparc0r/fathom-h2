@@ -52,7 +52,7 @@ typedef struct ui_fonts ui_fonts_t;
 
 /* Settings > Bluetooth: one device, as the platform knows it. */
 typedef struct { char addr[18]; char name[64]; int paired, connected; } ui_bt_dev_t;
-enum { UI_BT_TOGGLE, UI_BT_SCAN, UI_BT_PRESS, UI_BT_FORGET };
+enum { UI_BT_TOGGLE, UI_BT_SCAN, UI_BT_PRESS, UI_BT_FORGET, UI_BT_RANGE };
 /* Wi-Fi (Settings > Wi-Fi): the state, a network in range, what to do */
 typedef enum { UI_WIFI_OFF, UI_WIFI_ON, UI_WIFI_CONNECTING, UI_WIFI_CONNECTED } ui_wifi_state_t;
 typedef struct { int state; char ssid[33]; char ip[16]; int dbm; } ui_wifi_status_t;
@@ -67,6 +67,19 @@ enum { UI_SSH_OFF, UI_SSH_STARTING, UI_SSH_ON, UI_SSH_FAILED };
 typedef struct { int state; char usb_ip[16]; char wifi_ip[16]; char password[32]; } ui_ssh_t;
 enum { UI_SSH_TOGGLE, UI_SSH_NEW_PASSWORD };
 enum { UI_SOUND_BALANCE, UI_SOUND_LIMIT };
+/* Updates (Settings > About > Check for updates): only ever when asked.
+ * The state, the versions, the release's size and the work's progress
+ * (bytes done of total, while downloading, checking and unpacking). */
+enum { UI_UPD_IDLE, UI_UPD_CHECKING, UI_UPD_LATEST, UI_UPD_AVAILABLE, UI_UPD_DOWNLOADING, UI_UPD_VERIFYING,
+       UI_UPD_UNPACKING, UI_UPD_READY, UI_UPD_INSTALLING, UI_UPD_RESTARTING, UI_UPD_FAILED };
+typedef struct {
+    int state;
+    char current[48], latest[32];
+    int64_t size;
+    uint64_t done, total;
+    char message[96];       /* UI_UPD_FAILED: why */
+} ui_update_t;
+enum { UI_UPD_CHECK, UI_UPD_START, UI_UPD_CANCEL, UI_UPD_INSTALL };
 
 typedef struct {
     void (*brightness)(int level);        /* 1..UI_BRIGHTNESS_LEVELS: apply now */
@@ -113,8 +126,6 @@ typedef struct {
     int  (*eq_put)(const char *name, const eq_profile_t *p);
     void (*eq_preview)(const eq_profile_t *p);
     int  (*eq_remove)(const char *name);
-    /* Quick settings: the output's EQ off, or back on to the last one it had. */
-    void (*eq_toggle)(void);
     /* Library > Rescan: scan the music folder now (blocking, with its own progress screen). */
     void (*rescan)(void);
     /* USB drive mode: lend the card to the computer (the player exits for it). */
@@ -150,8 +161,20 @@ typedef struct {
      * played now, else why not (e.g. Wi-Fi is off), shown as it is. */
     int  (*radio_stations)(radio_station_t *out, int max);
     int  (*radio_ready)(char *why, size_t cap);
+    /* Find stations: add a station to fathom/radio.txt or remove one (by its
+     * stream), the file made from the example first if there's none yet
+     * (player/radio.h: radio_add, radio_remove; their results). NULL: no
+     * Add / Remove in the menus. */
+    int  (*radio_add)(const radio_station_t *st);
+    int  (*radio_remove)(const char *url);
     /* About: row i's label and value; returns -1 past the last row. */
     int  (*about)(int i, char *label, size_t lc, char *value, size_t vc);
+    /* About > Check for updates (NULL hides it). update_do: UI_UPD_CHECK (ask
+     * GitHub), UI_UPD_START (download, check and unpack the release offered),
+     * UI_UPD_CANCEL, UI_UPD_INSTALL (then the H2 restarts). The device says
+     * when the state changes with ui_update_changed(). */
+    void (*update_state)(ui_update_t *st);
+    void (*update_do)(int what);
 } ui_hooks_t;
 
 /* lib and player may be NULL (empty library, no playback). Settings
@@ -167,6 +190,7 @@ void ui_bt_changed(void);       /* Bluetooth state or devices changed: refresh i
 void ui_wifi_changed(void);     /* Wi-Fi state or networks changed: refresh its screens and the header */
 void ui_share_changed(void);    /* the network drive's state changed: refresh its screen */
 void ui_ssh_changed(void);      /* SSH's state changed: refresh its screen */
+void ui_update_changed(void);   /* the update's state or progress changed: refresh its screens */
 /* The library changed (a rescan): the open lists are read again, in place. */
 void ui_library_changed(void);
 /* Connected to a computer: ask what to be (USB drive, USB DAC, or keep playing). */
@@ -207,7 +231,10 @@ void ui_set_bt_link(int state);
 void ui_set_eq(const char *profile, const char *output);
 int  ui_theme_count(void);
 /* Jump to a named screen for screenshots: "home", "albums", "tracks", "playlists",
- * "playlist", "radio", "share", "ssh", "nowplaying", "themes", "quick", "context", "info". */
+ * "playlist", "radio", "share", "ssh", "nowplaying", "themes", "quick", "context", "info",
+ * "about", "update" (Settings > About > Check for updates, in the state update_state gives);
+ * Radio > Find stations: "rdir", "rdirgenres", "rdircountries", "rdirresults", "rdirsearch",
+ * "rdirctx", "rdirbusy" (still asking), "rdirerror" (when the directory can't be reached). */
 void ui_show(const char *what);
 
 #endif

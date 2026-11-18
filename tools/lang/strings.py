@@ -17,7 +17,7 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SOURCES = ['app/ui/ui.c', 'device/main.c', 'device/bt.c', 'device/wifi.c', 'device/share.c', 'device/ssh.c']
+SOURCES = ['app/ui/ui.c', 'app/net/radiodir.c', 'device/main.c', 'device/bt.c', 'device/wifi.c', 'device/share.c', 'device/ssh.c']
 LITERAL = re.compile(r'"((?:[^"\\\n]|\\.)*)"')
 
 

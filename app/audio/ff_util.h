@@ -26,5 +26,8 @@ int ff_to_s32(const AVFrame *f, int channels, int32_t *out);
  * included. NULL or a missing file: not checked (the simulator, a card without it). */
 void ff_set_ca_file(const char *path);
 void ff_tls_options(AVDictionary **opt);
+/* The bundle set, or NULL. (The player parses it once for all connections:
+ * app/net/tls_wrap.c.) */
+const char *ff_ca_file(void);
 
 #endif

@@ -42,7 +42,7 @@ endif()
 set(FATHOM_BOARD_SOURCES disp_drm.c audio_route.c)
 
 add_executable(fathom-player
-  main.c input.c uac_relay.c bt.c wifi.c share.c ssh.c tlscert.c radiometa.c out_router.c ff_trim.c ${ROOT}/app/audio/out_bt.c ${FATHOM_BOARD_SOURCES}
+  main.c input.c uac_relay.c bt.c wifi.c share.c ssh.c tlscert.c radiometa.c out_router.c ff_trim.c updater.c ${ROOT}/app/audio/out_bt.c ${FATHOM_BOARD_SOURCES}
   ${ROOT}/app/core/rng.c
   ${ROOT}/app/core/settings.c
   ${ROOT}/app/core/lang.c
@@ -60,6 +60,12 @@ add_executable(fathom-player
   ${ROOT}/app/audio/vorbis.c
   ${ROOT}/app/audio/streamlist.c
   ${ROOT}/app/audio/ff_util.c
+  ${ROOT}/app/net/http.c
+  ${ROOT}/app/net/json.c
+  ${ROOT}/app/net/radiodir.c
+  ${ROOT}/app/net/sha256.c
+  ${ROOT}/app/net/unzip.c
+  ${ROOT}/app/net/update.c
   ${ROOT}/app/audio/engine.c
   ${ROOT}/app/audio/loudness.c
   ${ROOT}/app/audio/btconv.c ${ROOT}/app/audio/eq.c
@@ -95,7 +101,15 @@ target_compile_definitions(fathom-player PRIVATE
 target_compile_options(fathom-player PRIVATE -Wall -Wextra -Wno-unused-parameter -ffunction-sections -fdata-sections)
 set_source_files_properties(${ROOT}/app/library/stb_impl.c PROPERTIES COMPILE_OPTIONS "-w")
 target_link_options(fathom-player PRIVATE -static -Wl,--gc-sections)
-target_link_libraries(fathom-player PRIVATE lvgl ${DEPS_STATIC_LDFLAGS} pthread m)
+# The certificate bundle parsed once for all of FFmpeg's HTTPS connections
+# (app/net/tls_wrap.c: FFmpeg's calls to mbedTLS are redirected to it)
+if(MBEDTLS_FOUND)
+  target_sources(fathom-player PRIVATE ${ROOT}/app/net/tls_wrap.c)
+  target_link_options(fathom-player PRIVATE
+    -Wl,--wrap=mbedtls_x509_crt_parse_file -Wl,--wrap=mbedtls_x509_crt_free)
+endif()
+# z: the updater's unzip (app/net/unzip.c), the zlib FFmpeg already links
+target_link_libraries(fathom-player PRIVATE lvgl ${DEPS_STATIC_LDFLAGS} z pthread m)
 install(TARGETS fathom-player RUNTIME DESTINATION bin)
 
 # Bit-perfect checks (tools/bitperfect): plays files through the player's engine
@@ -108,6 +122,8 @@ add_executable(fathom-bitperfect
   ${ROOT}/app/audio/vorbis.c
   ${ROOT}/app/audio/streamlist.c
   ${ROOT}/app/audio/ff_util.c
+  ${ROOT}/app/net/http.c
+  ${ROOT}/app/net/json.c
   ${ROOT}/app/audio/engine.c
   ${ROOT}/app/audio/eq.c
   ${ROOT}/app/audio/out_alsa.c

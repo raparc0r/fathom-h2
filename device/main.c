@@ -47,6 +47,7 @@
 #include "bt.h"
 #include "share.h"
 #include "ssh.h"
+#include "updater.h"
 #include "wifi.h"
 #include "radiometa.h"
 #include "out_router.h"
@@ -60,6 +61,7 @@
 #include "input.h"
 #include "library/library.h"
 #include "library/tags.h"
+#include "net/update.h"
 #include "audio/decoder.h"
 #include "audio/ff_util.h"
 #include "audio/eq.h"
@@ -619,6 +621,10 @@ static void usb_dac_poll(lv_timer_t *t)
 static void bt_ui_toggle_or_do(int what, const char *addr)
 {
     if (what == UI_BT_TOGGLE) settings_set_int("bluetooth.on", !bt_on());
+    if (what == UI_BT_RANGE) {                   /* fathom-bt reads it as it starts bluez-alsa */
+        settings_set_int("bluetooth.range", !settings_get_int("bluetooth.range", 0));
+        settings_save();
+    }
     bt_ui_do(what, addr);
 }
 
@@ -1017,30 +1023,9 @@ static void eq_poll(lv_timer_t *t)
 static int hook_eq_list(char names[][64], int max) { return eq_names(names, max); }
 static void hook_eq_set(const char *name)
 {
-    char key[64], label[64], last[80];
+    char key[64], label[64];
     eq_output(key, sizeof key, label, sizeof label);
     settings_set(key, name ? name : "");
-    snprintf(last, sizeof last, "%s.last", key);         /* what quick settings turns back on */
-    if (name && name[0]) settings_set(last, name);
-    eq_apply();
-}
-
-/* Quick settings: off, or back to the output's last EQ (to compare by ear). */
-static void hook_eq_toggle(void)
-{
-    char key[64], label[64], last[80], name[64];
-    eq_output(key, sizeof key, label, sizeof label);
-    snprintf(last, sizeof last, "%s.last", key);
-    snprintf(name, sizeof name, "%s", settings_get(key, ""));
-    if (name[0]) {
-        settings_set(last, name);
-        settings_set(key, "");
-    } else if (snprintf(name, sizeof name, "%s", settings_get(last, "")), name[0]) {
-        settings_set(key, name);
-    } else {
-        ui_toast("Choose an EQ first: Settings > Sound > EQ", 2500);
-        return;
-    }
     eq_apply();
 }
 
@@ -1188,6 +1173,40 @@ static void net_poll(lv_timer_t *t)
     }
 }
 
+/* ---- updates (Settings > About > Check for updates) ----
+ * Only when asked, never on their own (updater.c). */
+
+#define UPDATE_STAGE CARD_DIR "/fathom/update"
+
+static void hook_update_do(int what)
+{
+    if (what == UI_UPD_CHECK && !wifi_connected() && !getenv("http_proxy")) {
+        updater_refuse(!wifi_on() ? "Wi-Fi is off: Settings > Wi-Fi" : "Not connected yet: Settings > Wi-Fi");
+        return;
+    }
+    updater_do(what);
+}
+
+/* Installed: the new kernel needs a restart, as power-off does it (init's
+ * scripts stop the player, which closes the library). */
+static void update_poll(lv_timer_t *t)
+{
+    (void)t;
+    static unsigned seen;
+    unsigned s = updater_seq();
+    if (s != seen) { seen = s; ui_update_changed(); }
+    if (!updater_installed()) return;
+    fprintf(stderr, "update: installed, restarting\n");
+    g_powering_off = 1;                /* "Restarting" stays on the screen */
+    clock_save();
+    settings_save();
+    queue_save();
+    screen_set(1);
+    lv_refr_now(NULL);
+    sync();
+    if (system("/sbin/reboot") != 0) fprintf(stderr, "reboot failed\n");
+}
+
 /* ---- internet radio ---- */
 
 /* Home > Radio: the stations in fathom/radio.txt, or until there is one, the
@@ -1200,6 +1219,23 @@ static int hook_radio_stations(radio_station_t *out, int max)
     if (n >= 0) return n;
     snprintf(path, sizeof path, "%s/assets/radio.txt", g_data_dir);
     return radio_load(path, out, max);
+}
+
+/* Find stations: your list changed from the H2 (made from the example the first time). */
+static int hook_radio_add(const radio_station_t *st)
+{
+    char path[600], example[600];
+    snprintf(path, sizeof path, "%s/radio.txt", g_data_dir);
+    snprintf(example, sizeof example, "%s/assets/radio.txt", g_data_dir);
+    return radio_add(path, example, st);
+}
+
+static int hook_radio_remove(const char *url)
+{
+    char path[600], example[600];
+    snprintf(path, sizeof path, "%s/radio.txt", g_data_dir);
+    snprintf(example, sizeof example, "%s/assets/radio.txt", g_data_dir);
+    return radio_remove(path, example, url);
 }
 
 /* A station can play once Wi-Fi has an address (or, for testing over USB, a
@@ -1935,7 +1971,7 @@ static void idle_timer(lv_timer_t *t)
     player_now_t n = {0};
     if (g_player) player_now(g_player, &n);
     uint32_t now = ms_now();
-    if (minutes <= 0 || n.playing || usb_powered() || share_busy()) { idle_since = 0; return; }
+    if (minutes <= 0 || n.playing || usb_powered() || share_busy() || updater_busy()) { idle_since = 0; return; }
     uint32_t since = g_last_input > idle_since ? g_last_input : idle_since;
     if (!idle_since) { idle_since = now; return; }
     if (now - since >= (uint32_t)minutes * 60000) power_off("Idle: powering off");
@@ -1977,6 +2013,7 @@ static void polls(lv_timer_t *t)
     usb_poll(NULL);            /* the prompt soon after plugging in */
     bt_poll(NULL);
     wifi_poll(NULL);
+    update_poll(NULL);
     eq_poll(NULL);
     if (k % 2 == 0) {          /* 500 ms */
         usb_dac_poll(NULL);
@@ -2066,6 +2103,15 @@ int main(int argc, char **argv)
     char settings_path[600];
     snprintf(settings_path, sizeof settings_path, "%s/settings.ini", data);
     settings_load(settings_path);
+    /* An update's install cut short (power lost): finished before Wi-Fi and
+     * Bluetooth start from the card, then a restart into its kernel, so the kernel and
+     * its Wi-Fi modules are never from two releases. An unfinished download
+     * is removed. (Nothing here goes near the network.) */
+    if (update_resume(CARD_DIR, UPDATE_STAGE) == 1) {
+        sync();
+        if (system("/sbin/reboot") == 0) return 0;
+        fprintf(stderr, "reboot failed\n");
+    }
     clock_restore();
     /* HTTPS (radio): certificates checked against the bundle on the card */
     ff_set_ca_file("/mnt/sd/fathom/share/ca-certificates.crt");
@@ -2181,7 +2227,7 @@ int main(int argc, char **argv)
         .languages = hook_languages, .language_set = hook_language_set,
         .rescan = rescan, .usb_drive = usb_drive, .usb_dac = usb_dac_mode, .about = about,
         .eq_list = hook_eq_list, .eq_set = hook_eq_set, .eq_get = hook_eq_get, .eq_put = hook_eq_put,
-        .eq_preview = hook_eq_preview, .eq_remove = hook_eq_remove, .eq_toggle = hook_eq_toggle,
+        .eq_preview = hook_eq_preview, .eq_remove = hook_eq_remove,
     };
     if (bt_available() && out_is_alsa) {
         hooks.bt_state = bt_ui_state;
@@ -2194,6 +2240,9 @@ int main(int argc, char **argv)
         hooks.wifi_networks = wifi_ui_networks;
         hooks.wifi_do = wifi_ui_do;
         wifi_init(settings_get_int("wifi.on", 0));
+        updater_init(CARD_DIR, FATHOM_VERSION, settings_get("update.api", ""));   /* (a test server's) */
+        hooks.update_state = updater_ui_state;
+        hooks.update_do = hook_update_do;
         if (share_available()) {
             hooks.share_state = share_ui_state;
             hooks.share_do = hook_share_do;
@@ -2209,6 +2258,8 @@ int main(int argc, char **argv)
     if (player) {
         hooks.radio_stations = hook_radio_stations;
         hooks.radio_ready = hook_radio_ready;
+        hooks.radio_add = hook_radio_add;
+        hooks.radio_remove = hook_radio_remove;
     }
     g_lib = lib;
     g_music = music;

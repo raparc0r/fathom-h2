@@ -32,6 +32,12 @@ target_link_libraries(fathom_core PUBLIC m)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PLAYER_DEPS REQUIRED IMPORTED_TARGET sqlite3 flac libmpg123)
 add_library(fathom_player STATIC
+  app/net/http.c
+  app/net/json.c
+  app/net/radiodir.c
+  app/net/sha256.c
+  app/net/unzip.c
+  app/net/update.c
   app/library/tags.c
   app/library/cue.c
   app/library/library.c
@@ -52,7 +58,9 @@ add_library(fathom_player STATIC
   app/player/radio.c
   app/player/rfmeta.c)
 target_include_directories(fathom_player PUBLIC app third_party)
-target_link_libraries(fathom_player PUBLIC fathom_core PkgConfig::PLAYER_DEPS)
+# zlib: the updater's unzip (on the H2 it comes with FFmpeg's)
+find_package(ZLIB REQUIRED)
+target_link_libraries(fathom_player PUBLIC fathom_core PkgConfig::PLAYER_DEPS ZLIB::ZLIB)
 target_compile_options(fathom_player PRIVATE ${FATHOM_WARNINGS})
 set_source_files_properties(app/library/stb_impl.c PROPERTIES COMPILE_OPTIONS "-w")
 # Scaled JPEG decoding for cover art (always on the H2; on the desktop when available)
@@ -181,10 +189,33 @@ if((TREMOR_FOUND OR VORBISFILE_FOUND) AND VORBISENC_FOUND)
   target_compile_options(test_vorbis PRIVATE ${FATHOM_WARNINGS})
   add_test(NAME vorbis COMMAND test_vorbis)
 endif()
+add_executable(test_json tests/test_json.c)
+target_link_libraries(test_json PRIVATE fathom_player)
+target_compile_options(test_json PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME json COMMAND test_json)
+add_executable(test_radiodir tests/test_radiodir.c)
+target_link_libraries(test_radiodir PRIVATE fathom_player)
+target_compile_options(test_radiodir PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME radiodir COMMAND test_radiodir WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_executable(test_update tests/test_update.c)
+target_link_libraries(test_update PRIVATE fathom_player)
+target_compile_options(test_update PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME update COMMAND test_update WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_executable(test_lang tests/test_lang.c)
 target_link_libraries(test_lang PRIVATE fathom_core)
 target_compile_options(test_lang PRIVATE ${FATHOM_WARNINGS})
 add_test(NAME lang COMMAND test_lang)
+# The player's shared certificate bundle (app/net/tls_wrap.c): only where FFmpeg and mbedTLS
+# are installed and the linker has --wrap (GNU ld or lld on Linux, not macOS's ld)
+pkg_check_modules(MBEDTLS QUIET IMPORTED_TARGET mbedtls mbedx509 mbedcrypto)
+if(MBEDTLS_FOUND AND FFMPEG_FOUND AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(test_tls_wrap tests/test_tls_wrap.c app/net/tls_wrap.c app/audio/ff_util.c)
+  target_include_directories(test_tls_wrap PRIVATE app)
+  target_link_libraries(test_tls_wrap PRIVATE PkgConfig::FFMPEG PkgConfig::MBEDTLS pthread)
+  target_link_options(test_tls_wrap PRIVATE
+    -Wl,--wrap=mbedtls_x509_crt_parse_file -Wl,--wrap=mbedtls_x509_crt_free)
+  add_test(NAME tls_wrap COMMAND test_tls_wrap WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
 # The bootloader's copy of the Bluetooth and Wi-Fi firmware out of the stock system
 add_executable(test_fwcopy tests/test_fwcopy.c bootloader/fathom/fwcopy.c)
 target_include_directories(test_fwcopy PRIVATE bootloader/fathom)

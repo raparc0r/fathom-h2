@@ -209,3 +209,7 @@ CONFIG_LOG_BUF_SHIFT=16
 # CONFIG_CRYPTO_SHA3 is not set
 # CONFIG_CRYPTO_CTS is not set
 # CONFIG_CRYPTO_DEFLATE is not set
+# Page reclaim: the multi-generational LRU (CONFIG_LRU_GEN) was tried on
+# 2026-11-18 and left out: playback with network-drive downloads running,
+# with and without 1.5 MB less memory, gave no underruns and no measurable
+# difference in page faults either way, and it costs 16 KB.

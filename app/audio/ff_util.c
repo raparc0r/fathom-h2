@@ -123,3 +123,8 @@ void ff_tls_options(AVDictionary **opt)
     av_dict_set(opt, "ca_file", g_ca_file, 0);
     av_dict_set(opt, "tls_verify", "1", 0);
 }
+
+const char *ff_ca_file(void)
+{
+    return g_ca_file[0] ? g_ca_file : NULL;
+}

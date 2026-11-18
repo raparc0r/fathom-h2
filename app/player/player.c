@@ -635,6 +635,11 @@ const radio_station_t *player_radio_station(const player_t *p)
     return p->radio ? &p->rst[p->ri] : NULL;
 }
 
+const radio_station_t *player_radio_at(const player_t *p, int i)
+{
+    return p->radio && i >= 0 && i < p->rn ? &p->rst[i] : NULL;
+}
+
 void player_radio_set_info(player_t *p, const char *artist, const char *title, const char *art_url)
 {
     if (!p->radio) return;

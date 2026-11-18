@@ -104,6 +104,7 @@ int  player_restore(player_t *p, const char *path);
 void player_radio_play(player_t *p, const radio_station_t *st, int n, int i);
 int  player_radio(const player_t *p);
 const radio_station_t *player_radio_station(const player_t *p);   /* NULL off the radio */
+const radio_station_t *player_radio_at(const player_t *p, int i);  /* station i of those playing (NULL: none) */
 /* What's playing, from somewhere other than the stream (radio_station_t.info):
  * used over what the stream says until the station changes; NULL = clear.
  * art_url: its cover ("" or NULL = none). */

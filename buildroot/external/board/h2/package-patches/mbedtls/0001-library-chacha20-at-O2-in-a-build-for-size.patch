@@ -1,0 +1,24 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] library: ChaCha20 at -O2 in a build for size
+
+Fathom builds mbedTLS with -Os (external.mk). There GCC doesn't inline
+chacha20_quarter_round, and ChaCha20-Poly1305 runs at half the speed
+(measured: 251 against 561 MB/s on a computer); AES-GCM is as fast or faster.
+ChaCha20 alone at -O2 brings it back for a few hundred bytes. Its options come
+after CMAKE_C_FLAGS on the command line, so its -O2 wins.
+
+Upstream-Status: Inappropriate [Fathom's build choice]
+
+--- a/library/CMakeLists.txt
++++ b/library/CMakeLists.txt
+@@ -127,6 +127,10 @@
+     ssl_tls13_client.c
+     ssl_tls13_generic.c
+ )
++
++# ChaCha20 at -O2 in a build for size: at -Os its quarter round isn't inlined,
++# and ChaCha20-Poly1305 runs at half the speed
++set_source_files_properties(chacha20.c PROPERTIES COMPILE_OPTIONS -O2)
+
+ if(GEN_FILES)
+     find_package(Perl REQUIRED)

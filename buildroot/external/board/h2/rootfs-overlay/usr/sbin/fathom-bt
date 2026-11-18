@@ -19,6 +19,8 @@
 BT=/mnt/sd/fathom/bt
 STATE=/mnt/sd/fathom/bluetooth-pairings.tar
 RUN=/var/run/fathom-bt
+SETTINGS=/mnt/sd/fathom/settings.ini
+setting() { sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" $SETTINGS 2>/dev/null | tail -1 | tr -d '\r' | sed 's/[[:space:]]*$//'; }
 export LD_LIBRARY_PATH=$BT/usr/lib:$BT/lib
 export DBUS_SYSTEM_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket
 
@@ -72,12 +74,21 @@ start)
     # The threads that encode and send the audio run real-time (SCHED_FIFO
     # 10), so a busy network drive or SSH can't starve them (heard as gaps in
     # the headphones); they only ever work as fast as the music comes
+    # Settings > Bluetooth > Audio: "Longer range" (bluetooth.range = 1) sends
+    # less over the air, so the link has room to resend what's lost further
+    # away: SBC at medium quality, AAC at 128 kb/s, and no aptX (fixed at
+    # 352 kb/s). The chip already transmits at its maximum (12 dBm).
     ba=$(bluealsa)
     help=$($ba -h 2>&1)
-    codecs= rt=
-    echo "$help" | grep -q "a2dp-source:.*aptX" && codecs="-c aptX"
+    codecs= rt= range=
+    if [ "$(setting bluetooth.range)" = 1 ]; then
+        echo "$help" | grep -q -- "--sbc-quality" && range="--sbc-quality=medium"
+        echo "$help" | grep -q -- "--aac-bitrate" && range="$range --aac-bitrate=128000"
+    else
+        echo "$help" | grep -q "a2dp-source:.*aptX" && codecs="-c aptX"
+    fi
     echo "$help" | grep -q -- "--io-rt-priority" && rt="--io-rt-priority=10"
-    $ba -p a2dp-source $codecs $rt --a2dp-force-audio-cd --a2dp-volume >> /tmp/bluealsa.log 2>&1 &
+    $ba -p a2dp-source $codecs $rt $range --a2dp-force-audio-cd --a2dp-volume >> /tmp/bluealsa.log 2>&1 &
     echo $! > $RUN/bluealsa.pid
     ctl power on > /dev/null
     ctl pairable on > /dev/null              # bonding: pairings keep their keys

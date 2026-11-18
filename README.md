@@ -30,7 +30,10 @@ project, and if you haven't tried it, check it out: [rockbox.org](https://www.ro
   plus albums ripped as one file with a CUE sheet
 - The H2 as a transport for a USB DAC/amp, or as a USB DAC for your computer
 - Bluetooth headphones (SBC and aptX), with their buttons
-- Internet radio, and your music as a network drive over Wi-Fi (WebDAV over HTTPS)
+- Internet radio, with thousands of stations to find and search on the H2
+  ([radio-browser.info](https://www.radio-browser.info)), and your music as a network
+  drive over Wi-Fi (WebDAV over HTTPS)
+- Updates over Wi-Fi, when you ask for them
 - A parametric EQ: import AutoEQ profiles or make your own on the H2, saved per output,
   along with balance and a volume limit
 - A better shuffle: not just random songs, but one that feels random to a person (spread
@@ -79,7 +82,8 @@ The first time it starts, Fathom copies the Bluetooth and Wi-Fi firmware from th
 system into its own folder. Fathom can't distribute those files, but every H2 already has
 them.
 
-To update Fathom later, just copy the new `sd/` folder over the old files.
+To update Fathom later, go to Settings → About → Check for updates (from 0.8.0 on, with
+Wi-Fi), or copy the new `sd/` folder over the old files.
 
 ## Using it
 
@@ -99,6 +103,10 @@ Most of it should feel familiar. A few things worth knowing:
   one on the screen. On a Mac it's Finder → Go → Connect to Server. On Windows you need to
   install the certificate first (open the address in a browser and save it into "Trusted
   Root Certification Authorities"), then Map network drive.
+- Fathom doesn't contact anything on the internet by itself, except a time server when
+  Wi-Fi connects (the H2 has no clock that keeps running while it's off, and secure
+  connections need the date). Everything else happens only when you ask: radio, finding
+  stations, checking for updates.
 - SSH is off until you turn it on in Settings: `ssh root@10.42.0.1` over the USB cable, or
   the Wi-Fi address shown, with the password on the screen. Your music is in
   `/mnt/sd/Music`.
@@ -111,7 +119,8 @@ Fathom keeps its settings, library and cover cache in a `fathom` folder on the m
 card, and that's also where you put things to customise it:
 
 - `radio.txt` for your own radio stations, one per line as `Name = URL`. The URL can be the
-  stream itself or the station's `.m3u`, `.pls` or `.m3u8` link.
+  stream itself or the station's `.m3u`, `.pls` or `.m3u8` link. Stations you add from
+  Home → Radio → Find stations go here too.
 - `eq/` for EQ profiles. Get your headphones' `ParametricEQ.txt` from
   [AutoEQ](https://autoeq.app) (pick "Equalizer APO") and drop it in, then choose it in
   Settings → Sound → EQ.
