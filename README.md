@@ -32,7 +32,7 @@ project, and if you haven't tried it, check it out: [rockbox.org](https://www.ro
   H2. Each output remembers its own.
 - **A better shuffle.** It spreads songs across artists and albums, and plays what you
   haven't heard in a while first.
-- **Album covers and big, easy-to-read text**, with four themes, or your own.
+- **Themes**, use one of the four default themes or make your own.
 - **Lots of ways to browse**: artists, albums, genres, composers, years, folders,
   playlists, favourites, history and search.
 - **Volume levelling**, from ReplayGain tags, or measured on the H2 when tags are missing.
