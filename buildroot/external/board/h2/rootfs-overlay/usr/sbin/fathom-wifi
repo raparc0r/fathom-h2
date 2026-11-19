@@ -13,6 +13,7 @@
 #   fathom-wifi connect SSID [PASSWORD]   join (and save) a network; no password: open
 #   fathom-wifi forget SSID
 #   fathom-wifi ssid              the network joined now (for udhcpc's hook)
+#   fathom-wifi nvram             the board's chip settings, made (as on does)
 #
 # The programs and modules are in fathom/wifi (post-build.sh), the chip's firmware
 # in fathom/firmware/brcm (the user's own, from flash.img: extract-firmware.py
@@ -34,6 +35,22 @@ cli() { $W/usr/sbin/wpa_cli -p $CTRL -i wlan0 "$@" 2>/dev/null; }
 running() { [ -f $RUN/wpa.pid ] && kill -0 "$(cat $RUN/wpa.pid)" 2>/dev/null; }
 hex() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
 
+# The chip's settings: the stock file (from the H2's flash), and for this board
+# a copy with Cypress's Bluetooth coexistence parameters, as the Raspberry Pi
+# ships for the same chip; brcmfmac loads brcmfmac43430-sdio.<board>.txt in the
+# stock one's place. Without them a Wi-Fi scan takes the radio the chip shares
+# with Bluetooth for its whole length: a gap in the headphones every 5 s while
+# no saved network is in range. Made again whenever the stock file is newer.
+NV=${FW%.bin}.txt
+NVB=${FW%.bin}.hifiwalker,h2.txt
+nvram() {
+    [ -f $NV ] || return 0
+    grep -q '^btc_mode=' $NV && { rm -f "$NVB"; return 0; }   # (its own: as it is)
+    [ -f "$NVB" ] && [ ! $NV -nt "$NVB" ] && grep -q '^btc_mode=' "$NVB" && return 0
+    { cat $NV; printf '\n# Bluetooth coexistence (Cypress; fathom-wifi adds it)\nbtc_mode=1\nbtc_params8=0x4e20\nbtc_params1=0x7530\n'; } > "$NVB.new" &&
+        mv "$NVB.new" "$NVB" && sync
+}
+
 # Saved with every network enabled. Picking one makes wpa_supplicant disable all
 # the others, which is meant for now only: saved as it is, the H2 would never
 # rejoin them by itself (home, after a hotspot elsewhere).
@@ -47,6 +64,7 @@ case "$1" in
 on)
     running && { echo on; exit 0; }
     [ -f $FW ] || { say "no firmware at $FW (extract-firmware.py --wifi)"; exit 1; }
+    nvram
     # brcmfmac-wcc: the BCM43430's vendor code, which brcmfmac would ask modprobe
     # for (there's none): loaded first, it's found registered
     # cfg80211 keeps up to 1000 networks heard in scans, in memory the kernel
@@ -91,22 +109,33 @@ on)
     cli set ap_scan 1 > /dev/null
     # wpa_supplicant's own list of networks heard: 40, not 200 (saved ones are kept first)
     cli set bss_max_count 40 > /dev/null
-    # DHCP: tries in the background until a network is joined, renews after
-    udhcpc -i wlan0 -b -S -x hostname:fathom-h2 -p $RUN/udhcpc.pid > /dev/null 2>&1
+    # DHCP: tries in the background until a network is joined, renews after.
+    # It starts before wpa_supplicant has joined one (a few seconds), so its
+    # first tries go nowhere; then it would rest 20 s (-A 3: 3 s), and status
+    # asks it at once when the network is joined (an address took 30 s).
+    # In the background from the start: -b made its first three tries (10 s)
+    # before going there, and "on" waited for them. (From /: not holding the
+    # card, which USB drive mode lends to the computer.)
+    rm -f $RUN/asked
+    (cd / && exec udhcpc -f -i wlan0 -S -A 3 -x hostname:fathom-h2 -p $RUN/udhcpc.pid) < /dev/null > /dev/null 2>&1 &
     echo on
     ;;
 off)
     [ -f $RUN/udhcpc.pid ] && kill "$(cat $RUN/udhcpc.pid)" 2>/dev/null
+    # wpa_supplicant ended at once: asked to, it spends a second winding down
+    # with the chip, which is about to lose power (it writes the networks only
+    # when told to: nothing is lost). The interface goes down with the driver.
     if running; then
         pid=$(cat $RUN/wpa.pid)
-        cli terminate > /dev/null
-        sleep 0.5
-        kill "$pid" 2>/dev/null
+        kill -9 "$pid" 2>/dev/null
+        for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 0.02; done
     fi
     rm -f $RUN/*.pid $CTRL/wlan0
-    [ -e /sys/class/net/wlan0 ] && ifconfig wlan0 down 2>/dev/null
-    [ -e $MMC/$DEV ] && echo $DEV > $MMC/unbind
+    # The driver out first, while the chip still answers (0.6 s); then the chip
+    # unpowered. The other way round, brcmfmac detached from a chip already
+    # gone and waited 5 s for it, at every shutdown.
     for m in brcmfmac_wcc brcmfmac brcmutil cfg80211; do grep -q "^$m " /proc/modules && rmmod $m 2>/dev/null; done
+    [ -e $MMC/$DEV ] && echo $DEV > $MMC/unbind
     echo off
     ;;
 status)
@@ -130,11 +159,19 @@ status)
             logger -t fathom-wifi "joined another network: a new address"
             ip=
         fi
+        # Just joined, no address yet: DHCP asked now, once per joining
+        if [ -z "$ip" ] && [ ! -f $RUN/asked ] && [ -f $RUN/udhcpc.pid ]; then
+            kill -USR1 "$(cat $RUN/udhcpc.pid)" 2>/dev/null
+            touch $RUN/asked
+        fi
         uptime_s > $RUN/seen
-    elif cli list_networks | grep -q "\[DISABLED\]"; then
-        # The network picked can't be joined (out of range, wrong password): after
-        # a minute without a connection, any saved network will do again
-        [ $(( $(uptime_s) - $(cat $RUN/seen 2>/dev/null || echo 0) )) -ge 60 ] && cli enable_network all > /dev/null
+    else
+        rm -f $RUN/asked
+        if cli list_networks | grep -q "\[DISABLED\]"; then
+            # The network picked can't be joined (out of range, wrong password): after
+            # a minute without a connection, any saved network will do again
+            [ $(( $(uptime_s) - $(cat $RUN/seen 2>/dev/null || echo 0) )) -ge 60 ] && cli enable_network all > /dev/null
+        fi
     fi
     case "$state" in
     COMPLETED) [ -n "$ip" ] && s=connected || s=connecting ;;
@@ -194,8 +231,11 @@ forget)
 ssid)
     running && cli status | sed -n 's/^ssid=//p'
     ;;
+nvram)
+    nvram
+    ;;
 *)
-    echo "usage: fathom-wifi on|off|status|scan|saved|connect SSID [PASSWORD]|forget SSID|ssid" >&2
+    echo "usage: fathom-wifi on|off|status|scan|saved|connect SSID [PASSWORD]|forget SSID|ssid|nvram" >&2
     exit 2
     ;;
 esac

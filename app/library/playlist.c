@@ -162,7 +162,7 @@ int m3u_parse(const char *text, size_t len, const char *dir, const char *fallbac
 int m3u_read(const char *path, m3u_t *out)
 {
     memset(out, 0, sizeof *out);
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, "rbe");
     if (!f) return -1;
     char *buf = malloc(M3U_MAX_BYTES);
     size_t n = buf ? fread(buf, 1, M3U_MAX_BYTES, f) : 0;

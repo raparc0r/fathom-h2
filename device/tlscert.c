@@ -79,7 +79,7 @@ static int put(const char *path, const unsigned char *buf, size_t n)
 {
     char tmp[600];
     snprintf(tmp, sizeof tmp, "%s.new", path);
-    FILE *f = fopen(tmp, "wb");
+    FILE *f = fopen(tmp, "wbe");
     if (!f) return -1;
     int ok = fwrite(buf, 1, n, f) == n;
     ok = fflush(f) == 0 && ok;

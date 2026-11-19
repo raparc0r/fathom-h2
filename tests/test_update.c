@@ -280,6 +280,17 @@ static void test_versions(void)
     CHECK(update_is_newer("v0.8.0", "v0.8.0-rc1"));
     CHECK(update_is_newer("v0.8.0", "unknown"));
     CHECK(!update_is_newer("garbage", "v0.7.0"));
+
+    /* automatic checks: once a day, a failed try again after an hour */
+    long day = UPDATE_AUTO_EVERY, t = 1795000000;
+    CHECK(update_auto_due(t, 0, 0));                          /* never checked */
+    CHECK(!update_auto_due(t, t - 60, t - 60));               /* answered a minute ago */
+    CHECK(!update_auto_due(t, t - day + 60, t - day + 60));
+    CHECK(update_auto_due(t, t - day, t - day));
+    CHECK(!update_auto_due(t, t - 2 * day, t - 600));         /* failed 10 min ago */
+    CHECK(update_auto_due(t, t - 2 * day, t - UPDATE_AUTO_RETRY));
+    CHECK(update_auto_due(t, t + 3600, 0));                   /* the clock went back */
+    CHECK(update_auto_due(t, 0, t + 60));
 }
 
 static void test_release(void)
@@ -391,6 +402,8 @@ static void test_stage_and_install(void)
     CHECK(update_install(at("card"), stage) == UPDATE_OK);
     check_installed("new kernel");
     CHECK(is(at("card/uImage.prev"), "old kernel"));
+    CHECK(is(at("card/fathom/wifi/modules.prev/brcmfmac.ko"), "old module"));   /* with the old kernel */
+    CHECK(exists(at("card/fathom/boot-new")));                   /* for h2boot: a kernel to try */
     CHECK(update_resume(at("card"), stage) == 0);                /* nothing left to do */
 
     /* A second update: uImage.prev is the one before it */
@@ -399,6 +412,16 @@ static void test_stage_and_install(void)
     CHECK(update_stage(at("r.zip"), stage, NULL, NULL, NULL) == UPDATE_OK);
     CHECK(update_install(at("card"), stage) == UPDATE_OK);
     CHECK(is(at("card/uImage"), "newer kernel") && is(at("card/uImage.prev"), "new kernel"));
+    CHECK(is(at("card/fathom/wifi/modules.prev/brcmfmac.ko"), "new module"));
+    /* after a fallback (h2boot): the failed kernel and modules go at the next install */
+    put(at("card/uImage.failed"), "a kernel that didn't start");
+    mkdir(at("card/fathom/wifi/modules.failed"), 0755);
+    put(at("card/fathom/wifi/modules.failed/brcmfmac.ko"), "its module");
+    make_release(at("r.zip"), "fixed kernel", Z_GOOD);
+    mkdir(stage, 0755);
+    CHECK(update_stage(at("r.zip"), stage, NULL, NULL, NULL) == UPDATE_OK);
+    CHECK(update_install(at("card"), stage) == UPDATE_OK);
+    CHECK(!exists(at("card/uImage.failed")) && !exists(at("card/fathom/wifi/modules.failed")));
 }
 
 static void test_damaged(void)

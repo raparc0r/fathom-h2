@@ -36,6 +36,14 @@ int update_parse_version(const char *s, int v[3]);
  * that can't be read ("unknown") is older than any release. */
 int update_is_newer(const char *latest, const char *running);
 
+/* Automatic checks (Settings > About > Check automatically): 1 if one is due
+ * at `now`, the last answer (last_ok) a day old and the last try an hour old
+ * (a failed one isn't retried sooner). Seconds, as time() gives them; 0 for
+ * never. A clock set back since (NTP after a start without it) makes it due. */
+#define UPDATE_AUTO_EVERY (24 * 3600)
+#define UPDATE_AUTO_RETRY 3600
+int update_auto_due(long now, long last_ok, long last_try);
+
 typedef struct {
     char tag[32];           /* "v0.8.0" */
     char asset[128];        /* "fathom-h2-0.8.0.zip" */

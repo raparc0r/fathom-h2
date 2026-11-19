@@ -54,11 +54,13 @@ add_executable(fathom-player
   ${ROOT}/app/core/rng.c
   ${ROOT}/app/core/settings.c
   ${ROOT}/app/core/lang.c
+  ${ROOT}/app/core/batlog.c
   ${ROOT}/app/core/intern.c
   ${ROOT}/app/library/keys.c
   ${ROOT}/app/library/tags.c
   ${ROOT}/app/library/cue.c
   ${ROOT}/app/library/library.c
+  ${ROOT}/app/library/artdec.c
   ${ROOT}/app/library/fatwalk.c
   ${ROOT}/app/library/playlist.c
   ${ROOT}/app/library/stb_impl.c
@@ -171,6 +173,7 @@ add_executable(fathom-scan
   ${ROOT}/app/library/tags.c
   ${ROOT}/app/library/cue.c
   ${ROOT}/app/library/library.c
+  ${ROOT}/app/library/artdec.c
   ${ROOT}/app/library/fatwalk.c
   ${ROOT}/app/library/playlist.c
   ${ROOT}/app/library/stb_impl.c
@@ -182,7 +185,9 @@ add_executable(fathom-scan
   ${ROOT}/app/audio/ff_util.c
   ${ROOT}/app/audio/loudness.c)
 target_include_directories(fathom-scan PRIVATE ${ROOT}/app ${ROOT}/third_party ${DEPS_STATIC_INCLUDE_DIRS})
-target_compile_definitions(fathom-scan PRIVATE FATHOM_HAVE_FFMPEG FATHOM_HAVE_LIBJPEG FATHOM_HAVE_VORBIS FATHOM_VORBIS_TREMOR)
+# (the player's cover limits: what it measures is what the player does)
+target_compile_definitions(fathom-scan PRIVATE FATHOM_HAVE_FFMPEG FATHOM_HAVE_LIBJPEG FATHOM_HAVE_VORBIS FATHOM_VORBIS_TREMOR
+  FATHOM_ART_MAX_PIXELS=1200000LL FATHOM_JPEG_MAX_MEMORY=4194304L FATHOM_ART_MAX_FILE=4194304L)
 target_link_options(fathom-scan PRIVATE -static)
 target_link_libraries(fathom-scan PRIVATE ${DEPS_STATIC_LDFLAGS} pthread m)
 

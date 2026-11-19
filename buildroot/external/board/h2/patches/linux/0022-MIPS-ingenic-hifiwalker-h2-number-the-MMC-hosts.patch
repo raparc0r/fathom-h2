@@ -1,0 +1,26 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] MIPS: ingenic: hifiwalker-h2: number the MMC hosts
+
+With Wi-Fi on MSC1 there are two MMC hosts, and without aliases each takes
+the next free number as it probes: now and then the Wi-Fi host comes first,
+the microSD card becomes mmc1 (mmcblk1), and anything that looks for
+mmcblk0 misses it (the boot report waited 10 s and gave up). The card's
+slot is always mmc0 now, its card mmcblk0; Wi-Fi is mmc1.
+
+Upstream-Status: Pending
+
+--- a/arch/mips/boot/dts/ingenic/hifiwalker-h2.dts
++++ b/arch/mips/boot/dts/ingenic/hifiwalker-h2.dts
+@@ -18,6 +18,12 @@
+ / {
+ 	compatible = "hifiwalker,h2", "ingenic,x1000";
+ 	model = "HiFi Walker H2";
++
++	/* the microSD card always mmc0 (mmcblk0), Wi-Fi mmc1 */
++	aliases {
++		mmc0 = &msc0;
++		mmc1 = &msc1;
++	};
+ 
+ 	memory {
+ 		device_type = "memory";

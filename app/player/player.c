@@ -516,7 +516,7 @@ int player_save(player_t *p, const char *path)
     uint32_t at = st.state == ENG_STOPPED || p->radio ? p->resume_ms : st.pos_ms;
     char tmp[600];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    FILE *f = fopen(tmp, "w");
+    FILE *f = fopen(tmp, "we");
     if (!f) return -1;
     fprintf(f, "fathom-queue 1\nshuffle %d\nrepeat %d\npos %d\nuser_end %d\nposition_ms %u\nctx %d",
             p->shuffle, (int)p->repeat, p->pos, p->user_end, at, p->n);
@@ -532,7 +532,7 @@ int player_save(player_t *p, const char *path)
 
 int player_restore(player_t *p, const char *path)
 {
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(path, "re");
     if (!f) return -1;
     int version = 0, shuffle = 0, repeat = 0, pos = 0, user_end = 0, n = 0, no = 0;
     unsigned at = 0;

@@ -125,6 +125,15 @@ int main(void)
     CHECK(l.ids[0] == 2022 && l.ids[1] == 2019);
     CHECK(!strcmp(row(lib, &l, 1, meta), "2019") && !strcmp(meta, "2"));             /* First Light, Suites */
     CHECK(library_list(lib, LIB_YEAR_ALBUMS, 2019, &a) == 2);
+    /* (a year's albums show their artist, not the year again) */
+    CHECK(!strcmp(row(lib, &a, 0, meta), "First Light") && !strcmp(meta, "Ana Ruiz"));
+    CHECK(!strcmp(row(lib, &a, 1, meta), "Suites") && !strcmp(meta, "Some Ensemble"));
+    library_list_free(&a);
+    CHECK(library_list(lib, LIB_ALBUMS, 0, &a) > 0);   /* (so do all albums) */
+    int found = 0;
+    for (int i = 0; i < a.n; i++)
+        if (!strcmp(row(lib, &a, i, meta), "First Light")) found = !strcmp(meta, "Ana Ruiz");
+    CHECK(found);
     library_list_free(&a);
     library_list_free(&l);
 

@@ -34,6 +34,7 @@
 #define ROW_Y0     ((ROW_H - 38) / 2)   /* the playing-bars marker, centred in a row */
 #define ROW_MARGIN 6
 #define SLOTS      (ROWS + 2)   /* one spare row above and below for scrolling */
+#define ABOUT_MAX  16           /* Settings > About: the device's rows at most */
 #define STEP       4            /* stepped-corner notch and hard-shadow offset (Pixel Pastel) */
 #define SEGMENTS   24
 
@@ -74,7 +75,7 @@ static const uint32_t HOME_ICON[H_N] = {0xed46, 0xf000, 0xeb1c, 0xea90, 0xef2c, 
 #define ICON_W 22     /* the icon's column; the text starts after it */
 #define ICON_GAP 10
 #define BT_DEV_ROW 3   /* Settings > Bluetooth: on/off, Find headphones, Audio, then the devices */
-#define SWATCH_W 30   /* Settings > Theme: a little picture of each theme */
+#define SWATCH_W 30   /* Settings > Interface > Theme: a little picture of each theme */
 #define SWATCH_H 20
 
 /* Letters for the wheel: search (results last) and names (done last). */
@@ -85,19 +86,20 @@ static const char PASS_CHARS[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRST
                                  " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
 static const int PASS_GROUPS[] = {0, 26, 52, 62};   /* a, A, 0, symbols */
 static const char *const HISTORY[] = {"Recently played", "Most played"};
-static const char *const SETTINGS[] = {"Theme", "Home", "Display", "Sound", "Bluetooth", "Wi-Fi",
+static const char *const SETTINGS[] = {"Interface", "Home", "Display", "Sound", "Bluetooth", "Wi-Fi",
                                        "Network drive", "SSH", "USB connection", "Playback", "Power", "Library",
                                        "About"};
-enum { SET_THEME, SET_HOME, SET_DISPLAY, SET_SOUND, SET_BLUETOOTH, SET_WIFI, SET_SHARE, SET_SSH, SET_USB, SET_PLAYBACK,
+enum { SET_INTERFACE, SET_HOME, SET_DISPLAY, SET_SOUND, SET_BLUETOOTH, SET_WIFI, SET_SHARE, SET_SSH, SET_USB, SET_PLAYBACK,
        SET_POWER, SET_LIBRARY, SET_ABOUT };
 
 /* Rows of the quick settings panel and of Settings > Display. */
 typedef enum {
     ST_BRIGHTNESS, ST_SHUFFLE, ST_REPEAT, ST_SLEEP, ST_STOP_AFTER, ST_TIMEOUT,
-    ST_DIM, ST_ON_CHARGING, ST_OUTPUT, ST_EQ, ST_LEVELLING, ST_DAC_FILTER, ST_PAUSE_UNPLUG, ST_AUTO_OFF,
+    ST_DIM, ST_ON_CHARGING, ST_COVERS, ST_OUTPUT, ST_EQ, ST_LEVELLING, ST_DAC_FILTER, ST_PAUSE_UNPLUG, ST_AUTO_OFF,
     ST_RESCAN, ST_USB_DRIVE, ST_USB_COMPUTER, ST_USB_DAC, ST_N_SONGS, ST_N_ALBUMS, ST_N_ARTISTS, ST_N_PLAYLISTS,
     ST_BT, ST_BT_DEVICE, ST_WIFI, ST_WIFI_NET,
     ST_SHUF_BY, ST_SHUF_FRESH, ST_SHUF_INTERLUDES, ST_SHUF_WORKS, ST_SHUF_SPOKEN, ST_BALANCE, ST_VOL_LIMIT, ST_PURE, ST_TRANSPORT, ST_BATTERY, ST_LANGUAGE,
+    ST_THEME, ST_ALBUM_ARTISTS,
 } setting_t;
 /* Quick settings (quick_rows(): Bluetooth's and Wi-Fi's rows where they are) */
 static const setting_t QUICK[] = {ST_BRIGHTNESS, ST_SHUFFLE, ST_REPEAT, ST_EQ, ST_BT, ST_BT_DEVICE,
@@ -114,7 +116,8 @@ static const setting_t LIBRARY_ROWS[] = {ST_RESCAN, ST_N_SONGS, ST_N_ALBUMS, ST_
 static const setting_t USB_ROWS[] = {ST_USB_COMPUTER, ST_USB_DRIVE, ST_USB_DAC};
 static const int AUTO_OFFS[] = {5, 15, 30, 0};               /* minutes; 0 = never */
 static const int SLEEPS[] = {0, 15, 30, 45, 60, 90, PLAYER_SLEEP_END_ALBUM};   /* minutes; 0 = off */
-static const setting_t DISPLAY_ROWS[] = {ST_BRIGHTNESS, ST_TIMEOUT, ST_DIM, ST_ON_CHARGING, ST_LANGUAGE};
+static const setting_t DISPLAY_ROWS[] = {ST_BRIGHTNESS, ST_TIMEOUT, ST_DIM, ST_ON_CHARGING};
+static const setting_t INTERFACE_ROWS[] = {ST_THEME, ST_COVERS, ST_ALBUM_ARTISTS, ST_LANGUAGE};
 static const int TIMEOUTS[] = {15, 30, 60, 120, 300, 0};   /* seconds; 0 = never */
 
 /* Context menu actions. */
@@ -143,11 +146,11 @@ typedef enum {
     L_GENRES, L_GENRE_ALBUMS, L_COMPOSERS, L_COMPOSER_ALBUMS, L_COMPOSER_TRACKS, L_YEARS, L_YEAR_ALBUMS, L_FOLDER,
     L_TRACKS, L_SONGS, L_PLAYLISTS, L_PLAYLIST_TRACKS, L_HOME_EDIT,
     L_FAVOURITES, L_RECENT_ADDED, L_RECENT_PLAYED, L_MOST_PLAYED, L_HISTORY,
-    L_SETTINGS, L_THEMES, L_QUICK, L_DISPLAY, L_SOUND, L_EQ, L_EQ_EDIT, L_EQ_BAND, L_BLUETOOTH, L_WIFI, L_WIFI_PASS, L_SHARE, L_SSH, L_USB, L_PLAYBACK, L_POWER, L_LIBRARY, L_ABOUT, L_SIGNAL,
-    L_CONTEXT, L_INFO, L_QUEUE, L_PICK_PLAYLIST, L_SEARCH, L_RENAME, L_USB_ASK, L_RADIO,
+    L_SETTINGS, L_INTERFACE, L_THEMES, L_QUICK, L_DISPLAY, L_SOUND, L_EQ, L_EQ_EDIT, L_EQ_BAND, L_BLUETOOTH, L_WIFI, L_WIFI_PASS, L_SHARE, L_SSH, L_USB, L_PLAYBACK, L_POWER, L_LIBRARY, L_ABOUT, L_SIGNAL,
+    L_CONTEXT, L_INFO, L_QUEUE, L_PICK_PLAYLIST, L_SEARCH, L_RENAME, L_USB_ASK, L_WIFI_ASK, L_RADIO,
     /* Home > Radio > Find stations: its menu, genres, countries, a list of stations, search by name */
     L_RDIR, L_RDIR_GENRES, L_RDIR_COUNTRIES, L_RDIR_RESULTS, L_RDIR_SEARCH,
-    L_UPDATE, L_PLACEHOLDER
+    L_UPDATE, L_BATTERY, L_BAT_SPAN, L_BAT_HISTORY, L_PLACEHOLDER
 } list_kind_t;
 
 typedef struct {
@@ -240,10 +243,31 @@ static struct {
     lv_obj_t *scr, *header, *h_left, *h_right;
     lv_obj_t *list, *rows_box, *pill, *pill_notch[4], *pill_cursor;
     lv_obj_t *row[SLOTS], *row_lbl[SLOTS], *row_meta[SLOTS], *row_dot[SLOTS], *row_eq[SLOTS][3];
+    lv_obj_t *row_line[SLOTS], *row_lt[SLOTS], *row_la[SLOTS];   /* album rows: title and artist, one line */
     lv_obj_t *row_icon[SLOTS], *row_picon[SLOTS];   /* Home: an icon glyph, or a pixel icon */
     lv_obj_t *row_sw[SLOTS], *row_sw_part[SLOTS][3];  /* Theme: a little picture of each (bar, text, accent) */
+    lv_obj_t *row_cov[SLOTS];       /* Albums: each album's cover, the library's 34 px thumbnail */
+    lv_image_dsc_t cov_dsc[SLOTS];  /* (their pixels: g_cov, only while Albums is shown) */
+    int64_t cov_id[SLOTS];          /* the album each slot shows (-1: to be read) */
     lv_obj_t *row_wheel[SLOTS], *row_ch[SLOTS][3];   /* the typing row: letter before, the wheel's (larger), after */
     int slot_item[SLOTS], slot_playing[SLOTS];
+    /* album rows (line_layout): shown so, and how wide the title and the
+     * artist are in full */
+    int line_on[SLOTS], line_tw[SLOTS], line_aw[SLOTS];
+    /* Settings > About's rows from the device (about_look): read at most once
+     * a second, not for every count and row (the battery's are read from the
+     * PMIC: scrolling there lagged) */
+    int about_n, help_shown;
+    uint32_t about_at;
+    char about_lbl[ABOUT_MAX][32], about_val[ABOUT_MAX][48];
+    /* "Turn on Wi-Fi?" answered Turn on: what to do once it connects, if
+     * the screen it was asked from is still there (wifi_then_run) */
+    struct {
+        int what, armed, depth, sel, q_null;
+        list_kind_t kind;
+        uint32_t at;
+        rdir_query_t q;
+    } wifi_then;
     lv_obj_t *np_radio, *np_radio_px;   /* the radio's sign where a cover would be */
     lv_obj_t *np, *np_shadow, *np_art, *np_title, *np_artist, *np_album, *np_chip,
              *np_track, *np_fill, *np_seg[SEGMENTS], *np_t0, *np_t1, *np_img, *h_mode;
@@ -308,6 +332,13 @@ static struct {
      * one downloads, unpacks or installs (NULL: not shown) */
     ui_update_t upd;
     lv_obj_t *upd_ov, *upd_title, *upd_bar, *upd_detail, *upd_hint;
+    /* Settings > Power > Battery: the history as of bat_at (ms), its graph
+     * (over the list, which moves down below it: list_y0), the span shown */
+    batrep_t bat;
+    int bat_days, bat_span;   /* bat_span: -1 since full charge, else one of bat.span */
+    uint32_t bat_at;
+    lv_obj_t *bat_graph, *bat_lbl[9];
+    int list_y0;
 } S;
 
 enum { RD_JOB_NONE, RD_JOB_LIST, RD_JOB_RANDOM };
@@ -532,6 +563,17 @@ static void bt_look(void)
 }
 
 /* Settings > Wi-Fi: what the platform says now. */
+static void about_look(void)
+{
+    if (S.about_at && lv_tick_elaps(S.about_at) < 1000) return;
+    S.about_at = lv_tick_get() | 1;
+    S.about_n = 0;
+    while (S.hooks.about && S.about_n < ABOUT_MAX &&
+           S.hooks.about(S.about_n, S.about_lbl[S.about_n], sizeof S.about_lbl[0],
+                         S.about_val[S.about_n], sizeof S.about_val[0]) == 0)
+        S.about_n++;
+}
+
 static void wifi_look(void)
 {
     S.wifi_n = 0;
@@ -582,6 +624,7 @@ static int list_count(const level_t *l)
     case L_HOME: return S.home_n;
     case L_HOME_EDIT: return H_N;
     case L_USB_ASK: return 3;
+    case L_WIFI_ASK: return 2;
     case L_SETTINGS: return (int)(sizeof SETTINGS / sizeof SETTINGS[0]);
     case L_BLUETOOTH: bt_look(); return S.bt_on ? BT_DEV_ROW + S.bt_n : 1;
     case L_WIFI: wifi_look(); return S.wifi_on ? 3 + S.wifi_n : 1;   /* see wifi_row */
@@ -603,6 +646,7 @@ static int list_count(const level_t *l)
     case L_QUICK: bt_look(); wifi_look(); return quick_n();
     case L_USB: return (int)(sizeof USB_ROWS / sizeof USB_ROWS[0]);
     case L_DISPLAY: return (int)(sizeof DISPLAY_ROWS / sizeof DISPLAY_ROWS[0]);
+    case L_INTERFACE: return (int)(sizeof INTERFACE_ROWS / sizeof INTERFACE_ROWS[0]);
     case L_SOUND: {
         setting_t r[sizeof SOUND_ROWS / sizeof SOUND_ROWS[0]];
         return sound_rows(r);
@@ -616,13 +660,13 @@ static int list_count(const level_t *l)
         while (S.hooks.signal_path && n < 16 && S.hooks.signal_path(n, a, sizeof a, b, sizeof b) == 0) n++;
         return n;
     }
-    case L_ABOUT: {
-        int n = 0;
-        char a[8], b[8];
-        while (S.hooks.about && n < 32 && S.hooks.about(n, a, sizeof a, b, sizeof b) == 0) n++;
-        return n + (S.hooks.update_do != NULL) + 1;   /* + Check for updates, Reset settings */
-    }
+    case L_ABOUT:
+        about_look();
+        return S.about_n + 2 * (S.hooks.update_do != NULL) + 1;   /* + Check for updates and automatically, Reset settings */
     case L_UPDATE: update_look(); return S.upd.state == UI_UPD_AVAILABLE || S.upd.state == UI_UPD_FAILED ? 2 : 1;
+    case L_BATTERY: return 3;                      /* the graph's range, since full charge, history */
+    case L_BAT_SPAN: return 2 + BL_ACTS;            /* on battery, at this rate, each activity */
+    case L_BAT_HISTORY: return S.bat.nspans ? S.bat.nspans + 1 : 0;   /* + the average */
     case L_CONTEXT: return S.ctx_n;
     case L_INFO: return INFO_N;
     case L_QUEUE: return S.player ? player_queue_len(S.player) : 0;
@@ -712,6 +756,7 @@ static setting_t setting_at(const level_t *l, int i)
     case L_PLAYBACK: return PLAYBACK_ROWS[i];
     case L_POWER: return POWER_ROWS[i];
     case L_LIBRARY: return LIBRARY_ROWS[i];
+    case L_INTERFACE: return INTERFACE_ROWS[i];
     default: return DISPLAY_ROWS[i];
     }
 }
@@ -719,10 +764,14 @@ static setting_t setting_at(const level_t *l, int i)
 static int is_setting_level(list_kind_t k)
 {
     return k == L_QUICK || k == L_DISPLAY || k == L_SOUND || k == L_PLAYBACK || k == L_POWER || k == L_LIBRARY ||
-           k == L_USB;
+           k == L_USB || k == L_INTERFACE;
 }
 
 static const char *on_off(int v) { return v ? "On" : "Off"; }
+
+/* Settings > Interface > Artist names in Albums: each album's artist after its
+ * name (on), or its year on the right (off). */
+static int album_artists_on(void) { return settings_get_int("display.album_artists", 1) != 0; }
 
 /* ---------- the EQ editor ---------- */
 
@@ -809,6 +858,10 @@ static void eqe_adjust(const level_t *l, int d)
 }
 
 static void push(list_kind_t kind, const char *title, int64_t parent);
+static void about_look(void);
+enum { WT_NONE, WT_OK, WT_RDIR };   /* once Wi-Fi connects: nothing, OK again, ask the directory again */
+static int wifi_ask_if_off(int then);
+static void open_selected(void);
 
 /* Opens the editor on a profile; it plays while it's being edited. */
 static void eqe_open(const char *name)
@@ -875,6 +928,20 @@ static void setting_row(setting_t st, int editing, char *main, size_t mn, char *
         snprintf(main, mn, "Stay on while charging");
         snprintf(meta, tn, "%s", on_off(settings_get_int("display.on_charging", 0)));
         break;
+    case ST_THEME:
+        snprintf(main, mn, "Theme");
+        snprintf(meta, tn, "%.*s", (int)tn - 1, S.cur_theme < S.n_themes ? S.themes[S.cur_theme].name : "");
+        break;
+    case ST_ALBUM_ARTISTS:
+        snprintf(main, mn, "Artist names in Albums");
+        snprintf(meta, tn, "%s", on_off(album_artists_on()));
+        break;
+    case ST_COVERS: {
+        static const char *const W[] = {"Off", "Albums", "Songs", "Albums, songs"};
+        snprintf(main, mn, "Covers in lists");
+        snprintf(meta, tn, "%s", W[settings_get_int("display.covers", UI_COVERS_DEFAULT) & 3]);
+        break;
+    }
     case ST_OUTPUT:
         snprintf(main, mn, "Output");
         snprintf(meta, tn, "%.*s", (int)tn - 1, S.output[0] ? S.output : "-");   /* long names are cut */
@@ -940,7 +1007,7 @@ static void setting_row(setting_t st, int editing, char *main, size_t mn, char *
         break;
     case ST_SHUF_SPOKEN:
         snprintf(main, mn, "Leave out audiobooks");
-        snprintf(meta, tn, "%s", on_off(settings_get_int("shuffle.exclude_spoken", 0)));
+        snprintf(meta, tn, "%s", on_off(settings_get_int("shuffle.exclude_spoken", UI_EXCLUDE_SPOKEN_DEFAULT)));
         break;
     case ST_PAUSE_UNPLUG:
         snprintf(main, mn, "Pause on unplug");
@@ -1161,6 +1228,294 @@ static void update_row(int i, char *main, size_t mn, char *meta, size_t tn)
     }
 }
 
+
+/* ---------- battery history (Settings > Power > Battery) ---------- */
+
+static void style_label(lv_obj_t *l, const lv_font_t *font, uint32_t color);
+static void rows_box_place(void);
+
+#define BAT_GRAPH_H 90          /* the graph above the rows (three fit below it) */
+#define BAT_GX0 34              /* the plot: a column a pixel, 0-100 % between these */
+#define BAT_GY0 6
+#define BAT_GY1 64
+
+static const char *const BAT_ACTS[BL_ACTS] = {"Playing", "Screen on", "Paused"};   /* (playing and paused: the screen off) */
+
+static void fmt_dur(char *b, size_t n, int64_t secs)
+{
+    long m = (long)((secs + 30) / 60);
+    if (m < 60) snprintf(b, n, "%ld min", m);
+    else if (m % 60 == 0) snprintf(b, n, "%ld h", m / 60);
+    else snprintf(b, n, "%ld h %02ld min", m / 60, m % 60);
+}
+
+static void fmt_full(char *b, size_t n, int h10)
+{
+    if (h10 > 0) snprintf(b, n, "about %d h from full", (h10 + 5) / 10);
+    else snprintf(b, n, "\xe2\x80\x93");             /* (too little to say) */
+}
+
+/* A span's day: Today, Yesterday, 16 Nov (UTC, as About's clock); without a
+ * clock ever set, how many days back */
+static void bat_day(char *b, size_t n, int64_t t)
+{
+    int64_t now = S.bat.t1;
+    if (!S.bat.clock_ok) {
+        long d = (long)((now - t) / 86400);
+        if (d <= 0) snprintf(b, n, "Today");
+        else if (d == 1) snprintf(b, n, "Yesterday");
+        else snprintf(b, n, "%ld days ago", d);
+        return;
+    }
+    long dn = (long)(now / 86400), dt = (long)(t / 86400);
+    if (dt == dn) { snprintf(b, n, "Today"); return; }
+    if (dt == dn - 1) { snprintf(b, n, "Yesterday"); return; }
+    static const char *const MON[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    time_t tt = (time_t)t;
+    struct tm tm;
+    gmtime_r(&tt, &tm);
+    snprintf(b, n, "%d %s", tm.tm_mday, MON[tm.tm_mon]);
+}
+
+static const batspan_t *bat_cur(void)
+{
+    if (S.bat_span < 0) return S.bat.have_since ? &S.bat.since : NULL;
+    return S.bat_span < S.bat.nspans ? &S.bat.span[S.bat_span] : NULL;
+}
+
+/* The first of the metas (longest first, NULL-ended) that fits beside main
+ * in this theme's fonts (the pixel one is wide) */
+static void bat_meta(const char *main, char *meta, size_t tn, const char *const *alts)
+{
+    int room = UI_W - 2 * ROW_MARGIN - 2 * 12 - 16;
+    lv_point_t a, b;
+    lv_text_get_size(&a, tr(main), S.f->body, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    int i = 0;
+    for (; alts[i + 1]; i++) {
+        lv_text_get_size(&b, alts[i], S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        if (a.x + b.x <= room) break;
+    }
+    snprintf(meta, tn, "%s", alts[i]);
+}
+
+static void battery_row(list_kind_t k, int i, char *main, size_t mn, char *meta, size_t tn)
+{
+    char d[32], m1[64], m2[64], m3[64];
+    const char *dash = "\xe2\x80\x93";
+    if (k == L_BATTERY) {
+        if (i == 0) {
+            snprintf(main, mn, "%s", S.bat_days == 7 ? "Last 7 days" : "Last 24 hours");
+            snprintf(meta, tn, "%s", S.bat_days == 7 ? "OK: 24 hours" : "OK: 7 days");
+        } else if (i == 1) {
+            snprintf(main, mn, "Since full charge");
+            fmt_dur(d, sizeof d, S.bat.since.on_s);
+            snprintf(m1, sizeof m1, "%s, %d %%", d, S.bat.since.used);
+            snprintf(m2, sizeof m2, "%d %%", S.bat.since.used);
+            const char *alts[] = {m1, m2, NULL};
+            if (S.bat.have_since) bat_meta(main, meta, tn, alts);
+            else snprintf(meta, tn, "%s", dash);
+        } else {
+            snprintf(main, mn, "History");
+            if (S.bat.total_spans == 1) snprintf(meta, tn, "1 charge");
+            else if (S.bat.total_spans) snprintf(meta, tn, "%d charges", S.bat.total_spans);
+            else snprintf(meta, tn, "%s", dash);
+        }
+        return;
+    }
+    if (k == L_BAT_HISTORY) {
+        if (i < S.bat.nspans) {
+            const batspan_t *x = &S.bat.span[i];
+            bat_day(main, mn, x->start);
+            if (S.bat.clock_ok) {                  /* (two on one day: when each began) */
+                time_t tt = (time_t)x->start;
+                struct tm tm;
+                gmtime_r(&tt, &tm);
+                size_t l = strlen(main);
+                snprintf(main + l, mn - l, ", %02d:%02d", tm.tm_hour, tm.tm_min);
+            }
+            fmt_dur(d, sizeof d, x->on_s);
+            snprintf(m1, sizeof m1, "%d%s%d %%, %s", x->pct_start, dash, x->pct_end, d);
+            snprintf(m2, sizeof m2, "%d%s%d %%", x->pct_start, dash, x->pct_end);
+            const char *alts[] = {m1, m2, NULL};
+            bat_meta(main, meta, tn, alts);
+        } else {
+            snprintf(main, mn, "Average");
+            fmt_full(m1, sizeof m1, S.bat.avg_full_h10);
+            snprintf(m2, sizeof m2, "%d h", (S.bat.avg_full_h10 + 5) / 10);
+            const char *alts[] = {m1, m2, NULL};
+            if (S.bat.avg_full_h10 > 0) bat_meta(main, meta, tn, alts);
+            else snprintf(meta, tn, "%s", dash);
+        }
+        return;
+    }
+    const batspan_t *x = bat_cur();            /* L_BAT_SPAN */
+    if (!x) return;
+    if (i == 0) {
+        snprintf(main, mn, "On battery");
+        fmt_dur(d, sizeof d, x->on_s);
+        snprintf(m1, sizeof m1, "%s, %d %% used", d, x->used);
+        snprintf(m2, sizeof m2, "%s, %d %%", d, x->used);
+        snprintf(m3, sizeof m3, "%s", d);
+        const char *alts[] = {m1, m2, m3, NULL};
+        bat_meta(main, meta, tn, alts);
+    } else if (i == 1) {
+        snprintf(main, mn, "At this rate");
+        fmt_full(m1, sizeof m1, x->full_h10);
+        snprintf(m2, sizeof m2, "%d h from full", (x->full_h10 + 5) / 10);
+        snprintf(m3, sizeof m3, "%d h", (x->full_h10 + 5) / 10);
+        const char *alts[] = {m1, m2, m3, NULL};
+        if (x->full_h10 > 0) bat_meta(main, meta, tn, alts);
+        else snprintf(meta, tn, "%s", dash);
+    } else {
+        int a = i - 2;
+        snprintf(main, mn, "%s", BAT_ACTS[a]);
+        fmt_dur(d, sizeof d, x->act_s[a]);
+        snprintf(m1, sizeof m1, "%s, 1 %%/%d min", d, x->min_per_pct[a]);
+        snprintf(m2, sizeof m2, "1 %%/%d min", x->min_per_pct[a]);
+        const char *alts[] = {m1, m2, NULL};
+        if (!x->act_s[a]) snprintf(meta, tn, "%s", dash);
+        else if (x->min_per_pct[a]) bat_meta(main, meta, tn, alts);
+        else snprintf(meta, tn, "%s", d);
+    }
+}
+
+/* The graph's labels: 100, 50 and 0 down the side; the hours (or days) under
+ * it, and now */
+static void battery_labels(void)
+{
+    if (!S.bat_graph) return;
+    const theme_t *t = T();
+    for (int i = 0; i < 9; i++) {
+        style_label(S.bat_lbl[i], S.f->meta, t->text_muted);
+        show(S.bat_lbl[i], 0);
+    }
+    static const char *const Y[3] = {"100", "50", "0"};
+    for (int i = 0; i < 3; i++) {
+        set_text(S.bat_lbl[i], Y[i]);
+        lv_obj_set_style_text_align(S.bat_lbl[i], LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_width(S.bat_lbl[i], BAT_GX0 - 1);
+        lv_obj_set_pos(S.bat_lbl[i], 0, BAT_GY0 + i * (BAT_GY1 - BAT_GY0) / 2 - lv_font_get_line_height(S.f->meta) / 2);
+        show(S.bat_lbl[i], 1);
+    }
+    int64_t t0 = S.bat.t0, t1 = S.bat.t1, span = t1 - t0;
+    if (span <= 0) return;
+    lv_point_t nw;
+    lv_text_get_size(&nw, "now", S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    int n = 3, last_x = BAT_GX0 + BATREP_COLS - nw.x - 6;   /* ("now" at the right end) */
+    int lbl_y = BAT_GRAPH_H - lv_font_get_line_height(S.f->meta);   /* (the wider fonts are taller) */
+    if (lbl_y < BAT_GY1 + 4) lbl_y = BAT_GY1 + 4;   /* (below the charging strip) */
+    int64_t step = S.bat_days == 7 ? 86400 : 6 * 3600;
+    int64_t first = (t0 / step + 1) * step;
+    char b[16];
+    for (int64_t tt = first; tt < t1 && n < 8; tt += step) {
+        int x = BAT_GX0 + (int)((tt - t0) * BATREP_COLS / span);
+        lv_point_t sz;
+        lv_text_get_size(&sz, "00:00", S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        if (x + sz.x / 2 + 4 > last_x || x - sz.x / 2 < 2) continue;
+        if (S.bat.clock_ok && S.bat_days == 7) {
+            static const char *const WD[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+            time_t ttt = (time_t)tt;
+            struct tm tm;
+            gmtime_r(&ttt, &tm);
+            snprintf(b, sizeof b, "%s", WD[tm.tm_wday]);
+        } else if (S.bat.clock_ok) {
+            snprintf(b, sizeof b, "%02d:00", (int)((tt / 3600) % 24));
+        } else {
+            snprintf(b, sizeof b, "-%d %s", (int)((t1 - tt + step / 2) / (S.bat_days == 7 ? 86400 : 3600)),
+                     S.bat_days == 7 ? "d" : "h");
+        }
+        set_text(S.bat_lbl[n], b);
+        lv_obj_set_style_text_align(S.bat_lbl[n], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(S.bat_lbl[n], 64);
+        lv_obj_set_pos(S.bat_lbl[n], x - 32, lbl_y);
+        show(S.bat_lbl[n], 1);
+        n++;
+    }
+    set_text(S.bat_lbl[8], "now");
+    lv_obj_set_style_text_align(S.bat_lbl[8], LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_width(S.bat_lbl[8], 64);
+    lv_obj_set_pos(S.bat_lbl[8], BAT_GX0 + BATREP_COLS - 64, lbl_y);
+    show(S.bat_lbl[8], 1);
+}
+
+static void bat_rect(lv_layer_t *layer, lv_draw_rect_dsc_t *d, int x1, int y1, int x2, int y2)
+{
+    lv_area_t a = {x1, y1, x2, y2};
+    lv_draw_rect(layer, d, &a);
+}
+
+/* The graph, drawn whole: the charge a column a pixel (the theme's signal
+ * colour on battery, its muted one charging, with a strip under), filled
+ * faintly beneath; a dashed line where the H2 was off for a time not known */
+static void bat_graph_draw(lv_event_t *e)
+{
+    lv_layer_t *layer = lv_event_get_layer(e);
+    lv_area_t a;
+    lv_obj_get_coords(lv_event_get_target(e), &a);
+    const theme_t *t = T();
+    lv_draw_rect_dsc_t d;
+    lv_draw_rect_dsc_init(&d);
+    d.radius = 0;
+    d.bg_opa = LV_OPA_COVER;
+    int x0 = a.x1 + BAT_GX0, y0 = a.y1 + BAT_GY0, y1 = a.y1 + BAT_GY1;
+    d.bg_color = C(t->surface);
+    for (int g = 0; g < 3; g++) {
+        int y = y0 + g * (y1 - y0) / 2;
+        bat_rect(layer, &d, x0, y, x0 + BATREP_COLS - 1, y);
+    }
+    /* runs of columns at the same charge and state: one rectangle each */
+    for (int c = 0; c < BATREP_COLS;) {
+        int p = S.bat.pct[c], chg = S.bat.charging[c], e2 = c + 1;
+        while (e2 < BATREP_COLS && S.bat.pct[e2] == p && S.bat.charging[e2] == chg) e2++;
+        if (p >= 0) {
+            int y = y1 - p * (y1 - y0) / 100;
+            d.bg_color = C(chg ? t->text_muted : t->signal);
+            d.bg_opa = LV_OPA_40;
+            if (y + 2 <= y1) bat_rect(layer, &d, x0 + c, y + 2, x0 + e2 - 1, y1);
+            d.bg_opa = LV_OPA_COVER;
+            bat_rect(layer, &d, x0 + c, y, x0 + e2 - 1, y + 1);
+            if (chg) bat_rect(layer, &d, x0 + c, y1 + 2, x0 + e2 - 1, y1 + 3);
+        }
+        c = e2;
+    }
+    d.bg_color = C(t->text_muted);
+    d.bg_opa = LV_OPA_COVER;
+    for (int g = 0; g < S.bat.ngaps; g++)
+        for (int y = y0; y < y1; y += 4) bat_rect(layer, &d, x0 + S.bat.gap[g], y, x0 + S.bat.gap[g], y + 1);
+}
+
+/* The Battery screen's graph over the top of the list, which moves down below it */
+static void battery_place(list_kind_t k)
+{
+    int on = k == L_BATTERY && S.hooks.battery_report;
+    if (on && !S.bat_graph) {
+        S.bat_graph = box(S.list, 0, 0, UI_W, BAT_GRAPH_H);
+        lv_obj_add_event_cb(S.bat_graph, bat_graph_draw, LV_EVENT_DRAW_MAIN, NULL);
+        for (int i = 0; i < 9; i++) S.bat_lbl[i] = label(S.bat_graph);
+    }
+    if (S.bat_graph) {
+        show(S.bat_graph, on);
+        lv_obj_set_style_bg_color(S.bat_graph, C(T()->bg), 0);
+        lv_obj_set_style_bg_opa(S.bat_graph, LV_OPA_COVER, 0);
+        if (on) { lv_obj_move_foreground(S.bat_graph); battery_labels(); }
+    }
+    S.list_y0 = on ? BAT_GRAPH_H : 0;
+    rows_box_place();
+}
+
+static void battery_load(void)
+{
+    if (!S.bat_days) S.bat_days = 1;
+    memset(&S.bat, 0, sizeof S.bat);
+    S.bat.days = S.bat_days;
+    if (S.hooks.battery_report) S.hooks.battery_report(&S.bat, S.bat_days);
+    S.bat_at = lv_tick_get();
+    battery_labels();
+    if (S.bat_graph) lv_obj_invalidate(S.bat_graph);
+}
+
+static int covers_in(list_kind_t k);
+
 static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta, size_t tn, int *playing)
 {
     *playing = 0;
@@ -1168,6 +1523,8 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
     if (library_backed(l->kind)) {
         int64_t id = l->items.ids[i];
         if (S.lib) library_row(S.lib, view_of(l->kind), id, main, mn, meta, tn);
+        if (covers_in(l->kind) && !(album_artists_on() && library_row_shows_artist(view_of(l->kind))))
+            meta[0] = '\0';   /* (the cover takes the year's or length's place) */
         if (S.moving && l->kind == L_PLAYLIST_TRACKS && i == l->sel) snprintf(meta, tn, "Moving");
         if (S.now.active) {
             if (is_track_list(l->kind) || l->kind == L_FOLDER) *playing = id == S.now.track.id;
@@ -1182,6 +1539,9 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
         break;
     case L_USB_ASK:
         snprintf(main, mn, "%s", i == 0 ? "Use as a USB drive" : i == 1 ? "Use as a USB DAC" : "Keep playing");
+        break;
+    case L_WIFI_ASK:
+        snprintf(main, mn, "%s", i == 0 ? "Turn on Wi-Fi" : "Not now");
         break;
     case L_HOME_EDIT: {
         int h = S.home_order[i];
@@ -1335,15 +1695,26 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
         break;
     }
     case L_QUICK: case L_DISPLAY: case L_SOUND: case L_PLAYBACK: case L_POWER: case L_LIBRARY: case L_USB:
+    case L_INTERFACE:
         setting_row(setting_at(l, i), S.editing && i == l->sel, main, mn, meta, tn);
         break;
     case L_SIGNAL: if (S.hooks.signal_path) S.hooks.signal_path(i, main, mn, meta, tn); break;
     case L_ABOUT:
         if (i == list_count(l) - 1) snprintf(main, mn, "Reset all settings");
-        else if (S.hooks.update_do && i == list_count(l) - 2) snprintf(main, mn, "Check for updates");
-        else if (S.hooks.about) S.hooks.about(i, main, mn, meta, tn);
+        else if (S.hooks.update_do && i == list_count(l) - 2) {
+            snprintf(main, mn, "Check automatically");
+            snprintf(meta, tn, "%s", on_off(settings_get_int("update.auto", UI_UPDATE_AUTO_DEFAULT)));
+        } else if (S.hooks.update_do && i == list_count(l) - 3) {
+            const char *found = settings_get("update.found", "");   /* (the device's: newer than this one) */
+            snprintf(main, mn, "%s", found[0] ? "Update available" : "Check for updates");
+            snprintf(meta, tn, "%s", found);
+        } else if (i < S.about_n) {
+            snprintf(main, mn, "%s", S.about_lbl[i]);
+            snprintf(meta, tn, "%s", S.about_val[i]);
+        }
         break;
     case L_UPDATE: update_row(i, main, mn, meta, tn); break;
+    case L_BATTERY: case L_BAT_SPAN: case L_BAT_HISTORY: battery_row(l->kind, i, main, mn, meta, tn); break;
     case L_CONTEXT: snprintf(main, mn, "%s", CTX_LABEL[S.ctx[i]]); break;
     case L_INFO: info_row(l->parent, i, main, mn, meta, tn); break;
     case L_SEARCH:
@@ -1424,9 +1795,12 @@ static void style_label(lv_obj_t *l, const lv_font_t *font, uint32_t color)
     lv_obj_set_style_text_color(l, C(color), 0);
 }
 
+static void covers_reset(int forget);
+
 static void apply_theme(void)
 {
     const theme_t *t = T();
+    covers_reset(0);                       /* (the no-cover square takes the theme's colour) */
     S.f = &S.fonts[0];
     for (int i = 0; i < S.n_fonts; i++)
         if (!strcmp(S.fonts[i].family, t->font)) S.f = &S.fonts[i];
@@ -1460,6 +1834,16 @@ static void apply_theme(void)
         fill(S.row_dot[r], t->signal);
         style_label(S.row_lbl[r], S.f->body, t->text);
         style_label(S.row_meta[r], S.f->meta, t->text_muted);
+        style_label(S.row_lt[r], S.f->body, t->text);
+        style_label(S.row_la[r], S.f->meta, t->text_muted);
+        /* one line each (cut with "...", never wrapped), on one baseline */
+        int lt = lv_font_get_line_height(S.f->body), la = lv_font_get_line_height(S.f->meta);
+        int yt = (ROW_H - lt) / 2, base = yt + lt - S.f->body->base_line;
+        lv_obj_set_height(S.row_lt[r], lt);
+        lv_obj_set_height(S.row_la[r], la);
+        lv_obj_set_y(S.row_lt[r], yt);
+        lv_obj_set_y(S.row_la[r], base - (la - S.f->meta->base_line));
+        S.line_on[r] = 0;          /* (laid out again with the new fonts) */
         style_label(S.row_icon[r], S.f->icon ? S.f->icon : S.f->body, t->text_muted);
         for (int w = 0; w < 3; w++) style_label(S.row_ch[r][w], w == 1 ? S.f->title : S.f->meta, t->text_muted);
     }
@@ -1512,6 +1896,8 @@ static void color_slots(int sel_slot)
         int sel = j == sel_slot;
         set_text_color(S.row_lbl[j], C(sel ? t->select_fg : t->text));
         set_text_color(S.row_meta[j], C(sel ? t->select_fg : t->text_muted));
+        set_text_color(S.row_lt[j], C(sel ? t->select_fg : t->text));
+        set_text_color(S.row_la[j], C(sel ? t->select_fg : t->text_muted));
         set_text_color(S.row_icon[j], C(sel ? t->select_fg : t->text_muted));
         lv_color_t ic = C(sel ? t->select_fg : t->text_muted);
         if (!lv_color_eq(lv_obj_get_style_image_recolor(S.row_picon[j], 0), ic))
@@ -1536,13 +1922,13 @@ static int slot_under_pill(void)
     return floor_div(S.pill_y - S.rows_off + ROW_PITCH / 2, ROW_PITCH) + 1;
 }
 
-static void rows_box_place(void) { lv_obj_set_y(S.rows_box, -ROW_PITCH + S.rows_off); }
+static void rows_box_place(void) { lv_obj_set_y(S.rows_box, S.list_y0 - ROW_PITCH + S.rows_off); }
 
 static void anim_pill(void *var, int32_t v)
 {
     (void)var;
     S.pill_y = quantize(v, S.pill_target);
-    lv_obj_set_y(S.pill, S.pill_y);
+    lv_obj_set_y(S.pill, S.list_y0 + S.pill_y);
     color_slots(slot_under_pill());
 }
 
@@ -1765,13 +2151,165 @@ static int ui_text_list(list_kind_t k)
 {
     switch (k) {
     case L_HOME: case L_HOME_EDIT: case L_HISTORY: case L_SETTINGS: case L_QUICK: case L_DISPLAY: case L_SOUND:
+    case L_INTERFACE: case L_WIFI_ASK:
     case L_EQ_EDIT: case L_EQ_BAND: case L_SHARE: case L_SSH: case L_USB: case L_PLAYBACK: case L_POWER:
     case L_LIBRARY: case L_ABOUT: case L_SIGNAL: case L_CONTEXT: case L_INFO: case L_USB_ASK: case L_UPDATE:
-    case L_RDIR: case L_RDIR_GENRES:
+    case L_RDIR: case L_RDIR_GENRES: case L_BATTERY: case L_BAT_SPAN:
         return 1;
     default:
         return 0;
     }
+}
+
+/* Settings > Interface > Covers in lists (display.covers: 1 Albums, the default; 2 Songs):
+ * each album's cover before it, or each song's album's, in place of the year
+ * or the length */
+static int covers_in(list_kind_t k)
+{
+    int v = settings_get_int("display.covers", UI_COVERS_DEFAULT);
+    return (k == L_ALBUMS && (v & 1)) || (k == L_SONGS && (v & 2));
+}
+
+/* Albums' covers: the last COV_CACHE read, so scrolling a row reads one, not a
+ * screenful (2.3 KB each from the card's art cache, no decoding), and each
+ * visible row's pixels. Taken when Albums is drawn, given back when it goes
+ * or the screen turns off: about 45 KB, and nothing elsewhere. */
+#define COV_CACHE 12
+static struct covers {
+    struct cov { int64_t id; uint32_t used; int ok; uint16_t px[LIB_ART_SMALL * LIB_ART_SMALL]; } cache[COV_CACHE];
+    uint16_t slot[SLOTS][LIB_ART_SMALL * LIB_ART_SMALL];
+    uint32_t tick;
+} *g_cov;
+
+static int covers_take(void)
+{
+    if (g_cov) return 1;
+    if (!(g_cov = calloc(1, sizeof *g_cov))) return 0;
+    for (int j = 0; j < SLOTS; j++) {
+        S.cov_dsc[j].data = (const uint8_t *)g_cov->slot[j];
+        S.cov_dsc[j].data_size = sizeof g_cov->slot[j];
+        S.cov_id[j] = -1;
+    }
+    return 1;
+}
+
+static void covers_free(void)
+{
+    if (!g_cov) return;
+    for (int j = 0; j < SLOTS; j++) {
+        show(S.row_cov[j], 0);
+        lv_image_cache_drop(&S.cov_dsc[j]);
+        S.cov_dsc[j].data = NULL;
+        S.cov_id[j] = -1;
+    }
+    free(g_cov);
+    g_cov = NULL;
+    memset(&S.fill_sig, 0, sizeof S.fill_sig);   /* (the rows filled again when they're shown) */
+}
+
+static const uint16_t *cover_px(int64_t id)
+{
+    struct cov *e = &g_cov->cache[0];
+    for (int k = 0; k < COV_CACHE; k++) {
+        struct cov *c = &g_cov->cache[k];
+        if (c->used && c->id == id) { c->used = ++g_cov->tick; return c->ok ? c->px : NULL; }
+        if (c->used < e->used) e = c;              /* (the least recently used, or an empty one) */
+    }
+    e->id = id;
+    e->used = ++g_cov->tick;
+    e->ok = library_art(S.lib, id, LIB_ART_SMALL, e->px) == 0;
+    return e->ok ? e->px : NULL;
+}
+
+/* (the theme changed, or the library: each row's cover drawn again; a new
+ * library's covers read again) */
+static void covers_reset(int forget)
+{
+    for (int j = 0; j < SLOTS; j++) S.cov_id[j] = -1;
+    if (forget && g_cov) for (int k = 0; k < COV_CACHE; k++) g_cov->cache[k].used = 0;
+}
+
+/* ---------- album rows: title and artist on one line ----------
+ * The title, then the album artist in the smaller muted font, on one
+ * baseline, in a box that cuts them at the row's end ("..." on whichever
+ * is cut; an artist with no room left goes). On the selected row, once the
+ * marquee starts, the two scroll together as one line, as a long title does. */
+
+#define MARQUEE_REST_MS 2000   /* the rest at each end of a scroll (LVGL's own: 0.3 s) */
+#define LINE_GAP 8   /* between the title and the artist */
+
+static int line_width(int j) { return lv_obj_get_style_width(S.row_line[j], 0); }
+
+static void set_width_if(lv_obj_t *o, int w)
+{
+    if (lv_obj_get_style_width(o, 0) != w) lv_obj_set_width(o, w);
+}
+
+static void set_x_if(lv_obj_t *o, int x)
+{
+    if (lv_obj_get_style_x(o, 0) != x) lv_obj_set_x(o, x);
+}
+
+/* Both at rest: as much as fits, from the start. */
+static void line_layout(int j)
+{
+    int bw = line_width(j), tw = S.line_tw[j], aw = S.line_aw[j];
+    int min_a = lv_font_get_line_height(S.f->meta) * 2;   /* less room than this: no artist */
+    set_x_if(S.row_lt[j], 0);
+    if (tw + LINE_GAP + aw <= bw) {                          /* both in full */
+        set_width_if(S.row_lt[j], tw);
+        set_width_if(S.row_la[j], aw);
+        show(S.row_la[j], aw > 0);
+    } else if (tw + LINE_GAP + min_a > bw) {                 /* the title alone, cut */
+        set_width_if(S.row_lt[j], tw < bw ? tw : bw);
+        show(S.row_la[j], 0);
+    } else {                                                 /* the title, the artist cut */
+        set_width_if(S.row_lt[j], tw);
+        set_width_if(S.row_la[j], bw - tw - LINE_GAP);
+        show(S.row_la[j], 1);
+    }
+    set_x_if(S.row_la[j], tw + LINE_GAP);
+}
+
+static void line_scroll_cb(void *var, int32_t v)
+{
+    int j = (int)(intptr_t)lv_obj_get_user_data(var);
+    lv_obj_set_x(S.row_lt[j], -v);
+    lv_obj_set_x(S.row_la[j], S.line_tw[j] + LINE_GAP - v);
+}
+
+/* The selected row's line scrolls (on) or rests (off). */
+static void line_scroll(int j, int on)
+{
+    int bw = line_width(j), all = S.line_tw[j] + LINE_GAP + S.line_aw[j];
+    int running = lv_anim_get(S.row_line[j], line_scroll_cb) != NULL;
+    if (on && S.line_aw[j] > 0 && all > bw) {
+        if (running) return;
+        set_width_if(S.row_lt[j], S.line_tw[j]);    /* in full: the box cuts them */
+        set_width_if(S.row_la[j], S.line_aw[j]);
+        show(S.row_la[j], 1);
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, S.row_line[j]);
+        lv_anim_set_exec_cb(&a, line_scroll_cb);
+        lv_anim_set_values(&a, 0, all - bw);
+        lv_anim_set_duration(&a, lv_anim_speed_clamped(40, 300, 10000));   /* (a label's own speed) */
+        lv_anim_set_playback_duration(&a, a.duration);
+        lv_anim_set_playback_delay(&a, MARQUEE_REST_MS);
+        lv_anim_set_repeat_delay(&a, MARQUEE_REST_MS);
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_start(&a);
+        return;
+    }
+    if (running) lv_anim_delete(S.row_line[j], line_scroll_cb);
+    line_layout(j);
+}
+
+/* The copy set_text() keeps: whether a label already says s. */
+static int text_is(lv_obj_t *l, const char *s)
+{
+    const char *had = lv_obj_get_user_data(l);
+    return had && !strcmp(had, s);
 }
 
 static void fill_slots(const level_t *l, int n)
@@ -1783,7 +2321,7 @@ static void fill_slots(const level_t *l, int n)
         S.slot_playing[j] = 0;
         show(S.row[j], visible);
         if (!visible) continue;
-        char main[256], meta[24];
+        char main[256], meta[128];
         int playing;
         list_item(l, i, main, sizeof main, meta, sizeof meta, &playing);
         S.slot_playing[j] = playing;
@@ -1797,6 +2335,28 @@ static void fill_slots(const level_t *l, int n)
 
         int x = S.text_x0;
         int eq = playing && T()->playing_equalizer;
+
+        /* Albums: the cover first, in a straight column; the playing marker after it */
+        int cover = covers_in(l->kind) && S.lib && covers_take();   /* the album's cover (none: a plain square) */
+        show(S.row_cov[j], cover);
+        if (cover) {
+            int64_t id = l->kind == L_ALBUMS ? l->items.ids[i] : library_track_album(S.lib, l->items.ids[i]);
+            if (S.cov_id[j] != id) {
+                const uint16_t *px = cover_px(id);
+                uint16_t *to = g_cov->slot[j];
+                if (px) memcpy(to, px, sizeof g_cov->slot[j]);
+                else {
+                    uint16_t c = (uint16_t)theme_rgb565(T()->surface);
+                    for (size_t k = 0; k < sizeof g_cov->slot[j] / 2; k++) to[k] = c;
+                }
+                S.cov_id[j] = id;
+                lv_image_cache_drop(&S.cov_dsc[j]);
+                lv_image_set_src(S.row_cov[j], &S.cov_dsc[j]);
+                lv_obj_invalidate(S.row_cov[j]);
+            }
+            if (lv_obj_get_style_x(S.row_cov[j], 0) != x) lv_obj_set_x(S.row_cov[j], x);
+            x += LIB_ART_SMALL + ICON_GAP;
+        }
 
         /* Home (and Settings > Home): an icon before each item; on Now playing,
          * while music plays, the equalizer (or dot) takes its place, centred in
@@ -1859,11 +2419,35 @@ static void fill_slots(const level_t *l, int n)
             meta[0] = '\0';
         }
         int meta_w = 70;                           /* room for the meta: a wide one ("MP3 320" in a pixel font) gets more */
+        lv_point_t sz = {0, 0};
         if (meta[0] && !typing) {
-            lv_point_t sz;
             lv_text_get_size(&sz, meta, S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
             if (sz.x + 18 > meta_w) meta_w = sz.x + 18;
         }
+        int line = !typing && library_backed(l->kind) && library_row_shows_artist(view_of(l->kind)) &&
+                   album_artists_on();
+        S.line_on[j] = line;
+        show(S.row_line[j], line);
+        show(S.row_lbl[j], !line);
+        show(S.row_meta[j], !line);
+        if (line) {   /* an album: its title and artist on one line */
+            int same = text_is(S.row_lt[j], main) && text_is(S.row_la[j], meta) &&
+                       lv_obj_get_style_x(S.row_line[j], 0) == x;
+            if (!same || !lv_anim_get(S.row_line[j], line_scroll_cb)) {   /* (a scrolling one left to scroll) */
+                lv_point_t tz, az = {0, 0};
+                lv_text_get_size(&tz, main, S.f->body, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+                if (meta[0]) lv_text_get_size(&az, meta, S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+                S.line_tw[j] = tz.x;
+                S.line_aw[j] = az.x;
+                set_pos_width(S.row_line[j], x, 0, UI_W - 2 * ROW_MARGIN - x - 10);
+                set_text(S.row_lt[j], main);
+                set_text(S.row_la[j], meta);
+                lv_anim_delete(S.row_line[j], line_scroll_cb);
+                line_layout(j);
+            }
+            continue;
+        }
+        lv_anim_delete(S.row_line[j], line_scroll_cb);   /* (one that scrolled, now hidden) */
         set_pos_width(S.row_lbl[j], x, 0, UI_W - 2 * ROW_MARGIN - x - (typing ? WHEEL_W + 10 : meta[0] ? meta_w : 10));
         set_text(S.row_lbl[j], main);
         set_text(S.row_meta[j], meta);
@@ -1918,6 +2502,7 @@ static void render_list(render_mode_t mode)
                         : l->kind == L_PLAYLIST_TRACKS ? "None of these songs are on the card"
                         : l->kind == L_FAVOURITES ? "No favourites yet: Menu on a song"
                         : l->kind == L_RECENT_PLAYED || l->kind == L_MOST_PLAYED ? "Nothing played yet"
+                        : l->kind == L_BAT_HISTORY ? "No time on battery yet"
                         : l->kind == L_RDIR_RESULTS || l->kind == L_RDIR_COUNTRIES
                             ? (S.rd_job == RD_JOB_LIST ? "Searching\xE2\x80\xA6" : S.rd_state == RD_FAILED ? S.rd_msg
                                : l->kind == L_RDIR_COUNTRIES ? "No countries found" : "No stations found")
@@ -1931,7 +2516,9 @@ static void render_list(render_mode_t mode)
         stop_list_anims();
         S.pill_y = S.pill_target = target;
         S.rows_off = 0;
-        lv_obj_set_y(S.pill, target);
+        battery_place(l->kind);
+        if (!covers_in(l->kind)) covers_free();     /* (a list without covers: their memory back) */
+        lv_obj_set_y(S.pill, S.list_y0 + target);
         rows_box_place();
         color_slots(l->sel - l->top + 1);
         if (mode == R_ANIMATE && new_level)
@@ -1940,10 +2527,13 @@ static void render_list(render_mode_t mode)
         /* The list scrolled: the pill stays put and the rows slide under it. */
         lv_anim_delete(S.pill, anim_pill);
         S.pill_y = S.pill_target = target;
-        lv_obj_set_y(S.pill, target);
+        lv_obj_set_y(S.pill, S.list_y0 + target);
+        /* At most one row away: there's one spare row above and below (SLOTS),
+         * and from further the edge row had nothing behind it, empty for a
+         * moment while scrolling fast */
         int from = S.rows_off + top_delta * ROW_PITCH;
-        if (from > 2 * ROW_PITCH) from = 2 * ROW_PITCH;
-        if (from < -2 * ROW_PITCH) from = -2 * ROW_PITCH;
+        if (from > ROW_PITCH) from = ROW_PITCH;
+        if (from < -ROW_PITCH) from = -ROW_PITCH;
         lv_anim_delete(S.rows_box, anim_rows);
         S.rows_off = from;
         rows_box_place();
@@ -2462,7 +3052,9 @@ static void update_ok(int sel)
     int st = S.upd.state;
     if (st == UI_UPD_AVAILABLE && sel == 0) S.hooks.update_do(UI_UPD_START);
     else if (st == UI_UPD_FAILED && sel == 0) ui_toast(S.upd.message, 3000);   /* (whole, if the row cuts it) */
-    else if (st == UI_UPD_IDLE || st == UI_UPD_LATEST || st == UI_UPD_FAILED) S.hooks.update_do(UI_UPD_CHECK);
+    else if (st == UI_UPD_IDLE || st == UI_UPD_LATEST || st == UI_UPD_FAILED) {
+        if (!wifi_ask_if_off(WT_OK)) S.hooks.update_do(UI_UPD_CHECK);
+    }
     ui_update_changed();
 }
 
@@ -2488,7 +3080,7 @@ void ui_set_radio_art(const uint16_t *px)
     if (S.now_playing_view && S.now.radio) render(R_CONTENT);
 }
 
-void ui_toast(const char *text, int ms)
+static void toast_show(const char *text, int ms, const lv_font_t *font)
 {
     text = tr(text);
     if (!S.toast) {
@@ -2503,13 +3095,13 @@ void ui_toast(const char *text, int ms)
     lv_obj_set_style_radius(S.toast, t->radius, 0);
     lv_obj_set_style_border_color(S.toast, C(t->signal), 0);
     lv_obj_set_style_border_width(S.toast, 2, 0);
-    lv_obj_set_style_text_font(S.toast_lbl, S.f->body, 0);
+    lv_obj_set_style_text_font(S.toast_lbl, font, 0);
     lv_obj_set_style_text_color(S.toast_lbl, C(t->text), 0);
     /* One line when it fits the screen (with its margins), else wrapped and
      * centred on as many lines as it takes. */
     int32_t maxw = lv_obj_get_width(lv_layer_top()) - 2 * 12 - 2 * 14;
     lv_point_t sz;
-    lv_text_get_size(&sz, text, S.f->body, lv_obj_get_style_text_letter_space(S.toast_lbl, 0), 0, LV_COORD_MAX,
+    lv_text_get_size(&sz, text, font, lv_obj_get_style_text_letter_space(S.toast_lbl, 0), 0, LV_COORD_MAX,
                      LV_TEXT_FLAG_NONE);
     lv_label_set_long_mode(S.toast_lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(S.toast_lbl, LV_TEXT_ALIGN_CENTER, 0);
@@ -2523,6 +3115,138 @@ void ui_toast(const char *text, int ms)
         lv_timer_set_repeat_count(S.toast_timer, 1);
     }
     if (S.toast_timer) lv_timer_set_period(S.toast_timer, (uint32_t)ms);
+    S.help_shown = 0;
+}
+
+void ui_toast(const char *text, int ms) { toast_show(text, ms, S.f->body); }
+
+/* ---------- Menu in Settings: what the row is for ----------
+ * Two or three lines in the artist line's font, over the list, until the next key (or
+ * a while: longer texts stay longer). Rows where Menu does something else
+ * (Home's Move, forgetting a device or a network) have none. */
+
+static const char *setting_help(setting_t st)
+{
+    switch (st) {
+    case ST_THEME: return "Pick how Fathom looks. More themes can go in fathom/themes.";
+    case ST_COVERS: return "Show album covers when browsing Albums/Songs.";
+    case ST_ALBUM_ARTISTS: return "Display artist name when browsing albums.";
+    case ST_BRIGHTNESS: return "How bright the screen is. <OK>, then turn the wheel.";
+    case ST_TIMEOUT: return "How long the screen stays on. Saves battery.";
+    case ST_DIM: return "Dims the screen 5 seconds before it turns off.";
+    case ST_ON_CHARGING: return "Keeps the screen on while the H2 is plugged in.";
+    case ST_LANGUAGE: return "Interface language. More in fathom/lang.";
+    case ST_OUTPUT: return "Where the sound goes. <OK> shows each step in the path.";
+    case ST_PURE: return "Skips EQ, balance and levelling, for bit-perfect sound.";
+    case ST_EQ: return "Shape the sound with an equaliser. Each output keeps its own.";
+    case ST_BALANCE: return "Left/right balance. <OK>, then turn the wheel.";
+    case ST_VOL_LIMIT: return "Caps the volume, to protect your ears. Per output.";
+    case ST_LEVELLING: return "Plays songs at the same loudness, or albums as mastered.";
+    case ST_TRANSPORT: return "With a USB DAC: Bluetooth and screen off for the cleanest sound.";
+    case ST_USB_DAC: return "Use the H2 as an external USB DAC.";
+    case ST_DAC_FILTER: return "The DAC chip's filter, for headphones and line out. To taste.";
+    case ST_SHUFFLE: return "Shuffle current playlist.";
+    case ST_SHUF_BY: return "Shuffle songs or shuffle albums.";
+    case ST_SHUF_FRESH: return "Songs you haven't heard in a while come up sooner.";
+    case ST_SHUF_INTERLUDES: return "Leaves short intros, skits and interludes out of shuffle.";
+    case ST_SHUF_WORKS: return "Keeps a work's parts together and in order, like a symphony's movements.";
+    case ST_SHUF_SPOKEN: return "Leaves out tracks whose genre is audiobook, podcast or spoken.";
+    case ST_REPEAT: return "Repeat all, or one song.";
+    case ST_PAUSE_UNPLUG: return "Pauses when wired headphones are unplugged.";
+    case ST_BATTERY: return "Charge and time left. <OK> shows the battery history.";
+    case ST_AUTO_OFF: return "Turns the H2 off when it's not in use.";
+    case ST_SLEEP: return "Stops the music after a set time or at the end of the album.";
+    case ST_RESCAN: return "Force a library rescan.";
+    case ST_N_SONGS: case ST_N_ALBUMS: case ST_N_ARTISTS: case ST_N_PLAYLISTS: return "Library counts.";
+    case ST_USB_COMPUTER: return "What to do when plugged into a computer.";
+    case ST_USB_DRIVE: return "Use the H2 as a USB drive, to copy music.";
+    default: return NULL;
+    }
+}
+
+static const char *page_help(int set)
+{
+    static const char *const H[] = {
+        [SET_INTERFACE] = "Themes, list settings and languages.",
+        [SET_HOME] = "Show, hide and move the items on the Home screen.",
+        [SET_DISPLAY] = "Screen brightness and time-outs.",
+        [SET_SOUND] = "Output, EQ, balance, volume and levelling.",
+        [SET_BLUETOOTH] = "Pair and connect Bluetooth headphones and speakers.",
+        [SET_WIFI] = "Join and manage Wi-Fi networks.",
+        [SET_SHARE] = "Copy music to the H2 from a computer, over Wi-Fi.",
+        [SET_SSH] = "Connect to the H2 through SSH.",
+        [SET_USB] = "What the H2 does when you plug it into a computer.",
+        [SET_PLAYBACK] = "Shuffle options, repeat and pause on unplug.",
+        [SET_POWER] = "Battery, sleep timer and auto power off.",
+        [SET_LIBRARY] = "Rescan library and library stats.",
+        [SET_ABOUT] = "Device info and firmware updates.",
+    };
+    return set >= 0 && set < (int)(sizeof H / sizeof H[0]) ? H[set] : NULL;
+}
+
+static const char *row_help(const level_t *l)
+{
+    int i = l->sel, n = list_count(l), w;
+    switch (l->kind) {
+    case L_SETTINGS: return page_help(i);
+    case L_BLUETOOTH:
+        if (!S.hooks.bt_state) return NULL;
+        return i == 0 ? "Turns Bluetooth on or off. Off saves battery."
+             : i == 1 ? "Search for available Bluetooth devices."
+             : i == 2 ? "Optimize sound quality vs Bluetooth range." : NULL;
+    case L_WIFI:
+        switch (wifi_row(i, &w)) {
+        case WR_TOGGLE: return "Turns Wi-Fi on or off. Off saves battery.";
+        case WR_LINK: return "The network you're on. <OK> shows its address and signal.";
+        case WR_SEARCH: return "Refresh the list of networks.";
+        default: return NULL;
+        }
+    case L_SHARE:
+        if (!S.hooks.share_state) return NULL;
+        if (i == 0) return "Turns the network drive on or off.";
+        if (S.share.state != UI_SHARE_ON) return NULL;
+        return i == 1 ? "The name to type on your computer to connect."
+             : i == 2 ? "Use this IP if you can't connect with the hostname."
+             : i == 3 || i == 4 ? "Username and password for the network drive."
+             : i == 5 ? "Check it matches when your computer warns about the connection."
+             : "Generate a new password.";
+    case L_SSH:
+        if (!S.hooks.ssh_state) return NULL;
+        if (i == 0) return "Turns SSH on or off.";
+        if (S.ssh.state != UI_SSH_ON) return NULL;
+        return i == 1 || i == 2 ? "The address to connect to, over USB or Wi-Fi."
+             : i == 3 || i == 4 ? "Username and password for SSH."
+             : "Generate a new password.";
+    case L_ABOUT:
+        if (i == n - 1) return "Reset all settings to defaults. Press <OK> twice.";
+        if (S.hooks.update_do && i == n - 2) return "Check for updates once a day over Wi-Fi.";
+        if (S.hooks.update_do && i == n - 3) return "Check for a newer version of Fathom.";
+        if (i < S.about_n && !strcmp(S.about_lbl[i], "Clock")) return "Set from the internet over Wi-Fi. In UTC.";
+        if (i < S.about_n && !strcmp(S.about_lbl[i], "Charge cycles")) return "Battery wear, in full charges used.";
+        return NULL;
+    default:
+        return is_setting_level(l->kind) && l->kind != L_QUICK && i < n ? setting_help(setting_at(l, i)) : NULL;
+    }
+}
+
+/* Menu on a Settings row: its help, if it has one (1). */
+static int show_help(const level_t *l)
+{
+    const char *h = S.now_playing_view ? NULL : row_help(l);
+    if (!h) return 0;
+    int ms = 2000 + 45 * (int)strlen(h);
+    toast_show(h, ms > 7000 ? 7000 : ms, S.f->sub);   /* (between the rows and the meta: three lines at most) */
+    S.help_shown = 1;
+    return 1;
+}
+
+/* Any key puts a help away (and then does what it does). */
+static void help_hide(void)
+{
+    if (!S.help_shown) return;
+    S.help_shown = 0;
+    if (S.toast_timer) lv_timer_delete(S.toast_timer);
+    toast_hide(NULL);
 }
 
 /* ---------- level bar: a labelled bar over everything (brightness) ---------- */
@@ -2714,7 +3438,15 @@ static void rd_ask(const rdir_query_t *q)
 {
     rd_stop();
     S.rd_state = RD_IDLE;
-    if (!rd_ready(S.rd_msg, sizeof S.rd_msg)) { S.rd_state = RD_FAILED; return; }
+    if (!rd_ready(S.rd_msg, sizeof S.rd_msg)) {
+        S.rd_state = RD_FAILED;
+        if (wifi_ask_if_off(WT_RDIR)) {
+            snprintf(S.rd_msg, sizeof S.rd_msg, "%s", tr("Wi-Fi is off"));
+            S.wifi_then.q_null = !q;
+            if (q) S.wifi_then.q = *q;
+        }
+        return;
+    }
     if (rdir_start(q)) {
         S.rd_state = RD_FAILED;
         snprintf(S.rd_msg, sizeof S.rd_msg, "%s", RD_UNREACHABLE);
@@ -2743,7 +3475,7 @@ static void rd_play(const radio_station_t *st, const rdir_meta_t *meta, int n, i
 {
     char why[96];
     if (!S.player || !st || i < 0 || i >= n) return;
-    if (!rd_ready(why, sizeof why)) { ui_toast(why, 2500); return; }
+    if (!rd_ready(why, sizeof why)) { if (!wifi_ask_if_off(WT_OK)) ui_toast(why, 2500); return; }
     if (rd_on_air(&st[i])) { S.now_playing_view = 1; return; }
     player_radio_play(S.player, st, n, i);
     if (meta) rdir_count_click(meta[i].uuid);
@@ -2756,7 +3488,7 @@ static void rd_random(const rdir_query_t *q)
 {
     char why[96];
     if (!S.player) return;
-    if (!rd_ready(why, sizeof why)) { ui_toast(why, 2500); return; }
+    if (!rd_ready(why, sizeof why)) { if (!wifi_ask_if_off(WT_OK)) ui_toast(why, 2500); return; }
     if (S.rd_job == RD_JOB_RANDOM) return;            /* already looking */
     rdir_query_t r = *q;
     r.random = 1;
@@ -2876,6 +3608,39 @@ static void push_from_here(list_kind_t kind, const char *title, int64_t parent)
     S.now_playing_view = 0;
     push(kind, title, parent);
     S.stack[S.depth - 1].back_to_np = from_np;
+}
+
+/* Something that needs Wi-Fi, with Wi-Fi off: ask to turn it on (1), and
+ * once it has connected do `then` (WT_*) where it was asked. On, but not
+ * connected yet (or no Wi-Fi at all), the caller says why as before (0). */
+static int wifi_ask_if_off(int then)
+{
+    if (!S.hooks.wifi_state || !S.hooks.wifi_do) return 0;
+    char busy[32];
+    ui_wifi_status_t st;
+    if (S.hooks.wifi_state(busy, sizeof busy, &st) || busy[0]) return 0;
+    if (S.stack[S.depth - 1].kind == L_WIFI_ASK) return 1;
+    S.wifi_then.what = then;
+    S.wifi_then.armed = 0;
+    push_from_here(L_WIFI_ASK, "Turn on Wi-Fi?", 0);
+    return 1;
+}
+
+/* Wi-Fi connected (or gave up): what "Turn on Wi-Fi" was for. */
+static void wifi_then_run(int connected)
+{
+    if (!S.wifi_then.armed) return;
+    S.wifi_then.armed = 0;
+    level_t *l = &S.stack[S.depth - 1];
+    if (!connected) {
+        if (S.depth == S.wifi_then.depth && l->kind == S.wifi_then.kind)
+            ui_toast("Couldn't connect: Settings > Wi-Fi", 2500);
+        return;
+    }
+    if (S.now_playing_view || S.depth != S.wifi_then.depth || l->kind != S.wifi_then.kind) return;   /* moved on */
+    if (S.wifi_then.what == WT_RDIR) rd_ask(S.wifi_then.q_null ? NULL : &S.wifi_then.q);
+    else if (S.wifi_then.what == WT_OK && l->sel == S.wifi_then.sel) open_selected();
+    render(R_ANIMATE);
 }
 
 void ui_usb_prompt(void)
@@ -3225,7 +3990,7 @@ static void shuffle_prefs_apply(void)
         .albums = settings_get_int("shuffle.albums", 0),
         .freshness = settings_get_int("shuffle.freshness", 1),
         .skip_interludes = settings_get_int("shuffle.skip_interludes", 1),
-        .exclude_spoken = settings_get_int("shuffle.exclude_spoken", 0),
+        .exclude_spoken = settings_get_int("shuffle.exclude_spoken", UI_EXCLUDE_SPOKEN_DEFAULT),
         .keep_works = settings_get_int("shuffle.keep_works", 0),
     };
     player_set_shuffle_prefs(S.player, &sp);
@@ -3234,6 +3999,11 @@ static void shuffle_prefs_apply(void)
 static void setting_ok(setting_t st)
 {
     switch (st) {
+    case ST_BATTERY:                       /* its history */
+        if (!S.hooks.battery_report) break;
+        battery_load();
+        push(L_BATTERY, "Battery", 0);
+        break;
     case ST_BRIGHTNESS: S.editing = !S.editing; break;
     case ST_PURE: if (S.hooks.pure_toggle) S.hooks.pure_toggle(); break;
     case ST_LANGUAGE: {                    /* English, then the card's translations, round */
@@ -3267,6 +4037,12 @@ static void setting_ok(setting_t st)
     case ST_STOP_AFTER: if (S.player) player_set_stop_after(S.player, !player_stop_after(S.player)); break;
     case ST_DIM: settings_set_int("display.dim", !settings_get_int("display.dim", 1)); break;
     case ST_ON_CHARGING: settings_set_int("display.on_charging", !settings_get_int("display.on_charging", 0)); break;
+    case ST_COVERS: settings_set_int("display.covers", (settings_get_int("display.covers", UI_COVERS_DEFAULT) + 1) & 3); break;
+    case ST_THEME: push(L_THEMES, "Theme", 0); break;
+    case ST_ALBUM_ARTISTS:
+        settings_set_int("display.album_artists", !album_artists_on());
+        library_set_album_artists(S.lib, album_artists_on());
+        break;
     case ST_DAC_FILTER: if (S.hooks.dac_filter_next) S.hooks.dac_filter_next(); break;
     case ST_EQ: {                          /* the profiles, for the output playing now */
         if (S.pure) { ui_toast("Bypassed in Pure mode", 1500); break; }
@@ -3295,7 +4071,7 @@ static void setting_ok(setting_t st)
     case ST_SHUF_BY: case ST_SHUF_FRESH: case ST_SHUF_INTERLUDES: case ST_SHUF_WORKS: case ST_SHUF_SPOKEN: {
         static const char *const key[] = {"shuffle.albums", "shuffle.freshness", "shuffle.skip_interludes",
                                           "shuffle.keep_works", "shuffle.exclude_spoken"};
-        static const int def[] = {0, 1, 1, 0, 0};
+        static const int def[] = {0, 1, 1, 0, UI_EXCLUDE_SPOKEN_DEFAULT};
         int k = (int)(st - ST_SHUF_BY);
         settings_set_int(key[k], !settings_get_int(key[k], def[k]));
         shuffle_prefs_apply();
@@ -3416,7 +4192,10 @@ static void open_selected(void)
         int i = l->sel - 1;
         if (!S.player || i >= S.radio_n) break;
         char why[96] = "";
-        if (S.hooks.radio_ready && S.hooks.radio_ready(why, sizeof why) != 0) { ui_toast(why, 2500); break; }
+        if (S.hooks.radio_ready && S.hooks.radio_ready(why, sizeof why) != 0) {
+            if (!wifi_ask_if_off(WT_OK)) ui_toast(why, 2500);
+            break;
+        }
         if (rd_on_air(&S.radio[i])) { S.now_playing_view = 1; break; }
         player_radio_play(S.player, S.radio, S.radio_n, i);
         S.now_playing_view = 1;
@@ -3484,6 +4263,20 @@ static void open_selected(void)
     case L_CREDIT_ALBUMS:   /* their songs on this album */
         if (id >= 0 && library_album_name(S.lib, id, name, sizeof name) == 0) push_credit_tracks(name, l->parent, id);
         break;
+    case L_WIFI_ASK:
+        pop();
+        if (l->sel == 0 && S.hooks.wifi_do) {
+            S.hooks.wifi_do(UI_WIFI_TOGGLE, NULL, NULL);
+            settings_set_int("wifi.on", 1);
+            level_t *b = &S.stack[S.depth - 1];
+            S.wifi_then.armed = S.wifi_then.what != WT_NONE;
+            S.wifi_then.depth = S.depth;
+            S.wifi_then.kind = b->kind;
+            S.wifi_then.sel = b->sel;
+            S.wifi_then.at = lv_tick_get();
+            ui_toast("Turning on Wi-Fi", 1500);
+        }
+        break;
     case L_USB_ASK:
         pop();
         if (l->sel == 0 && S.hooks.usb_drive) S.hooks.usb_drive();
@@ -3545,7 +4338,7 @@ static void open_selected(void)
         if (!S.hooks.share_do) break;
         if (l->sel == 0) {
             S.hooks.share_do(UI_SHARE_TOGGLE);
-            if (!S.share_on) ui_toast("On while Wi-Fi is connected", 2000);
+            if (!S.share_on && !wifi_ask_if_off(WT_NONE)) ui_toast("On while Wi-Fi is connected", 2000);
         } else if (S.share.state != UI_SHARE_ON) {
             if (S.share.state == UI_SHARE_WAITING) ui_toast("Settings > Wi-Fi: join a network", 2000);
         } else if (l->sel == 1) {
@@ -3588,7 +4381,7 @@ static void open_selected(void)
         else if (l->sel - BT_DEV_ROW < S.bt_n) S.hooks.bt_do(UI_BT_PRESS, S.bt[l->sel - BT_DEV_ROW].addr);
         break;
     case L_SETTINGS: {
-        static const list_kind_t sub[] = {L_THEMES, L_HOME_EDIT, L_DISPLAY, L_SOUND, L_BLUETOOTH, L_WIFI, L_SHARE, L_SSH,
+        static const list_kind_t sub[] = {L_INTERFACE, L_HOME_EDIT, L_DISPLAY, L_SOUND, L_BLUETOOTH, L_WIFI, L_SHARE, L_SSH,
                                           L_USB, L_PLAYBACK, L_POWER, L_LIBRARY, L_ABOUT};
         push(sub[l->sel], SETTINGS[l->sel], 0);
         if (sub[l->sel] == L_HOME_EDIT) ui_toast("OK shows or hides. Menu: Move", 2500);
@@ -3596,14 +4389,23 @@ static void open_selected(void)
         break;
     }
     case L_ABOUT:
-        if (S.hooks.update_do && l->sel == list_count(l) - 2) {   /* Check for updates: only ever from here */
+        if (S.hooks.update_do && l->sel == list_count(l) - 3) {   /* Check for updates: from here, or */
+            if (wifi_ask_if_off(WT_OK)) break;
             S.hooks.update_do(UI_UPD_CHECK);
             push(L_UPDATE, "Updates", 0);
+        } else if (S.hooks.update_do && l->sel == list_count(l) - 2) {   /* by itself (off by default) */
+            int on = !settings_get_int("update.auto", UI_UPDATE_AUTO_DEFAULT);
+            settings_set_int("update.auto", on);
+            settings_save();
+            if (on) ui_toast("Once a day, while the H2 rests on Wi-Fi", 3000);
         } else if (l->sel == list_count(l) - 1) {   /* Reset all settings: press twice */
             uint32_t now = lv_tick_get();
             if (S.reset_armed && now - S.reset_armed < 3000) {
                 S.reset_armed = 0;
+                int used = settings_get_int("battery.used", 0);   /* (the battery's wear: not a setting) */
                 settings_reset();
+                if (used) settings_set_int("battery.used", used);
+                library_set_album_artists(S.lib, album_artists_on());
                 home_load();
                 S.stack[0].sel = home_index(H_SETTINGS);
                 if (S.hooks.brightness) S.hooks.brightness(brightness());
@@ -3617,6 +4419,26 @@ static void open_selected(void)
         }
         break;
     case L_UPDATE: update_ok(l->sel); break;
+    case L_BATTERY:
+        if (l->sel == 0) {                         /* the range: 24 hours or 7 days */
+            S.bat_days = S.bat_days == 7 ? 1 : 7;
+            battery_load();
+        } else if (l->sel == 1) {
+            if (!S.bat.have_since) { ui_toast("Not since a full charge yet", 2000); break; }
+            S.bat_span = -1;
+            push(L_BAT_SPAN, "Since full charge", 0);
+        } else if (S.bat.nspans) {
+            push(L_BAT_HISTORY, "History", 0);
+        }
+        break;
+    case L_BAT_HISTORY:
+        if (l->sel < S.bat.nspans) {
+            char day[32];
+            S.bat_span = l->sel;
+            bat_day(day, sizeof day, S.bat.span[l->sel].start);
+            push(L_BAT_SPAN, day, 0);
+        }
+        break;
     case L_EQ:
         if (!S.hooks.eq_set) break;
         if (l->sel == 0) S.hooks.eq_set("");
@@ -3680,6 +4502,7 @@ static void open_selected(void)
         break;
     }
     case L_QUICK: case L_DISPLAY: case L_SOUND: case L_PLAYBACK: case L_POWER: case L_LIBRARY: case L_USB:
+    case L_INTERFACE:
         setting_ok(setting_at(l, l->sel));
         break;
     case L_CONTEXT: if (l->sel < S.ctx_n) run_context(S.ctx[l->sel]); break;
@@ -3795,7 +4618,6 @@ static void show_initial(const level_t *l)
  * artist and album lines scroll back and forth if they don't fit, resting
  * 2 s at each end. Any key puts them back (ellipsis) and restarts the wait. */
 
-#define MARQUEE_REST_MS 2000   /* the rest at each end of a scroll (LVGL's own: 0.3 s) */
 
 /* LVGL takes the delays at each end of a long-mode scroll from the label's
  * "anim" style: a template animation. */
@@ -3823,10 +4645,10 @@ static void marquee_set(int on)
     lv_label_long_mode_t nm = S.now_playing_view ? m : LV_LABEL_LONG_DOT;
     if (lv_label_get_long_mode(S.np_artist) != nm) lv_label_set_long_mode(S.np_artist, nm);
     if (lv_label_get_long_mode(S.np_album) != nm) lv_label_set_long_mode(S.np_album, nm);
-    if (on && !S.now_playing_view && list_count(&S.stack[S.depth - 1]) > 0) {
-        int slot = slot_under_pill();
-        if (slot >= 0 && slot < SLOTS) lv_label_set_long_mode(S.row_lbl[slot], LV_LABEL_LONG_SCROLL);
-    }
+    int slot = on && !S.now_playing_view && list_count(&S.stack[S.depth - 1]) > 0 ? slot_under_pill() : -1;
+    if (slot >= 0 && slot < SLOTS && !S.line_on[slot]) lv_label_set_long_mode(S.row_lbl[slot], LV_LABEL_LONG_SCROLL);
+    for (int r = 0; r < SLOTS; r++)   /* album rows: title and artist as one line */
+        if (S.line_on[r]) line_scroll(r, r == slot);
 }
 
 static void marquee_fire(lv_timer_t *t)
@@ -3851,6 +4673,7 @@ void ui_library_changed(void)
     /* Refreshed in place (a background scan may finish while you listen or
      * browse): every open list is read again, keeping its place where it can. */
     S.lib_gen++;
+    covers_reset(1);
     finish_transition();
     pending_free();
     for (int d = 0; d < S.depth; d++) {
@@ -3881,6 +4704,7 @@ void ui_wifi_changed(void)
         S.wifi_link = link;
         if (S.h_right) render_header_status();
     }
+    if (link == 2) wifi_then_run(1);
     level_t *l = &S.stack[S.depth - 1];
     if ((l->kind != L_WIFI && l->kind != L_QUICK) || S.now_playing_view) return;
     int n = list_count(l);
@@ -3931,6 +4755,7 @@ void ui_set_awake(int on)
     S.asleep = !on;
     if (!S.h_right) return;
     if (!on) {
+        covers_free();                        /* (read again when the screen's back) */
         render_header_status();               /* (the charging pulse stops) */
         marquee_set(0);
         if (S.marquee_timer) lv_timer_pause(S.marquee_timer);
@@ -3962,6 +4787,8 @@ void ui_set_output(const char *name)
 
 void ui_key(ui_key_t k)
 {
+    int had_help = S.help_shown;
+    help_hide();
     marquee_arm();
     if (k == UI_KEY_OK || k == UI_KEY_BACK || k == UI_KEY_BACK_LONG) capture();
     level_t *l = &S.stack[S.depth - 1];
@@ -3982,6 +4809,8 @@ void ui_key(ui_key_t k)
             return;
         }
         if (!S.now_playing_view && (l->kind == L_CONTEXT || l->kind == L_QUICK)) pop();
+        else if (had_help) ;                       /* (Menu again: just put it away) */
+        else if (show_help(l)) ;
         else if (open_context()) ui_toast("No actions here", 1000);
         render(R_ANIMATE);
         return;
@@ -4220,6 +5049,9 @@ int ui_tick(void)
 
 void ui_tick_1s(void)
 {
+    if (S.wifi_then.armed && lv_tick_elaps(S.wifi_then.at) >= 45000) wifi_then_run(0);   /* (no network joined, say) */
+    list_kind_t k = S.stack[S.depth - 1].kind;
+    if ((k == L_BATTERY || k == L_BAT_SPAN || k == L_BAT_HISTORY) && lv_tick_elaps(S.bat_at) >= 60000) battery_load();
     S.ticking = 1;
     render(R_CONTENT);
     S.ticking = 0;
@@ -4297,9 +5129,20 @@ void ui_show(const char *what)
         S.stack[S.depth - 1].sel = SET_ABOUT;
         push(L_ABOUT, "About", 0);
         level_t *l = &S.stack[S.depth - 1];
-        l->sel = list_count(l) - (S.hooks.update_do ? 2 : 1);
+        l->sel = list_count(l) - (S.hooks.update_do ? 3 : 1);   /* Check for updates */
         if (!strcmp(what, "update")) push(L_UPDATE, "Updates", 0);
         ui_update_changed();
+    } else if (!strncmp(what, "battery", 7)) {       /* "battery", "battery7", "batterysince", "batteryhistory" */
+        S.stack[0].sel = home_index(H_SETTINGS);
+        push(L_SETTINGS, "Settings", 0);
+        S.stack[S.depth - 1].sel = SET_POWER;
+        push(L_POWER, "Power", 0);
+        S.bat_days = !strcmp(what, "battery7") ? 7 : 1;
+        battery_load();
+        push(L_BATTERY, "Battery", 0);
+        if (!strcmp(what, "battery7")) S.stack[S.depth - 1].sel = 0;
+        if (!strcmp(what, "batterysince")) { S.stack[S.depth - 1].sel = 1; S.bat_span = -1; push(L_BAT_SPAN, "Since full charge", 0); }
+        if (!strcmp(what, "batteryhistory")) { S.stack[S.depth - 1].sel = 2; push(L_BAT_HISTORY, "History", 0); }
     } else if (!strcmp(what, "radio")) {
         S.stack[0].sel = home_index(H_RADIO);
         S.radio_n = S.hooks.radio_stations ? S.hooks.radio_stations(S.radio, RADIO_MAX) : -1;
@@ -4402,6 +5245,13 @@ void ui_show(const char *what)
         finish_transition();
     } else if (!strcmp(what, "usbask")) {
         ui_usb_prompt();
+    } else if (!strcmp(what, "wifiask")) {          /* (as from a station, with Wi-Fi off) */
+        push(L_RADIO, "Radio", 0);
+        push(L_WIFI_ASK, "Turn on Wi-Fi?", 0);
+    } else if (!strcmp(what, "interface")) {
+        S.stack[0].sel = home_index(H_SETTINGS);
+        push(L_SETTINGS, "Settings", 0);
+        push(L_INTERFACE, "Interface", 0);
     } else if (!strcmp(what, "sound")) {
         S.stack[0].sel = home_index(H_SETTINGS);
         push(L_SETTINGS, "Settings", 0);
@@ -4453,6 +5303,7 @@ void ui_init(lv_obj_t *screen, const theme_t *themes, int n_themes,
 {
     memset(&S, 0, sizeof S);
     S.lib = lib;
+    library_set_album_artists(lib, album_artists_on());
     S.player = player;
     shuffle_prefs_apply();
     S.np_seq = (uint32_t)-1;
@@ -4526,6 +5377,16 @@ void ui_init(lv_obj_t *screen, const theme_t *themes, int n_themes,
         S.row_sw_part[j][1] = box(S.row_sw[j], 3, SWATCH_H - 8, 14, 3);     /* a line of text */
         S.row_sw_part[j][2] = box(S.row_sw[j], 20, SWATCH_H - 8, SWATCH_W - 25, 3);   /* the accent */
         show(S.row_sw[j], 0);
+        S.row_cov[j] = lv_image_create(row);
+        lv_obj_remove_flag(S.row_cov[j], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_pos(S.row_cov[j], 10, (ROW_H - LIB_ART_SMALL) / 2);
+        S.cov_dsc[j].header.magic = LV_IMAGE_HEADER_MAGIC;
+        S.cov_dsc[j].header.cf = LV_COLOR_FORMAT_RGB565;
+        S.cov_dsc[j].header.w = LIB_ART_SMALL;
+        S.cov_dsc[j].header.h = LIB_ART_SMALL;
+        S.cov_dsc[j].header.stride = LIB_ART_SMALL * 2;
+        S.cov_id[j] = -1;
+        show(S.row_cov[j], 0);
         S.row_picon[j] = lv_image_create(row);
         lv_obj_remove_flag(S.row_picon[j], LV_OBJ_FLAG_CLICKABLE);
         lv_obj_align(S.row_picon[j], LV_ALIGN_LEFT_MID, 10, 0);
@@ -4536,6 +5397,11 @@ void ui_init(lv_obj_t *screen, const theme_t *themes, int n_themes,
         S.row_meta[j] = label(row);
         lv_obj_set_width(S.row_meta[j], LV_SIZE_CONTENT);
         lv_obj_align(S.row_meta[j], LV_ALIGN_RIGHT_MID, -10, 0);
+        S.row_line[j] = box(row, 10, 0, 10, ROW_H);   /* (cuts what it holds at its edges) */
+        lv_obj_set_user_data(S.row_line[j], (void *)(intptr_t)j);
+        S.row_lt[j] = label(S.row_line[j]);
+        S.row_la[j] = label(S.row_line[j]);
+        show(S.row_line[j], 0);
         S.row_wheel[j] = box(row, 0, 0, WHEEL_W, ROW_H);
         lv_obj_set_flex_flow(S.row_wheel[j], LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(S.row_wheel[j], LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);

@@ -373,7 +373,7 @@ static void monitor_kill_strays(void)
         if (pid <= 1) continue;
         char path[64], cmd[128] = "";
         snprintf(path, sizeof path, "/proc/%d/cmdline", pid);
-        FILE *f = fopen(path, "r");
+        FILE *f = fopen(path, "re");
         if (!f) continue;
         size_t n = fread(cmd, 1, sizeof cmd - 1, f);
         fclose(f);

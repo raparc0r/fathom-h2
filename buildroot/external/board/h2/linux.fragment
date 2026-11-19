@@ -93,7 +93,9 @@ CONFIG_U_SERIAL_CONSOLE=y
 # Display (draft driver, device-tree node disabled until tested): X1000 smart LCD,
 # MIPI-DBI panel, PWM backlight on TCU channel 0. Built in so it's compile-checked.
 CONFIG_DRM=y
-CONFIG_DRM_FBDEV_EMULATION=y
+# No fbdev emulation: nothing uses /dev/fb0 (the player and the "Card removed"
+# screen draw through DRM), and it reserved a 150 KB framebuffer for fbcon.
+# CONFIG_DRM_FBDEV_EMULATION is not set
 CONFIG_TINYDRM_X1000_SLCD=y
 CONFIG_PWM=y
 CONFIG_PWM_JZ4740=y
@@ -114,12 +116,12 @@ CONFIG_SND_SIMPLE_CARD=y
 CONFIG_SND_SOC_SIMPLE_AMPLIFIER=y
 CONFIG_DMA_JZ4780=y
 
-# Stage 3: kernel messages on the H2's own screen (fbcon on the x1000-slcd DRM device)
-CONFIG_FRAMEBUFFER_CONSOLE=y
-CONFIG_FONT_SUPPORT=y
-CONFIG_FONTS=y
-CONFIG_FONT_8x16=y
-CONFIG_VT_CONSOLE=y
+# No virtual terminals or text console on the screen (about 400 KB of kernel
+# with fbdev emulation): kernel messages go to the USB serial console and
+# pstore, and the screen showed only the boot logo, which h2boot has already
+# drawn: the panel keeps it (patch 0013) until the player's first frame.
+# CONFIG_VT is not set
+# CONFIG_FRAMEBUFFER_CONSOLE is not set
 
 # Hardware RNG (X1000), so the random pool is ready for SSH and the player at boot
 CONFIG_HW_RANDOM=y
@@ -149,12 +151,8 @@ CONFIG_SOFTLOCKUP_DETECTOR=y
 CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC=y
 CONFIG_DETECT_HUNG_TASK=y
 CONFIG_BOOTPARAM_HUNG_TASK_PANIC=y
-# Boot logo: Fathom's (external.mk puts it in place of Tux), centred by
-# fbcon=logo-pos:center on the command line
-CONFIG_LOGO=y
-CONFIG_LOGO_LINUX_CLUT224=y
-# CONFIG_LOGO_LINUX_MONO is not set
-# CONFIG_LOGO_LINUX_VGA16 is not set
+# No kernel boot logo (fbcon drew it): h2boot's stays on the panel
+# CONFIG_LOGO is not set
 
 # Bluetooth: the BCM4343A1 on UART0 (hci_bcm, a serdev driver). Its firmware
 # patch is the stock one, never shipped with Fathom: fathom-bluetooth copies

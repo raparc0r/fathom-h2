@@ -18,7 +18,7 @@ static char g_assets[512];
 
 static void *slurp(const char *path, size_t *len)
 {
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, "rbe");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
@@ -121,7 +121,7 @@ static const ui_fonts_t *fallback_set(const int *px)
 {
     char f[640];
     snprintf(f, sizeof f, "%s/fonts/%s", g_assets, FALLBACK_FILE);
-    FILE *probe = fopen(f, "rb");
+    FILE *probe = fopen(f, "rbe");
     if (!probe) return NULL;
     fclose(probe);
     return load_set("noto", f, f, px, NULL);

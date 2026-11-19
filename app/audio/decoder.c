@@ -1,10 +1,12 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "decoder.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 
 #include <FLAC/stream_decoder.h>
 #include <mpg123.h>
@@ -35,6 +37,7 @@ struct decoder {
 
     mpg123_handle *mp3;
     int mp3_bytes;   /* bytes per sample mpg123 actually delivers */
+    int mp3_fd;      /* the file, opened here (close-on-exec), -1 none */
 
     /* A CUE track (cue.h): frames [part_start, part_end) of `file` (part_end
      * 0: to its end). Reads, seeks and total_frames are the part's. */
@@ -122,9 +125,17 @@ static int open_flac(decoder_t *d, const char *path)
     d->flac = FLAC__stream_decoder_new();
     if (!d->flac) return -1;
     FLAC__stream_decoder_set_md5_checking(d->flac, false);
-    if (FLAC__stream_decoder_init_file(d->flac, path, flac_write, flac_meta, flac_err, d) !=
-        FLAC__STREAM_DECODER_INIT_STATUS_OK)
+    /* Opened here, close-on-exec, rather than by libFLAC: a program the player
+     * starts meanwhile (the SSH server, Wi-Fi's) would otherwise keep the file
+     * open for good, and the card couldn't be lent to a computer. libFLAC
+     * closes it at finish. */
+    FILE *f = fopen(path, "rbe");
+    if (!f) return -1;
+    if (FLAC__stream_decoder_init_FILE(d->flac, f, flac_write, flac_meta, flac_err, d) !=
+        FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+        fclose(f);
         return -1;
+    }
     if (!FLAC__stream_decoder_process_until_end_of_metadata(d->flac) || !d->fmt.rate) return -1;
     strcpy(d->fmt.codec, "FLAC");
     return 0;
@@ -173,6 +184,7 @@ static int allow_encoding(mpg123_handle *mh, int enc)
 
 static int open_mp3(decoder_t *d, const char *path)
 {
+    d->mp3_fd = -1;
     if (!mp3_ready) { mpg123_init(); mp3_ready = 1; }   /* no-op on recent mpg123, needed on old ones */
     d->mp3 = mpg123_new(NULL, NULL);
     if (!d->mp3) return -1;
@@ -182,7 +194,8 @@ static int open_mp3(decoder_t *d, const char *path)
     mpg123_param(d->mp3, MPG123_RESYNC_LIMIT, -1, 0);
     /* 32-bit output if this mpg123 build has it, else 16-bit; we widen to int32 ourselves */
     if (allow_encoding(d->mp3, MPG123_ENC_SIGNED_32) && allow_encoding(d->mp3, MPG123_ENC_SIGNED_16)) return -1;
-    if (mpg123_open(d->mp3, path) != MPG123_OK) return -1;
+    d->mp3_fd = open(path, O_RDONLY | O_CLOEXEC);     /* (as FLAC's, above) */
+    if (d->mp3_fd < 0 || mpg123_open_fd(d->mp3, d->mp3_fd) != MPG123_OK) return -1;
     long rate;
     int ch, enc;
     if (mpg123_getformat(d->mp3, &rate, &ch, &enc) != MPG123_OK) return -1;
@@ -798,6 +811,7 @@ void decoder_close(decoder_t *d)
     dsd_close(d->dsd);
     if (d->flac) { FLAC__stream_decoder_finish(d->flac); FLAC__stream_decoder_delete(d->flac); }
     if (d->mp3) { mpg123_close(d->mp3); mpg123_delete(d->mp3); }
+    if (d->mp3 && d->mp3_fd >= 0) close(d->mp3_fd);
     vorbis_close(d->vorbis);
 #ifdef FATHOM_HAVE_FFMPEG
     avio_closep(&d->vpb);                /* (after Tremor, which reads from it) */

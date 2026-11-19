@@ -3,8 +3,9 @@
 # udhcpc. In the build container: docker/run.sh sh tests/test_fathom_wifi.sh
 set -u
 T=$(mktemp -d); SRC=/work/buildroot/external/board/h2/rootfs-overlay
-mkdir -p $T/wifi/usr/sbin $T/run $T/ctrl $T/st
-sed -e "s#^W=.*#W=$T/wifi#" -e "s#^RUN=.*#RUN=$T/run#" -e "s#^CTRL=.*#CTRL=$T/ctrl#" $SRC/usr/sbin/fathom-wifi > $T/fathom-wifi
+mkdir -p $T/wifi/usr/sbin $T/run $T/ctrl $T/st $T/fw
+sed -e "s#^W=.*#W=$T/wifi#" -e "s#^RUN=.*#RUN=$T/run#" -e "s#^CTRL=.*#CTRL=$T/ctrl#" \
+    -e "s#^FW=.*#FW=$T/fw/brcmfmac43430-sdio.bin#" $SRC/usr/sbin/fathom-wifi > $T/fathom-wifi
 sed -e "s#^RUN=.*#RUN=$T/run#" -e "s#/usr/sbin/fathom-wifi#$T/fathom-wifi#" $SRC/usr/share/udhcpc/default.script.d/fathom-wifi-lease > $T/hook
 chmod +x $T/fathom-wifi $T/hook
 mkdir -p $T/bin; printf '#!/bin/sh\necho "$@" >> %s/st/log\n' $T > $T/bin/logger; chmod +x $T/bin/logger; export PATH=$T/bin:$PATH
@@ -72,6 +73,22 @@ interface=wlan0 $T/hook deconfig
 check "hook: deconfig drops the record" '[ ! -f $T/run/lease-ssid ]'
 interface=usb0 $T/hook bound
 check "hook ignores other interfaces" '[ ! -f $T/run/lease-ssid ]'
+
+# 7. The chip's settings for this board: the stock ones and Bluetooth coexistence
+NV=$T/fw/brcmfmac43430-sdio.txt; NVB=$T/fw/brcmfmac43430-sdio.hifiwalker,h2.txt
+printf 'boardflags=0x00404201\nmuxenab=0x10\n' > $NV; touch -d '2019-01-02' $NV
+$T/fathom-wifi nvram
+check "nvram: the board's file made, stock lines first" '[ "$(head -2 $NVB)" = "$(cat $NV)" ]'
+check "nvram: with the coexistence lines" 'grep -qx btc_mode=1 $NVB && grep -qx btc_params8=0x4e20 $NVB && grep -qx btc_params1=0x7530 $NVB'
+check "nvram: the stock file untouched" '[ "$(cat $NV)" = "$(printf "boardflags=0x00404201\nmuxenab=0x10")" ]'
+touch -d '2020-01-01' $NVB; $T/fathom-wifi nvram
+check "nvram: not written again when it's up to date" '[ "$(date -r $NVB +%Y)" = 2020 ]'
+printf 'boardflags=0x00404201\nmuxenab=0x10\nnew=1\n' > $NV; $T/fathom-wifi nvram
+check "nvram: made again from a newer stock file" 'grep -qx new=1 $NVB && grep -qx btc_mode=1 $NVB'
+printf 'muxenab=0x10\nbtc_mode=4\n' > $NV; $T/fathom-wifi nvram
+check "nvram: a stock file with its own coexistence left as it is" '[ ! -f $NVB ]'
+rm -f $NV; $T/fathom-wifi nvram
+check "nvram: no stock file, nothing made" '[ ! -f $NVB ]'
 
 kill $U $(cat $T/run/wpa.pid) 2>/dev/null
 echo "$ok passed, $bad failed"; [ $bad = 0 ]

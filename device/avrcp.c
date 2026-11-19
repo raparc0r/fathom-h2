@@ -100,7 +100,7 @@ static void read_now(now_t *n)
 {
     memset(n, 0, sizeof *n);
     snprintf(n->status, sizeof n->status, "Stopped");
-    FILE *f = fopen(NOW_FILE, "r");
+    FILE *f = fopen(NOW_FILE, "re");
     if (!f) return;
     char line[600];
     while (fgets(line, sizeof line, f)) {

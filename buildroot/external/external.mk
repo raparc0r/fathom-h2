@@ -17,16 +17,6 @@ BLUEZ_ALSA_CONF_OPTS += --enable-aptx --disable-aptx-hd --with-libfreeaptx
 $(BLUEZ_ALSA_TARGET_CONFIGURE): | libfreeaptx
 endif
 
-# The kernel's boot logo is Fathom's (assets/logo.png, converted to the
-# kernel's 224-colour PPM). fbcon shows it while the system starts; the kernel
-# command line keeps messages off the screen (post-image.sh).
-define FATHOM_LINUX_LOGO
-	python3 $(BR2_EXTERNAL_FATHOM_PATH)/../../tools/logo/png2ppm.py \
-		$(BR2_EXTERNAL_FATHOM_PATH)/../../assets/logo.png \
-		$(LINUX_DIR)/drivers/video/logo/logo_linux_clut224.ppm
-endef
-LINUX_PRE_BUILD_HOOKS += FATHOM_LINUX_LOGO
-
 # musl's libc.so is in the initramfs (RAM for good): built for size. (With no
 # -O flag musl would pick its own default, -O2 with -O3 for malloc and the
 # string functions: 47 KB more. On MIPS memcpy, memset and the rest are C,
@@ -71,6 +61,11 @@ FATHOM_LIB_CFLAGS = -mno-shared -mplt -ffunction-sections -fdata-sections
 FATHOM_LIB_ENV = CFLAGS="$(TARGET_CFLAGS) $(FATHOM_LIB_CFLAGS)" LDFLAGS="$(TARGET_LDFLAGS) -no-pie"
 # (Ogg FLAC goes through FFmpeg, so libFLAC needs no Ogg)
 FLAC_CONF_OPTS += --disable-shared --disable-ogg
+# libFLAC's bit reader in 32-bit words, the X1000's own: its default, 64, makes
+# every shift, mask and count-leading-zeros of the Rice decoding two operations
+# on a 32-bit CPU. The decoded samples are the same (rg-bench's hash pass, two
+# builds, the same files).
+FLAC_CONF_OPTS += --disable-64-bit-words
 FLAC_CONF_ENV += $(FATHOM_LIB_ENV)
 LIBOGG_CONF_OPTS += --disable-shared
 LIBOGG_CONF_ENV += $(FATHOM_LIB_ENV)

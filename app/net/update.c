@@ -61,6 +61,12 @@ int update_is_newer(const char *latest, const char *running)
     return cmp > 0 || (cmp == 0 && pr == 1);
 }
 
+int update_auto_due(long now, long last_ok, long last_try)
+{
+    if (now < last_ok || now < last_try) return 1;           /* the clock went back */
+    return now - last_ok >= UPDATE_AUTO_EVERY && now - last_try >= UPDATE_AUTO_RETRY;
+}
+
 /* ---------- GitHub's answer ---------- */
 
 static int has_suffix(const char *s, const char *suf)
@@ -146,7 +152,7 @@ static void drop_cache(int fd)
 int update_file_sha256(const char *path, char hex[65], update_progress_fn progress, void *ctx,
                        const volatile int *abort)
 {
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
     struct stat st;
     uint64_t total = fstat(fd, &st) == 0 ? (uint64_t)st.st_size : 0, done = 0;
@@ -248,7 +254,7 @@ static int make_dirs(const char *path)
 
 static int write_marker(const char *path, const char *text)
 {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) return -1;
     size_t n = strlen(text);
     int ok = write(fd, text, n) == (ssize_t)n && fsync(fd) == 0;
@@ -464,7 +470,7 @@ int update_stage(const char *zip_path, const char *stage, update_progress_fn pro
             if (!strcmp(sums[i].path, rel)) s = &sums[i];
         if (!s || s->seen) { err = UPDATE_ERR_DAMAGED; goto out; }   /* a file nobody vouches for */
         if (make_dirs(path)) { err = UPDATE_ERR_WRITE; goto out; }
-        sink_t k = {.fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644), .done = &done, .total = total,
+        sink_t k = {.fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644), .done = &done, .total = total,
                     .progress = progress, .ctx = ctx};
         if (k.fd < 0) { err = UPDATE_ERR_WRITE; goto out; }
         sha256_init(&k.sha);
@@ -534,7 +540,7 @@ static int copy_file(const char *from, const char *to)
 {
     char part[1024];
     snprintf(part, sizeof part, "%s.part", to);
-    int in = open(from, O_RDONLY), out = in < 0 ? -1 : open(part, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int in = open(from, O_RDONLY | O_CLOEXEC), out = in < 0 ? -1 : open(part, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (out < 0) { if (in >= 0) close(in); return -1; }
     char *b = malloc(32768);
     ssize_t k = -1;
@@ -548,18 +554,45 @@ static int copy_file(const char *from, const char *to)
     return 0;
 }
 
+/* The card's Wi-Fi modules copied to modules.prev, beside uImage.prev: the
+ * old kernel can only load its own, and h2boot puts both back if the new
+ * kernel won't start (bootloader/fathom/bootpick.c). */
+static int keep_modules(const char *mods, const char *prev)
+{
+    update_remove_tree(prev);
+    if (mkdir(prev, 0755)) return -1;
+    char **names;
+    int n = list_dir(mods, &names), bad = n < 0;
+    for (int i = 0; i < n && !bad; i++) {
+        char a[1024], b[1024];
+        snprintf(a, sizeof a, "%s/%s", mods, names[i]);
+        snprintf(b, sizeof b, "%s/%s", prev, names[i]);
+        bad = copy_file(a, b) != 0;
+    }
+    free_names(names, n > 0 ? n : 0);
+    return bad ? -1 : 0;
+}
+
 int update_install(const char *card, const char *stage)
 {
     char sd[1024], mark[1024], kernel[1024], now[1024], prev[1024];
+    char mods[1024], mods_prev[1024], new_mods[1024], boot_new[1024];
     snprintf(sd, sizeof sd, "%s/sd", stage);
     snprintf(mark, sizeof mark, "%s/INSTALLING", stage);
     snprintf(kernel, sizeof kernel, "%s/sd/uImage", stage);
     snprintf(now, sizeof now, "%s/uImage", card);
     snprintf(prev, sizeof prev, "%s/uImage.prev", card);
+    snprintf(mods, sizeof mods, "%s/fathom/wifi/modules", card);
+    snprintf(mods_prev, sizeof mods_prev, "%s/fathom/wifi/modules.prev", card);
+    snprintf(new_mods, sizeof new_mods, "%s/sd/fathom/wifi/modules", stage);
+    snprintf(boot_new, sizeof boot_new, "%s/fathom/boot-new", card);
     if (!exists(mark)) {
         char ready[1024];
         snprintf(ready, sizeof ready, "%s/READY", stage);
-        if (!exists(ready) || write_marker(mark, "installing\n")) return UPDATE_ERR_INSTALL;
+        if (!exists(ready)) return UPDATE_ERR_INSTALL;
+        /* (once, before anything moves: cut short, the card's are the new ones) */
+        if (exists(kernel) && exists(new_mods) && exists(mods) && keep_modules(mods, mods_prev)) return UPDATE_ERR_INSTALL;
+        if (write_marker(mark, "installing\n")) return UPDATE_ERR_INSTALL;
     }
     sync();
     /* Everything but the kernel: the new modules can't be loaded by the old
@@ -577,6 +610,16 @@ int update_install(const char *card, const char *stage)
             fprintf(stderr, "update: can't install uImage: %s\n", strerror(errno));
             return UPDATE_ERR_INSTALL;
         }
+        /* h2boot starts it twice at most without the player getting up (which
+         * deletes this), then goes back to uImage.prev and modules.prev. What
+         * an earlier fallback left goes. */
+        char failed[1024];
+        snprintf(failed, sizeof failed, "%s/uImage.failed", card);
+        unlink(failed);
+        snprintf(failed, sizeof failed, "%s/fathom/wifi/modules.failed", card);
+        update_remove_tree(failed);
+        if (write_marker(boot_new, "a new kernel: h2boot tries it twice, then the one before\n"))
+            fprintf(stderr, "update: can't mark the new kernel: %s\n", strerror(errno));
     }
     sync();
     update_remove_tree(sd);

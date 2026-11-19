@@ -379,7 +379,7 @@ struct dsd_dec {
 
 dsd_dec_t *dsd_open(const char *path, int dop, audio_format_t *fmt)
 {
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, "rbe");
     if (!f) return NULL;
     dsd_dec_t *d = calloc(1, sizeof *d);
     if (!d) { fclose(f); return NULL; }

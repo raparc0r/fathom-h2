@@ -101,7 +101,7 @@ static void line_set(int fd, int value)
 
 static int read_str(const char *path, char *buf, size_t cap)
 {
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(path, "re");
     if (!f) return -1;
     int ok = fgets(buf, (int)cap, f) != NULL;
     fclose(f);

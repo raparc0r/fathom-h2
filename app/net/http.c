@@ -70,7 +70,7 @@ int64_t http_download(const char *url, const char *path, http_progress_fn progre
     if (!pb) return -1;
     char part[1024];
     snprintf(part, sizeof part, "%s.part", path);
-    FILE *f = fopen(part, "wb");
+    FILE *f = fopen(part, "wbe");
     if (!f) { avio_closep(&pb); return -1; }
     int64_t total = avio_size(pb);
     uint64_t done = 0;

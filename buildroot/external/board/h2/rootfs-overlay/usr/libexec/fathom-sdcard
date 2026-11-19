@@ -11,7 +11,9 @@
 #            "Card removed" until it's back
 #   add      the card is mounted as at boot and the player started as at boot
 #            (S90fathom); it brings back Bluetooth, Wi-Fi and the network
-#            drive as their settings say
+#            drive as their settings say, and looks for new music in the
+#            background, as after USB drive mode (/tmp/fathom-rescan): a card
+#            taken out has most likely been in a computer
 #
 #   fathom-sdcard check    at start-up (S10sdcard): no card mounted, the screen says so
 #
@@ -120,6 +122,7 @@ add)
     fi
     say "card back ($dev): starting Fathom"
     hide
+    touch /tmp/fathom-rescan            # (the player: a scan once it's up)
     # As at boot, with init's environment rather than this event's
     env -i HOME=/ PATH=/sbin:/usr/sbin:/bin:/usr/bin SHELL=/bin/sh USER=root TERM=linux \
         /etc/init.d/S90fathom start > /dev/null 2>&1

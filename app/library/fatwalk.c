@@ -216,7 +216,7 @@ static uint32_t find(fw_t *f, uint32_t cluster, const char *name)
 
 int fatwalk(const char *dev, const char *mount, const char *rel, fatwalk_cb cb, void *ctx)
 {
-    fw_t f = {.fd = open(dev, O_RDONLY), .fat_sec_no = -1, .cb = cb, .ctx = ctx};
+    fw_t f = {.fd = open(dev, O_RDONLY | O_CLOEXEC), .fat_sec_no = -1, .cb = cb, .ctx = ctx};
     if (f.fd < 0) return -1;
     uint8_t bs[512];
     int rc = -1;

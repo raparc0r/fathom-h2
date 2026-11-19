@@ -43,9 +43,14 @@ int tags_read_flac_reference(const char *path, tags_t *t);
  * a Xing header come out approximate). */
 void tags_set_exact_mp3_length(int exact);
 
-/* Embedded front cover (JPEG/PNG bytes), malloc'd into *data. Returns 0 if
- * found. A CUE track's path: its file's. */
+/* Embedded cover (JPEG/PNG bytes), malloc'd into *data: the front cover, else
+ * the first other picture (not a file icon). Returns 0 if found. A CUE
+ * track's path: its file's. */
 int tags_picture(const char *path, unsigned char **data, size_t *len);
+/* Where that cover's bytes are in a FLAC (the same choice), to be read from
+ * the file rather than memory: 0 with *off and *len, or -1 (none, or not a
+ * FLAC: tags_picture then). */
+int tags_picture_at(const char *path, long *off, long *len);
 /* Skip embedded pictures larger than this (default: no limit). */
 void tags_set_max_picture(size_t bytes);
 

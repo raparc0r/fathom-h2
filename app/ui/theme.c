@@ -232,7 +232,7 @@ int theme_parse(const char *text, theme_t *t, char *err, size_t errcap)
 
 int theme_load_file(const char *path, theme_t *t, char *err, size_t errcap)
 {
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, "rbe");
     if (!f) { if (err && errcap) snprintf(err, errcap, "cannot open %s\n", path); return -1; }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);

@@ -127,7 +127,7 @@ static long log_pos;
 
 static void read_log(void)
 {
-    FILE *f = fopen(ACCESS_LOG, "r");
+    FILE *f = fopen(ACCESS_LOG, "re");
     if (!f) return;
     if (fseek(f, 0, SEEK_END) == 0 && ftell(f) < log_pos) log_pos = 0;   /* emptied */
     fseek(f, log_pos, SEEK_SET);
@@ -144,7 +144,7 @@ static void read_log(void)
     log_pos = ftell(f);
     fclose(f);
     if (log_pos > 32768) {                   /* empty it */
-        FILE *t = fopen(ACCESS_LOG, "w");
+        FILE *t = fopen(ACCESS_LOG, "we");
         if (t) fclose(t);
         log_pos = 0;
     }

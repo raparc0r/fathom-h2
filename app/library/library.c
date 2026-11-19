@@ -6,6 +6,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -19,17 +20,12 @@
 
 #include <sqlite3.h>
 
+#include "library/artdec.h"
 #include "library/cue.h"
 #include "library/fatwalk.h"
 #include "library/keys.h"
 #include "library/playlist.h"
 #include "library/tags.h"
-#include "stb/stb_image.h"
-
-#ifdef FATHOM_HAVE_LIBJPEG
-#include <setjmp.h>
-#include <jpeglib.h>
-#endif
 
 #ifndef FATHOM_SQLITE_CACHE
 #define FATHOM_SQLITE_CACHE "-2000"   /* KiB; the H2 build uses less */
@@ -49,9 +45,10 @@
 
 struct library {
     sqlite3 *db;
+    int no_album_artists;   /* album rows show the year, not the artist (library_set_album_artists) */
     char art_dir[1024];
     sqlite3_stmt *row_album, *row_artist, *row_credited, *row_track, *track_full, *album_name, *artist_name;
-    sqlite3_stmt *row_playlist, *row_pl_track, *playlist_name;
+    sqlite3_stmt *row_playlist, *row_pl_track, *row_plays, *track_album, *playlist_name;
     sqlite3_stmt *row_genre, *row_composer, *row_year, *row_folder, *genre_name, *composer_name, *folder_name;
     char pl_dir[1024];      /* your own playlists ("" = none) */
     int scan_changes;       /* tracks the last scan added, changed or dropped */
@@ -165,6 +162,7 @@ library_t *library_open(const char *db_path, const char *art_dir)
     sqlite3_exec(lib->db, "ALTER TABLE playlists ADD COLUMN size INTEGER", NULL, NULL, NULL);
     sqlite3_exec(lib->db, "ALTER TABLE tracks ADD COLUMN search TEXT", NULL, NULL, NULL);
     sqlite3_exec(lib->db, "ALTER TABLE albums ADD COLUMN search TEXT", NULL, NULL, NULL);
+    sqlite3_exec(lib->db, "ALTER TABLE albums ADD COLUMN art_sig INTEGER DEFAULT 0", NULL, NULL, NULL);
     sqlite3_exec(lib->db, "ALTER TABLE artists ADD COLUMN search TEXT", NULL, NULL, NULL);
     /* volume levelling: rg_state 0 = not done yet, 1 = from tags, 2 = measured, 3 = couldn't */
     sqlite3_exec(lib->db, "ALTER TABLE tracks ADD COLUMN rg_state INTEGER DEFAULT 0", NULL, NULL, NULL);
@@ -234,7 +232,8 @@ library_t *library_open(const char *db_path, const char *art_dir)
         sqlite3_exec(lib->db, "COMMIT", NULL, NULL, NULL);
     }
     index_search(lib, 1);
-    lib->row_album = prep(lib->db, "SELECT title, year FROM albums WHERE id=?");
+    lib->row_album = prep(lib->db, "SELECT al.title, al.year, ar.name FROM albums al"
+                                    " LEFT JOIN artists ar ON ar.id=al.artist_id WHERE al.id=?");
     lib->row_artist = prep(lib->db, "SELECT name, nalbums FROM artists WHERE id=?");
     lib->row_credited = prep(lib->db, "SELECT name, ncredit_albums FROM artists WHERE id=?");
     lib->row_track = prep(lib->db, "SELECT title, duration_ms FROM tracks WHERE id=?");
@@ -246,6 +245,8 @@ library_t *library_open(const char *db_path, const char *art_dir)
     lib->artist_name = prep(lib->db, "SELECT name FROM artists WHERE id=?");
     lib->row_playlist = prep(lib->db, "SELECT name, ntracks FROM playlists WHERE id=?");
     lib->row_pl_track = prep(lib->db, "SELECT title, duration_ms, artist FROM tracks WHERE id=?");
+    lib->row_plays = prep(lib->db, "SELECT title, play_count, artist FROM tracks WHERE id=?");   /* (Most played) */
+    lib->track_album = prep(lib->db, "SELECT album_id FROM tracks WHERE id=?");
     lib->playlist_name = prep(lib->db, "SELECT name FROM playlists WHERE id=?");
     lib->row_genre = prep(lib->db, "SELECT name, nalbums FROM genres WHERE id=?");
     lib->row_composer = prep(lib->db, "SELECT name, nalbums FROM composers WHERE id=?");
@@ -254,7 +255,7 @@ library_t *library_open(const char *db_path, const char *art_dir)
     lib->genre_name = prep(lib->db, "SELECT name FROM genres WHERE id=?");
     lib->composer_name = prep(lib->db, "SELECT name FROM composers WHERE id=?");
     lib->folder_name = prep(lib->db, "SELECT name FROM folders WHERE id=?");
-    if (!lib->row_playlist || !lib->row_pl_track || !lib->playlist_name ||
+    if (!lib->row_playlist || !lib->row_pl_track || !lib->row_plays || !lib->track_album || !lib->playlist_name ||
         !lib->row_album || !lib->row_artist || !lib->row_credited || !lib->row_track || !lib->track_full ||
         !lib->album_name || !lib->artist_name || !lib->row_genre || !lib->row_composer || !lib->row_year ||
         !lib->row_folder || !lib->genre_name || !lib->composer_name || !lib->folder_name) {
@@ -288,6 +289,8 @@ void library_close(library_t *lib)
     sqlite3_finalize(lib->artist_name);
     sqlite3_finalize(lib->row_playlist);
     sqlite3_finalize(lib->row_pl_track);
+    sqlite3_finalize(lib->row_plays);
+    sqlite3_finalize(lib->track_album);
     sqlite3_finalize(lib->playlist_name);
     sqlite3_close(lib->db);
     free(lib);
@@ -734,20 +737,6 @@ out:
 
 /* ---------- cover art ---------- */
 
-static unsigned char *slurp(const char *path, size_t *len)
-{
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    unsigned char *b = (n > 0 && n < 32 * 1024 * 1024) ? malloc((size_t)n) : NULL;
-    if (b && fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); b = NULL; }
-    fclose(f);
-    *len = b ? (size_t)n : 0;
-    return b;
-}
-
 /* Find a cover image file in an album folder: preferred names first, then any
  * image. Returns the match's rank (lower is better) or -1. */
 static int find_cover_file(const char *dir, char *out, size_t cap)
@@ -795,59 +784,6 @@ static void art_path(const library_t *lib, int64_t album_id, int size, char *out
     snprintf(out, cap, "%s/%lld-%d.rgb565", lib->art_dir, (long long)album_id, size);
 }
 
-#ifdef FATHOM_HAVE_LIBJPEG
-/*
- * JPEG covers through libjpeg(-turbo), which scales by 1/2, 1/4 or 1/8 while
- * decoding: a 3000x3000 cover decodes straight to 375x375 (0.4 MB instead of
- * 27 MB), and much faster. Picks the smallest output that still has at least
- * `min_side` pixels on its short side. Returns an RGB888 buffer (free()).
- */
-typedef struct { struct jpeg_error_mgr pub; jmp_buf jb; } jerr_t;
-static void jpeg_fail(j_common_ptr c) { longjmp(((jerr_t *)c->err)->jb, 1); }
-
-static unsigned char *decode_jpeg_scaled(const unsigned char *enc, size_t len, FILE *fp, int min_side, int *w, int *h)
-{
-    struct jpeg_decompress_struct c;
-    jerr_t err;
-    unsigned char *volatile img = NULL;
-    c.err = jpeg_std_error(&err.pub);
-    err.pub.error_exit = jpeg_fail;
-    if (setjmp(err.jb)) {
-        jpeg_destroy_decompress(&c);
-        free(img);
-        return NULL;
-    }
-    jpeg_create_decompress(&c);
-    /* Progressive JPEGs keep every DCT coefficient of the full image in memory
-     * whatever the output scale (about 12 MB for a 2000x2000 cover). Cap it, so
-     * libjpeg fails cleanly instead of the kernel killing the player. */
-    c.mem->max_memory_to_use = FATHOM_JPEG_MAX_MEMORY;
-    if (fp) jpeg_stdio_src(&c, fp);   /* streamed: the encoded file is never held in RAM */
-    else jpeg_mem_src(&c, enc, (unsigned long)len);
-    if (jpeg_read_header(&c, TRUE) != JPEG_HEADER_OK) { jpeg_destroy_decompress(&c); return NULL; }
-    unsigned short_side = c.image_width < c.image_height ? c.image_width : c.image_height;
-    unsigned denom = 1;
-    while (denom < 8 && short_side / (denom * 2) >= (unsigned)min_side) denom *= 2;
-    c.scale_num = 1;
-    c.scale_denom = denom;
-    c.out_color_space = JCS_RGB;
-    c.dct_method = JDCT_IFAST;
-    jpeg_start_decompress(&c);
-    *w = (int)c.output_width;
-    *h = (int)c.output_height;
-    if ((long long)*w * *h > FATHOM_ART_MAX_PIXELS) { jpeg_destroy_decompress(&c); return NULL; }
-    img = malloc((size_t)*w * *h * 3);
-    if (!img) { jpeg_destroy_decompress(&c); return NULL; }
-    while (c.output_scanline < c.output_height) {
-        JSAMPROW row = img + (size_t)c.output_scanline * *w * 3;
-        jpeg_read_scanlines(&c, &row, 1);
-    }
-    jpeg_finish_decompress(&c);
-    jpeg_destroy_decompress(&c);
-    return img;
-}
-#endif
-
 /*
  * Shrink a square RGB888 region (side `src`, row stride `stride` bytes) to
  * `dst` x `dst` by averaging the source pixels under each output pixel.
@@ -875,121 +811,226 @@ static void area_downscale(const unsigned char *in, int src, int stride, unsigne
     }
 }
 
-int library_art_decode(const unsigned char *enc, size_t len, int size, uint16_t *pixels)
+static const art_limits_t ART_LIMITS = {FATHOM_JPEG_MAX_MEMORY, FATHOM_ART_MAX_PIXELS, FATHOM_ART_MAX_FILE};
+
+/* Crop to a square and shrink to size x size RGB565: 0, -1 */
+static int art_square(const unsigned char *img, int w, int h, int size, uint16_t *pixels)
 {
-    int w = 0, h = 0, ch;
-    unsigned char *img = NULL;
-    if (!enc || len < 4) return -1;
-#ifdef FATHOM_HAVE_LIBJPEG
-    if (enc[0] == 0xFF && enc[1] == 0xD8) img = decode_jpeg_scaled(enc, len, NULL, size * 3 / 2, &w, &h);
-#endif
-    if (!img) {
-        if (!stbi_info_from_memory(enc, (int)len, &w, &h, &ch) || (long long)w * h > FATHOM_ART_MAX_PIXELS) return -1;
-        img = stbi_load_from_memory(enc, (int)len, &w, &h, &ch, 3);
-    }
-    if (!img) return -1;
     int side = w < h ? w : h;
-    const unsigned char *crop = img + 3 * ((size_t)((h - side) / 2) * w + (w - side) / 2);
-    unsigned char *rs = malloc((size_t)size * size * 3);
-    if (rs) {
-        area_downscale(crop, side, w * 3, rs, size);
-        to_rgb565(rs, size, pixels);
-    }
+    const unsigned char *crop = img + 3 * ((size_t)((h - side) / 2) * (size_t)w + (size_t)((w - side) / 2));
+    unsigned char *rs = malloc((size_t)size * (size_t)size * 3);
+    if (!rs) return -1;
+    area_downscale(crop, side, w * 3, rs, size);
+    to_rgb565(rs, size, pixels);
     free(rs);
-    free(img);
-    return rs ? 0 : -1;
+    return 0;
 }
 
-static int make_art(library_t *lib, int64_t album_id, const char *dir, const char *first_track)
+int library_art_decode(const unsigned char *enc, size_t len, int size, uint16_t *pixels)
 {
-    char file[2048];
-    unsigned char *enc = NULL;
-    size_t enc_len = 0;
-    int w = 0, h = 0, ch;
+    unsigned char *img;
+    int w, h;
+    if (art_decode_mem(enc, len, size * 3 / 2, &ART_LIMITS, &img, &w, &h)) return -1;
+    int r = art_square(img, w, h, size, pixels);
+    free(img);
+    return r;
+}
+
+/* Done with a file read for its cover: out of the page cache, where a 20 MB
+ * PNG would push out the player's own code (run from the card). */
+static void art_done(FILE *f)
+{
+#ifdef POSIX_FADV_DONTNEED
+    posix_fadvise(fileno(f), 0, 0, POSIX_FADV_DONTNEED);
+#endif
+    fclose(f);
+}
+
+/* An image file, decoded small (artdec.h). NULL if it isn't one we can read. */
+static unsigned char *art_from_file(const char *file, int *w, int *h)
+{
+    FILE *f = fopen(file, "rbe");
+    unsigned char *img = NULL;
+    if (f && art_decode(f, 0, -1, LIB_ART_LARGE * 3 / 2, &ART_LIMITS, &img, w, h)) img = NULL;
+    if (f) art_done(f);
+    return img;
+}
+
+/* A track's embedded cover: a FLAC's read from where it is in the file
+ * (any size), others' through memory (up to FATHOM_ART_MAX_FILE). */
+static unsigned char *art_from_track(const char *track, int *w, int *h)
+{
+    long off, len;
+    unsigned char *img = NULL, *enc;
+    size_t n;
+    if (tags_picture_at(track, &off, &len) == 0) {
+        FILE *f = fopen(track, "rbe");
+        if (f && art_decode(f, off, len, LIB_ART_LARGE * 3 / 2, &ART_LIMITS, &img, w, h)) img = NULL;
+        if (f) art_done(f);
+    } else if (tags_picture(track, &enc, &n) == 0) {
+        if (art_decode_mem(enc, n, LIB_ART_LARGE * 3 / 2, &ART_LIMITS, &img, w, h)) img = NULL;
+        free(enc);
+    }
+    return img;
+}
+
+/* "CD1", "Disc 2", "disk 01 - Bonus": one disc of an album, whose cover is
+ * often in the folder above. */
+static int disc_folder(const char *dir)
+{
+    const char *b = strrchr(dir, '/');
+    b = b ? b + 1 : dir;
+    static const char *const pre[] = {"cd", "disc", "disk"};
+    for (int i = 0; i < 3; i++) {
+        size_t n = strlen(pre[i]);
+        if (strncasecmp(b, pre[i], n)) continue;
+        const char *p = b + n;
+        while (*p == ' ' || *p == '_' || *p == '-' || *p == '.') p++;
+        if (isdigit((unsigned char)*p)) return 1;
+    }
+    return 0;
+}
+
+/* The folder above dir, into out: 0, or -1 if there's none. */
+static int parent_dir(const char *dir, char *out, size_t cap)
+{
+    const char *slash = strrchr(dir, '/');
+    if (!slash || slash == dir || (size_t)(slash - dir) >= cap) return -1;
+    memcpy(out, dir, (size_t)(slash - dir));
+    out[slash - dir] = '\0';
+    return 0;
+}
+
+/* The album's cover, best first: an image named like a cover in its folder
+ * (or, for a disc's folder, in the album's above it); the first track's
+ * embedded one, then up to four other tracks' that have one; any other image
+ * in the folder (a scan or a booklet page loses to an embedded cover). Each
+ * is tried until one decodes. */
+static int make_art(library_t *lib, sqlite3_stmt *others, int64_t album_id, const char *dir, const char *first_track)
+{
+    char file[2048], up[2048], pfile[2048];
+    int w = 0, h = 0;
     unsigned char *img = NULL;
     int rank = find_cover_file(dir, file, sizeof file);
-    int have_file = rank >= 0;
-    /* A file that isn't named like a cover (a scan, a booklet page, a photo)
-     * loses to a front cover embedded in the music file. */
-    if (rank > 4 && first_track && tags_picture(first_track, &enc, &enc_len) == 0) have_file = 0;
-#ifdef FATHOM_HAVE_LIBJPEG
-    const char *dot = have_file ? strrchr(file, '.') : NULL;
-    if (dot && (!strcasecmp(dot, ".jpg") || !strcasecmp(dot, ".jpeg"))) {
-        FILE *fp = fopen(file, "rb");
-        if (fp) {
-            img = decode_jpeg_scaled(NULL, 0, fp, LIB_ART_LARGE * 3 / 2, &w, &h);
-            fclose(fp);
-        }
+    int prank = -1;
+    if ((rank < 0 || rank > 4) && disc_folder(dir) && parent_dir(dir, up, sizeof up) == 0) {
+        prank = find_cover_file(up, pfile, sizeof pfile);
+        if (prank > 4) prank = -1;                   /* (only one named like a cover up there) */
     }
-#endif
-    if (!img) {
-        struct stat st;
-        /* Anything else is decoded from memory: skip huge files (scans, photos). */
-        if (!enc && have_file && stat(file, &st) == 0 && st.st_size <= FATHOM_ART_MAX_FILE) enc = slurp(file, &enc_len);
-        if (!enc && first_track) tags_picture(first_track, &enc, &enc_len);
-        if (!enc) return -1;
+    if (rank >= 0 && rank <= 4) img = art_from_file(file, &w, &h);
+    if (!img && prank >= 0) img = art_from_file(pfile, &w, &h);
+    if (!img && first_track) img = art_from_track(first_track, &w, &h);
+    if (!img && others) {
+        sqlite3_reset(others);
+        sqlite3_bind_int64(others, 1, album_id);
+        sqlite3_bind_text(others, 2, first_track ? first_track : "", -1, SQLITE_STATIC);
+        while (!img && sqlite3_step(others) == SQLITE_ROW)
+            img = art_from_track((const char *)sqlite3_column_text(others, 0), &w, &h);
+        sqlite3_reset(others);
     }
-#ifdef FATHOM_HAVE_LIBJPEG
-    if (!img && enc_len > 3 && enc[0] == 0xFF && enc[1] == 0xD8)
-        img = decode_jpeg_scaled(enc, enc_len, NULL, LIB_ART_LARGE * 3 / 2, &w, &h);
-#endif
-    if (!img && enc) {
-        /* stb_image decodes at full size: cap the pixel count so a huge cover
-         * can't exhaust the H2's RAM (a 3000x3000 image is 27 MB decoded). */
-        if (!stbi_info_from_memory(enc, (int)enc_len, &w, &h, &ch) ||
-            (long long)w * h > FATHOM_ART_MAX_PIXELS) {
-            free(enc);
-            return -1;
-        }
-        img = stbi_load_from_memory(enc, (int)enc_len, &w, &h, &ch, 3);
-    }
-    free(enc);
+    if (!img && rank > 4) img = art_from_file(file, &w, &h);
     if (!img) return -1;
-    /* centre-crop to a square */
-    int side = w < h ? w : h;
-    const unsigned char *crop = img + 3 * ((size_t)((h - side) / 2) * w + (w - side) / 2);
-
     const int sizes[2] = {LIB_ART_LARGE, LIB_ART_SMALL};
     int ok = 0;
     for (int i = 0; i < 2; i++) {
         int s = sizes[i];
-        unsigned char *rs = malloc((size_t)s * s * 3);
-        uint16_t *px = malloc((size_t)s * s * 2);
-        if (rs && px) {
-            area_downscale(crop, side, w * 3, rs, s);
-            to_rgb565(rs, s, px);
+        uint16_t *px = malloc((size_t)s * (size_t)s * 2);
+        if (px && art_square(img, w, h, s, px) == 0) {
             char path[1200];
             art_path(lib, album_id, s, path, sizeof path);
-            FILE *f = fopen(path, "wb");
+            FILE *f = fopen(path, "wbe");
             if (f) { ok += fwrite(px, 2, (size_t)s * s, f) == (size_t)s * s; fclose(f); }
         }
-        free(rs);
         free(px);
     }
-    free(img);   /* stb_image and the libjpeg path both use malloc */
+    free(img);
     return ok == 2 ? 0 : -1;
 }
 
+/* What a coverless album's cover could come from, as one number: the images
+ * in its folder (and a disc's album folder) by name and size, and its tracks
+ * (how many, their times, how many have a picture). The same next scan: no
+ * need to look again. */
+static uint64_t fnv(uint64_t hsh, const void *p, size_t n)
+{
+    const unsigned char *b = p;
+    for (size_t i = 0; i < n; i++) hsh = (hsh ^ b[i]) * 1099511628211ULL;
+    return hsh;
+}
+
+static uint64_t images_sig(const char *dir)
+{
+    uint64_t sig = 0;
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *e;
+    char path[2048];
+    while ((e = readdir(d))) {
+        const char *dot = strrchr(e->d_name, '.');
+        if (e->d_name[0] == '.' || !dot) continue;
+        if (strcasecmp(dot, ".jpg") && strcasecmp(dot, ".jpeg") && strcasecmp(dot, ".png")) continue;
+        struct stat st;
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        long long size = stat(path, &st) == 0 ? (long long)st.st_size : -1;
+        uint64_t one = fnv(14695981039346656037ULL, e->d_name, strlen(e->d_name));
+        sig ^= fnv(one, &size, sizeof size);            /* (any order) */
+    }
+    closedir(d);
+    return sig;
+}
+
+static int64_t art_sig(sqlite3_stmt *tracks, int64_t album_id, const char *dir)
+{
+    char up[2048];
+    uint64_t sig = images_sig(dir);
+    if (disc_folder(dir) && parent_dir(dir, up, sizeof up) == 0) sig = fnv(sig, "^", 1) ^ images_sig(up);
+    sqlite3_reset(tracks);
+    sqlite3_bind_int64(tracks, 1, album_id);
+    if (sqlite3_step(tracks) == SQLITE_ROW) {
+        int64_t v[3] = {sqlite3_column_int64(tracks, 0), sqlite3_column_int64(tracks, 1), sqlite3_column_int64(tracks, 2)};
+        sig = fnv(sig, v, sizeof v);
+    }
+    sqlite3_reset(tracks);
+    return (int64_t)(sig & 0x7fffffffffffffffULL) | 1;   /* (never 0: not looked yet) */
+}
+
+/* New albums' covers, and coverless ones' again when what they could come
+ * from has changed (an image added to the folder, a track retagged). */
 static void build_art(library_t *lib, lib_progress_cb cb, void *ctx)
 {
     sqlite3_stmt *q = prep(lib->db,
-        "SELECT al.id, al.dir, t.path FROM albums al LEFT JOIN tracks t ON t.id=al.first_track WHERE al.art=0");
-    sqlite3_stmt *u = prep(lib->db, "UPDATE albums SET art=? WHERE id=?");
-    if (!q || !u) { sqlite3_finalize(q); sqlite3_finalize(u); return; }
-    int n = 0;
+        "SELECT al.id, al.dir, t.path, al.art, al.art_sig FROM albums al LEFT JOIN tracks t ON t.id=al.first_track"
+        " WHERE al.art<>1");
+    sqlite3_stmt *u = prep(lib->db, "UPDATE albums SET art=?, art_sig=? WHERE id=?");
+    sqlite3_stmt *others = prep(lib->db,
+        "SELECT path FROM tracks WHERE album_id=? AND has_pic=1 AND path<>? ORDER BY disc, track LIMIT 4");
+    sqlite3_stmt *tracks = prep(lib->db,
+        "SELECT COUNT(*), TOTAL(mtime), TOTAL(has_pic) FROM tracks WHERE album_id=?");
+    if (!q || !u || !others || !tracks) goto out;
+    int n = 0, retried = 0, found = 0;
     while (sqlite3_step(q) == SQLITE_ROW) {
         int64_t id = sqlite3_column_int64(q, 0);
         const char *dir = (const char *)sqlite3_column_text(q, 1);
         const char *first = (const char *)sqlite3_column_text(q, 2);
-        int r = make_art(lib, id, dir ? dir : "", first);
+        int art = sqlite3_column_int(q, 3);
+        int64_t sig = art_sig(tracks, id, dir ? dir : "");
+        if (art == 2 && sig == sqlite3_column_int64(q, 4)) continue;   /* nothing new to look at */
+        int r = make_art(lib, others, id, dir ? dir : "", first);
+        if (art == 2) retried++;
+        if (r == 0) found++;
         sqlite3_reset(u);
         sqlite3_bind_int(u, 1, r == 0 ? 1 : 2);   /* 2 = looked, none found */
-        sqlite3_bind_int64(u, 2, id);
+        sqlite3_bind_int64(u, 2, sig);
+        sqlite3_bind_int64(u, 3, id);
         sqlite3_step(u);
         if (cb && (++n % 20) == 0) cb(n, -1, "cover art", ctx);
     }
+    if (n) fprintf(stderr, "library: covers: %d looked for (%d again), %d found\n", n, retried, found);
+out:
     sqlite3_finalize(q);
     sqlite3_finalize(u);
+    sqlite3_finalize(others);
+    sqlite3_finalize(tracks);
 }
 
 /* ---------- playlists ---------- */
@@ -1669,11 +1710,11 @@ int library_scan(library_t *lib, const char *root, lib_progress_cb cb, void *ctx
     t_search = now_s();
     pv_free(&plv);
 
-    if (changed) {
-        sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
-        build_art(lib, cb, ctx);
-        sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
-    }
+    /* every scan: new albums, and coverless ones whose folder or tracks changed
+     * (an image added to the folder doesn't change any track) */
+    sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+    build_art(lib, cb, ctx);
+    sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
     t_art = now_s();
     fprintf(stderr, "library: scan %.1f s, %d changes: %swalk %.1f, files %.1f, groups %.1f, playlists %.1f, search %.1f, art %.1f\n",
             t_art - t0, changed, fast ? "fast " : "", t_walk - t0, t_files - t_walk, t_groups - t_files, t_pl - t_groups, t_search - t_pl,
@@ -1782,6 +1823,11 @@ int library_needs_tags(library_t *lib)
                             " (path LIKE '%.flac' OR path LIKE '%.wv' OR path LIKE '%.ape')))", 0) > 0;
 }
 
+int library_needs_art(library_t *lib)
+{
+    return get_int_col(lib, "SELECT EXISTS(SELECT 1 FROM albums WHERE art=2 AND COALESCE(art_sig, 0)=0)", 0) > 0;
+}
+
 int library_list_composer_tracks(library_t *lib, int64_t composer_id, int64_t album_id, lib_list_t *out)
 {
     g_credit_album = album_id;
@@ -1825,8 +1871,9 @@ int library_row(library_t *lib, lib_view_t view, int64_t id,
                     : (view == LIB_ALBUM_TRACKS || view == LIB_SONGS || view == LIB_CREDIT_TRACKS ||
                        view == LIB_COMPOSER_TRACKS) ? lib->row_track
                     : view == LIB_PLAYLISTS ? lib->row_playlist
-                    : (view == LIB_PLAYLIST_TRACKS || view == LIB_FAVOURITES || view == LIB_RECENT_PLAYED ||
-                       view == LIB_MOST_PLAYED) ? lib->row_pl_track
+                    : view == LIB_MOST_PLAYED ? lib->row_plays
+                    : (view == LIB_PLAYLIST_TRACKS || view == LIB_FAVOURITES || view == LIB_RECENT_PLAYED)
+                        ? lib->row_pl_track
                     : lib->row_album;   /* albums, artist albums, recently added */
     sqlite3_reset(s);
     sqlite3_bind_int64(s, 1, view == LIB_FOLDER ? -id : id);
@@ -1841,7 +1888,11 @@ int library_row(library_t *lib, lib_view_t view, int64_t id,
         view == LIB_COMPOSERS || view == LIB_YEARS)
         snprintf(meta, meta_cap, "%d", v);                                                   /* a count */
     else if (view == LIB_FOLDER) snprintf(meta, meta_cap, "%d song%s", v, v == 1 ? "" : "s");
+    else if (view == LIB_MOST_PLAYED) snprintf(meta, meta_cap, "%d play%s", v, v == 1 ? "" : "s");
     else if (track_list) snprintf(meta, meta_cap, "%d:%02d", v / 60000, (v / 1000) % 60);   /* length */
+    else if (library_row_shows_artist(view) && !lib->no_album_artists && sqlite3_column_text(s, 2) &&
+             *sqlite3_column_text(s, 2))
+        copy_col(s, 2, meta, meta_cap);                                                      /* album artist */
     else if (v > 0) snprintf(meta, meta_cap, "%d", v);                                       /* album year */
     if (view == LIB_PLAYLIST_TRACKS || view == LIB_FAVOURITES || view == LIB_RECENT_PLAYED ||
         view == LIB_MOST_PLAYED) {   /* a mix of artists: "Title · Artist" */
@@ -1850,6 +1901,21 @@ int library_row(library_t *lib, lib_view_t view, int64_t id,
         if (a && *a && l + 4 < main_cap) snprintf(main + l, main_cap - l, " \xC2\xB7 %s", (const char *)a);
     }
     return 0;
+}
+
+void library_set_album_artists(library_t *lib, int on)
+{
+    if (lib) lib->no_album_artists = !on;
+}
+
+int64_t library_track_album(library_t *lib, int64_t track_id)
+{
+    sqlite3_stmt *s = lib->track_album;
+    sqlite3_reset(s);
+    sqlite3_bind_int64(s, 1, track_id);
+    int64_t a = sqlite3_step(s) == SQLITE_ROW ? sqlite3_column_int64(s, 0) : 0;
+    sqlite3_reset(s);
+    return a;
 }
 
 int library_track(library_t *lib, int64_t id, lib_track_t *t)
@@ -1916,7 +1982,7 @@ int library_art(library_t *lib, int64_t album_id, int size, uint16_t *pixels)
 {
     char path[1200];
     art_path(lib, album_id, size, path, sizeof path);
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, "rbe");
     if (!f) return -1;
     size_t n = fread(pixels, 2, (size_t)size * size, f);
     fclose(f);
@@ -2086,7 +2152,7 @@ static int write_playlist(library_t *lib, int64_t id)
 
     char tmp[1200];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    FILE *f = fopen(tmp, "w");
+    FILE *f = fopen(tmp, "we");
     if (!f) return -1;
     fprintf(f, "#EXTM3U\n#PLAYLIST:%s\n", name);
     sqlite3_stmt *it = prep(lib->db,

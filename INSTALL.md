@@ -1,0 +1,58 @@
+# Installing Fathom on a HiFi Walker H2
+
+Fathom runs from the microSD card. All it puts on the H2 itself is a small bootloader,
+which starts Fathom from the card and can still start the stock firmware. Your music
+stays where it is: Fathom only reads it.
+
+**Which H2:** the one sold from 2023. In the stock firmware, System Settings → About the
+player → Version shows **V1.9 to V2.3** on these. Older H2s (V1.1 to V1.8) aren't
+supported yet, and the installer refuses them.
+
+**You need:**
+
+- a microSD card formatted **FAT32** (exFAT won't work);
+- the H2 charged above 50 %;
+- the release, `fathom-h2-VERSION.zip`, unzipped on a computer.
+
+## 1. Put your music in a `Music` folder
+
+Fathom looks for music in a folder called `Music` at the top of the card (subfolders
+inside it are fine). Music anywhere else on the card won't show up, so if yours is at the
+top of the card or in a folder with another name, move it into `Music` first.
+
+## 2. Copy Fathom to the card
+
+Put the card in the computer and copy everything inside the release's `sd/` folder to the
+top of the card. The release's other folders (`recovery/` and `about/`) stay on the
+computer.
+
+| On the card | What it is |
+|---|---|
+| `update.upt` | the installer, for the stock firmware's updater |
+| `uImage`, `linux_cmdline.txt` | the system Fathom runs on |
+| `fathom/` | the player, its fonts and themes; later also your settings and library |
+| `Music/` | your music, untouched |
+
+## 3. Install
+
+Put the card in the H2 and turn it on (the stock firmware, as usual; if your H2 runs
+Rockbox, hold **Play** while turning it on to start the stock firmware). Go to
+**System Settings → Firmware Update**. The H2 restarts into its updater, installs Fathom's
+bootloader, and restarts into Fathom, which reads your library (a few minutes the first
+time for a big one; later checks take seconds).
+
+At that first start, Fathom also copies the Bluetooth and Wi-Fi firmware from the stock
+firmware into its own folder, and says so. Fathom can't distribute those files, but every
+H2 already has them: there's nothing more to do for Bluetooth and Wi-Fi.
+
+The stock firmware stays on the H2: hold **Play** while turning it on to start it instead.
+You can delete `update.upt` from the card afterwards.
+
+## Next
+
+- **Recommended:** make a backup of your H2's flash, in a few minutes, from the
+  bootloader's menu. [ADVANCED.md](ADVANCED.md) explains how.
+- **Using Fathom**, from adding music to EQ, Bluetooth headphones, radio and updates:
+  [GUIDE.md](GUIDE.md).
+- **If the installer won't run** or the H2 doesn't start, and to remove Fathom completely:
+  [ADVANCED.md](ADVANCED.md).

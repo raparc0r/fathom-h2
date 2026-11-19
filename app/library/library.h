@@ -86,7 +86,18 @@ void library_list_free(lib_list_t *l);
 int  library_list_credit_tracks(library_t *lib, int64_t artist_id, int64_t album_id, lib_list_t *out);
 /* How many albums an artist has as album artist, and is credited on. */
 void library_artist_counts(library_t *lib, int64_t artist_id, int *nalbums, int *ncredit_albums);
-/* Text for one row: main label and right-hand metadata (year, duration, count). */
+/* Album lists whose rows show the album artist on the right, not the year:
+ * where the list isn't one artist's already, and the year isn't its order
+ * (an artist's albums, the ones they're credited on, keep the year). */
+static inline int library_row_shows_artist(lib_view_t v)
+{
+    return v == LIB_ALBUMS || v == LIB_RECENT_ADDED || v == LIB_GENRE_ALBUMS || v == LIB_YEAR_ALBUMS ||
+           v == LIB_COMPOSER_ALBUMS;
+}
+/* Whether those rows show the artist (on, by default) or the year. */
+void library_set_album_artists(library_t *lib, int on);
+/* Text for one row: main label and right-hand metadata (year, album artist,
+ * duration, count). */
 int  library_row(library_t *lib, lib_view_t view, int64_t id,
                  char *main, size_t main_cap, char *meta, size_t meta_cap);
 int  library_track(library_t *lib, int64_t id, lib_track_t *t);
@@ -95,6 +106,10 @@ int  library_artist_name(library_t *lib, int64_t artist_id, char *out, size_t ca
 /* Tracks read before tags added later (the composer, a CUE sheet in the
  * tags): a scan reads just those from them, once. 1 if there are any. */
 int  library_needs_tags(library_t *lib);
+/* Albums without a cover that no scan has looked at since covers could come
+ * from more places (FLAC pictures of any type, other tracks, a disc's album
+ * folder, big images): one background scan finds theirs. */
+int  library_needs_art(library_t *lib);
 /* A composer's tracks on one album (LIB_COMPOSER_TRACKS). */
 int  library_list_composer_tracks(library_t *lib, int64_t composer_id, int64_t album_id, lib_list_t *out);
 /* Names for screens' titles: 0, or -1 if there's no such one. A folder id of 0
@@ -107,6 +122,8 @@ int64_t library_album_artist(library_t *lib, int64_t album_id);   /* 0 if unknow
 
 /* Cached cover art for an album as RGB565 (size*size*2 bytes). 0 if present. */
 int library_art(library_t *lib, int64_t album_id, int size, uint16_t *pixels);
+/* A track's album (its cover in Songs): the id, 0 if unknown. */
+int64_t library_track_album(library_t *lib, int64_t track_id);
 /* An image file's contents (JPEG, PNG) as a square cover, centre-cropped, as
  * RGB565 (size*size*2 bytes): a radio station's. 0 if decoded. */
 int library_art_decode(const unsigned char *enc, size_t len, int size, uint16_t *pixels);

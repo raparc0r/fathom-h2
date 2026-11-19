@@ -33,7 +33,7 @@ int settings_load(const char *path)
     snprintf(g_path, sizeof g_path, "%s", path);
     g_n = 0;
     g_dirty = 0;
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(path, "re");
     if (!f) return 0;
     char line[256];
     while (fgets(line, sizeof line, f) && g_n < MAX_ENTRIES) {
@@ -94,7 +94,7 @@ int settings_save(void)
     if (!g_dirty || !g_path[0]) return 0;
     char tmp[600];
     snprintf(tmp, sizeof tmp, "%s.tmp", g_path);
-    FILE *f = fopen(tmp, "w");
+    FILE *f = fopen(tmp, "we");
     if (!f) return -1;
     fprintf(f, "; Fathom settings. Edit with the player off; unknown keys are kept.\n");
     for (int i = 0; i < g_n; i++) fprintf(f, "%s = %s\n", g_e[i].key, g_e[i].value);

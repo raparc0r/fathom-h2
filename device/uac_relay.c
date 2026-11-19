@@ -111,7 +111,7 @@ static int find_card(void)
     for (int n = 0; n < 8; n++) {
         char path[48], id[32] = "";
         snprintf(path, sizeof path, "/proc/asound/card%d/id", n);
-        FILE *f = fopen(path, "r");
+        FILE *f = fopen(path, "re");
         if (!f) continue;
         if (!fgets(id, sizeof id, f)) id[0] = '\0';
         fclose(f);
@@ -283,7 +283,7 @@ static void stream_open(relay_state_t *s, unsigned rate)
     s->out_open = s->buf && s->out_ok && s->out.open(s->out.ctx, &fmt) == 0;
     if (!s->out_open) { stream_close(s); return; }
     /* Bit-perfect checks (tools/usbdac): what the DAC gets, as it gets it */
-    if (access("/tmp/fathom-usbdac-tap", F_OK) == 0 && (s->tap = fopen("/tmp/fathom-usbdac.raw", "wb"))) {
+    if (access("/tmp/fathom-usbdac-tap", F_OK) == 0 && (s->tap = fopen("/tmp/fathom-usbdac.raw", "wbe"))) {
         out_alsa_set_tap(s->out.ctx, s->tap);
         char d[96];
         s->out.describe(s->out.ctx, d, sizeof d);

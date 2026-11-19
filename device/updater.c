@@ -2,7 +2,9 @@
 /*
  * Updates over Wi-Fi (Settings > About > Check for updates), on a worker
  * thread at the lowest priority (nice 19: the audio thread is SCHED_FIFO and
- * the UI comes first too), one step at a time, each only when asked:
+ * the UI comes first too), one step at a time, each only when asked (the
+ * check also by itself once a day when Settings > About > Check automatically
+ * is on, quietly: updater_check_quiet):
  *
  *   check     GitHub's latest release (pre-releases and drafts aren't
  *             "latest"); offered only if it's newer than this one
@@ -40,6 +42,9 @@ static struct {
     volatile int abort;
     int running;                     /* a worker is out */
     int installed;
+    int quiet;                       /* the check out is the automatic one: nothing on the screen */
+    int quiet_result;                /* its answer, until read: 1 answered, -1 none */
+    char quiet_tag[32];              /* a newer release it found, or "" */
 } U = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
 static void changed_locked(void) { U.seq++; }
@@ -102,6 +107,22 @@ static void *check_thread(void *arg)
             parsed ? "no zip" : r.asset);
     free(buf);
     pthread_mutex_lock(&U.mu);
+    if (U.quiet) {                   /* only a newer release shows, as if asked */
+        int newer = n > 0 && !parsed && update_is_newer(r.tag, U.st.current);
+        U.quiet = 0;
+        U.quiet_result = n > 0 ? 1 : -1;
+        snprintf(U.quiet_tag, sizeof U.quiet_tag, "%s", newer ? r.tag : "");
+        if (newer) {
+            U.rel = r;
+            U.st.size = r.size;
+            snprintf(U.st.latest, sizeof U.st.latest, "%s", r.tag);
+            U.st.state = UI_UPD_AVAILABLE;
+        }
+        U.running = 0;
+        changed_locked();
+        pthread_mutex_unlock(&U.mu);
+        return NULL;
+    }
     snprintf(U.st.latest, sizeof U.st.latest, "%s", r.tag);
     if (U.abort) U.st.state = UI_UPD_IDLE;
     else if (n < 0) fail_locked(UPDATE_ERR_NET, NULL);
@@ -251,7 +272,11 @@ void updater_do(int what)
     int s = U.st.state;
     switch (what) {
     case UI_UPD_CHECK:
-        if (s <= UI_UPD_AVAILABLE || s == UI_UPD_FAILED) {
+        if (U.running && U.quiet) {      /* asked during the automatic check: it answers here */
+            U.quiet = 0;
+            U.st.state = UI_UPD_CHECKING;
+            U.st.message[0] = '\0';
+        } else if (s <= UI_UPD_AVAILABLE || s == UI_UPD_FAILED) {
             if (run_locked(check_thread)) { U.st.state = UI_UPD_CHECKING; U.st.message[0] = '\0'; }
         }
         break;
@@ -279,6 +304,29 @@ void updater_do(int what)
     }
     changed_locked();
     pthread_mutex_unlock(&U.mu);
+}
+
+int updater_check_quiet(void)
+{
+    pthread_mutex_lock(&U.mu);
+    int s = U.st.state, ok = 0;
+    if (s == UI_UPD_IDLE || s == UI_UPD_LATEST || s == UI_UPD_FAILED) {
+        U.quiet = 1;                     /* (the worker reads it under the lock, after this) */
+        ok = run_locked(check_thread);
+        if (!ok) U.quiet = 0;
+    }
+    pthread_mutex_unlock(&U.mu);
+    return ok;
+}
+
+int updater_quiet_result(char *tag, size_t cap)
+{
+    pthread_mutex_lock(&U.mu);
+    int r = U.quiet_result;
+    U.quiet_result = 0;
+    snprintf(tag, cap, "%s", U.quiet_tag);
+    pthread_mutex_unlock(&U.mu);
+    return r;
 }
 
 void updater_refuse(const char *why)

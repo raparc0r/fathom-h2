@@ -4,6 +4,7 @@
 #define FATHOM_UI_H
 
 #include "audio/eq.h"
+#include "core/batlog.h"
 #include "library/library.h"
 #include "lvgl.h"
 #include "player/player.h"
@@ -46,6 +47,11 @@ struct ui_fonts {
 #define UI_BRIGHTNESS_LEVELS  16
 #define UI_BRIGHTNESS_DEFAULT 9
 #define UI_TIMEOUT_DEFAULT    30   /* seconds; 0 = never */
+/* Defaults of settings read in more than one place (settings.ini keeps
+ * only what was changed: someone who never changed one gets a new default) */
+#define UI_COVERS_DEFAULT          1   /* display.covers: 1 Albums, 2 Songs, 3 both */
+#define UI_EXCLUDE_SPOKEN_DEFAULT  1   /* shuffle.exclude_spoken: audiobooks out of shuffle */
+#define UI_UPDATE_AUTO_DEFAULT     1   /* update.auto: ask GitHub once a day, never download */
 
 /* What the UI asks of the platform when a setting changes (either may be NULL). */
 typedef struct ui_fonts ui_fonts_t;
@@ -175,6 +181,9 @@ typedef struct {
      * when the state changes with ui_update_changed(). */
     void (*update_state)(ui_update_t *st);
     void (*update_do)(int what);
+    /* Settings > Power > Battery: the history for a graph of `days` (1 or 7),
+     * from core/batlog.c. 0, or -1 (none: Battery shows only the charge). */
+    int  (*battery_report)(batrep_t *rep, int days);
 } ui_hooks_t;
 
 /* lib and player may be NULL (empty library, no playback). Settings

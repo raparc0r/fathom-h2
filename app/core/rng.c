@@ -52,7 +52,7 @@ double rng_range(rng_t *r, double lo, double hi)
 uint64_t rng_os_seed(void)
 {
     uint64_t seed = 0;
-    FILE *f = fopen("/dev/urandom", "rb");
+    FILE *f = fopen("/dev/urandom", "rbe");
     if (f) {
         size_t got = fread(&seed, 1, sizeof seed, f);
         fclose(f);

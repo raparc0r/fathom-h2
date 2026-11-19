@@ -17,9 +17,9 @@ gzip -9 -n -c "$BINARIES_DIR/vmlinux.bin" > "$BINARIES_DIR/vmlinux.bin.gz"
 "$HOST_DIR/bin/mkimage" -A mips -O linux -T kernel -C gzip -a "$load" -e "$entry" \
     -n "Fathom $(date -u +%Y%m%d-%H%M)" -d "$BINARIES_DIR/vmlinux.bin.gz" "$sd/uImage" >/dev/null
 
-# Console on the USB gadget's serial port only: the screen shows the boot logo,
-# centred, with no cursor (kernel messages are still in dmesg and pstore).
-printf '%s\n' "loglevel=7 panic=10 console=ttyGS0,115200 fbcon=logo-pos:center vt.global_cursor_default=0 snd_usb_audio.lowlatency=0 firmware_class.path=/mnt/sd/fathom/firmware" > "$sd/linux_cmdline.txt"
+# Console on the USB gadget's serial port only (there's no text console on the
+# screen: h2boot's logo stays until the player; messages are in dmesg and pstore).
+printf '%s\n' "loglevel=7 panic=10 console=ttyGS0,115200 snd_usb_audio.lowlatency=0 firmware_class.path=/mnt/sd/fathom/firmware" > "$sd/linux_cmdline.txt"
 
 # The player and its assets, run from the card (see S90fathom): fathom/bin, fathom/assets
 if [ -f "$BINARIES_DIR/fathom-player" ]; then

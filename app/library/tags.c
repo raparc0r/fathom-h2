@@ -3,10 +3,12 @@
 #include "tags.h"
 
 #include <ctype.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 
 #include <FLAC/metadata.h>
 #include <mpg123.h>
@@ -146,10 +148,11 @@ static int read_flac_libflac(const char *path, tags_t *t)
         }
         FLAC__metadata_object_delete(vc);
     }
-    FLAC__StreamMetadata *pic = NULL;
-    if (FLAC__metadata_get_picture(path, &pic, FLAC__STREAM_METADATA_PICTURE_TYPE_FRONT_COVER,
+    FLAC__StreamMetadata *pic = NULL;   /* (any picture: the fast reader leaves out only icons) */
+    if (FLAC__metadata_get_picture(path, &pic, (FLAC__StreamMetadata_Picture_Type)(-1),
                                    NULL, NULL, (unsigned)-1, (unsigned)-1, (unsigned)-1, (unsigned)-1) && pic) {
-        t->has_picture = 1;
+        t->has_picture = pic->data.picture.type != FLAC__STREAM_METADATA_PICTURE_TYPE_FILE_ICON_STANDARD &&
+                         pic->data.picture.type != FLAC__STREAM_METADATA_PICTURE_TYPE_FILE_ICON;
         FLAC__metadata_object_delete(pic);
     }
     return 0;
@@ -172,7 +175,7 @@ static int read_flac(const char *path, tags_t *t) { return read_flac_cue(path, t
 /* The same, and with `cue` the CUESHEET comment's text (malloc'd) */
 static int read_flac_cue(const char *path, tags_t *t, char **cue, size_t *cue_len)
 {
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, "rbe");
     if (!f) return -1;
     unsigned char h[10];
     int ok = 0, vc_done = 0;
@@ -235,7 +238,7 @@ static int read_flac_cue(const char *path, tags_t *t, char **cue, size_t *cue_le
         } else if (type == 6 && len >= 4) {           /* PICTURE: its type only */
             unsigned char pt[4];
             if (fread(pt, 1, 4, f) != 4) break;
-            if (be32(pt) == 3) t->has_picture = 1;    /* the front cover */
+            if (be32(pt) != 1 && be32(pt) != 2) t->has_picture = 1;   /* a cover of any kind, not an icon */
             if (fseek(f, (long)(len - 4), SEEK_CUR)) break;
         } else if (type == 127) {
             break;                                     /* invalid */
@@ -390,7 +393,7 @@ static void read_id3_file(FILE *f, tags_t *t)
 
 static void read_id3(const char *path, tags_t *t)
 {
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, "rbe");
     if (!f) return;
     read_id3_file(f, t);
     fclose(f);
@@ -407,7 +410,8 @@ static int read_mp3(const char *path, tags_t *t)
     if (!mh) return 0;
     mpg123_param(mh, MPG123_ADD_FLAGS, MPG123_QUIET | MPG123_GAPLESS, 0);
     mpg123_param(mh, MPG123_RESYNC_LIMIT, -1, 0);
-    if (mpg123_open(mh, path) == MPG123_OK) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);          /* (opened here: close-on-exec) */
+    if (fd >= 0 && mpg123_open_fd(mh, fd) == MPG123_OK) {
         long rate;
         int ch, enc;
         if (mpg123_getformat(mh, &rate, &ch, &enc) == MPG123_OK) {
@@ -420,6 +424,7 @@ static int read_mp3(const char *path, tags_t *t)
         mpg123_close(mh);
     }
     mpg123_delete(mh);
+    if (fd >= 0) close(fd);
     return 0;
 }
 
@@ -430,7 +435,7 @@ static int read_mp3(const char *path, tags_t *t)
  * out: the player can't play them. */
 static int read_dsd(const char *path, tags_t *t)
 {
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, "rbe");
     if (!f) return -1;
     dsd_info_t in;
     const char *name;
@@ -619,7 +624,7 @@ static int ogg_pic_type(const unsigned char *head, size_t n)
 static int ogg_vorbis_walk(const char *path, tags_t *t, int *front, int *first, long want,
                            unsigned char **data, size_t *len, size_t max)
 {
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, "rbe");
     if (!f) return -1;
     ogg_rd_t r;
     uint32_t rate = 0;
@@ -859,6 +864,63 @@ int tags_cuesheet(const char *path, char **text, size_t *len)
 }
 
 static size_t g_max_picture = (size_t)-1;
+
+/* A FLAC's PICTURE blocks, read for their type and where their bytes are:
+ * the front cover (3), else "other" (0, what some taggers write for any
+ * cover), else the first of any other kind; never a file icon (1, 2). */
+int tags_picture_at(const char *path, long *off, long *len)
+{
+    const char *sfx = cue_part_suffix(path);
+    if (sfx) {
+        char file[1024];
+        if ((size_t)(sfx - path) >= sizeof file) return -1;
+        memcpy(file, path, (size_t)(sfx - path));
+        file[sfx - path] = '\0';
+        return tags_picture_at(file, off, len);
+    }
+    if (strcasecmp(ext_of(path), "flac")) return -1;
+    FILE *f = fopen(path, "rbe");
+    if (!f) return -1;
+    unsigned char h[10];
+    int best = 99;
+    if (fread(h, 1, 4, f) != 4) goto out;
+    if (!memcmp(h, "ID3", 3)) {
+        if (fread(h + 4, 1, 6, f) != 6) goto out;
+        long skip = 10 + ((long)(h[6] & 0x7f) << 21 | (long)(h[7] & 0x7f) << 14 | (long)(h[8] & 0x7f) << 7 | (h[9] & 0x7f));
+        if (h[5] & 0x10) skip += 10;
+        if (fseek(f, skip, SEEK_SET) || fread(h, 1, 4, f) != 4) goto out;
+    }
+    if (memcmp(h, "fLaC", 4)) goto out;
+    for (int last = 0; !last;) {
+        unsigned char bh[4];
+        if (fread(bh, 1, 4, f) != 4) break;
+        last = bh[0] & 0x80;
+        int type = bh[0] & 0x7f;
+        uint32_t blen = be24(bh + 1);
+        long next = ftell(f) + (long)blen;
+        if (type == 6 && blen >= 32) {
+            unsigned char b[8];
+            if (fread(b, 1, 8, f) != 8) break;          /* its type, the MIME type's length */
+            uint32_t pt = be32(b), ml = be32(b + 4);
+            int rank = pt == 3 ? 0 : pt == 0 ? 1 : (pt == 1 || pt == 2) ? 99 : 2;
+            if (rank < best && ml < blen && !fseek(f, (long)ml, SEEK_CUR) && fread(b, 1, 4, f) == 4) {
+                uint32_t dl = be32(b);                   /* the description's length, then 16 bytes of sizes */
+                unsigned char d[4];
+                if (dl < blen && !fseek(f, (long)dl + 16, SEEK_CUR) && fread(d, 1, 4, f) == 4) {
+                    uint32_t n = be32(d);
+                    long at = ftell(f);
+                    if (n && at + (long)n <= next) { best = rank; *off = at; *len = (long)n; }
+                }
+            }
+        } else if (type == 127) {
+            break;
+        }
+        if (best == 0 || fseek(f, next, SEEK_SET)) break;
+    }
+out:
+    fclose(f);
+    return best < 99 ? 0 : -1;
+}
 void tags_set_max_picture(size_t bytes) { g_max_picture = bytes; }
 
 int tags_picture(const char *path, unsigned char **data, size_t *len)
@@ -875,18 +937,21 @@ int tags_picture(const char *path, unsigned char **data, size_t *len)
     }
     const char *e = ext_of(path);
     if (!strcasecmp(e, "flac")) {
-        FLAC__StreamMetadata *pic = NULL;
-        if (!FLAC__metadata_get_picture(path, &pic, FLAC__STREAM_METADATA_PICTURE_TYPE_FRONT_COVER,
-                                        NULL, NULL, (unsigned)-1, (unsigned)-1, (unsigned)-1, (unsigned)-1) || !pic)
-            return -1;
-        *len = pic->data.picture.data_length;
-        *data = *len <= g_max_picture ? malloc(*len) : NULL;
-        if (*data) memcpy(*data, pic->data.picture.data, *len);
-        FLAC__metadata_object_delete(pic);
+        long off, n;
+        if (tags_picture_at(path, &off, &n) || (size_t)n > g_max_picture) return -1;
+        FILE *f = fopen(path, "rbe");
+        if (!f) return -1;
+        *data = malloc((size_t)n ? (size_t)n : 1);
+        if (!*data || fseek(f, off, SEEK_SET) || fread(*data, 1, (size_t)n, f) != (size_t)n) {
+            free(*data);
+            *data = NULL;
+        }
+        fclose(f);
+        *len = *data ? (size_t)n : 0;
         return *data ? 0 : -1;
     }
     if (!strcasecmp(e, "mp3") || dsd_path(path)) {
-        FILE *f = fopen(path, "rb");
+        FILE *f = fopen(path, "rbe");
         if (!f) return -1;
         dsd_info_t in;
         if (dsd_path(path) && (dsd_probe(f, &in) || !in.id3 || fseeko(f, (off_t)in.id3, SEEK_SET))) {

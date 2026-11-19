@@ -1,0 +1,57 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] x1000: h2boot: go back to the previous kernel when an update's won't start (Eros Q)
+
+An update over Wi-Fi keeps the kernel it replaces as /uImage.prev and its
+Wi-Fi modules as /fathom/wifi/modules.prev, and leaves /fathom/boot-new.
+Before loading /uImage, boot_linux() moves that marker on (boot-new,
+boot-try1, boot-try2; the player deletes it once it's up): a third start
+that still finds boot-try2 puts the previous kernel and modules back in
+place, the new ones kept as .failed, and leaves /fathom/boot-fell-back for
+the player to say so. A /uImage that won't load at all goes back at once.
+Cards without the markers (copied by hand) start /uImage as before.
+
+The code is Fathom's bootloader/fathom/bootpick.c (tested on the host by
+tests/test_bootpick.c), which bootloader/build.sh copies into
+bootloader/x1000/.
+---
+--- a/bootloader/SOURCES	2026-11-18 14:47:07
++++ b/bootloader/SOURCES	2026-11-18 14:47:20
+@@ -83,6 +83,7 @@
+ #if defined(EROS_QN)
+ x1000/fwcopy.c
+ x1000/fwcopy-h2boot.c
++x1000/bootpick.c
+ #endif
+ #elif defined(HIBY_R1_NATIVE)
+ ingenic/gui-ingenic.c
+--- a/bootloader/x1000/boot.c	2026-11-18 14:47:03
++++ b/bootloader/x1000/boot.c	2026-11-18 14:47:20
+@@ -27,6 +27,9 @@
+ #include "file.h"
+ #include "linuxboot.h"
+ #include "boot-x1000.h"
++#if defined(EROS_QN)
++#include "bootpick.h"
++#endif
+ #include <ctype.h>
+ #include <sys/types.h>
+ #if defined(EROS_QN)
+@@ -134,10 +137,18 @@
+      * the stock system in the flash, if it isn't there yet */
+     fathom_copy_firmware(false);
+     show_boot_logo();   /* Fathom: on screen while the kernel loads */
++    /* Fathom: an update's kernel gets two starts to reach the player, then
++     * the one before it goes back in place (bootpick.c) */
++    int fell_back = check_disk(false) == DISK_PRESENT && fathom_boot_pick();
+ #endif
+     struct uimage_header uh;
+     size_t img_length;
+     int handle = load_uimage_file("/uImage", &uh, &img_length);
++#if defined(EROS_QN)
++    /* one that won't load at all: the one before it, at once */
++    if(handle < 0 && !fell_back && fathom_boot_fall_back() == 0)
++        handle = load_uimage_file("/uImage", &uh, &img_length);
++#endif
+     if(handle < 0)
+         return;
+ 

@@ -274,7 +274,7 @@ int cue_parse(const char *text, size_t len, cue_sheet_t *out)
 
 int cue_read(const char *path, cue_sheet_t *out)
 {
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, "rbe");
     if (!f) return -1;
     char *b = malloc(CUE_MAX_BYTES);
     size_t n = b ? fread(b, 1, CUE_MAX_BYTES, f) : 0;

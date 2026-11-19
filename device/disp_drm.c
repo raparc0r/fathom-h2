@@ -116,7 +116,7 @@ fail:
 
 void disp_drm_set_backlight_raw(int value)
 {
-    FILE *f = fopen(BL_PATH, "w");
+    FILE *f = fopen(BL_PATH, "we");
     if (!f) return;
     fprintf(f, "%d\n", value < 0 ? 0 : value);
     fclose(f);
@@ -126,7 +126,7 @@ int disp_drm_backlight_max(void)
 {
     static int max;
     if (!max) {
-        FILE *f = fopen("/sys/class/backlight/backlight/max_brightness", "r");
+        FILE *f = fopen("/sys/class/backlight/backlight/max_brightness", "re");
         if (!f || fscanf(f, "%d", &max) != 1 || max <= 0) max = 255;
         if (f) fclose(f);
     }

@@ -57,7 +57,7 @@ int lang_load(const char *path)
 {
     clear();
     if (!path || !*path) return 0;
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, "rbe");
     if (!f) return -1;
     fseek(f, 0, SEEK_END);
     long len = ftell(f);

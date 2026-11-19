@@ -40,6 +40,7 @@
 #include "audio/engine.h"
 #include "core/rng.h"
 #include "core/lang.h"
+#include "core/batlog.h"
 #include "core/settings.h"
 #include "audio/mixer_alsa.h"
 #include "audio_route.h"
@@ -116,7 +117,7 @@ static void screen_shot(void)
         if (lv_obj_get_width(c) >= LV_HOR_RES && lv_obj_get_height(c) >= LV_VER_RES) { what = c; break; }
     }
     lv_draw_buf_t *img = lv_snapshot_take(what, LV_COLOR_FORMAT_RGB888);
-    FILE *f = img ? fopen("/tmp/fathom-screen.bmp", "wb") : NULL;
+    FILE *f = img ? fopen("/tmp/fathom-screen.bmp", "wbe") : NULL;
     if (f) {
         int w = img->header.w, h = img->header.h, row = (w * 3 + 3) & ~3;
         uint32_t v[] = {54u + (uint32_t)row * h, 0, 54, 40, (uint32_t)w, (uint32_t)h};
@@ -147,7 +148,7 @@ static void every_second(lv_timer_t *t) { (void)t; ui_tick_1s(); }
 /* Battery level and charging state from the AXP2101 driver (power_supply class). */
 static int read_int_file(const char *path, char *buf, size_t cap)
 {
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(path, "re");
     if (!f) return -1;
     int ok = fgets(buf, (int)cap, f) != NULL;
     fclose(f);
@@ -177,11 +178,38 @@ static void clock_restore(void)
 
 static void clock_save(void) { settings_set_int("clock.last", (int)time(NULL)); }
 
+/* ---- battery history (core/batlog.c): Settings > Power > Battery ----
+ * fathom/battery.log on the card: the charge and the state, noted every 10 s
+ * (battery_log_poll), written every 10 minutes, at charger changes and when
+ * the player stops. */
+static batlog_t g_batlog;
+static int g_batlog_on;
+
+static int64_t mono_s(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec;
+}
+
+static void batlog_end(void) { if (g_batlog_on) batlog_off(&g_batlog, mono_s()); }   /* switching off, restarting */
+
+static int hook_battery_report(batrep_t *rep, int days)
+{
+    if (!g_batlog_on) return -1;
+    batrec_t *r = NULL;
+    int n = batlog_load(g_batlog.path, &g_batlog, mono_s(), &r);
+    if (n > 0) batlog_report(r, n, days, rep);
+    free(r);
+    return n > 0 ? 0 : -1;
+}
+
 
 static void power_off(const char *why)
 {
     fprintf(stderr, "power off: %s\n", why);
     g_powering_off = 1;
+    batlog_end();
     clock_save();
     settings_save();
     queue_save();
@@ -353,7 +381,7 @@ static void volume_init(const char *data)
     snprintf(g_vol_path, sizeof g_vol_path, "%s/volume", data);
     if (mixer_open(&g_mix, NULL, "Master Playback Volume")) { fprintf(stderr, "volume: no mixer control\n"); return; }
     g_user_vol = mixer_get(&g_mix);                     /* the driver's safe default */
-    FILE *f = fopen(g_vol_path, "r");
+    FILE *f = fopen(g_vol_path, "re");
     int v;
     if (f && fscanf(f, "%d", &v) == 1 && v >= g_mix.min && v <= g_mix.max) g_user_vol = v;
     if (f) fclose(f);
@@ -392,7 +420,7 @@ static void volume_step(int dir)
     if (v < 0) return;
     g_user_vol = v;
     volume_show(v);
-    FILE *f = fopen(g_vol_path, "w");
+    FILE *f = fopen(g_vol_path, "we");
     if (f) { fprintf(f, "%d\n", v); fclose(f); }
 }
 
@@ -493,7 +521,7 @@ static void usb_volume_step(int dir)
     snprintf(t, sizeof t, "%s%ld.%ld dB%s", g_usb_cdb < 0 ? "-" : "", a / 100, (a % 100) / 10,
              vol_limit() && g_usb_cdb >= cap ? " (limit)" : "");
     ui_level("Volume", (int)(g_usb_cdb - g_usb_lo), (int)(g_usb_hi - g_usb_lo), t);
-    FILE *f = fopen(g_usb_vol_path, "w");
+    FILE *f = fopen(g_usb_vol_path, "we");
     if (f) { fprintf(f, "%ld\n", g_usb_cdb); fclose(f); }
 }
 
@@ -544,7 +572,7 @@ static void usb_dac_attach(int n, const char *usbid)
                  mixer_db_range(&g_usb_mix, &g_usb_lo, &g_usb_hi);
     if (g_usb_soft) { mixer_close(&g_usb_mix); g_usb_lo = -6000; g_usb_hi = 0; }
     g_usb_cdb = USB_FIRST_CDB;
-    FILE *f = fopen(g_usb_vol_path, "r");
+    FILE *f = fopen(g_usb_vol_path, "re");
     long v;
     if (f && fscanf(f, "%ld", &v) == 1) g_usb_cdb = v;
     if (f) fclose(f);
@@ -1046,7 +1074,7 @@ static int hook_eq_put(const char *name, const eq_profile_t *p)
     mkdir(dir, 0755);
     eq_path(name, path, sizeof path);
     snprintf(tmp, sizeof tmp, "%s.new", path);
-    FILE *f = fopen(tmp, "w");
+    FILE *f = fopen(tmp, "we");
     if (!f) return -1;
     fprintf(f, "Preamp: %.1f dB\n", p->preamp_db);
     for (int i = 0; i < p->n; i++)
@@ -1170,13 +1198,20 @@ static void net_poll(lv_timer_t *t)
         unlink("/var/run/fathom-clock");
         fprintf(stderr, "clock: set by NTP\n");
         clock_save();
+        if (g_batlog_on) batlog_clock_set(&g_batlog, time(NULL), mono_s());   /* (how long it was off, known now) */
     }
 }
 
 /* ---- updates (Settings > About > Check for updates) ----
- * Only when asked, never on their own (updater.c). */
+ * When asked, or a quiet check by itself once a day with Check automatically
+ * on (auto_update_poll); downloads and installs only ever when asked.
+ * settings.ini keeps: update.auto (0/1), update.checked (the last answer's
+ * time), update.found (a newer release seen, "" if none) and update.told (the
+ * one the wake-up toast has announced: each is said once). */
 
 #define UPDATE_STAGE CARD_DIR "/fathom/update"
+
+static int g_update_asked;          /* a check from the screen: what it finds is seen there */
 
 static void hook_update_do(int what)
 {
@@ -1184,7 +1219,51 @@ static void hook_update_do(int what)
         updater_refuse(!wifi_on() ? "Wi-Fi is off: Settings > Wi-Fi" : "Not connected yet: Settings > Wi-Fi");
         return;
     }
+    if (what == UI_UPD_CHECK) g_update_asked = 1;
     updater_do(what);
+}
+
+/* What a check found (tag: newer, or "" for up to date), and whether its owner has seen it. */
+static void update_found(const char *tag, int seen)
+{
+    settings_set_int("update.checked", (int)time(NULL));
+    settings_set("update.found", tag);
+    if (seen && tag[0]) settings_set("update.told", tag);
+    settings_save();
+}
+
+/* The screen turned on by Power: a newer release found by the automatic
+ * check, once (on two lines: a long version number may not leave room for
+ * the second half on the first in the wider themes). */
+static void update_announce(void)
+{
+    const char *tag = settings_get("update.found", "");
+    if (!tag[0] || !strcmp(tag, settings_get("update.told", ""))) return;
+    char t[96];
+    snprintf(t, sizeof t, "Fathom %s is available\nSettings > About", tag);
+    ui_toast(t, 4000);
+    fprintf(stderr, "update: told %s is available\n", tag);
+    settings_set("update.told", tag);
+    settings_save();
+}
+
+/* The player is up: an update's new kernel started (h2boot, bootloader/
+ * fathom/bootpick.c, gives it two starts to get here before going back to the
+ * one before); or it didn't, and the H2 went back: said once. */
+static void boot_markers(void)
+{
+    static const char *const tried[] = {"boot-new", "boot-try1", "boot-try2"};
+    char p[300];
+    for (size_t i = 0; i < sizeof tried / sizeof tried[0]; i++) {
+        snprintf(p, sizeof p, CARD_DIR "/fathom/%s", tried[i]);
+        if (!unlink(p)) fprintf(stderr, "update: the new system started (%s)\n", tried[i]);
+    }
+    snprintf(p, sizeof p, CARD_DIR "/fathom/boot-fell-back");
+    if (!access(p, F_OK)) {
+        fprintf(stderr, "update: the new system didn't start twice: h2boot went back to the one before\n");
+        ui_toast("The update didn't start, so the H2 went back to the previous version", 6000);
+        unlink(p);
+    }
 }
 
 /* Installed: the new kernel needs a restart, as power-off does it (init's
@@ -1194,10 +1273,19 @@ static void update_poll(lv_timer_t *t)
     (void)t;
     static unsigned seen;
     unsigned s = updater_seq();
-    if (s != seen) { seen = s; ui_update_changed(); }
+    if (s != seen) {
+        seen = s;
+        ui_update_changed();
+        ui_update_t st;
+        updater_ui_state(&st);
+        if (g_update_asked && st.state == UI_UPD_AVAILABLE) { g_update_asked = 0; update_found(st.latest, 1); }
+        else if (g_update_asked && st.state == UI_UPD_LATEST) { g_update_asked = 0; update_found("", 1); }
+        else if (st.state == UI_UPD_FAILED || st.state == UI_UPD_IDLE) g_update_asked = 0;   /* (or cancelled) */
+    }
     if (!updater_installed()) return;
     fprintf(stderr, "update: installed, restarting\n");
     g_powering_off = 1;                /* "Restarting" stays on the screen */
+    batlog_end();
     clock_save();
     settings_save();
     queue_save();
@@ -1291,7 +1379,7 @@ static void now_publish(lv_timer_t *t)
              n.radio ? -2 - (long long)player_seq(g_player) : (long long)n.track.id,   /* radio: new song, new id */
              (unsigned)n.len_ms, (unsigned)n.pos_ms, n.track.title, n.track.artist, n.track.album);
     if (!strcmp(buf, last)) return;
-    FILE *f = fopen(NOW_FILE ".new", "w");
+    FILE *f = fopen(NOW_FILE ".new", "we");
     if (!f) return;
     fputs(buf, f);
     if (fclose(f) == 0 && rename(NOW_FILE ".new", NOW_FILE) == 0) memcpy(last, buf, sizeof last);
@@ -1700,7 +1788,7 @@ static void usb_dac_mode_poll(lv_timer_t *t)
 /* A file in /tmp left by fathom-usbdisk, read and removed; 0 if there was one. */
 static int take_tmp_file(const char *path, char *out, size_t cap)
 {
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(path, "re");
     if (!f) return -1;
     out[0] = '\0';
     if (out && cap && fgets(out, (int)cap, f)) out[strcspn(out, "\n")] = '\0';
@@ -1724,7 +1812,7 @@ static int g_scan_result, g_scan_changes;
  * (library_set_fast_walk): find it in /proc/mounts. */
 static void fast_walk_setup(library_t *lib, const char *music)
 {
-    FILE *f = fopen("/proc/mounts", "r");
+    FILE *f = fopen("/proc/mounts", "re");
     if (!f || !music) { if (f) fclose(f); return; }
     char dev[128], mnt[256], type[32], best_dev[128] = "", best_mnt[256] = "";
     while (fscanf(f, "%127s %255s %31s %*[^\n]", dev, mnt, type) == 3) {
@@ -1742,6 +1830,7 @@ static void fast_walk_setup(library_t *lib, const char *music)
 static void *scan_thread(void *arg)
 {
     (void)arg;
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);   /* below the music and the UI, as levelling */
     g_scan_result = g_scan_lib ? library_scan(g_scan_lib, g_music, NULL, NULL) : -1;
     g_scan_changes = g_scan_lib && g_scan_result >= 0 ? library_scan_changes(g_scan_lib) : 0;
     g_scan_state = 2;
@@ -2000,6 +2089,47 @@ static void queue_timer(lv_timer_t *t)
     if (n.playing || player_seq(g_player) != g_queue_saved_seq) queue_save();
 }
 
+/* ---- automatic update checks (Settings > About > Check automatically) ----
+ * Off unless the owner turns it on. At most once a day (a failed try again
+ * after an hour: update_auto_due), only on Wi-Fi already joined and while the
+ * H2 rests: the screen off for a minute, nothing playing unless it's charging,
+ * no download, network-drive transfer, USB drive or DAC mode. It only asks
+ * GitHub: a newer release is said by a toast the next time Power turns the
+ * screen on, and offered in Settings > About. */
+
+#define AUTO_UPDATE_REST_MS 60000
+
+static void auto_update_poll(void)
+{
+    static long tried;               /* (since this start: a restart tries again at once) */
+    char tag[32];
+    int r = updater_quiet_result(tag, sizeof tag);
+    if (r) {
+        fprintf(stderr, "update: checked by itself: %s\n", r < 0 ? "no answer" : tag[0] ? tag : "up to date");
+        if (r > 0) update_found(tag, 0);
+    }
+    if (!settings_get_int("update.auto", UI_UPDATE_AUTO_DEFAULT) || g_screen_on || ms_now() - g_last_input < AUTO_UPDATE_REST_MS) return;
+    if (!wifi_connected() || share_busy() || updater_busy() || g_usb_drive || g_relay || g_charge_mode) return;
+    player_now_t n = {0};
+    if (g_player) player_now(g_player, &n);
+    if (n.playing && !usb_powered()) return;
+    long now = (long)time(NULL);
+    if (!update_auto_due(now, settings_get_int("update.checked", 0), tried)) return;
+    if (updater_check_quiet()) tried = now;
+}
+
+/* The battery history's note: the charge, and what drains it */
+static void battery_log_poll(void)
+{
+    if (!g_batlog_on || g_bat_pct < 0) return;
+    player_now_t n = {0};
+    if (g_player) player_now(g_player, &n);
+    int out = g_usb_card >= 0 ? BL_OUT_USB : on_bt_now() ? BL_OUT_BT : g_jack_lo ? BL_OUT_LINE : BL_OUT_WIRED;
+    int f = (g_charging ? BL_CHARGING : 0) | (g_screen_on ? BL_SCREEN : 0) | (n.playing ? BL_PLAYING : 0) |
+            (wifi_available() && wifi_on() ? BL_WIFI : 0) | (bt_available() && bt_on() ? BL_BT : 0) | out << BL_OUT_SHIFT;
+    batlog_note(&g_batlog, mono_s(), g_bat_pct, f);
+}
+
 /* ---- the polls: one timer ----
  * Everything the player polls, on one 250 ms timer: LVGL's timers drift apart,
  * so a dozen of them (250, 300, 500 ms, 1, 10, 30 s) woke the CPU 30 to 40 times
@@ -2022,13 +2152,14 @@ static void polls(lv_timer_t *t)
         net_poll(NULL);
         scan_poll(NULL);
     }
+    if (k % 40 == 0) auto_update_poll();   /* 10 s */
     if (k % 4 == 0) {          /* 1 s */
         every_second(NULL);
         now_publish(NULL);
         charge_poll(NULL);
         rg_poll(NULL);
     }
-    if (k % 40 == 0) poll_battery(NULL);   /* 10 s */
+    if (k % 40 == 0) { poll_battery(NULL); battery_log_poll(); }   /* 10 s */
     if (k % 40 == 20) queue_timer(NULL);   /* 10 s */
     if (k % 120 == 0) idle_timer(NULL);    /* 30 s */
 }
@@ -2179,6 +2310,7 @@ int main(int argc, char **argv)
     int have = library_list(lib, LIB_SONGS, 0, &songs);
     library_list_free(&songs);
     char usb_msg[128];
+    /* back from USB drive mode, or the card taken out and put back (fathom-sdcard) */
     int back_from_usb = take_tmp_file("/tmp/fathom-rescan", usb_msg, sizeof usb_msg) == 0;
     snprintf(g_db_path, sizeof g_db_path, "%s", db);
     snprintf(g_art_path, sizeof g_art_path, "%s", art);
@@ -2225,6 +2357,7 @@ int main(int argc, char **argv)
         .sound_value = hook_sound_value, .sound_adjust = hook_sound_adjust,
         .pure_toggle = hook_pure_toggle, .signal_path = hook_signal_path,
         .transport_toggle = hook_transport_toggle, .battery_info = hook_battery_info,
+        .battery_report = hook_battery_report,
         .languages = hook_languages, .language_set = hook_language_set,
         .rescan = rescan, .usb_drive = usb_drive, .usb_dac = usb_dac_mode, .about = about,
         .eq_list = hook_eq_list, .eq_set = hook_eq_set, .eq_get = hook_eq_get, .eq_put = hook_eq_put,
@@ -2242,6 +2375,8 @@ int main(int argc, char **argv)
         hooks.wifi_do = wifi_ui_do;
         wifi_init(settings_get_int("wifi.on", 0));
         updater_init(CARD_DIR, FATHOM_VERSION, settings_get("update.api", ""));   /* (a test server's) */
+        if (!update_is_newer(settings_get("update.found", ""), FATHOM_VERSION) && settings_get("update.found", "")[0])
+            settings_set("update.found", "");    /* installed since */
         hooks.update_state = updater_ui_state;
         hooks.update_do = hook_update_do;
         if (share_available()) {
@@ -2273,6 +2408,8 @@ int main(int argc, char **argv)
     ui_set_theme(theme);
     screen_set(1);
     g_fast = lv_timer_create(every_100ms, 100, NULL);
+    batlog_open(&g_batlog, CARD_DIR "/fathom/battery.log", time(NULL), mono_s());   /* (the clock restored) */
+    g_batlog_on = 1;
     poll_battery(NULL);
     usb_dac_poll(NULL);
     g_usb_was = usb_on_computer();   /* already plugged in at start: don't ask */
@@ -2293,10 +2430,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "library: no music folder (%s)\n", music);
         ui_toast("No Music folder on the card", 5000);
     }
+    boot_markers();                      /* (up: an update's kernel worked) */
     if (back_from_usb && have > 0 && !force_scan) scan_start();
     /* a library from before some tags (composers): read them in the background, once */
     else if (have > 0 && !force_scan && library_needs_tags(lib)) {
         fprintf(stderr, "library: reading tags added since the last scan\n");
+        scan_start();
+    }
+    /* albums left without a cover by a version that looked in fewer places: once */
+    else if (have > 0 && !force_scan && library_needs_art(lib)) {
+        fprintf(stderr, "library: looking again for missing covers\n");
         scan_start();
     }
 
@@ -2319,7 +2462,9 @@ int main(int argc, char **argv)
             } else if (ev.kind == IN_MEDIA) {
                 media_key(ev.ui_key);                /* the headphones' buttons; the screen stays as it is */
             } else if (ev.kind == IN_POWER) {
+                int was_on = g_screen_on;
                 screen_set(!g_screen_on);
+                if (!was_on && wifi_available()) update_announce();
             } else if (g_relay && ev.kind == IN_UI) {
                 /* USB DAC mode: Back ends it; Play, Prev and Next are the
                  * computer's media keys (also with the screen off) */
@@ -2369,6 +2514,7 @@ int main(int argc, char **argv)
     } else if (!g_powering_off) {
         DISP(show_last_frame)();
     }
+    if (g_batlog_on) batlog_flush(&g_batlog);   /* (a restart or USB drive mode: the H2 stays on) */
     clock_save();
     settings_save();
     queue_save();

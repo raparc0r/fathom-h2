@@ -62,7 +62,7 @@ int radio_parse(const char *text, radio_station_t *out, int max)
 
 int radio_load(const char *path, radio_station_t *out, int max)
 {
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, "rbe");
     if (!f) return -1;
     char *buf = malloc(65536);
     if (!buf) { fclose(f); return -1; }
@@ -85,7 +85,7 @@ int radio_load(const char *path, radio_station_t *out, int max)
 /* A file's text (NUL-terminated, a BOM dropped), or NULL. */
 static char *read_text(const char *path)
 {
-    FILE *f = path ? fopen(path, "rb") : NULL;
+    FILE *f = path ? fopen(path, "rbe") : NULL;
     if (!f) return NULL;
     char *buf = malloc(LIST_MAX);
     size_t n = buf ? fread(buf, 1, LIST_MAX - 1, f) : 0;
@@ -145,7 +145,7 @@ static int write_text(const char *path, const char *text)
 {
     char tmp[600];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    FILE *f = fopen(tmp, "wb");
+    FILE *f = fopen(tmp, "wbe");
     if (!f) return -1;
     size_t n = strlen(text);
     int ok = fwrite(text, 1, n, f) == n;

@@ -155,6 +155,45 @@ static void sim_update_do(int what)
                   [UI_UPD_CANCEL] = UI_UPD_AVAILABLE, [UI_UPD_INSTALL] = UI_UPD_INSTALLING};
     g_sim_upd.state = next[what];
 }
+/* A made-up week on battery, for Settings > Power > Battery: charged
+ * overnight, mostly playing with the screen off, the screen on a little each
+ * hour, paused late; one day switched off for three hours (not known how
+ * long: no Wi-Fi), one topped up at lunch */
+static int sim_battery_report(batrep_t *rep, int days)
+{
+    static batrec_t r[8000];
+    int n = 0;
+    const int64_t now = 1795000000 - 1795000000 % 86400 + 7 * 86400 + 15 * 3600 + 20 * 60;   /* (a Tuesday, 15:20 UTC) */
+    double level = 40;
+    int last_pct = -1, last_flags = -1;
+    for (int64_t t = now - 7 * 86400; t <= now; t += 60) {
+        int hour = (int)(t / 3600 % 24), min = (int)(t / 60 % 60), day = (int)((now - t) / 86400);
+        int charging = hour < 6 || (day == 2 && hour == 13 && min < 40);
+        if (day == 4 && hour >= 12 && hour < 15) {          /* off */
+            if (last_flags >= 0 && r[n - 1].kind != BL_OFF) r[n++] = (batrec_t){t, (uint8_t)last_pct, (uint8_t)last_flags, BL_OFF, 0};
+            level -= 0.3 / 60;
+            continue;
+        }
+        if (n && r[n - 1].kind == BL_OFF) {                 /* on again: its clock where it stopped */
+            r[n++] = (batrec_t){t, (uint8_t)last_pct, (uint8_t)last_flags, BL_BOOT, 0};
+            last_flags = -1;
+        }
+        int act = hour >= 22 ? BL_ACT_PAUSED : min < 10 ? BL_ACT_SCREEN : BL_ACT_PLAYING;
+        static const double rate[BL_ACTS] = {4.0, 12.0, 1.5};
+        level += charging ? 30.0 / 60 : -rate[act] / 60;
+        if (level > 100) level = 100;
+        if (level < 1) level = 1;
+        int pct = (int)ceil(level - 1e-9);
+        int flags = (charging ? BL_CHARGING : 0) | (act == BL_ACT_SCREEN ? BL_SCREEN | BL_PLAYING : act == BL_ACT_PLAYING ? BL_PLAYING : 0);
+        if ((pct != last_pct || flags != last_flags || t + 60 > now) && n < 8000) {
+            r[n++] = (batrec_t){t, (uint8_t)pct, (uint8_t)flags, BL_SAMPLE, 0};
+            last_pct = pct, last_flags = flags;
+        }
+    }
+    batlog_report(r, n, days, rep);
+    return 0;
+}
+
 static const ui_hooks_t g_hooks = {.fonts = ui_theme_fonts, .icon = ui_theme_icon, .radio_stations = sim_radio,
                                    .radio_add = sim_radio_add, .radio_remove = sim_radio_remove,
                                    .share_state = sim_share_state, .share_do = sim_share_do,
@@ -163,7 +202,8 @@ static const ui_hooks_t g_hooks = {.fonts = ui_theme_fonts, .icon = ui_theme_ico
                                    .pure_toggle = sim_pure_toggle, .signal_path = sim_signal_path,
                                    .transport_toggle = sim_transport_toggle, .battery_info = sim_battery_info,
                                    .languages = sim_languages, .language_set = sim_language_set,
-                                   .update_state = sim_update_state, .update_do = sim_update_do};
+                                   .update_state = sim_update_state, .update_do = sim_update_do,
+                                   .battery_report = sim_battery_report};
 
 static void cue_sample(void);
 
@@ -213,11 +253,12 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
     static const char *const screens[] = {"home", "albums", "tracks", "playlists", "playlist", "nowplaying", "themes",
                                           "quick", "context", "info", "queue", "glyphs", "search",
                                           "artists", "artist", "artistsongs", "albumartists", "homeedit",
-                                          "usbask", "usbdrive", "scrub", "sound", "radio", "radionp", "share", "ssh", "toast", "genres", "folders", "folder", "years", "homeend", "homeall", "signal", "purenp",
+                                          "usbask", "wifiask", "interface", "usbdrive", "scrub", "sound", "radio", "radionp", "share", "ssh", "toast", "genres", "folders", "folder", "years", "homeend", "homeall", "signal", "purenp",
                                           "rdir", "rdirgenres", "rdirresults", "rdirbusy", "rdircountries", "rdirsearch",
                                           "rdirctx", "rdirerror", "rdirnp", "rdirnpmenu", "rdirrandom",
                                           "about", "update", "updatelatest", "updatefailed", "updateprogress",
-                                          "updateready", "updateinstall"};
+                                          "updateready", "updateinstall", "battery", "battery7", "batterysince",
+                                          "batteryhistory"};
     static const char *const slug[] = {"studio-mint", "studio-ember", "studio-pastel", "pixel-pastel"};
     for (int t = 0; t < 4 && t < g_n_themes; t++) {   /* the built-in themes */
         ui_set_theme(t);

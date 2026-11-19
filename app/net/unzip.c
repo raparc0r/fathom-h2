@@ -21,7 +21,7 @@ static int read_at(FILE *f, uint64_t off, void *buf, size_t n)
 int zip_open(zip_t *z, const char *path)
 {
     memset(z, 0, sizeof *z);
-    z->f = fopen(path, "rb");
+    z->f = fopen(path, "rbe");
     if (!z->f) return -1;
     if (fseeko(z->f, 0, SEEK_END) || ftello(z->f) < 22) goto fail;
     z->file_size = (uint64_t)ftello(z->f);

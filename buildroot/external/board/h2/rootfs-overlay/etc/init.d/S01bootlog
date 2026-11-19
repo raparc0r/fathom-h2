@@ -22,13 +22,23 @@ rsr=$(busybox devmem 0x10000008 32 2>/dev/null)
 busybox devmem 0x10000008 32 0 2>/dev/null
 if [ $(( ${rsr:-0} & 3 )) -eq 2 ]; then echo restart; else echo power-on; fi > /tmp/fathom-reset
 
+# The card in the microSD slot (MSC0, 13450000.mmc), by its slot: mmcblk0 since
+# the device tree numbers the slots; before, now and then Wi-Fi's slot came
+# first and the card was mmcblk1 (this waited 10 s for mmcblk0 and gave up)
+card() {
+    for b in /sys/block/mmcblk*; do
+        case "$(readlink -f "$b")" in */13450000.mmc/*) echo "${b##*/}"; return 0 ;; esac
+    done
+    return 1
+}
 for i in 1 2 3 4 5 6 7 8 9 10; do
-    [ -b /dev/mmcblk0p1 ] && break
+    disk=$(card) && [ -b /dev/$disk ] && break
     sleep 1
 done
+[ -b /dev/${disk}p1 ] || sleep 1     # (the partition shows up just after the disk)
 
-if mount -t vfat -o rw,noatime /dev/mmcblk0p1 /mnt/sd 2>/dev/null ||
-   mount -t vfat -o rw,noatime /dev/mmcblk0 /mnt/sd 2>/dev/null; then
+if [ -n "$disk" ] && { mount -t vfat -o rw,noatime /dev/${disk}p1 /mnt/sd 2>/dev/null ||
+                       mount -t vfat -o rw,noatime /dev/$disk /mnt/sd 2>/dev/null; }; then
     mkdir -p /mnt/sd/fathom
     # The last five start-ups: boot-1.log is this one, boot-5.log the oldest
     for f in /mnt/sd/fathom/boot-*.log; do

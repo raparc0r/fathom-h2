@@ -114,7 +114,7 @@ int eq_parse(const char *text, eq_profile_t *p, char *err, size_t cap)
 
 int eq_load(const char *path, eq_profile_t *p, char *err, size_t cap)
 {
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, "rbe");
     if (!f) { snprintf(err, cap, "can't open it"); return -1; }
     char text[8192];
     size_t n = fread(text, 1, sizeof text - 1, f);

@@ -18,7 +18,7 @@ int vorbis_sniff(const unsigned char *h, size_t n)
 int vorbis_file_is_vorbis(const char *path)
 {
     unsigned char h[27 + 255 + 7];
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, "rbe");
     if (!f) return 0;
     size_t n = fread(h, 1, sizeof h, f);
     fclose(f);
@@ -81,7 +81,7 @@ static vorbis_file_t *opened(vorbis_file_t *v, uint32_t *rate, uint8_t *channels
 vorbis_file_t *vorbis_open(const char *path, uint32_t *rate, uint8_t *channels, uint64_t *frames)
 {
     vorbis_file_t *v = calloc(1, sizeof *v);
-    FILE *f = v ? fopen(path, "rb") : NULL;
+    FILE *f = v ? fopen(path, "rbe") : NULL;
     if (!f) { free(v); return NULL; }
     ov_callbacks cb = {cb_read, cb_seek, cb_close, cb_tell};
     if (ov_open_callbacks(f, &v->vf, NULL, 0, cb) < 0) {   /* (on failure the file is still ours) */

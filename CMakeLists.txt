@@ -21,6 +21,7 @@ add_library(fathom_core STATIC
   app/core/settings.c
   app/core/intern.c
   app/core/lang.c
+  app/core/batlog.c
   app/library/keys.c
   app/shuffle/shuffle.c
   app/ui/theme.c)
@@ -41,6 +42,7 @@ add_library(fathom_player STATIC
   app/library/tags.c
   app/library/cue.c
   app/library/library.c
+  app/library/artdec.c
   app/library/fatwalk.c
   app/library/playlist.c
   app/library/stb_impl.c
@@ -207,6 +209,21 @@ add_executable(test_update tests/test_update.c)
 target_link_libraries(test_update PRIVATE fathom_player)
 target_compile_options(test_update PRIVATE ${FATHOM_WARNINGS})
 add_test(NAME update COMMAND test_update WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+if(JPEG_FOUND)
+  add_executable(test_art tests/test_art.c)
+  target_link_libraries(test_art PRIVATE fathom_player)
+  target_compile_options(test_art PRIVATE ${FATHOM_WARNINGS})
+  add_test(NAME art COMMAND test_art)
+endif()
+# h2boot's fallback to the previous kernel: its own code, on a folder for a card
+add_executable(test_bootpick tests/test_bootpick.c bootloader/fathom/bootpick.c)
+target_compile_definitions(test_bootpick PRIVATE BOOTPICK_HOST)
+target_compile_options(test_bootpick PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME bootpick COMMAND test_bootpick)
+add_executable(test_batlog tests/test_batlog.c)
+target_link_libraries(test_batlog PRIVATE fathom_core)
+target_compile_options(test_batlog PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME batlog COMMAND test_batlog)
 add_executable(test_lang tests/test_lang.c)
 target_link_libraries(test_lang PRIVATE fathom_core)
 target_compile_options(test_lang PRIVATE ${FATHOM_WARNINGS})
