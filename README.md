@@ -22,6 +22,8 @@ project, and if you haven't tried it, check it out: [rockbox.org](https://www.ro
 
 ## Features
 
+- **First H2 firmware with Wi-Fi.** Fathom enables the Wi-Fi chip in the H2!
+- **Over 20 hours of play time.**
 - **Easy to install, and to undo.** You copy it to the card and run the H2's own firmware
   update. The stock firmware stays, and Settings → About → Uninstall Fathom puts the H2
   back on it completely, from the H2 itself.
