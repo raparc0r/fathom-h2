@@ -53,7 +53,7 @@ project, and if you haven't tried it, check it out: [rockbox.org](https://www.ro
 
 ## Compatibility
 
-Fathom is only compatible with he HiFi Walker H2 revision 4, sold from 2023. Older H2s aren't
+Fathom is only compatible with the HiFi Walker H2 revision 4, sold from 2023. Older H2s aren't
 supported, and the installer won't run on them. Fathom is free software with no warranty,
 tested on one H2, but it's hard to break: the H2 can always be recovered from a computer.
 
