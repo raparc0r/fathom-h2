@@ -2,7 +2,7 @@
 
 # Fathom
 
-Latest version: [0.10.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.10.0) released November 19th 2026
+Latest version: [0.11.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.11.0) released November 19th 2026
 
 [Features](#features) · [Compatibility](#compatibility) · [Installing](#installing) · [Internet access](#internet-access) · [Licence](#licence) · [How it was made](#how-it-was-made)
 

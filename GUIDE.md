@@ -142,9 +142,11 @@ stops the music after a while or at the end of the album.
 ## Updating Fathom
 
 Once a day, while the H2 rests on a Wi-Fi network it has joined before, Fathom asks GitHub
-whether there's a newer version, and tells you the next time you wake the H2. That's the
-only thing it contacts by itself, besides a time server when Wi-Fi connects; turn it off
-in Settings → About → Check automatically.
+whether there's a newer version, tells you the next time you wake the H2, and puts
+**Update available!** at the top of Home. Choose it, then **Install new version** to get
+it, or **Ignore** to hide it until a newer one comes out. That's the only thing Fathom
+contacts by itself, besides a time server when Wi-Fi connects; turn it off in Settings →
+About → Check automatically.
 
 To update: Settings → About → **Check for updates**, then **Update to vX.Y.Z**. It
 downloads (about 14 MB) while the music plays on, checks every file, then asks: **Play**

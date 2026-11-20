@@ -67,6 +67,12 @@ static int home_hidden_by_default(int h) { return h == H_COMPOSERS || h == H_YEA
  * disc, microphone-2, users, music, playlist, heart, clock-plus, history,
  * radio, settings; then category, feather, calendar, folder), and Pixel Pastel's own, drawn on its 10 px grid (pixel_icons.h,
  * from tools/icons/pixel_icons.py), in the same order. */
+/* Home's "Update available!": first on Home while a newer Fathom is on offer
+ * (update.found, from the update check) and not ignored (update.ignored); not
+ * an item Settings > Home shows, hides or moves. Its icon: circle-arrow-up
+ * (Tabler), and Pixel Pastel's own after the items' (pixel_icons.h). */
+#define H_UPDATE H_N
+#define UPDATE_ICON 0xf703
 static const uint32_t HOME_ICON[H_N] = {0xed46, 0xf000, 0xeb1c, 0xea90, 0xef2c, 0xebf2,
                                         0xeafc, 0xeec0, 0xeabe, 0xf7c5, 0xebea, 0xef2d, 0xeb20,
                                         0xf1f6, 0xee8b, 0xea53, 0xeaad};   /* category, feather, calendar, folder */
@@ -150,7 +156,7 @@ typedef enum {
     L_CONTEXT, L_INFO, L_QUEUE, L_PICK_PLAYLIST, L_SEARCH, L_RENAME, L_USB_ASK, L_WIFI_ASK, L_RADIO,
     /* Home > Radio > Find stations: its menu, genres, countries, a list of stations, search by name */
     L_RDIR, L_RDIR_GENRES, L_RDIR_COUNTRIES, L_RDIR_RESULTS, L_RDIR_SEARCH,
-    L_UPDATE, L_BATTERY, L_BAT_SPAN, L_BAT_HISTORY, L_UNINSTALL, L_PLACEHOLDER
+    L_UPDATE, L_BATTERY, L_BAT_SPAN, L_BAT_HISTORY, L_UNINSTALL, L_UPD_ASK, L_PLACEHOLDER
 } list_kind_t;
 
 typedef struct {
@@ -202,7 +208,7 @@ static struct {
     int moving;             /* Queue: the selected track moves with the wheel */
     int home_order[H_N];    /* every Home item, in the order set in Settings > Home */
     int home_hidden[H_N];   /* by item */
-    int home[H_N], home_n;  /* the items shown on Home */
+    int home[H_N + 1], home_n;  /* the items shown on Home (+ H_UPDATE, first, when there's one) */
     lv_timer_t *marquee_timer;  /* starts scrolling long text after a pause */
     lv_obj_t *np_next, *np_out, *np_pause, *empty;
     int lib_counts[4];      /* songs, albums, artists, playlists (Library screen) */
@@ -255,6 +261,7 @@ static struct {
     int64_t cov_id[SLOTS];          /* the album each slot shows (-1: to be read) */
     lv_obj_t *row_wheel[SLOTS], *row_ch[SLOTS][3];   /* the typing row: letter before, the wheel's (larger), after */
     int slot_item[SLOTS], slot_playing[SLOTS];
+    int slot_accent[SLOTS];   /* drawn in the theme's accent colour (Home's Update available!) */
     /* album rows (line_layout): shown so, and how wide the title and the
      * artist are in full */
     int line_on[SLOTS], line_tw[SLOTS], line_aw[SLOTS];
@@ -503,9 +510,18 @@ static lib_view_t view_of(list_kind_t k)
 
 /* ---------- Home items ---------- */
 
+/* A newer Fathom the update check found, not ignored: its tag ("v0.11.0"), or NULL. */
+static const char *update_offered(void)
+{
+    if (!S.hooks.update_do) return NULL;
+    const char *found = settings_get("update.found", "");
+    return found[0] && strcmp(found, settings_get("update.ignored", "")) ? found : NULL;
+}
+
 static void home_rebuild(void)
 {
     S.home_n = 0;
+    if (update_offered()) S.home[S.home_n++] = H_UPDATE;
     for (int i = 0; i < H_N; i++)
         if (!S.home_hidden[S.home_order[i]] || S.home_order[i] == H_SETTINGS) S.home[S.home_n++] = S.home_order[i];
 }
@@ -558,6 +574,22 @@ static void home_changed(void)
         if (S.home[i] == was) sel = i;
     S.stack[0].sel = sel;
     if (S.stack[0].top > sel) S.stack[0].top = sel;
+}
+
+/* The update entry came or went (a check found one, it was installed or
+ * ignored): Home again, its selection on the same item. */
+static void home_sync(void)
+{
+    int has = S.home_n > 0 && S.home[0] == H_UPDATE;
+    if (has == (update_offered() != NULL)) return;
+    level_t *h = &S.stack[0];
+    int was = h->sel < S.home_n ? S.home[h->sel] : -1;
+    home_rebuild();
+    int sel = 0;
+    for (int i = 0; i < S.home_n; i++)
+        if (S.home[i] == was) sel = i;
+    h->sel = sel;
+    if (h->top > sel) h->top = sel;
 }
 
 /* Where item h is on Home (0 if it's hidden). */
@@ -678,7 +710,8 @@ static int list_count(const level_t *l)
 {
     if (library_backed(l->kind)) return l->items.n;
     switch (l->kind) {
-    case L_HOME: return S.home_n;
+    case L_HOME: home_sync(); return S.home_n;
+    case L_UPD_ASK: return 2;                      /* install, ignore */
     case L_HOME_EDIT: return H_N;
     case L_USB_ASK: return 3;
     case L_WIFI_ASK: return 2;
@@ -1652,8 +1685,23 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
     }
     switch (l->kind) {
     case L_HOME:
+        if (S.home[i] == H_UPDATE) {
+            const char *tag = update_offered();
+            snprintf(main, mn, "Update available!");
+            snprintf(meta, tn, "%s", tag ? tag : "");
+            break;
+        }
         snprintf(main, mn, "%s", HOME[S.home[i]]);
         if (S.home[i] == H_NOWPLAYING) *playing = S.now.playing;
+        break;
+    case L_UPD_ASK:
+        if (i == 0) {
+            const char *tag = update_offered();
+            snprintf(main, mn, "Install new version");
+            snprintf(meta, tn, "%s", tag ? tag : "");
+        } else {
+            snprintf(main, mn, "Ignore");
+        }
         break;
     case L_USB_ASK:
         snprintf(main, mn, "%s", i == 0 ? "Use as a USB drive" : i == 1 ? "Use as a USB DAC" : "Keep playing");
@@ -2025,13 +2073,13 @@ static void color_slots(int sel_slot)
     if (sel_slot == S.colored_slot) return;
     const theme_t *t = T();
     for (int j = 0; j < SLOTS; j++) {
-        int sel = j == sel_slot;
-        set_text_color(S.row_lbl[j], C(sel ? t->select_fg : t->text));
-        set_text_color(S.row_meta[j], C(sel ? t->select_fg : t->text_muted));
+        int sel = j == sel_slot, acc = S.slot_accent[j];
+        set_text_color(S.row_lbl[j], C(sel ? t->select_fg : acc ? t->signal : t->text));
+        set_text_color(S.row_meta[j], C(sel ? t->select_fg : acc ? t->signal : t->text_muted));
         set_text_color(S.row_lt[j], C(sel ? t->select_fg : t->text));
         set_text_color(S.row_la[j], C(sel ? t->select_fg : t->text_muted));
-        set_text_color(S.row_icon[j], C(sel ? t->select_fg : t->text_muted));
-        lv_color_t ic = C(sel ? t->select_fg : t->text_muted);
+        set_text_color(S.row_icon[j], C(sel ? t->select_fg : acc ? t->signal : t->text_muted));
+        lv_color_t ic = C(sel ? t->select_fg : acc ? t->signal : t->text_muted);
         if (!lv_color_eq(lv_obj_get_style_image_recolor(S.row_picon[j], 0), ic))
             lv_obj_set_style_image_recolor(S.row_picon[j], ic, 0);
         for (int w = 0; w < 3; w++) set_text_color(S.row_ch[j][w], C(sel ? t->select_fg : w == 1 ? t->text : t->text_muted));
@@ -2282,7 +2330,7 @@ static void utf8_of(uint32_t c, char out[5])
 static int ui_text_list(list_kind_t k)
 {
     switch (k) {
-    case L_HOME: case L_HOME_EDIT: case L_HISTORY: case L_SETTINGS: case L_WIFI_ASK:
+    case L_HOME: case L_HOME_EDIT: case L_HISTORY: case L_SETTINGS: case L_WIFI_ASK: case L_UPD_ASK:
     case L_EQ_EDIT: case L_EQ_BAND: case L_SHARE: case L_SSH: case L_ABOUT: case L_CONTEXT: case L_USB_ASK: case L_UPDATE:
     case L_UNINSTALL:
     case L_RDIR: case L_RDIR_GENRES: case L_BATTERY: case L_BAT_SPAN:
@@ -2450,6 +2498,7 @@ static void fill_slots(const level_t *l, int n)
         int visible = i >= 0 && i < n;
         S.slot_item[j] = visible ? i : -1;
         S.slot_playing[j] = 0;
+        S.slot_accent[j] = visible && l->kind == L_HOME && S.home[i] == H_UPDATE;
         show(S.row[j], visible);
         if (!visible) continue;
         char main[256], meta[128];
@@ -2505,7 +2554,7 @@ static void fill_slots(const level_t *l, int n)
         show(S.row_picon[j], pix && !playing);
         if (glyph && !playing) {
             char u[5];
-            utf8_of(HOME_ICON[hid], u);
+            utf8_of(hid == H_UPDATE ? UPDATE_ICON : HOME_ICON[hid], u);
             set_text(S.row_icon[j], u);
             if (lv_obj_get_style_x(S.row_icon[j], 0) != x) lv_obj_set_x(S.row_icon[j], x);
         }
@@ -3474,6 +3523,9 @@ static const char *row_help(const level_t *l)
             if (!strcmp(S.about_lbl[i], "Charge cycles")) return "Battery wear, in full charges used.";
             return NULL;
         }
+    case L_UPD_ASK:
+        return i == 0 ? "Download and install it: Settings > About > Updates."
+                      : "Hide it from Home until a newer version is out.";
     case L_UNINSTALL:
         if (i >= n) return NULL;
         switch (uninstall_row(i)) {
@@ -4410,6 +4462,7 @@ static void open_selected(void)
     switch (l->kind) {
     case L_HOME:
         switch (l->sel < S.home_n ? S.home[l->sel] : -1) {
+        case H_UPDATE: push_ui(L_UPD_ASK, "Update available", 0); break;
         case H_NOWPLAYING: S.now_playing_view = 1; break;
         case H_SHUFFLE:
             if (S.player) { player_shuffle_all(S.player); S.now_playing_view = 1; }
@@ -4566,6 +4619,30 @@ static void open_selected(void)
             S.wifi_then.sel = b->sel;
             S.wifi_then.at = lv_tick_get();
             ui_toast("Turning on Wi-Fi", 1500);
+        }
+        break;
+    case L_UPD_ASK:
+        if (l->sel == 0) {
+            /* Settings > About > Check for updates, as if chosen there (it
+             * offers to turn on Wi-Fi first if it's off) */
+            while (S.depth > 1) pop();
+            S.stack[0].sel = home_index(H_SETTINGS);
+            push_ui(L_SETTINGS, "Settings", 0);
+            S.stack[S.depth - 1].sel = SET_ABOUT;
+            push_ui(L_ABOUT, "About", 0);
+            level_t *a = &S.stack[S.depth - 1];
+            list_count(a);                          /* (the device's rows: about_n) */
+            a->sel = S.about_n;                     /* Check for updates */
+            open_selected();
+        } else {
+            const char *tag = update_offered();
+            if (tag) {
+                settings_set("update.ignored", tag);
+                settings_save();
+            }
+            pop();
+            home_sync();
+            ui_toast("Hidden until a newer version", 2000);
         }
         break;
     case L_USB_ASK:

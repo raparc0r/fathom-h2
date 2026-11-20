@@ -279,7 +279,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                                           "about", "update", "updatelatest", "updatefailed", "updateprogress",
                                           "updateready", "updateinstall", "battery", "battery7", "batterysince",
                                           "batteryhistory", "uninstall", "uninstallchecking", "uninstallfailed",
-                                          "uninstallnone", "uninstallpending"};
+                                          "uninstallnone", "uninstallpending", "homeupdate", "askupdate", "askignore", "askinstall"};
     static const char *const slug[] = {"studio-mint", "studio-ember", "studio-pastel", "pixel-pastel"};
     for (int t = 0; t < 4 && t < g_n_themes; t++) {   /* the built-in themes */
         ui_set_theme(t);
@@ -359,6 +359,21 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 for (size_t k = 0; k < sizeof st / sizeof st[0]; k++)
                     if (!strcmp(st[k].name, screens[s])) g_sim_uni = st[k].u;
                 ui_show("uninstall");
+            } else if (!strcmp(screens[s], "homeupdate") || !strcmp(screens[s], "askupdate") ||
+                       !strcmp(screens[s], "askignore") || !strcmp(screens[s], "askinstall")) {
+                /* a newer version found by the check: first on Home, and its page
+                 * (the update's stand-in back at rest: its progress screen takes the keys) */
+                g_sim_upd.state = UI_UPD_IDLE;
+                ui_update_changed();
+                settings_set("update.found", "v0.11.0");
+                settings_set("update.ignored", "");
+                ui_show("home");
+                for (int k = 0; k < 12; k++) ui_key(UI_KEY_UP);   /* the top: the entry */
+                ui_key(!strcmp(screens[s], "homeupdate") ? UI_KEY_DOWN : UI_KEY_OK);
+                if (!strcmp(screens[s], "askignore")) ui_key(UI_KEY_DOWN), ui_key(UI_KEY_OK);   /* Ignore: Home, without it */
+                if (!strcmp(screens[s], "askinstall")) ui_key(UI_KEY_OK);   /* Install: About > Updates */
+                ui_set_theme(t);                            /* (the slide finished) */
+                settings_set("update.found", "");
             } else if (!strcmp(screens[s], "toast")) {    /* a long one: it wraps */
                 ui_show("ssh");
                 ui_toast("Over USB and Wi-Fi, with the password", 3000);

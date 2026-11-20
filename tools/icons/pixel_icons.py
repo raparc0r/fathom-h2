@@ -200,11 +200,24 @@ ICONS = {
         '.X......X.',
         '.XXXXXXXX.',
         '..........'],
+    # Home's "Update available!", shown only while there's one: not a Home item
+    # Settings > Home can show or move (H_UPDATE, after the items)
+    'update': [
+        '...XXXX...',
+        '.XX....XX.',
+        '.X..XX..X.',
+        'X..XXXX..X',
+        'X.X.XX.X.X',
+        'X...XX...X',
+        'X...XX...X',
+        '.X..XX..X.',
+        '.XX....XX.',
+        '...XXXX...'],
 }
 # (in the UI's H_* order: items added later come after settings)
 ORDER = ['nowplaying', 'shuffle', 'search', 'albums', 'artists', 'albumartists', 'songs',
          'playlists', 'favourites', 'recent', 'history', 'radio', 'settings',
-         'genres', 'composers', 'years', 'folders']
+         'genres', 'composers', 'years', 'folders', 'update']
 
 
 def main(out, preview):
@@ -222,7 +235,7 @@ def main(out, preview):
         f.write('};\n')
     if preview:
         s, gap, cols = 8, 4, 6
-        w, h = cols * (10 * s + gap * s), 2 * (10 * s + gap * s)
+        w, h = cols * (10 * s + gap * s), (len(ORDER) + cols - 1) // cols * (10 * s + gap * s)
         px = [[(23, 20, 42)] * w for _ in range(h)]
         for k, name in enumerate(ORDER):
             ox, oy = (k % cols) * (14 * s) + 2 * s, (k // cols) * (14 * s) + 2 * s
