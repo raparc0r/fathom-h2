@@ -12,7 +12,9 @@
  */
 void key_artist(const char *artist, const char *album_artist, char *out, size_t cap);
 
-/* Album key: normalized (album artist or artist) + U+001F + normalized album title. */
+/* Album key: the album artist's key (as key_artist makes it for the album artist, or
+ * the artist without one; "various artists" for compilations) + U+001F + the
+ * normalized album title. */
 void key_album(const char *artist, const char *album_artist, const char *album,
                char *out, size_t cap);
 

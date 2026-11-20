@@ -54,5 +54,6 @@ You can delete `update.upt` from the card afterwards.
   bootloader's menu. [ADVANCED.md](ADVANCED.md) explains how.
 - **Using Fathom**, from adding music to EQ, Bluetooth headphones, radio and updates:
   [GUIDE.md](GUIDE.md).
-- **If the installer won't run** or the H2 doesn't start, and to remove Fathom completely:
-  [ADVANCED.md](ADVANCED.md).
+- **To remove Fathom** and go back to HiBy's firmware: Settings → About → Uninstall
+  Fathom ([GUIDE.md](GUIDE.md)).
+- **If the installer won't run** or the H2 doesn't start: [ADVANCED.md](ADVANCED.md).

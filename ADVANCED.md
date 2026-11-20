@@ -126,16 +126,37 @@ you can build it for your own H2: `tools/bluetooth-aac/README.md` in the source.
 ## Removing Fathom
 
 The stock firmware was never removed: hold **Play** while turning the H2 on to start it,
-any time. To take Fathom's bootloader off the flash as well:
+any time. To take Fathom's bootloader off the flash as well, use Settings → About →
+**Uninstall Fathom** ([GUIDE.md](GUIDE.md) has the steps). What it does:
 
-- if you saved `erosqnative-boot.bin` with jztool, put it at the top of the card, open the
-  bootloader's menu (Vol+ at power-on) and choose **Bootloader → Restore**;
-- otherwise, take HiBy's own update file for your H2, add its bootloader with Rockbox's
-  `hibyos_nativepatcher.sh mkstockuboot` (HiBy's updates leave the bootloader alone by
-  themselves), and put it at the top of the card as `update.upt`. Then hold **Vol+** while
-  turning the H2 on and choose **Boot select → HibyOS Recovery**: HiBy's own updater
-  installs it, bootloader included. Use the update for the version your H2 had, or a newer
-  one: on an H2 sold with newer firmware, HiBy's V2.2 left the screen blank.
+- It looks for HiBy's update file (a `.upt`, which is an ISO 9660 image) at the top of
+  the card and of the `Music` folder, checks that it's for this H2 (`erosq_2024`, hardware
+  revision 4), that every image matches the MD5 in its `update.txt`, and that `uboot.bin`
+  is HiBy's U-Boot.
+- HiBy's update files carry their bootloader but leave it out of `update.txt`, so their
+  updater doesn't install it. Fathom adds the same entry as Rockbox's
+  `hibyos_nativepatcher.sh mkstockuboot`, in place (one 2 KB sector and the file's length
+  in its directory records; what it overwrites is kept in `fathom/uninstall/`, so Back
+  puts it back), and names the file `update.upt`. A Fathom installer already called
+  `update.upt` is renamed `fathom-install.upt`.
+- It restarts into HiBy's recovery with HiBy's own signal (0x1A1A in the CPM scratch
+  register), which Fathom's bootloader honours. The recovery installs what `update.txt`
+  lists, bootloader included, then starts HiBy's firmware. With nothing to install it
+  waits 10 minutes and restarts.
+
+Use the update for the version your H2 had, or a newer one: on an H2 sold with newer
+firmware, HiBy's V2.2 bootloader left the screen blank.
+
+If Fathom doesn't start, the same can be done by hand:
+
+- if you saved `erosqnative-boot.bin` with jztool before installing, put it at the top of
+  the card, open the bootloader's menu (Vol+ at power-on) and choose **Bootloader →
+  Restore**;
+- otherwise, add HiBy's bootloader to its update file with Rockbox's
+  `hibyos_nativepatcher.sh mkstockuboot` on a computer, put the result at the top of the
+  card as `update.upt`, hold **Vol+** while turning the H2 on and choose **Boot select →
+  HibyOS Recovery**. If the H2 doesn't start at all, load the bootloader with jztool first
+  (above).
 
 ## Building it yourself
 

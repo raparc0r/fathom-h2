@@ -3,7 +3,7 @@ Subject: [PATCH] MIPS: ingenic: add HiFi Walker H2 board
 
 Board option and device tree for the HiFi Walker H2 (AIGO Eros Q hw4):
 memory, timers (TCU channel 0 handed to PWM for the backlight), blue LED,
-microSD, USB OTG in peripheral mode, buttons and scroll wheel, the hardware
+microSD, USB OTG (device, and host for USB DACs), buttons and scroll wheel, the hardware
 RNG, display + backlight, a read-only PMIC battery monitor, and audio
 (X1000 I2S -> ES9018K2M -> headphone amplifier -> output switch).
 
@@ -21,14 +21,14 @@ diff -Naur a/arch/mips/boot/dts/ingenic/Makefile b/arch/mips/boot/dts/ingenic/Ma
 diff -Naur a/arch/mips/boot/dts/ingenic/hifiwalker-h2.dts b/arch/mips/boot/dts/ingenic/hifiwalker-h2.dts
 --- /dev/null
 +++ b/arch/mips/boot/dts/ingenic/hifiwalker-h2.dts
-@@ -0,0 +1,439 @@
+@@ -0,0 +1,446 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * HiFi Walker H2 digital audio player (AIGO Eros Q family, hardware rev 4):
 + * Ingenic X1000, 32 MiB RAM, AXP2101 PMIC, ES9018K2M DAC.
 + *
-+ * Nothing here writes the PMIC or the SPI-NAND flash, and USB never supplies
-+ * VBUS (device mode only).
++ * Nothing here writes the PMIC or the SPI-NAND flash; USB supplies VBUS only
++ * as the host, to a USB DAC (usb_vbus, while fathom-usbrole allows it).
 + * Pin assignments: from Rockbox's erosqnative port.
 + */
 +/dts-v1/;
@@ -48,10 +48,13 @@ diff -Naur a/arch/mips/boot/dts/ingenic/hifiwalker-h2.dts b/arch/mips/boot/dts/i
 +		reg = <0x0 0x02000000>;
 +	};
 +
-+	/* Kernel log and oops records that survive a reset (pstore): 128 KiB, 1 MiB
++	/* Kernel log and oops records that survive a reset (pstore): 96 KiB, 1 MiB
 +	 * below the top of RAM. Not the very top: booting from flash, the SPL takes
 +	 * its buffers from there (and clears them); the bootloader works upwards
-+	 * from the bottom (itself, the kernel image, the unpacked kernel). */
++	 * from the bottom (itself, the kernel image, the unpacked kernel). Two oops
++	 * records and the console's log, 32 KiB each; no pmsg zone (nothing writes
++	 * /dev/pmsg0). It was 128 KiB, 32 KiB of it never used: the pmsg zone and
++	 * 16 KiB too few for a third record. */
 +	reserved-memory {
 +		#address-cells = <1>;
 +		#size-cells = <1>;
@@ -59,10 +62,9 @@ diff -Naur a/arch/mips/boot/dts/ingenic/hifiwalker-h2.dts b/arch/mips/boot/dts/i
 +
 +		ramoops@1f00000 {
 +			compatible = "ramoops";
-+			reg = <0x01f00000 0x20000>;
++			reg = <0x01f00000 0x18000>;
 +			record-size = <0x8000>;
 +			console-size = <0x8000>;
-+			pmsg-size = <0x4000>;
 +		};
 +	};
 +
@@ -357,14 +359,19 @@ diff -Naur a/arch/mips/boot/dts/ingenic/hifiwalker-h2.dts b/arch/mips/boot/dts/i
 +		vbat-supply = <&bt_vbat>;
 +		clocks = <&rtc>;
 +		clock-names = "lpo";
-+		pinctrl-names = "default";
-+		pinctrl-0 = <&pins_rtc32k>;
 +	};
 +};
 +
-+/* The RTC's 32.768 kHz output (clk32k), for the Bluetooth module's sleep clock */
++/*
++ * The RTC's 32.768 kHz output (clk32k) on PB26: the sleep clock (LPO) of the
++ * Bluetooth/Wi-Fi module, enabled by whichever of the two is on (hci_bcm, and
++ * Wi-Fi's mmc-pwrseq). The pin belongs to the clock's own node, so neither
++ * depends on the other's driver to have set it (patch 0015).
++ */
 +&rtc {
 +	#clock-cells = <0>;
++	pinctrl-names = "default";
++	pinctrl-0 = <&pins_rtc32k>;
 +};
 +
 +/* AXP2101 PMIC: read-only battery monitor (draft, enabled for stage-3 testing) */

@@ -35,6 +35,15 @@ link_normal() {
         [ -L $C/$f ] || ln -s $G/functions/$f $C/
     done
 }
+# Back to serial, network and USB drive, bound; a second try after a moment
+# (the controller may still be letting go of the last configuration)
+normal() {
+    unbind
+    rm -f $C/uac2.0 $C/hid.keys
+    link_normal
+    echo "Serial, network and USB drive" > $C/strings/0x409/configuration
+    bind 2>/dev/null || { sleep 1; bind; }
+}
 
 case "$1" in
 dac)
@@ -42,7 +51,7 @@ dac)
     unbind
     rm -f $C/mass_storage.0 $C/acm.GS0 $C/ecm.usb0
     if [ ! -d $A ]; then
-        mkdir $A || { link_normal; bind; say "no USB audio function"; exit 1; }
+        mkdir $A || { normal; say "no USB audio function"; exit 1; }
         echo 0 > $A/p_chmask                  # nothing from the H2 to the computer
         echo 3 > $A/c_chmask                  # stereo from the computer
         echo 44100,48000,88200,96000,176400,192000 > $A/c_srate
@@ -72,16 +81,19 @@ dac)
         ln -s $K $C/
     fi
     echo "USB DAC" > $C/strings/0x409/configuration
-    bind || { say "cannot bind"; exit 1; }
+    # Refused (the controller can't take the audio function as it is): the
+    # computer gets its serial, network and drive back rather than nothing
+    # until a restart, and the player says USB DAC mode isn't available
+    if ! bind; then
+        say "cannot bind the USB DAC: back to normal"
+        normal || say "cannot bind"
+        exit 1
+    fi
     say "USB DAC"
     ;;
 normal)
-    [ -L $C/mass_storage.0 ] && exit 0
-    unbind
-    rm -f $C/uac2.0 $C/hid.keys
-    link_normal
-    echo "Serial, network and USB drive" > $C/strings/0x409/configuration
-    bind || { say "cannot bind"; exit 1; }
+    [ -L $C/mass_storage.0 ] && [ -n "$(cat $G/UDC 2>/dev/null)" ] && exit 0   # (linked, and bound)
+    normal || { say "cannot bind"; exit 1; }
     say "USB drive"
     ;;
 *)

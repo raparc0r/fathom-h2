@@ -49,16 +49,19 @@
 #include "share.h"
 #include "ssh.h"
 #include "updater.h"
+#include "uninstaller.h"
+#include "sys/uninstall.h"
 #include "wifi.h"
 #include "radiometa.h"
 #include "out_router.h"
 #include "audio/out_bt.h"
 #include "audio/output.h"
 #include "disp_drm.h"
+#include "hw_paths.h"
 #define DISP(f) disp_drm_##f
-#define DISP_DEV "/dev/dri/card0"
+#define DISP_DEV HW_DRM
 #define CARD_DIR "/mnt/sd"
-#define USB_ONLINE "/sys/class/power_supply/battery/online"
+#define USB_ONLINE HW_USB_ONLINE
 #include "input.h"
 #include "library/library.h"
 #include "library/tags.h"
@@ -207,6 +210,7 @@ static int hook_battery_report(batrep_t *rep, int days)
 
 static void power_off(const char *why)
 {
+    if (g_powering_off) return;        /* (charging mode asks every second until init stops us) */
     fprintf(stderr, "power off: %s\n", why);
     g_powering_off = 1;
     batlog_end();
@@ -216,7 +220,10 @@ static void power_off(const char *why)
     screen_set(1);                     /* the message must be visible */
     ui_toast(why, 5000);
     lv_refr_now(NULL);
-    if (system("/sbin/poweroff") != 0) fprintf(stderr, "poweroff failed\n");
+    if (system("/sbin/poweroff") != 0) {
+        fprintf(stderr, "poweroff failed\n");
+        g_powering_off = 0;            /* (asked again later, as before) */
+    }
 }
 
 /* The stock firmware cuts power at 3.40 V. Power off a little above that, on
@@ -268,12 +275,14 @@ static long battery_left_s(void)
 
 static void hook_battery_info(char *out, size_t cap)
 {
+    char pct[16], n[16];
     if (g_bat_pct < 0) { snprintf(out, cap, "-"); return; }
-    if (g_charging) { snprintf(out, cap, "%d %%, %s", g_bat_pct, g_bat_pct >= 100 ? "full" : "charging"); return; }
+    snprintf(pct, sizeof pct, "%d %%", g_bat_pct);
+    if (g_charging) { tr_fill(out, cap, g_bat_pct >= 100 ? "%s, full" : "%s, charging", pct, NULL); return; }
     long s = battery_left_s();
-    if (s < 0) snprintf(out, cap, "%d %%", g_bat_pct);
-    else if (s >= 2 * 3600) snprintf(out, cap, "%d %%, about %ld h left", g_bat_pct, (s + 1800) / 3600);
-    else snprintf(out, cap, "%d %%, about %ld min left", g_bat_pct, (s + 300) / 600 * 10 > 10 ? (s + 300) / 600 * 10 : 10);
+    if (s < 0) { snprintf(out, cap, "%s", pct); return; }
+    snprintf(n, sizeof n, "%ld", s >= 2 * 3600 ? (s + 1800) / 3600 : (s + 300) / 600 * 10 > 10 ? (s + 300) / 600 * 10 : 10);
+    tr_fill(out, cap, s >= 2 * 3600 ? "%s, about %s h left" : "%s, about %s min left", pct, n);
 }
 
 static void poll_battery(lv_timer_t *t)
@@ -281,13 +290,13 @@ static void poll_battery(lv_timer_t *t)
     (void)t;
     static int low_count;
     char cap[16], status[32], volt[24];
-    if (read_int_file("/sys/class/power_supply/battery/capacity", cap, sizeof cap)) { ui_set_battery(-1, 0); return; }
-    int charging = !read_int_file("/sys/class/power_supply/battery/status", status, sizeof status) &&
+    if (read_int_file(HW_BATTERY "capacity", cap, sizeof cap)) { ui_set_battery(-1, 0); return; }
+    int charging = !read_int_file(HW_BATTERY "status", status, sizeof status) &&
                    !strncmp(status, "Charging", 8);
     int pct = atoi(cap);
     ui_set_battery(pct, charging);
     /* on power: charging, or full (or held) while plugged in */
-    g_charging = !read_int_file("/sys/class/power_supply/battery/status", status, sizeof status) &&
+    g_charging = !read_int_file(HW_BATTERY "status", status, sizeof status) &&
                  strncmp(status, "Discharging", 11) != 0;
     battery_track(pct, g_charging);
 
@@ -297,7 +306,7 @@ static void poll_battery(lv_timer_t *t)
     else if (pct <= 5 && !warned5) { warned5 = warned10 = 1; ui_toast("Battery at 5 %: charge soon", 4000); }
     else if (pct <= 10 && !warned10) { warned10 = 1; ui_toast("Battery at 10 %", 3000); }
 
-    long uv = read_int_file("/sys/class/power_supply/battery/voltage_now", volt, sizeof volt) ? 0 : atol(volt);
+    long uv = read_int_file(HW_BATTERY "voltage_now", volt, sizeof volt) ? 0 : atol(volt);
     if (!charging && uv > 0 && uv < LOW_BATTERY_UV) {
         if (++low_count == 3) power_off("Battery empty: powering off");
     } else {
@@ -350,9 +359,9 @@ static void volume_show(int raw)
 {
     char t[32];
     int tenths = (raw - g_mix.max) * 5;                 /* 0.5 dB per step below max */
-    if (raw <= g_mix.min) snprintf(t, sizeof t, "muted");
+    if (raw <= g_mix.min) snprintf(t, sizeof t, "%s", tr("muted"));
     else snprintf(t, sizeof t, "%s%d.%d dB%s", tenths < 0 ? "-" : "", abs(tenths) / 10, abs(tenths) % 10,
-                  vol_limit() && raw >= hp_cap() ? " (limit)" : "");
+                  vol_limit() && raw >= hp_cap() ? tr(" (limit)") : "");
     ui_level("Volume", raw - g_mix.min, g_mix.max - g_mix.min, t);
 }
 
@@ -406,8 +415,8 @@ static void volume_step(int dir)
 {
     if (out_router_on_bt()) {               /* the headphones' own volume (AVRCP), or bluez-alsa's */
         int v = bt_volume_step(dir);
-        char t[32];
-        snprintf(t, sizeof t, "%d %%%s", (v * 100 + 63) / 127, bt_limit_pct() < 100 && v >= bt_cap() ? " (limit)" : "");
+        char t[48];
+        snprintf(t, sizeof t, "%d %%%s", (v * 100 + 63) / 127, bt_limit_pct() < 100 && v >= bt_cap() ? tr(" (limit)") : "");
         ui_level("Volume", v, 127, t);
         return;
     }
@@ -428,7 +437,7 @@ static void jacks_changed(int hp, int lo)
 {
     int hp_changed = hp != g_jack_hp;
     if (g_jack_hp && !hp && g_usb_card < 0 && !out_router_on_bt() && g_player &&
-        settings_get_int("playback.pause_on_unplug", 1))
+        settings_get_int("playback.pause_on_unplug", UI_PAUSE_ON_UNPLUG_DEFAULT))
         player_pause(g_player, 1);   /* headphones out: pause */
     g_jack_hp = hp;
     g_jack_lo = lo;
@@ -476,8 +485,8 @@ static int usb_card_find(char *usbid, size_t cap)
 {
     for (int n = 1; n < 8; n++) {
         char path[64], pcm[32];
-        snprintf(path, sizeof path, "/proc/asound/card%d/usbid", n);
-        snprintf(pcm, sizeof pcm, "/dev/snd/pcmC%dD0p", n);
+        snprintf(path, sizeof path, HW_USBID_N, n);
+        snprintf(pcm, sizeof pcm, HW_PCM_N, n);
         if (access(pcm, W_OK) || read_int_file(path, usbid, cap)) continue;
         usbid[strcspn(usbid, "\r\n")] = 0;
         return n;
@@ -488,7 +497,7 @@ static int usb_card_find(char *usbid, size_t cap)
 static void usb_card_name(int n, char *out, size_t cap)
 {
     char ctl[32];
-    snprintf(ctl, sizeof ctl, "/dev/snd/controlC%d", n);
+    snprintf(ctl, sizeof ctl, HW_CTL_N, n);
     snprintf(out, cap, "USB DAC");
     int fd = open(ctl, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
@@ -516,10 +525,10 @@ static void usb_volume_step(int dir)
     long v = g_usb_cdb + dir * 100L, cap = usb_cap();
     g_usb_cdb = v < g_usb_lo ? g_usb_lo : v > cap ? cap : v;
     usb_volume_apply();
-    char t[48];
+    char t[64];
     long a = labs(g_usb_cdb);
     snprintf(t, sizeof t, "%s%ld.%ld dB%s", g_usb_cdb < 0 ? "-" : "", a / 100, (a % 100) / 10,
-             vol_limit() && g_usb_cdb >= cap ? " (limit)" : "");
+             vol_limit() && g_usb_cdb >= cap ? tr(" (limit)") : "");
     ui_level("Volume", (int)(g_usb_cdb - g_usb_lo), (int)(g_usb_hi - g_usb_lo), t);
     FILE *f = fopen(g_usb_vol_path, "we");
     if (f) { fprintf(f, "%ld\n", g_usb_cdb); fclose(f); }
@@ -536,7 +545,7 @@ static int g_transport_bt;           /* Bluetooth was on: on again after */
 
 static void transport_update(void)
 {
-    int want = g_usb_card >= 0 && settings_get_int("sound.transport", 0);
+    int want = g_usb_card >= 0 && settings_get_int("sound.transport", UI_TRANSPORT_DEFAULT);
     if (want == g_transport) return;
     g_transport = want;
     if (want) {
@@ -552,7 +561,7 @@ static void transport_update(void)
 
 static void hook_transport_toggle(void)
 {
-    int on = !settings_get_int("sound.transport", 0);
+    int on = !settings_get_int("sound.transport", UI_TRANSPORT_DEFAULT);
     settings_set_int("sound.transport", on);
     transport_update();
     if (on) ui_toast(g_transport ? "Transport mode: Bluetooth off, screen off after 10 s"
@@ -567,7 +576,7 @@ static void usb_dac_attach(int n, const char *usbid)
     snprintf(g_usb_vol_path, sizeof g_usb_vol_path, "%s/volume-usb-%s-%s", g_data_dir, vid, pid);
 
     char ctl[32], name[44];
-    snprintf(ctl, sizeof ctl, "/dev/snd/controlC%d", n);
+    snprintf(ctl, sizeof ctl, HW_CTL_N, n);
     g_usb_soft = mixer_find_playback_volume(ctl, name) || mixer_open(&g_usb_mix, ctl, name) ||
                  mixer_db_range(&g_usb_mix, &g_usb_lo, &g_usb_hi);
     if (g_usb_soft) { mixer_close(&g_usb_mix); g_usb_lo = -6000; g_usb_hi = 0; }
@@ -584,7 +593,7 @@ static void usb_dac_attach(int n, const char *usbid)
     route_apply(0);                    /* mutes the H2's own DAC */
     usb_volume_apply();                /* the DAC's level before any audio reaches it */
     transport_update();
-    snprintf(g_usb_dev, sizeof g_usb_dev, "/dev/snd/pcmC%dD0p", n);
+    snprintf(g_usb_dev, sizeof g_usb_dev, HW_PCM_N, n);
     engine_switch_output(g_eng, out_router_alsa, g_usb_dev);
     fprintf(stderr, "usb dac: card %d %s (%s), %s, %ld cdB\n", n, g_usb_name, usbid,
             g_usb_soft ? "software volume" : "hardware volume", g_usb_cdb);
@@ -607,7 +616,7 @@ static void output_home(void)
         route_apply(0);
         ui_set_output(name);
     } else {
-        engine_switch_output(g_eng, out_router_alsa, (void *)"/dev/snd/pcmC0D0p");
+        engine_switch_output(g_eng, out_router_alsa, (void *)HW_PCM);
         route_apply(0);
     }
 }
@@ -635,7 +644,7 @@ static void usb_dac_poll(lv_timer_t *t)
         return;
     }
     char path[64];
-    snprintf(path, sizeof path, "/proc/asound/card%d/usbid", g_usb_card);
+    snprintf(path, sizeof path, HW_USBID_N, g_usb_card);
     eng_status_t st;
     engine_status(g_eng, &st);
     if (access(path, F_OK) || st.output_lost) usb_dac_detach();
@@ -650,7 +659,7 @@ static void bt_ui_toggle_or_do(int what, const char *addr)
 {
     if (what == UI_BT_TOGGLE) settings_set_int("bluetooth.on", !bt_on());
     if (what == UI_BT_RANGE) {                   /* fathom-bt reads it as it starts bluez-alsa */
-        settings_set_int("bluetooth.range", !settings_get_int("bluetooth.range", 0));
+        settings_set_int("bluetooth.range", !settings_get_int("bluetooth.range", UI_BT_RANGE_DEFAULT));
         settings_save();
     }
     bt_ui_do(what, addr);
@@ -739,7 +748,7 @@ static void eq_apply(void)
     int on = name[0] && eq_load(path, &p, err, sizeof err) == 0;
     if (name[0] && !on) {
         char t[200];
-        snprintf(t, sizeof t, "EQ \"%s\": %s", name, err);
+        tr_fill(t, sizeof t, "EQ \"%s\": %s", name, err);
         ui_toast(t, 4000);
         fprintf(stderr, "eq: %s: %s\n", path, err);
     }
@@ -830,17 +839,19 @@ static void hook_sound_value(int what, char *out, size_t cap)
 {
     if (what == UI_SOUND_BALANCE) {
         int b = balance_db();
-        if (!b) snprintf(out, cap, "Centre");
-        else snprintf(out, cap, "%d dB %s", abs(b), b < 0 ? "left" : "right");
+        char n[16];
+        snprintf(n, sizeof n, "%d", abs(b));
+        if (!b) snprintf(out, cap, "%s", tr("Centre"));
+        else tr_fill(out, cap, b < 0 ? "%s dB left" : "%s dB right", n, NULL);
     } else if (on_line_out_now()) {
-        snprintf(out, cap, "Fixed level");
+        snprintf(out, cap, "%s", tr("Fixed level"));
     } else if (on_bt_now()) {
         int p = bt_limit_pct();
-        if (p >= 100) snprintf(out, cap, "Off");
+        if (p >= 100) snprintf(out, cap, "%s", tr("Off"));
         else snprintf(out, cap, "%d %%", p);
     } else {
         int l = vol_limit();
-        if (!l) snprintf(out, cap, "Off");
+        if (!l) snprintf(out, cap, "%s", tr("Off"));
         else snprintf(out, cap, "%d dB", l);
     }
 }
@@ -953,67 +964,67 @@ static int hook_signal_path(int i, char *label, size_t lc, char *value, size_t v
         value[0] = '\0';
         size_t n = 0;
 #define WHY(c, s) do { if (c) n += (size_t)snprintf(value + n, n < vc ? vc - n : 0, "%s%s", n ? ", " : "", s); } while (0)
-        WHY(on_bt_now(), "Bluetooth");
-        WHY(st.eq, "EQ");
-        WHY(st.track_gain != 1.0f, "levelling");
-        WHY(st.balance[0] != 1.0f || st.balance[1] != 1.0f, "balance");
-        WHY(st.gain != 1.0f, "software volume");
-        WHY(st.out_fmt.rate && st.out_fmt.rate != st.fmt.rate, "resampled");
-        WHY(!st.fmt.bits && strncmp(st.fmt.codec, "DSD", 3), "lossy file");
-        WHY(!st.fmt.bits && !strncmp(st.fmt.codec, "DSD", 3), "DSD made PCM");
-        WHY(st.stream, "a stream");
+        WHY(on_bt_now(), tr("Bluetooth"));
+        WHY(st.eq, tr("EQ"));
+        WHY(st.track_gain != 1.0f, tr("levelling"));
+        WHY(st.balance[0] != 1.0f || st.balance[1] != 1.0f, tr("balance"));
+        WHY(st.gain != 1.0f, tr("software volume"));
+        WHY(st.out_fmt.rate && st.out_fmt.rate != st.fmt.rate, tr("resampled"));
+        WHY(!st.fmt.bits && strncmp(st.fmt.codec, "DSD", 3), tr("lossy file"));
+        WHY(!st.fmt.bits && !strncmp(st.fmt.codec, "DSD", 3), tr("DSD made PCM"));
+        WHY(st.stream, tr("a stream"));
 #undef WHY
         if (!value[0]) snprintf(value, vc, "-");
-        snprintf(label, lc, "%s", L[i]);
+        snprintf(label, lc, "%s", tr(L[i]));
         return 0;
     }
-    snprintf(label, lc, "%s", L[i]);
+    snprintf(label, lc, "%s", tr(L[i]));   /* (translated here: the values hold names too) */
     switch (i) {
     case 0:
-        if (!playing) { snprintf(value, vc, "Nothing playing"); break; }
+        if (!playing) { snprintf(value, vc, "%s", tr("Nothing playing")); break; }
         fmt_khz(k, sizeof k, st.fmt.rate);
         if (!strncmp(st.fmt.codec, "DSD", 3))       /* the rate is the PCM's (or DoP's) */
-            snprintf(value, vc, "%s as %s %s%s", st.fmt.codec, st.fmt.dop ? "DoP" : "PCM", k, st.fmt.channels == 1 ? " mono" : "");
-        else if (st.fmt.bits) snprintf(value, vc, "%s %u-bit %s%s", st.fmt.codec, st.fmt.bits, k, st.fmt.channels == 1 ? " mono" : "");
-        else snprintf(value, vc, "%s %s%s", st.fmt.codec, k, st.fmt.channels == 1 ? " mono" : "");
+            snprintf(value, vc, "%s as %s %s%s", st.fmt.codec, st.fmt.dop ? "DoP" : "PCM", k, st.fmt.channels == 1 ? tr(" mono") : "");
+        else if (st.fmt.bits) snprintf(value, vc, "%s %u-bit %s%s", st.fmt.codec, st.fmt.bits, k, st.fmt.channels == 1 ? tr(" mono") : "");
+        else snprintf(value, vc, "%s %s%s", st.fmt.codec, k, st.fmt.channels == 1 ? tr(" mono") : "");
         break;
     case 1:
-        if (pure) snprintf(value, vc, "Bypassed");
-        else if (settings_get_int("sound.levelling", LEVEL_OFF) == LEVEL_OFF) snprintf(value, vc, "Off");
+        if (pure) snprintf(value, vc, "%s", tr("Bypassed"));
+        else if (settings_get_int("sound.levelling", LEVEL_OFF) == LEVEL_OFF) snprintf(value, vc, "%s", tr("Off"));
         else db_text(value, vc, 20.0 * log10(st.track_gain > 0 ? st.track_gain : 1e-6));
         break;
     case 2: {
         char key[64], lab[64];
         eq_output(key, sizeof key, lab, sizeof lab);
         const char *name = settings_get(key, "");
-        if (pure) snprintf(value, vc, "Bypassed");
-        else if (!st.eq || !name[0]) snprintf(value, vc, "Off");
+        if (pure) snprintf(value, vc, "%s", tr("Bypassed"));
+        else if (!st.eq || !name[0]) snprintf(value, vc, "%s", tr("Off"));
         else snprintf(value, vc, "%s", name);
         break;
     }
     case 3:
-        if (pure) snprintf(value, vc, "Bypassed");
+        if (pure) snprintf(value, vc, "%s", tr("Bypassed"));
         else hook_sound_value(UI_SOUND_BALANCE, value, vc);
         break;
     case 4:
-        if (on_bt_now()) snprintf(value, vc, "The headphones'");
+        if (on_bt_now()) snprintf(value, vc, "%s", tr("The headphones'"));
         else if (g_usb_card >= 0) {
             char d[24];
             db_text(d, sizeof d, g_usb_cdb / 100.0);
-            snprintf(value, vc, "%s %s", g_usb_soft ? "Software" : "In the DAC", d);
-        } else if (on_line_out_now()) snprintf(value, vc, "Fixed 0 dB");
+            tr_fill(value, vc, g_usb_soft ? "Software %s" : "In the DAC %s", d, NULL);
+        } else if (on_line_out_now()) snprintf(value, vc, "%s", tr("Fixed 0 dB"));
         else {
             char d[24];
             int raw = mixer_get(&g_mix);
             db_text(d, sizeof d, (raw - g_mix.max) * 0.5);
-            snprintf(value, vc, "In the DAC %s", d);
+            tr_fill(value, vc, "In the DAC %s", d, NULL);
         }
         break;
     case 5: {
         char pcm[200], name[64];
         if (g_usb_card >= 0) snprintf(value, vc, "%s", g_usb_name);
         else if (on_bt_now() && bt_pcm(pcm, sizeof pcm, name, sizeof name)) snprintf(value, vc, "%s", name);
-        else snprintf(value, vc, "ES9018K2M %s", on_line_out_now() ? "line out" : "headphones");
+        else snprintf(value, vc, "ES9018K2M %s", tr(on_line_out_now() ? "line out" : "headphones"));
         break;
     }
     case 6: {                                        /* what the hardware took */
@@ -1031,7 +1042,7 @@ static int hook_signal_path(int i, char *label, size_t lc, char *value, size_t v
         break;
     }
     case 7:
-        snprintf(value, vc, "%s", !playing ? "-" : bp ? "Bit-perfect" : "Not bit-perfect");
+        snprintf(value, vc, "%s", !playing ? "-" : tr(bp ? "Bit-perfect" : "Not bit-perfect"));
         break;
     }
     return 0;
@@ -1239,8 +1250,8 @@ static void update_announce(void)
 {
     const char *tag = settings_get("update.found", "");
     if (!tag[0] || !strcmp(tag, settings_get("update.told", ""))) return;
-    char t[96];
-    snprintf(t, sizeof t, "Fathom %s is available\nSettings > About", tag);
+    char t[160];
+    tr_fill(t, sizeof t, "Fathom %s is available\nSettings > About", tag, NULL);
     ui_toast(t, 4000);
     fprintf(stderr, "update: told %s is available\n", tag);
     settings_set("update.told", tag);
@@ -1293,6 +1304,51 @@ static void update_poll(lv_timer_t *t)
     lv_refr_now(NULL);
     sync();
     if (system("/sbin/reboot") != 0) fprintf(stderr, "reboot failed\n");
+}
+
+/* ---- Uninstall Fathom (Settings > About > Uninstall Fathom) ----
+ * The battery is checked here, before the file is made ready and again before
+ * the restart: HiBy's updater then rewrites the flash, and must not run out
+ * half way. The restart goes straight into HiBy's recovery (h2boot honours
+ * HiBy's own signal, uninstaller_ask_recovery); if the signal can't be set, the
+ * H2 switches off and the toast says how to get there by hand. */
+
+static void hook_uninstall_do(int what)
+{
+    if ((what == UI_UNI_APPLY || what == UI_UNI_RESTART) && !g_charging && g_bat_pct >= 0 &&
+        g_bat_pct < UNINSTALL_MIN_BATTERY) {
+        ui_toast("Charge the H2 to 50 % or plug it in first", 3000);
+        return;
+    }
+    if (what != UI_UNI_RESTART) {
+        uninstaller_do(what);
+        return;
+    }
+    if (uninstaller_ask_recovery()) {
+        power_off("Hold Vol+ as you turn the H2 on, then choose Boot select > HibyOS Recovery");
+        return;
+    }
+    fprintf(stderr, "uninstall: restarting into HiBy's recovery\n");
+    g_powering_off = 1;
+    batlog_end();
+    clock_save();
+    settings_save();
+    queue_save();
+    screen_set(1);
+    ui_message_screen("Restarting", "HiBy's recovery puts its firmware back. Don't turn the H2 off.");
+    lv_refr_now(NULL);
+    sync();
+    if (system("/sbin/reboot") != 0) fprintf(stderr, "reboot failed\n");
+}
+
+static void uninstall_poll(void)
+{
+    static unsigned seen;
+    unsigned s = uninstaller_seq();
+    if (s != seen) {
+        seen = s;
+        ui_uninstall_changed();
+    }
 }
 
 /* ---- internet radio ---- */
@@ -1423,7 +1479,7 @@ static void bt_poll(lv_timer_t *t)
         g_bt_routed[0] = '\0';
         if (!out_router_on_bt()) return;
         engine_pause(g_eng, 1);
-        engine_switch_output(g_eng, out_router_alsa, (void *)"/dev/snd/pcmC0D0p");
+        engine_switch_output(g_eng, out_router_alsa, (void *)HW_PCM);
         route_apply(0);
         ui_toast("Bluetooth disconnected: paused", 2500);
         fprintf(stderr, "bluetooth: disconnected\n");
@@ -1494,10 +1550,10 @@ static void screen_timer(lv_timer_t *t)
     (void)t;
     int timeout = g_transport && (g_timeout <= 0 || g_timeout > TRANSPORT_TIMEOUT_S) ? TRANSPORT_TIMEOUT_S : g_timeout;
     if (!g_screen_on || timeout <= 0) return;
-    if (!g_transport && settings_get_int("display.on_charging", 0) && usb_powered()) { g_last_input = ms_now(); return; }
+    if (!g_transport && settings_get_int("display.on_charging", UI_ON_CHARGING_DEFAULT) && usb_powered()) { g_last_input = ms_now(); return; }
     uint32_t idle = ms_now() - g_last_input, limit = (uint32_t)timeout * 1000;
     if (idle >= limit) screen_set(0);
-    else if (!g_dimmed && limit > 5000 && idle >= limit - 5000 && settings_get_int("display.dim", 1)) {
+    else if (!g_dimmed && limit > 5000 && idle >= limit - 5000 && settings_get_int("display.dim", UI_DIM_DEFAULT)) {
         g_dimmed = 1;
         screen_apply();
     }
@@ -1539,18 +1595,32 @@ static void power_on_reason(char *out, size_t cap)
 
 static void charge_screen_show(void)
 {
-    char pct[32] = "", body[64];
-    read_int_file("/sys/class/power_supply/battery/capacity", pct, sizeof pct);
+    char pct[32] = "", body[160];
+    read_int_file(HW_BATTERY "capacity", pct, sizeof pct);
     pct[strcspn(pct, "\r\n")] = '\0';
-    snprintf(body, sizeof body, "%s%%\n\nPress Power to start", pct[0] ? pct : "-");
+    char pc[40];
+    snprintf(pc, sizeof pc, "%s%%", pct[0] ? pct : "-");
+    tr_fill(body, sizeof body, "%s\n\nPress Power to start", pc, NULL);
     if (g_charge_screen) lv_obj_delete(g_charge_screen);
     g_charge_screen = ui_message_screen("Charging", body);
     screen_set(1);
     g_charge_shown = ms_now();
 }
 
+/* Started for good in this boot (not in charging mode, or left it): a
+ * restart of the player (after USB drive mode, the card back) mustn't go
+ * back into charging mode because the PMIC still says USB powered it on. */
+#define STARTED_MARK "/tmp/fathom-started"
+
+static void started_mark(void)
+{
+    int fd = open(STARTED_MARK, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    if (fd >= 0) close(fd);
+}
+
 static void charge_mode_end(void)
 {
+    started_mark();
     g_charge_mode = 0;
     if (g_charge_screen) lv_obj_delete(g_charge_screen);
     g_charge_screen = NULL;
@@ -1572,21 +1642,19 @@ static const char *const DAC_FILTER = "DAC Filter";
 
 static void dac_filter_name(char *out, size_t cap)
 {
-    if (mixer_enum_get("/dev/snd/controlC0", DAC_FILTER, out, (int)cap) < 0) snprintf(out, cap, "-");
+    if (mixer_enum_get(HW_CTL, DAC_FILTER, out, (int)cap) < 0) snprintf(out, cap, "-");
 }
 
 static void dac_filter_next(void)
 {
-    int n = mixer_enum_count("/dev/snd/controlC0", DAC_FILTER);
-    int cur = mixer_enum_get("/dev/snd/controlC0", DAC_FILTER, NULL, 0);
+    int n = mixer_enum_count(HW_CTL, DAC_FILTER);
+    int cur = mixer_enum_get(HW_CTL, DAC_FILTER, NULL, 0);
     if (n <= 0 || cur < 0) return;
     int next = (cur + 1) % n;
-    if (mixer_enum_set("/dev/snd/controlC0", DAC_FILTER, next) == 0) settings_set_int("sound.dac_filter", next);
+    if (mixer_enum_set(HW_CTL, DAC_FILTER, next) == 0) settings_set_int("sound.dac_filter", next);
 }
 
 static const char *g_music;
-static const theme_t *g_scan_theme;
-static const ui_fonts_t *g_scan_fonts;
 static int scan_with_progress(library_t *lib, const char *music, const theme_t *t, const ui_fonts_t *f);
 
 /* ---------- USB drive mode ----------
@@ -1612,6 +1680,14 @@ static int usb_on_computer(void)
         }
     if (d) closedir(d);
     return !strncmp(state, "configured", 10);
+}
+
+/* After Reset all settings: out, and S90fathom starts the player again
+ * (2 s), which sets everything from the defaults. */
+static void restart_player(void)
+{
+    fprintf(stderr, "settings reset: starting again\n");
+    g_quit = 1;
 }
 
 static void usb_drive(void)
@@ -1671,13 +1747,20 @@ static void usb_dac_mode(void)
     if (g_player) player_pause(g_player, 1);
     /* the engine lets go of the DAC (it can't open this) until the mode ends */
     engine_switch_output(g_eng, out_router_alsa, (void *)"/dev/snd/usb-dac-mode");
+    route_apply(0);                    /* (from Bluetooth the H2's DAC was left muted) */
     g_usb_quiet_until = ms_now() + 15000;
     if (usb_gadget("dac")) {
         output_home();
         ui_toast("USB DAC mode isn't available", 2500);
         return;
     }
-    g_relay = uac_relay_start("/dev/snd/pcmC0D0p");
+    g_relay = uac_relay_start(HW_PCM);
+    if (!g_relay) {                    /* (out of memory): all the way back */
+        usb_gadget("normal");
+        output_home();
+        ui_toast("USB DAC mode couldn't start", 2500);
+        return;
+    }
     g_dac_text[0] = '\0';
     g_dac_screen = ui_dac_screen();
     g_dac_gone = 0;
@@ -1790,18 +1873,34 @@ static int take_tmp_file(const char *path, char *out, size_t cap)
 {
     FILE *f = fopen(path, "re");
     if (!f) return -1;
-    out[0] = '\0';
-    if (out && cap && fgets(out, (int)cap, f)) out[strcspn(out, "\n")] = '\0';
+    if (out && cap) {
+        out[0] = '\0';
+        if (fgets(out, (int)cap, f)) out[strcspn(out, "\n")] = '\0';
+    }
     fclose(f);
     unlink(path);
     return 0;
 }
 
+/* What fathom-usbdisk says when it can't lend the card, here for the
+ * translations' list (the toast translates them); one it adds later shows
+ * as it wrote it. */
+static const char *usbdisk_text(const char *msg)
+{
+    static const char *const known[] = {N_("USB drive mode isn't available"), N_("The card is in use: try again"),
+                                        N_("Couldn't start USB drive mode")};
+    for (size_t i = 0; i < sizeof known / sizeof known[0]; i++)
+        if (!strcmp(msg, known[i])) return known[i];
+    return msg;
+}
+
 /* ---------- background scans ----------
- * Checking the card for new music takes ~20 s on the H2 (listing ~500 FAT
- * folders), so after USB drive mode and from Settings > Rescan it runs on a
- * thread with its own connection to the library while the music plays; the
- * lists are refreshed when it's done, if anything changed. */
+ * Checking the card for new music takes about a second when nothing changed
+ * (the FAT read directly), minutes after adding music (tags, covers), so after
+ * USB drive mode, a card put back, a network drive's changes and from
+ * Settings > Library > Rescan it runs on a thread with its own connection to
+ * the library while the music plays; the lists are refreshed when it's done,
+ * if anything changed. */
 static char g_db_path[512], g_art_path[512], g_pl_path[600];
 static pthread_t g_scan_thread;
 static library_t *g_scan_lib;              /* the scan's own connection */
@@ -1825,6 +1924,33 @@ static void fast_walk_setup(library_t *lib, const char *music)
     }
     fclose(f);
     if (best_dev[0]) library_set_fast_walk(lib, best_dev, best_mnt);
+}
+
+/* The card's free space, asked once in the background soon after the start: the
+ * FAT driver doesn't trust the count kept on the card, so the first statvfs()
+ * after a mount reads the whole FAT (15 MB on a 128 GB card: 1.9 s at start-up),
+ * and Settings > About, usually the first to ask, stalled for it. Counted, the
+ * kernel keeps it up to date; About's later asks take a millisecond. (The player
+ * starts again after USB drive mode and when the card comes back: asked again.) */
+static void *free_space_thread(void *arg)
+{
+    (void)arg;
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);   /* below the music and the UI */
+    sleep(15);                                                    /* (after the start's own reading) */
+    struct statvfs st;
+    statvfs(g_music ? g_music : CARD_DIR, &st);
+    return NULL;
+}
+
+static void free_space_warm(void)
+{
+    pthread_t t;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&a, 64 * 1024);
+    pthread_create(&t, &a, free_space_thread, NULL);
+    pthread_attr_destroy(&a);
 }
 
 static void *scan_thread(void *arg)
@@ -2011,9 +2137,9 @@ static int about(int i, char *label, size_t lc, char *value, size_t vc)
     case 2: {
         char c[16];
         snprintf(label, lc, "Battery");
-        if (!read_int_file("/sys/class/power_supply/battery/capacity", a, sizeof a) &&
-            !read_int_file("/sys/class/power_supply/battery/voltage_now", b, sizeof b)) {
-            if (!read_int_file("/sys/class/power_supply/battery/temp", c, sizeof c))   /* tenths of a degree */
+        if (!read_int_file(HW_BATTERY "capacity", a, sizeof a) &&
+            !read_int_file(HW_BATTERY "voltage_now", b, sizeof b)) {
+            if (!read_int_file(HW_BATTERY "temp", c, sizeof c))   /* tenths of a degree */
                 snprintf(value, vc, "%d %%, %.2f V, %d \xC2\xB0" "C", atoi(a), atol(b) / 1e6, (atoi(c) + 5) / 10);
             else snprintf(value, vc, "%d %%, %.2f V", atoi(a), atol(b) / 1e6);
         } else snprintf(value, vc, "-");
@@ -2030,8 +2156,10 @@ static int about(int i, char *label, size_t lc, char *value, size_t vc)
         snprintf(label, lc, "SD card");
         if (statvfs(g_music ? g_music : CARD_DIR, &st) == 0) {
             double gb = 1024.0 * 1024 * 1024;
-            snprintf(value, vc, "%.1f of %.1f GB free", (double)st.f_bavail * st.f_frsize / gb,
-                     (double)st.f_blocks * st.f_frsize / gb);
+            char fr[16], all[16];
+            snprintf(fr, sizeof fr, "%.1f", (double)st.f_bavail * st.f_frsize / gb);
+            snprintf(all, sizeof all, "%.1f", (double)st.f_blocks * st.f_frsize / gb);
+            tr_fill(value, vc, "%s of %s GB free", fr, all);
         } else {
             snprintf(value, vc, "-");
         }
@@ -2041,7 +2169,13 @@ static int about(int i, char *label, size_t lc, char *value, size_t vc)
         time_t now = time(NULL);
         struct tm tm;
         snprintf(label, lc, "Clock");
-        if (now > 1735689600 && gmtime_r(&now, &tm)) strftime(value, vc, "%d %b %Y, %H:%M UTC", &tm);
+        if (now > 1735689600 && gmtime_r(&now, &tm)) {
+            static const char *const MON[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+            char d[8], date[48];
+            snprintf(d, sizeof d, "%d", tm.tm_mday);
+            snprintf(date, sizeof date, "%s %s", d, tr(MON[tm.tm_mon]));   /* (as the battery's days) */
+            snprintf(value, vc, "%s %d, %02d:%02d UTC", date, tm.tm_year + 1900, tm.tm_hour, tm.tm_min);
+        }
         else snprintf(value, vc, "Not set: needs Wi-Fi");
         return 0;
     }
@@ -2056,11 +2190,11 @@ static void idle_timer(lv_timer_t *t)
 {
     (void)t;
     static uint32_t idle_since;
-    int minutes = settings_get_int("power.auto_off", 15);
+    int minutes = settings_get_int("power.auto_off", UI_AUTO_OFF_DEFAULT);
     player_now_t n = {0};
     if (g_player) player_now(g_player, &n);
     uint32_t now = ms_now();
-    if (minutes <= 0 || n.playing || usb_powered() || share_busy() || updater_busy()) { idle_since = 0; return; }
+    if (minutes <= 0 || n.playing || usb_powered() || share_busy() || updater_busy() || uninstaller_busy()) { idle_since = 0; return; }
     uint32_t since = g_last_input > idle_since ? g_last_input : idle_since;
     if (!idle_since) { idle_since = now; return; }
     if (now - since >= (uint32_t)minutes * 60000) power_off("Idle: powering off");
@@ -2090,12 +2224,13 @@ static void queue_timer(lv_timer_t *t)
 }
 
 /* ---- automatic update checks (Settings > About > Check automatically) ----
- * Off unless the owner turns it on. At most once a day (a failed try again
- * after an hour: update_auto_due), only on Wi-Fi already joined and while the
- * H2 rests: the screen off for a minute, nothing playing unless it's charging,
- * no download, network-drive transfer, USB drive or DAC mode. It only asks
- * GitHub: a newer release is said by a toast the next time Power turns the
- * screen on, and offered in Settings > About. */
+ * On unless the owner turns it off (UI_UPDATE_AUTO_DEFAULT). At most once a
+ * day (a failed try again after an hour: update_auto_due), only on Wi-Fi
+ * already joined and while the H2 rests: the screen off for a minute,
+ * nothing playing unless it's charging, no download, network-drive transfer,
+ * USB drive or DAC mode. It only asks GitHub: a newer release is said by a
+ * toast the next time Power turns the screen on, and offered in Settings >
+ * About. */
 
 #define AUTO_UPDATE_REST_MS 60000
 
@@ -2144,6 +2279,7 @@ static void polls(lv_timer_t *t)
     bt_poll(NULL);
     wifi_poll(NULL);
     update_poll(NULL);
+    uninstall_poll();
     eq_poll(NULL);
     if (k % 2 == 0) {          /* 500 ms */
         usb_dac_poll(NULL);
@@ -2174,7 +2310,11 @@ static void scan_progress(int done, int total, const char *path, void *ctx)
     uint32_t now = ms_now();
     if (now - s->last < 250 && done != total) return;   /* redraw at most 4x per second */
     s->last = now;
-    if (total > 0) lv_label_set_text_fmt(s->count, "%d of %d", done, total);
+    char a[16], b[16], t[64];
+    snprintf(a, sizeof a, "%d", done);
+    snprintf(b, sizeof b, "%d", total);
+    tr_fill(t, sizeof t, "%s of %s", a, b);
+    if (total > 0) lv_label_set_text(s->count, t);
     else lv_label_set_text_fmt(s->count, "%d", done);
     const char *slash = path ? strrchr(path, '/') : NULL;
     lv_label_set_text(s->path, slash ? slash + 1 : path ? path : "");
@@ -2189,7 +2329,7 @@ static int scan_with_progress(library_t *lib, const char *music, const theme_t *
     lv_obj_t *title = lv_label_create(scr);
     lv_obj_set_style_text_font(title, f->title, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(t->text), 0);
-    lv_label_set_text(title, "Reading your library");
+    lv_label_set_text(title, tr("Reading your library"));
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 16, 60);
     scan_ui_t s = {.count = lv_label_create(scr), .path = lv_label_create(scr)};
     lv_obj_set_style_text_font(s.count, f->body, 0);
@@ -2227,6 +2367,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--scan")) force_scan = 1;
         else { fprintf(stderr, "usage: %s [--music DIR] [--data DIR] [--assets DIR] [--scan] [--theme N]\n", argv[0]); return 2; }
     }
+    /* SQLite's temporary files (a scan's groups are made aside in temp
+     * tables) on the card, not in /tmp: that's RAM. (Before SQLite starts.) */
+    setenv("SQLITE_TMPDIR", data, 0);
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
     signal(SIGUSR1, on_usr1);
@@ -2235,6 +2378,8 @@ int main(int argc, char **argv)
     char settings_path[600];
     snprintf(settings_path, sizeof settings_path, "%s/settings.ini", data);
     settings_load(settings_path);
+    snprintf(g_data_dir, sizeof g_data_dir, "%s", data);
+    hook_language_set(settings_get("display.language", ""));   /* before anything is drawn (the first scan's screen) */
     /* An update's install cut short (power lost): finished before Wi-Fi and
      * Bluetooth start from the card, then a restart into its kernel, so the kernel and
      * its Wi-Fi modules are never from two releases. An unfinished download
@@ -2333,8 +2478,6 @@ int main(int argc, char **argv)
     }
     volume_init(data);
     engine_t *eng = engine_new(&out);
-    snprintf(g_data_dir, sizeof g_data_dir, "%s", data);
-    hook_language_set(settings_get("display.language", ""));   /* before the UI draws anything */
     g_eng = out_is_alsa ? eng : NULL;   /* USB DACs need the ALSA output to switch */
     player_t *player = eng ? player_new(lib, eng) : NULL;
     g_player = player;
@@ -2359,7 +2502,7 @@ int main(int argc, char **argv)
         .transport_toggle = hook_transport_toggle, .battery_info = hook_battery_info,
         .battery_report = hook_battery_report,
         .languages = hook_languages, .language_set = hook_language_set,
-        .rescan = rescan, .usb_drive = usb_drive, .usb_dac = usb_dac_mode, .about = about,
+        .rescan = rescan, .restart = restart_player, .usb_drive = usb_drive, .usb_dac = usb_dac_mode, .about = about,
         .eq_list = hook_eq_list, .eq_set = hook_eq_set, .eq_get = hook_eq_get, .eq_put = hook_eq_put,
         .eq_preview = hook_eq_preview, .eq_remove = hook_eq_remove,
     };
@@ -2391,6 +2534,9 @@ int main(int argc, char **argv)
         hooks.ssh_do = hook_ssh_do;
         ssh_init(settings_get_int("ssh.on", 0), made_up_password("ssh.password", 0));
     }
+    uninstaller_init(CARD_DIR);
+    hooks.uninstall_state = uninstaller_ui_state;
+    hooks.uninstall_do = hook_uninstall_do;
     if (player) {
         hooks.radio_stations = hook_radio_stations;
         hooks.radio_ready = hook_radio_ready;
@@ -2399,15 +2545,14 @@ int main(int argc, char **argv)
     }
     g_lib = lib;
     g_music = music;
-    g_scan_theme = &themes[theme];
-    g_scan_fonts = theme_fonts;
     int filter = settings_get_int("sound.dac_filter", -1);   /* the DAC filter chosen last time */
-    if (filter >= 0) mixer_enum_set("/dev/snd/controlC0", DAC_FILTER, filter);
+    if (filter >= 0) mixer_enum_set(HW_CTL, DAC_FILTER, filter);
     ui_set_hooks(&hooks);
     route_apply(0);                    /* the output's name: the first route_apply() came before the UI */
     ui_set_theme(theme);
     screen_set(1);
     g_fast = lv_timer_create(every_100ms, 100, NULL);
+    free_space_warm();
     batlog_open(&g_batlog, CARD_DIR "/fathom/battery.log", time(NULL), mono_s());   /* (the clock restored) */
     g_batlog_on = 1;
     poll_battery(NULL);
@@ -2419,18 +2564,20 @@ int main(int argc, char **argv)
         char why[32];
         power_on_reason(why, sizeof why);
         poll_battery(NULL);                  /* g_charging, now */
-        g_charge_mode = !strncmp(why, "vbus", 4) && g_charging;
+        g_charge_mode = !strncmp(why, "vbus", 4) && g_charging && access(STARTED_MARK, F_OK) != 0;
         fprintf(stderr, "power on: %s%s\n", why, g_charge_mode ? " (charging mode)" : "");
         if (g_charge_mode) charge_screen_show();
+        else started_mark();
     }
     lv_timer_create(polls, 250, NULL);
     levelling_apply();                   /* (off in Pure mode) */
-    if (take_tmp_file("/tmp/fathom-usbdisk.msg", usb_msg, sizeof usb_msg) == 0) ui_toast(usb_msg, 3000);
+    if (take_tmp_file("/tmp/fathom-usbdisk.msg", usb_msg, sizeof usb_msg) == 0) ui_toast(usbdisk_text(usb_msg), 3000);
     else if (access(music, F_OK) != 0) {
         fprintf(stderr, "library: no music folder (%s)\n", music);
         ui_toast("No Music folder on the card", 5000);
     }
     boot_markers();                      /* (up: an update's kernel worked) */
+    if (uninstaller_pending()) ui_toast("Uninstall Fathom is ready: Settings > About", 5000);
     if (back_from_usb && have > 0 && !force_scan) scan_start();
     /* a library from before some tags (composers): read them in the background, once */
     else if (have > 0 && !force_scan && library_needs_tags(lib)) {

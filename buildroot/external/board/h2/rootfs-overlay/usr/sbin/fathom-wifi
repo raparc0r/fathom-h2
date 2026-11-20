@@ -10,7 +10,9 @@
 #                                 connecting, connected)
 #   fathom-wifi scan              SSID|DBM|SECURED|SAVED per network in range, best first
 #   fathom-wifi saved             the saved networks' names
-#   fathom-wifi connect SSID [PASSWORD]   join (and save) a network; no password: open
+#   fathom-wifi connect SSID [PASSWORD]   join a network (no password: open, or as
+#                                 saved) and save it once joined; exit 3: the
+#                                 password isn't valid, 4: it's wrong, 5: refused
 #   fathom-wifi forget SSID
 #   fathom-wifi ssid              the network joined now (for udhcpc's hook)
 #   fathom-wifi nvram             the board's chip settings, made (as on does)
@@ -18,7 +20,8 @@
 # The programs and modules are in fathom/wifi (post-build.sh), the chip's firmware
 # in fathom/firmware/brcm (the user's own, from flash.img: extract-firmware.py
 # --wifi). Saved networks: fathom/wifi/networks.conf (wpa_supplicant's format; on
-# FAT, readable by anyone holding the card).
+# FAT, readable by anyone holding the card). Network names in and out are their
+# real text (UTF-8, as the phone or router named it; wpa_cli's escapes: AWK_SSID).
 
 W=/mnt/sd/fathom/wifi
 BT=/mnt/sd/fathom/bt
@@ -28,12 +31,70 @@ CTRL=/var/run/wpa_supplicant
 MMC=/sys/bus/platform/drivers/jz4740-mmc
 DEV=13460000.mmc
 FW=/mnt/sd/fathom/firmware/brcm/brcmfmac43430-sdio.bin
+JOIN=40                                 # connect waits up to this many half seconds
+UPTIME=/proc/uptime
 export LD_LIBRARY_PATH=$W/usr/lib:$W/lib:$BT/usr/lib:$BT/lib
+nl='
+'
 
 say() { echo "wifi: $1" >&2; }
 cli() { $W/usr/sbin/wpa_cli -p $CTRL -i wlan0 "$@" 2>/dev/null; }
-running() { [ -f $RUN/wpa.pid ] && kill -0 "$(cat $RUN/wpa.pid)" 2>/dev/null; }
+running() { [ -f $RUN/wpa.pid ] && read -r wpid < $RUN/wpa.pid && kill -0 "$wpid" 2>/dev/null; }
 hex() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
+# (status runs every few seconds while Wi-Fi is on: these start no process)
+# v: KEY's value in wpa_cli's KEY=VALUE lines ($2), "" without one
+val() { v="$nl$2"; case "$v" in *"$nl$1="*) v=${v#*"$nl$1="}; v=${v%%"$nl"*} ;; *) v= ;; esac; }
+up() { read -r up _ < $UPTIME; up=${up%.*}; }
+
+# wpa_cli prints a network's name with its bytes escaped (printf_encode):
+# \" \\ \e \n \r \t, and \xHH for each byte outside printable ASCII, so
+# "Anna’s iPhone" comes as Anna\xe2\x80\x99s iPhone. In awk:
+#   esc(HEX)   the name whose bytes are HEX, as wpa_cli writes it (to find
+#              it in wpa_cli's lists)
+#   fmt(TEXT)  wpa_cli's TEXT as a printf format of the real bytes (octal
+#              escapes); a control character becomes "?" (names go out one
+#              per line)
+# No byte above 127 ever goes through awk: the same in any locale.
+AWK_SSID='
+function ssid_init(  i) { for (i = 32; i < 127; i++) ord[sprintf("%c", i)] = i; hexd = "0123456789abcdef" }
+function hexv(h) { h = tolower(h); return (index(hexd, substr(h, 1, 1)) - 1) * 16 + index(hexd, substr(h, 2, 1)) - 1 }
+function esc(h,   o, i, b) {
+    o = ""
+    for (i = 1; i < length(h); i += 2) {
+        b = hexv(substr(h, i, 2))
+        if (b == 34) o = o "\\\""
+        else if (b == 92) o = o "\\\\"
+        else if (b == 27) o = o "\\e"
+        else if (b == 10) o = o "\\n"
+        else if (b == 13) o = o "\\r"
+        else if (b == 9) o = o "\\t"
+        else if (b >= 32 && b < 127) o = o sprintf("%c", b)
+        else o = o sprintf("\\x%02x", b)
+    }
+    return o
+}
+function fmt(s,   o, i, c, k) {
+    o = ""
+    for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c ~ /[A-Za-z0-9 ._]/) { o = o c; continue }   # (not "-": never an option to printf)
+        k = ord[c]
+        if (c == "\\") {
+            c = substr(s, ++i, 1)
+            if (c == "x") { k = hexv(substr(s, i + 1, 2)); i += 2 }
+            else k = c == "\"" || c == "\\" ? ord[c] : 63
+        }
+        o = o sprintf("\\%03o", k < 32 || k == 127 ? 63 : k)
+    }
+    return o
+}'
+# u: the real name of wpa_cli's escaped $1 (a process only for one with escapes)
+unesc() {
+    case "$1" in
+    *\\*) u=$(printf "$(printf '%s\n' "$1" | awk "$AWK_SSID"' BEGIN { ssid_init() } { print fmt($0) }')") ;;
+    *) u=$1 ;;
+    esac
+}
 
 # The chip's settings: the stock file (from the H2's flash), and for this board
 # a copy with Cypress's Bluetooth coexistence parameters, as the Raspberry Pi
@@ -55,10 +116,12 @@ nvram() {
 # the others, which is meant for now only: saved as it is, the H2 would never
 # rejoin them by itself (home, after a hotspot elsewhere).
 save() { cli save_config > /dev/null; sed -i '/^[[:space:]]*disabled=1$/d' $CONF; sync; }
-uptime_s() { cut -d. -f1 /proc/uptime; }
 
-# The network id of a saved SSID, or ""
-net_id() { cli list_networks | tail -n +2 | awk -F'\t' -v s="$1" '$2 == s { print $1; exit }'; }
+# The ids of the networks saved as SSID (its real name), oldest first
+net_ids() {
+    cli list_networks | tail -n +2 |
+        awk -F'\t' -v h="$(hex "$1")" "$AWK_SSID"' BEGIN { ssid_init(); s = esc(h) } $2 == s { print $1 }'
+}
 
 case "$1" in
 on)
@@ -109,11 +172,13 @@ on)
     cli set ap_scan 1 > /dev/null
     # wpa_supplicant's own list of networks heard: 40, not 200 (saved ones are kept first)
     cli set bss_max_count 40 > /dev/null
-    # DHCP: tries in the background until a network is joined, renews after.
-    # It starts before wpa_supplicant has joined one (a few seconds), so its
-    # first tries go nowhere; then it would rest 20 s (-A 3: 3 s), and status
-    # asks it at once when the network is joined (an address took 30 s).
-    # In the background from the start: -b made its first three tries (10 s)
+    # DHCP: in the background, renewing the address once there's one. It
+    # starts before wpa_supplicant has joined a network (a few seconds), and
+    # tries again 3 s after each try that brought nothing (-A 3; 20 s by
+    # default: an address took 30 s). A try that fails with no network joined
+    # puts it to rest until status sees one joined (its lease hook,
+    # fathom-wifi-lease): not three tries and a script every 12 s while
+    # nothing saved is in range. In the background from the start: -b made its first three tries (10 s)
     # before going there, and "on" waited for them. (From /: not holding the
     # card, which USB drive mode lends to the computer.)
     rm -f $RUN/asked
@@ -140,38 +205,56 @@ off)
     ;;
 status)
     running || { echo "off|||"; exit 0; }
+    # (asked every few seconds while Wi-Fi is on: two or three wpa_cli, little else)
     st=$(cli status)
-    state=$(echo "$st" | sed -n 's/^wpa_state=//p')
-    ssid=$(echo "$st" | sed -n 's/^ssid=//p')
-    ip=$(echo "$st" | sed -n 's/^ip_address=//p')
-    [ -z "$ip" ] && ip=$(ifconfig wlan0 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p')
-    sig=$(cli signal_poll | sed -n 's/^RSSI=//p')
+    val wpa_state "$st"; state=$v
+    val ssid "$st"; unesc "$v"; ssid=$u
+    val ip_address "$st"; ip=$v
+    sig=
     if [ "$state" = COMPLETED ]; then
+        [ -z "$ip" ] && ip=$(ifconfig wlan0 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p')
+        val RSSI "$(cli signal_poll)"; sig=$v
         # Joined a different network from the one the address came from
         # (wpa_supplicant moved on; udhcpc keeps its lease until it's due):
         # let that address go and ask this network for one
-        if [ -f $RUN/lease-ssid ] && [ "$(cat $RUN/lease-ssid)" != "$ssid" ] && [ -f $RUN/udhcpc.pid ]; then
-            p=$(cat $RUN/udhcpc.pid)
+        up
+        lease=
+        [ -f $RUN/lease-ssid ] && IFS= read -r lease < $RUN/lease-ssid
+        if [ -f $RUN/lease-ssid ] && [ "$lease" != "$ssid" ] && [ -f $RUN/udhcpc.pid ]; then
+            read -r p < $RUN/udhcpc.pid
             rm -f $RUN/lease-ssid
             # release, then a fresh discover: apart, as two signals pending at once
             # arrive lowest first (USR1, renew, would come before the release)
             kill -USR2 "$p" 2>/dev/null; sleep 0.3; kill -USR1 "$p" 2>/dev/null
+            echo $up > $RUN/asked              # (asked: not again just below)
             logger -t fathom-wifi "joined another network: a new address"
             ip=
         fi
-        # Just joined, no address yet: DHCP asked now, once per joining
-        if [ -z "$ip" ] && [ ! -f $RUN/asked ] && [ -f $RUN/udhcpc.pid ]; then
-            kill -USR1 "$(cat $RUN/udhcpc.pid)" 2>/dev/null
-            touch $RUN/asked
+        # Joined, no address yet: DHCP woken (udhcpc rests while no network is
+        # joined: its lease hook), and again every 10 s until there's one. (A
+        # wake while it's already asking changes nothing: udhcpc lets a search
+        # in progress be.)
+        if [ -z "$ip" ] && [ -f $RUN/udhcpc.pid ]; then
+            asked=
+            [ -f $RUN/asked ] && read -r asked < $RUN/asked
+            if [ -z "$asked" ] || [ $((up - asked)) -ge 10 ]; then
+                read -r p < $RUN/udhcpc.pid
+                kill -USR1 "$p" 2>/dev/null
+                echo $up > $RUN/asked
+            fi
         fi
-        uptime_s > $RUN/seen
+        echo $up > $RUN/seen
     else
         rm -f $RUN/asked
-        if cli list_networks | grep -q "\[DISABLED\]"; then
+        case "$(cli list_networks)" in
+        *"[DISABLED]"*)
             # The network picked can't be joined (out of range, wrong password): after
             # a minute without a connection, any saved network will do again
-            [ $(( $(uptime_s) - $(cat $RUN/seen 2>/dev/null || echo 0) )) -ge 60 ] && cli enable_network all > /dev/null
-        fi
+            up; seen=0
+            [ -f $RUN/seen ] && read -r seen < $RUN/seen
+            [ $((up - ${seen:-0})) -ge 60 ] && cli enable_network all > /dev/null
+            ;;
+        esac
     fi
     case "$state" in
     COMPLETED) [ -n "$ip" ] && s=connected || s=connecting ;;
@@ -179,7 +262,7 @@ status)
     ASSOCIATING|ASSOCIATED|AUTHENTICATING|4WAY_HANDSHAKE|GROUP_HANDSHAKE) s=connecting ;;
     *) s=on ;;
     esac
-    echo "$s|$ssid|$ip|$sig"
+    printf '%s|%s|%s|%s\n' "$s" "$ssid" "$ip" "$sig"
     ;;
 scan)
     running || exit 1
@@ -188,48 +271,94 @@ scan)
     [ "$(cli scan_results | wc -l)" -gt 1 ] || sleep 2
     saved=$(cli list_networks | tail -n +2 | cut -f2)
     # bssid freq signal flags ssid -> the best of each SSID, strongest first
-    cli scan_results | tail -n +2 | awk -F'\t' '$5 != "" && $5 !~ /^\\x00/ {
+    # (compared as wpa_cli writes them; shown by their real names)
+    cli scan_results | tail -n +2 | awk -F'\t' "$AWK_SSID"'
+    BEGIN { ssid_init() }
+    $5 != "" && $5 !~ /^\\x00/ {
         sec = ($4 ~ /WPA|WEP|SAE/) ? 1 : 0
         if (!($5 in best) || $3 > best[$5]) { best[$5] = $3; s[$5] = sec }
-    } END { for (n in best) print best[n] "\t" n "\t" s[n] }' | sort -rn | \
-    while IFS="$(printf '\t')" read -r dbm ssid sec; do
+    } END { for (n in best) print best[n] "\t" n "\t" s[n] "\t" fmt(n) }' | sort -rn | \
+    while IFS="$(printf '\t')" read -r dbm ssid sec f; do
         sv=0
-        echo "$saved" | grep -qxF -- "$ssid" && sv=1
-        echo "$ssid|$dbm|$sec|$sv"
+        case "$nl$saved$nl" in *"$nl$ssid$nl"*) sv=1 ;; esac
+        printf "$f|%s|%s|%s\n" "$dbm" "$sec" "$sv"
     done
     ;;
 saved)
     running || exit 1
-    cli list_networks | tail -n +2 | cut -f2
+    cli list_networks | tail -n +2 | awk -F'\t' "$AWK_SSID"' BEGIN { ssid_init() } { print fmt($2) }' |
+        while IFS= read -r f; do printf "$f\n"; done
     ;;
 connect)
     running || exit 1
     [ -n "$2" ] || exit 2
-    id=$(net_id "$2")
-    if [ -z "$id" ]; then
-        id=$(cli add_network | tail -1)
-        cli set_network "$id" ssid "$(hex "$2")" > /dev/null
+    old=$(net_ids "$2")
+    id=${old%%"$nl"*} new=
+    if [ -z "$id" ] || [ -n "$3" ]; then
+        # A new network; and a password for a saved one is tried as a new one
+        # too: the saved one stays as it is until this one has joined
+        id=$(cli add_network | tail -1) new=1
+        cli set_network "$id" ssid "$(hex "$2")" > /dev/null   # (its real bytes)
         cli set_network "$id" scan_ssid 1 > /dev/null       # hidden networks too
-    fi
-    if [ -n "$3" ]; then
-        cli set_network "$id" key_mgmt WPA-PSK > /dev/null
-        cli set_network "$id" psk "\"$3\"" | grep -q OK || { say "the password isn't valid (8 to 63 characters)"; exit 3; }
-    elif [ -z "$(cli get_network "$id" psk | grep -v FAIL)" ]; then
-        cli set_network "$id" key_mgmt NONE > /dev/null
+        if [ -n "$3" ]; then
+            cli set_network "$id" key_mgmt WPA-PSK > /dev/null
+            cli set_network "$id" psk "\"$3\"" | grep -q OK ||
+                { cli remove_network "$id" > /dev/null; say "the password isn't valid (8 to 63 characters)"; exit 3; }
+        else
+            cli set_network "$id" key_mgmt NONE > /dev/null
+        fi
     fi
     cli enable_network "$id" > /dev/null
     cli select_network "$id" > /dev/null               # (the others off while it's joined; status: a minute without it, back on)
-    uptime_s > $RUN/seen
+    up; echo $up > $RUN/seen
+    # Until it's joined or refused. wpa_supplicant marks a network it gave up
+    # on for now [TEMP-DISABLED]; when that comes after the network let us in
+    # (associated: the key exchange had started), the password is wrong (its
+    # WRONG_KEY); before, the network said no (or isn't there).
+    r= got= i=0
+    while [ $i -lt $JOIN ]; do
+        st=$(cli status)
+        val wpa_state "$st"
+        case "$v" in
+        COMPLETED) val id "$st"; [ "$v" = "$id" ] && { r=joined; break; } ;;
+        ASSOCIATED|4WAY_HANDSHAKE|GROUP_HANDSHAKE) got=1 ;;
+        esac
+        if cli list_networks | awk -F'\t' -v id="$id" '$1 == id && $4 ~ /TEMP-DISABLED/ { f = 1 } END { exit !f }'; then
+            r=refused
+            [ -n "$got" ] && case "$(cli get_network "$id" key_mgmt)" in *PSK*|*SAE*) r=wrong ;; esac
+            break
+        fi
+        sleep 0.5; i=$((i + 1))
+    done
+    if [ -n "$r" ] && [ "$r" != joined ]; then
+        # Not kept (wpa_supplicant would try it again and again, silently): a
+        # new one goes; a saved one whose password is wrong too, so choosing
+        # it again asks for the password. The others are back on.
+        if [ -n "$new" ] || [ $r = wrong ]; then cli remove_network "$id" > /dev/null; fi
+        cli enable_network all > /dev/null
+        [ -z "$new" ] && [ $r = wrong ] && save
+        [ $r = wrong ] && { say "wrong password"; exit 4; }
+        say "the network refused"; exit 5
+    fi
+    # Joined, or still trying when the wait is over (kept: wpa_supplicant
+    # carries on). Once joined, a new password takes the old one's place.
+    if [ "$r" = joined ] && [ -n "$new" ]; then
+        for o in $old; do cli remove_network "$o" > /dev/null; done
+    fi
     save
     echo "$id"
     ;;
 forget)
     running || exit 1
-    id=$(net_id "$2")
-    [ -n "$id" ] && cli remove_network "$id" > /dev/null && save
+    ids=$(net_ids "$2")
+    [ -n "$ids" ] || exit 0
+    for id in $ids; do cli remove_network "$id" > /dev/null; done
+    save
     ;;
 ssid)
-    running && cli status | sed -n 's/^ssid=//p'
+    running || exit 0
+    val ssid "$(cli status)"; unesc "$v"
+    [ -n "$u" ] && printf '%s\n' "$u"
     ;;
 nvram)
     nvram

@@ -7,6 +7,7 @@
  * deleted (for a rescan once it's quiet) and when files are being copied
  * (the H2 stays awake). Like wifi.c. */
 #include "share.h"
+#include "shell.h"
 #include "tlscert.h"
 
 #include <pthread.h>
@@ -56,45 +57,6 @@ static void set_state(int st)
     pthread_mutex_unlock(&S.mu);
 }
 
-static int run(const char *cmd, char *out, size_t cap)
-{
-    FILE *f = popen(cmd, "r");
-    if (!f) return -1;
-    size_t got = 0, r;
-    if (out && cap) {
-        while (got + 1 < cap && (r = fread(out + got, 1, cap - 1 - got, f)) > 0) got += r;
-        out[got] = '\0';
-    }
-    char sink[256];
-    while (fread(sink, 1, sizeof sink, f) > 0) {}
-    int st = pclose(f);
-    return st < 0 ? -1 : (st >> 8) & 0xff;
-}
-
-/* s as one single-quoted shell word. */
-static void shell_quote(const char *s, char *out, size_t cap)
-{
-    size_t o = 0;
-    if (cap < 3) { if (cap) out[0] = '\0'; return; }
-    out[o++] = '\'';
-    for (; *s && o + 5 < cap; s++) {
-        if (*s == '\'') { memcpy(out + o, "'\\''", 4); o += 4; }
-        else out[o++] = *s;
-    }
-    out[o++] = '\'';
-    out[o] = '\0';
-}
-
-static void wlan_ip(char *out, size_t cap)
-{
-    char buf[64] = "";
-    out[0] = '\0';
-    if (run("ifconfig wlan0 2>/dev/null | sed -n 's/.*inet addr:\\([0-9.]*\\).*/\\1/p'", buf, sizeof buf) == 0) {
-        buf[strcspn(buf, "\n")] = '\0';
-        snprintf(out, cap, "%s", buf);
-    }
-}
-
 static int start(const char *music, const char *password)
 {
     char qm[600], qp[80], c[800], err[200] = "", fp[24];
@@ -102,10 +64,10 @@ static int start(const char *music, const char *password)
     pthread_mutex_lock(&S.mu);
     snprintf(S.cert, sizeof S.cert, "%s", fp);
     pthread_mutex_unlock(&S.mu);
-    shell_quote(music, qm, sizeof qm);
-    shell_quote(password, qp, sizeof qp);
+    sh_quote(music, qm, sizeof qm);
+    sh_quote(password, qp, sizeof qp);
     snprintf(c, sizeof c, "printf '%%s\\n' %s | " FATHOM_SHARE " on %s 2>&1 >/dev/null", qp, qm);
-    int st = run(c, err, sizeof err);
+    int st = sh_run(c, err, sizeof err);
     if (st) {
         err[strcspn(err, "\n")] = '\0';
         fprintf(stderr, "share: didn't start: %s\n", err);
@@ -117,7 +79,7 @@ static int start(const char *music, const char *password)
 
 static void stop(void)
 {
-    run(FATHOM_SHARE " off >/dev/null 2>&1", NULL, 0);
+    sh_run(FATHOM_SHARE " off >/dev/null 2>&1", NULL, 0);
     fprintf(stderr, "share: off\n");
 }
 
@@ -190,7 +152,7 @@ static void *worker(void *arg)
                 running = 1;
                 log_pos = 0;
                 char ip[16];
-                wlan_ip(ip, sizeof ip);
+                if_ip("wlan0", ip, sizeof ip);
                 pthread_mutex_lock(&S.mu);
                 snprintf(S.ip, sizeof S.ip, "%s", ip);
                 S.seq++;
@@ -220,7 +182,7 @@ void share_init(const char *music, int on, const char *password)
     S.want = on;
     S.state = on ? UI_SHARE_WAITING : UI_SHARE_OFF;
     pthread_mutex_unlock(&S.mu);
-    run(FATHOM_SHARE " off >/dev/null 2>&1", NULL, 0);    /* one left from a player that crashed */
+    sh_run(FATHOM_SHARE " off >/dev/null 2>&1", NULL, 0);    /* one left from a player that crashed */
     pthread_t th;
     if (pthread_create(&th, NULL, worker, NULL)) return;
     pthread_detach(th);

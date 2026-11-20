@@ -69,6 +69,9 @@ typedef struct {
     eq_t *eq;
     unsigned eq_seen;         /* the flush count its filters were last reset at */
     uint32_t start_until;     /* a stream starting (open, resume, skip): START_MS patience until then */
+    long lost;                /* a stall closed the stream: what was queued then (frames at the
+                               * track's rate), reported as the delay until the next one, so the
+                               * engine resumes from what was heard (engine.c) */
     int16_t *buf;
     long cap;
 } out_bt_t;
@@ -206,6 +209,7 @@ static int pcm_open(out_bt_t *o)
     o->broken = 0;
     pthread_mutex_unlock(&o->mu);
     o->start_until = now_ms() + START_MS;      /* a new stream */
+    o->lost = 0;
     return 0;
 }
 
@@ -221,7 +225,7 @@ static void pcm_must(out_bt_t *o, const char *cmd, int timeout_ms)
 static int bt_open(void *ctx, const audio_format_t *fmt)
 {
     out_bt_t *o = ctx;
-    if (!o->pcm[0]) return -1;
+    if (!o->pcm[0]) return -2;                 /* no link */
     if (!btconv_rate_for(fmt->rate)) {
         fprintf(stderr, "bt: can't play %u Hz over Bluetooth\n", fmt->rate);
         return -1;
@@ -239,7 +243,7 @@ static int bt_open(void *ctx, const audio_format_t *fmt)
     o->fmt = *fmt;
     fprintf(stderr, "bt: %s %u Hz, from %u Hz %d-bit\n", o->codec, o->link_rate, fmt->rate, fmt->bits);
     /* the stream stays open across tracks; paused, it opens at the resume */
-    return o->fd >= 0 || o->paused ? 0 : pcm_open(o);
+    return o->fd >= 0 || o->paused || pcm_open(o) == 0 ? 0 : -2;
 }
 
 /* Adds `len` bytes to what's to be written. */
@@ -310,6 +314,8 @@ static int send_kept(out_bt_t *o, unsigned gen)
     return 0;
 }
 
+static long bt_delay(void *ctx);
+
 static long bt_write(void *ctx, const int32_t *frames, long n)
 {
     out_bt_t *o = ctx;
@@ -331,7 +337,9 @@ static long bt_write(void *ctx, const int32_t *frames, long n)
     long w = btconv_run(o->conv, frames, n, o->buf);
     if (keep(o, (const char *)o->buf, (size_t)w * 4)) return -1;
     if (send_kept(o, gen) < 0) {
+        long q = bt_delay(o);                  /* what the headphones never got goes with the stream */
         pcm_close(o);
+        o->lost = q;
         return -1;
     }
     return n;
@@ -341,8 +349,9 @@ static long bt_delay(void *ctx)
 {
     out_bt_t *o = ctx;
     if (!o->conv) return 0;
+    if (o->fd < 0) return o->lost;             /* no stream: paused (nothing queued), or a stall's loss */
     int q = 0;
-    if (o->fd >= 0) ioctl(o->fd, FIONREAD, &q);
+    ioctl(o->fd, FIONREAD, &q);
     return (long)((double)q / 4 * btconv_ratio(o->conv)) + (long)o->fmt.rate * LINK_DELAY_MS / 1000;
 }
 
@@ -357,6 +366,7 @@ static void bt_flush(void *ctx)
     out_bt_t *o = ctx;
     o->gen++;
     o->start_until = now_ms() + START_MS;
+    o->lost = 0;
     pcm_must(o, "Drop", 500);                  /* what's queued goes; the stream stays */
     if (o->conv) btconv_reset(o->conv);
 }
@@ -376,6 +386,7 @@ static void bt_pause(void *ctx, int on)
     }
     pthread_mutex_lock(&o->mu);
     o->paused = 1;
+    o->lost = 0;
     o->gen++;                                  /* what the engine's side kept is dropped */
     if (o->fd >= 0) close(o->fd);
     if (o->ctrl >= 0) close(o->ctrl);
@@ -387,6 +398,7 @@ static void bt_close(void *ctx)
 {
     out_bt_t *o = ctx;
     pcm_close(o);
+    o->lost = 0;
     btconv_destroy(o->conv);
     o->conv = NULL;
 }

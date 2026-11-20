@@ -25,6 +25,15 @@ static void dec(const unsigned char *p, batrec_t *r)
     r->pct = p[4], r->flags = p[5], r->kind = p[6], r->known = 0;
 }
 
+/* A record, not a header written again or anything else: 0.9.0 and before
+ * wrote the header at every flush on the H2 (in append mode, musl's ftell()
+ * before the first write says 0), and each read back as a sample dated 2014.
+ * Such files are read as if they had none, and trimmed without them. */
+static int ours(const unsigned char *p)
+{
+    return memcmp(p, MAGIC, 8) && p[6] <= BL_CLOCK;
+}
+
 /* The file's records into *out (malloc'd): the count, 0 for none, -1 not ours */
 static int read_file(const char *path, batrec_t **out)
 {
@@ -38,38 +47,68 @@ static int read_file(const char *path, batrec_t **out)
     batrec_t *r = n > 0 ? malloc((size_t)n * sizeof *r) : NULL;
     long k = 0;
     unsigned char b[8];
-    while (r && k < n && fread(b, 1, 8, f) == 8) dec(b, &r[k++]);
+    while (r && k < n && fread(b, 1, 8, f) == 8)
+        if (ours(b)) dec(b, &r[k++]);
     fclose(f);
     *out = r;
     return (int)k;
 }
 
-static int write_file(const char *path, const batrec_t *r, int n)
-{
-    FILE *f = fopen(path, "wbe");
-    if (!f) return -1;
-    int ok = fwrite(MAGIC, 1, 8, f) == 8;
-    unsigned char b[8];
-    for (int i = 0; ok && i < n; i++) { enc(&r[i], b); ok = fwrite(b, 1, 8, f) == 8; }
-    return fclose(f) == 0 && ok ? 0 : -1;
-}
-
-/* Past BATLOG_TRIM_BYTES: only the last BATLOG_KEEP_DAYS, from a start on */
+/* Past BATLOG_TRIM_BYTES: the last BATLOG_KEEP_DAYS, and never more than
+ * three quarters of the limit (a heavy user's 60 days can be megabytes; a
+ * trim that kept them all grew without end). Read and copied in passes, not
+ * loaded: a file grown big before this must not cost its size
+ * in RAM. A cut inside a start gets a start record of its own, holding the
+ * base then in effect (its start's, or a clock set since), so the analysis
+ * moves the records kept as it did before. */
 static void trim(const char *path, int64_t now)
 {
     struct stat st;
     if (stat(path, &st) || st.st_size <= BATLOG_TRIM_BYTES) return;
-    batrec_t *r;
-    int n = read_file(path, &r);
-    if (n <= 0) { free(r); if (n < 0) remove(path); return; }   /* (not ours: started again) */
+    FILE *f = fopen(path, "rbe");
+    if (!f) return;
+    unsigned char h[8], b[8];
+    if (fread(h, 1, 8, f) != 8 || memcmp(h, MAGIC, 8)) { fclose(f); remove(path); return; }   /* (not ours: started again) */
+    long n = (long)(st.st_size - 8) / 8;
+    long keep = BATLOG_TRIM_BYTES * 3 / 4 / 8;
+    long lo = n - keep > n / 4 ? n - keep : n / 4;         /* (a quarter at least goes) */
     int64_t cut = now - (int64_t)BATLOG_KEEP_DAYS * 86400;
-    int from = n;
-    for (int i = 0; i < n; i++)
-        if (r[i].kind == BL_BOOT && (r[i].t >= cut || i >= n - n / 4)) { from = i; break; }   /* (a quarter at least goes) */
+    /* the first start or sample past lo that's recent (or in the last
+     * quarter: an H2 unused for 60 days keeps something) */
+    long from = n;
+    int64_t base = 0;
+    int have_base = 0, at_boot = 0;
+    for (long i = 0; i < n && fread(b, 1, 8, f) == 8; i++) {
+        batrec_t r;
+        dec(b, &r);
+        if (i >= lo && (r.kind == BL_BOOT || r.kind == BL_SAMPLE) && (r.t >= cut || i >= n - n / 4)) {
+            from = i, at_boot = r.kind == BL_BOOT;
+            break;
+        }
+        if (r.kind == BL_BOOT || r.kind == BL_CLOCK) base = r.t, have_base = r.kind == BL_BOOT || have_base;
+    }
     char tmp[600];
     snprintf(tmp, sizeof tmp, "%s.new", path);
-    if (from < n && write_file(tmp, r + from, n - from) == 0) rename(tmp, path);
-    free(r);
+    FILE *o = fseek(f, 8 + from * 8, SEEK_SET) == 0 ? fopen(tmp, "wbe") : NULL;
+    if (!o) { fclose(f); return; }
+    int ok = fwrite(MAGIC, 1, 8, o) == 8;
+    if (ok && from < n && !at_boot && have_base) {
+        batrec_t s = {.t = base, .kind = BL_BOOT};
+        enc(&s, b);
+        ok = fwrite(b, 1, 8, o) == 8;
+    }
+    unsigned char blk[4096];
+    size_t got;
+    while (ok && (got = fread(blk, 1, sizeof blk, f)) > 0) {
+        size_t w = 0;
+        for (size_t i = 0; i + 8 <= got; i += 8)      /* (no stray headers kept) */
+            if (ours(blk + i)) memmove(blk + w, blk + i, 8), w += 8;
+        ok = fwrite(blk, 1, w, o) == w;
+    }
+    ok = !ferror(f) && ok;
+    fclose(f);
+    if (fclose(o) == 0 && ok) rename(tmp, path);
+    else remove(tmp);
 }
 
 /* ---------- the log ---------- */
@@ -130,13 +169,18 @@ int batlog_flush(batlog_t *b)
     if (!b->n) return 0;
     FILE *f = fopen(b->path, "abe");
     if (!f) return -1;
-    int ok = 1;
-    if (ftell(f) == 0) ok = fwrite(MAGIC, 1, 8, f) == 8;
+    /* (the file's size, not ftell(): in append mode that's 0 before the
+     * first write on musl, and a header went in at every flush) */
+    struct stat st;
+    int ok = fstat(fileno(f), &st) == 0;
+    long size = ok ? (long)st.st_size : 0;
+    if (ok && size == 0) ok = fwrite(MAGIC, 1, 8, f) == 8, size = 8;
     unsigned char e[8];
-    for (int i = 0; ok && i < b->n; i++) { enc(&b->buf[i], e); ok = fwrite(e, 1, 8, f) == 8; }
+    for (int i = 0; ok && i < b->n; i++) { enc(&b->buf[i], e); ok = fwrite(e, 1, 8, f) == 8; size += 8; }
     if (fclose(f) || !ok) return -1;
     b->n = 0;
     b->flushed = b->mono;
+    if (size > BATLOG_TRIM_BYTES) trim(b->path, b->base + b->mono);   /* (a start of weeks: not only at the next) */
     return 0;
 }
 

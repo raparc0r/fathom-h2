@@ -1,0 +1,56 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] dmaengine: jz4780: fill a channel's descriptor pool when it is requested
+
+A transfer's descriptors are allocated with GFP_NOWAIT when it is prepared;
+for audio that's in the PCM trigger, in atomic context. A pool block is a
+whole page, and the pool starts empty, so the first audio start after boot
+needed a fresh page from the page allocator. With the H2's 24 MiB, free
+memory in the first seconds after boot can be below the min watermark (616
+KiB), and the start failed: "ASoC error (-12): at soc_component_trigger()",
+and the player's first write with it. Two blocks are now put in the pool
+when the channel is requested (sleeping allowed); freed blocks stay in the
+pool until it is destroyed.
+
+Upstream-Status: Pending
+
+--- a/drivers/dma/dma-jz4780.c
++++ b/drivers/dma/dma-jz4780.c
+@@ -112,6 +112,8 @@
+ 
+ /* Size of allocations for hardware descriptor blocks. */
+ #define JZ_DMA_DESC_BLOCK_SIZE	PAGE_SIZE
++/* blocks put in a channel's pool when it is requested (one in use, one ending) */
++#define JZ_DMA_PREALLOC_DESC	2
+ #define JZ_DMA_MAX_DESC		\
+ 	(JZ_DMA_DESC_BLOCK_SIZE / sizeof(struct jz4780_dma_hwdesc))
+ 
+@@ -770,6 +772,29 @@
+ 		return -ENOMEM;
+ 	}
+ 
++	/*
++	 * Descriptors are allocated with GFP_NOWAIT when a transfer is
++	 * prepared (for audio, in the PCM trigger, in atomic context), and a
++	 * pool block is a whole page: the first prepare after boot needed a
++	 * fresh page from the page allocator, and below the min watermark it
++	 * failed (ASoC error -12 at the first audio start). Fill the pool now,
++	 * while sleeping is allowed: freed blocks stay in the pool.
++	 */
++	{
++		void *blk[JZ_DMA_PREALLOC_DESC];
++		dma_addr_t phys[JZ_DMA_PREALLOC_DESC];
++		int i, n;
++
++		for (n = 0; n < JZ_DMA_PREALLOC_DESC; n++) {
++			blk[n] = dma_pool_alloc(jzchan->desc_pool, GFP_KERNEL,
++						&phys[n]);
++			if (!blk[n])
++				break;
++		}
++		for (i = 0; i < n; i++)
++			dma_pool_free(jzchan->desc_pool, blk[i], phys[i]);
++	}
++
+ 	return 0;
+ }
+ 

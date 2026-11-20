@@ -12,6 +12,7 @@
 #include "audio/decoder.h"
 #include "audio/vorbis.h"
 #include "library/tags.h"
+#include "tmpdir.h"
 
 static int failures;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
@@ -137,7 +138,8 @@ static int32_t pcm[(FRAMES + 4096) * 2];
 
 int main(void)
 {
-    char dir[] = "/tmp/fathom-test-vorbis-XXXXXX";
+    char dir[200];
+    test_tmp(dir, sizeof dir, "fathom-test-vorbis");
     if (!mkdtemp(dir)) return 1;
     char path[256];
     snprintf(path, sizeof path, "%s/tone.ogg", dir);

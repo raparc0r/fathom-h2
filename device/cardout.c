@@ -4,9 +4,10 @@
  * starts it once the player has gone (the player, its fonts and everything it
  * would draw with are on the card) and stops it when the card is back.
  *
- * It draws the picture in card_out.h ("Card removed / Put it back to
- * continue."), lights the screen, and then sleeps in poll() on the buttons:
- * no timer runs unless something is due.
+ * It draws the picture in card_out.h ("No/bad card /
+ * Put in a card with Fathom on it."), for a card pulled out and one that
+ * can't be used alike, lights the screen, and then sleeps in poll() on the
+ * buttons: no timer runs unless something is due.
  *   - the screen goes dark after LIT_MS without a button, as the player's
  *     would; any button lights it again, a short press of Power toggles it;
  *   - Power held for POWER_OFF_MS switches the H2 off, as in the player;
@@ -37,17 +38,18 @@
 #include <unistd.h>
 
 #include "card_out.h"
+#include "hw_paths.h"
 
 #define LIT_MS        60000            /* the screen stays lit this long after a button */
 #define POWER_OFF_MS  2000             /* hold Power this long to switch off */
 #define OFF_MS        (10 * 60000)     /* on battery, switch off after this long */
-#define BL "/sys/class/backlight/backlight/"
 #define MAX_INPUTS 8
 
 static volatile sig_atomic_t g_quit;
 static int g_fd = -1, g_w, g_h;
 static uint32_t g_fb, g_pitch;
 static uint8_t *g_map;
+static size_t g_map_size;
 
 static void on_signal(int s) { (void)s; g_quit = 1; }
 
@@ -71,7 +73,7 @@ static int read_int(const char *path)
 static void backlight(int v)
 {
     char s[16];
-    int fd = open(BL "brightness", O_WRONLY | O_CLOEXEC);
+    int fd = open(HW_BACKLIGHT "brightness", O_WRONLY | O_CLOEXEC);
     if (fd < 0) return;
     int n = snprintf(s, sizeof s, "%d\n", v);
     if (write(fd, s, (size_t)n) < 0) syslog(LOG_ERR, "backlight: %m");
@@ -131,7 +133,7 @@ static void draw(int rows)
  * Fails while another program (the player, on its way out) is the DRM master. */
 static int screen_open(void)
 {
-    g_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    g_fd = open(HW_DRM, O_RDWR | O_CLOEXEC);
     if (g_fd < 0) return -1;
     uint32_t conn[4], crtc[4];
     struct drm_mode_card_res res = {0};
@@ -162,6 +164,7 @@ static int screen_open(void)
     if (ioctl(g_fd, DRM_IOCTL_MODE_MAP_DUMB, &md)) goto fail;
     g_map = mmap(NULL, cd.size, PROT_READ | PROT_WRITE, MAP_SHARED, g_fd, (off_t)md.offset);
     if (g_map == MAP_FAILED) { g_map = NULL; goto fail; }
+    g_map_size = cd.size;
     draw(CARD_OUT_H);                   /* (in the buffer before the CRTC shows it) */
     struct drm_mode_crtc set = {.crtc_id = crtc[0], .fb_id = g_fb, .set_connectors_ptr = (uintptr_t)&conn[0],
                                 .count_connectors = 1, .mode = modes[0], .mode_valid = 1};
@@ -169,7 +172,10 @@ static int screen_open(void)
     flush();
     return 0;
 fail:
-    close(g_fd);                        /* (the buffer goes with it) */
+    /* (the buffer goes once nothing holds it: the mapping does too, and
+     * this is retried up to 40 times while the player lets go of the screen) */
+    if (g_map) munmap(g_map, g_map_size);
+    close(g_fd);
     g_fd = -1;
     g_map = NULL;
     return -1;
@@ -197,7 +203,7 @@ int main(void)
     if (g_fd < 0) syslog(LOG_ERR, "no screen: only the backlight says so");
 
     /* lit as the player had it, or at about its default if it was dark */
-    int max = read_int(BL "max_brightness"), level = read_int(BL "brightness");
+    int max = read_int(HW_BACKLIGHT "max_brightness"), level = read_int(HW_BACKLIGHT "brightness");
     if (max <= 0) max = 255;
     if (level <= 0) level = max * 100 / 255;
     backlight(level);
@@ -247,7 +253,7 @@ int main(void)
         }
         if (lit && now >= lit_until) { lit = 0; backlight(0); }
         if (now >= off_at) {
-            if (read_int("/sys/class/power_supply/battery/online") == 1) off_at = now + OFF_MS;   /* on USB power */
+            if (read_int(HW_USB_ONLINE) == 1) off_at = now + OFF_MS;   /* on USB power */
             else { power_off("No card for 10 minutes"); off_at = now + OFF_MS; }
         }
     }

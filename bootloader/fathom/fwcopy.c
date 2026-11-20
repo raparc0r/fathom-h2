@@ -15,6 +15,7 @@
  */
 #include "fwcopy.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #define UBIFS_MAGIC 0x06101831u
@@ -251,3 +252,28 @@ static int contains(const uint8_t *d, uint32_t n, const char *s)
 int fwc_check_wifi_fw(const uint8_t *d, uint32_t n) { return n > 200000 && contains(d, n, "43430a1-roml"); }
 
 int fwc_check_nvram(const uint8_t *d, uint32_t n) { return contains(d, n, "manfid=0x2d0") && contains(d, n, "boardtype="); }
+
+/* ---------- the stock kernel's header ---------- */
+
+static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+
+int fwc_kernel_note(const uint8_t *h, char *out, uint32_t cap)
+{
+    if (be32(h) != 0x27051956u) return -1;              /* IH_MAGIC */
+    uint8_t c[FWC_UIMAGE_HDR];
+    memcpy(c, h, sizeof c);
+    memset(c + 4, 0, 4);                                /* the CRC is over the header with it 0 */
+    uint32_t crc = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < sizeof c; i++) {
+        crc ^= c[i];
+        for (int k = 0; k < 8; k++) crc = crc & 1 ? 0xEDB88320u ^ (crc >> 1) : crc >> 1;
+    }
+    if (~crc != be32(h + 4)) return -1;
+    char name[33];
+    uint32_t n = 0;
+    for (uint32_t i = 32; i < 64 && h[i]; i++)
+        name[n++] = h[i] >= 0x20 && h[i] < 0x7f ? (char)h[i] : '?';
+    name[n] = '\0';
+    int len = snprintf(out, cap, "name=%s\ntime=%lu\n", name, (unsigned long)be32(h + 8));
+    return len < 0 || (uint32_t)len >= cap ? -1 : len;
+}

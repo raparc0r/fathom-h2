@@ -117,10 +117,11 @@ void ff_set_ca_file(const char *path)
     snprintf(g_ca_file, sizeof g_ca_file, "%s", path && !access(path, R_OK) ? path : "");
 }
 
+/* Always checked: without the bundle nothing verifies, so HTTPS fails
+ * rather than trusting whoever answers (updates are installed from it). */
 void ff_tls_options(AVDictionary **opt)
 {
-    if (!g_ca_file[0]) return;
-    av_dict_set(opt, "ca_file", g_ca_file, 0);
+    if (g_ca_file[0]) av_dict_set(opt, "ca_file", g_ca_file, 0);
     av_dict_set(opt, "tls_verify", "1", 0);
 }
 

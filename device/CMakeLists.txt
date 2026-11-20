@@ -50,7 +50,7 @@ endif()
 set(FATHOM_BOARD_SOURCES disp_drm.c audio_route.c)
 
 add_executable(fathom-player
-  main.c input.c uac_relay.c bt.c wifi.c share.c ssh.c tlscert.c radiometa.c out_router.c ff_trim.c jpeg_trim.c updater.c ${ROOT}/app/audio/out_bt.c ${FATHOM_BOARD_SOURCES}
+  main.c input.c uac_relay.c bt.c wifi.c share.c ssh.c shell.c tlscert.c radiometa.c out_router.c ff_trim.c jpeg_trim.c updater.c uninstaller.c ${ROOT}/app/audio/out_bt.c ${FATHOM_BOARD_SOURCES}
   ${ROOT}/app/core/rng.c
   ${ROOT}/app/core/settings.c
   ${ROOT}/app/core/lang.c
@@ -76,6 +76,9 @@ add_executable(fathom-player
   ${ROOT}/app/net/sha256.c
   ${ROOT}/app/net/unzip.c
   ${ROOT}/app/net/update.c
+  ${ROOT}/app/sys/hibyupt.c
+  ${ROOT}/app/sys/md5.c
+  ${ROOT}/app/sys/uninstall.c
   ${ROOT}/app/audio/engine.c
   ${ROOT}/app/audio/loudness.c
   ${ROOT}/app/audio/btconv.c ${ROOT}/app/audio/eq.c
@@ -116,7 +119,7 @@ set_source_files_properties(${ROOT}/app/library/stb_impl.c PROPERTIES COMPILE_OP
 # builds and fills them, a little work per key; LVGL draws them). Decoding,
 # the engine and outputs, the display, input, the scan's walk and cover
 # scaling, and image decoding stay at -O2.
-set_property(SOURCE main.c bt.c wifi.c share.c ssh.c tlscert.c radiometa.c updater.c
+set_property(SOURCE main.c bt.c wifi.c share.c ssh.c shell.c tlscert.c radiometa.c updater.c
   ${ROOT}/app/core/settings.c ${ROOT}/app/core/lang.c
   ${ROOT}/app/library/tags.c ${ROOT}/app/library/cue.c ${ROOT}/app/library/playlist.c
   ${ROOT}/app/shuffle/shuffle.c
@@ -168,6 +171,7 @@ target_link_libraries(fathom-bitperfect PRIVATE ${DEPS_STATIC_LDFLAGS} pthread m
 add_executable(fathom-scan
   ${ROOT}/tools/fathom-scan/main.c
   ${ROOT}/app/core/intern.c
+  ${ROOT}/app/core/lang.c
   ${ROOT}/app/core/rng.c
   ${ROOT}/app/library/keys.c
   ${ROOT}/app/library/tags.c

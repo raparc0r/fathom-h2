@@ -63,9 +63,9 @@ diff -Naur a/drivers/gpu/drm/tiny/x1000-slcd.c b/drivers/gpu/drm/tiny/x1000-slcd
 + * controller (SLCDC), 8-bit Intel 8080 bus. Used by the HiFi Walker H2 / AIGO
 + * Eros Q family (GC9308 or ILI9342C panel, 320x240).
 + *
-+ * First version: commands and pixels are written through the SLCDC data
-+ * register by the CPU (no DMA yet). Controller setup follows the register
-+ * descriptions in Rockbox's X1000 port; panel init sequences are the vendor's.
++ * Commands go through the SLCDC data register (CPU), pixels by descriptor DMA
++ * from a shadow frame (by the CPU without a DMA buffer). Controller setup
++ * follows Rockbox's X1000 port; panel init sequences are the vendor's.
 + */
 +
 +#include <linux/backlight.h>

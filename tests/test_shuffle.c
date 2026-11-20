@@ -191,6 +191,19 @@ static void test_keys(void)
     key_album("Nina Simone", "Various Artists", "Jazz Classics", k, sizeof k);
     CHECK(!strcmp(k, "various artists\x1fjazz classics"));
     CHECK(key_is_various("VA") && !key_is_various("Vampire Weekend"));
+    /* one album whatever its tracks' artists add: guests, "The", a VA spelling */
+    char k2[128];
+    key_album("Eminem", "", "Recovery", k, sizeof k);
+    key_album("Eminem feat. Rihanna", "", "Recovery", k2, sizeof k2);
+    CHECK(!strcmp(k, k2) && !strcmp(k, "eminem\x1frecovery"));
+    key_album("The Beatles", "", "Abbey Road", k, sizeof k);
+    key_album("x", "Beatles", "Abbey Road", k2, sizeof k2);
+    CHECK(!strcmp(k, k2));
+    key_album("a", "VA", "Hits", k, sizeof k);
+    key_album("b", "Various Artists", "Hits", k2, sizeof k2);
+    CHECK(!strcmp(k, k2));
+    key_album("", "", "Untitled", k, sizeof k);
+    CHECK(!strcmp(k, "unknown artist\x1funtitled"));
 }
 
 static int credits_are(const char *artist, const char *title, const char *const *want, int nwant)

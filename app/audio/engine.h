@@ -20,17 +20,19 @@ typedef struct {
     eng_state_t    state;
     uint32_t       seq;          /* +1 whenever a new track starts (play or gapless) */
     int64_t        track_id;     /* id passed with the track that is playing */
+    uint32_t       tag;          /* ...and its tag (engine_queue_ahead; 0 for engine_play's) */
     uint32_t       pos_ms;       /* heard position (output delay subtracted) */
     uint32_t       len_ms;
     audio_format_t fmt;          /* source format */
-    int            next_queued;  /* a gapless successor is lined up */
-    int            ended;        /* playback ran out (no successor) */
-    int            error;        /* last track failed to open */
-    int            output_lost;  /* a write failed (device gone); the engine paused */
+    int            next_queued;  /* gapless successors lined up */
+    int            ended;        /* playback ran out (no successor), or the track failed */
+    int            error;        /* the track couldn't be played (unreadable, or the output can't
+                                  * take its format); track_id is that track's */
+    unsigned       stop_seq;     /* +1 each time playback stops by itself (ended or error) */
+    int            output_lost;  /* a write or open failed (device gone); the engine paused */
     int            starting;     /* a track is about to start (engine_play not yet taken up) */
     int            start_paused; /* ...and it will start paused */
     int            eq;           /* the EQ is on for this track */
-    int            eq_in_output; /* ...run by the output (Bluetooth: at the link's rate) */
     int            stream;       /* the track is an internet stream (no length, no seeking) */
     int            connecting;   /* ...and it is still connecting */
     unsigned       meta_seq;     /* changes with meta */
@@ -57,6 +59,18 @@ void engine_queue_next(engine_t *e, const char *path, int64_t id);  /* gapless s
  * takes effect at the track's first sample, so gapless joins stay seamless. */
 void engine_play_gain(engine_t *e, const char *path, int64_t id, float gain);
 void engine_queue_next_gain(engine_t *e, const char *path, int64_t id, float gain);
+/* Lines up what follows the current track, in order (replacing what was lined
+ * up; n = 0: nothing), at most ENGINE_AHEAD: the engine goes on to each by
+ * itself, gapless, however late the caller looks. `tag` (the caller's, not 0)
+ * comes back in eng_status_t.tag while that one plays. */
+#define ENGINE_AHEAD 8
+typedef struct {
+    const char *path;
+    int64_t     id;
+    float       gain;
+    uint32_t    tag;
+} engine_track_t;
+void engine_queue_ahead(engine_t *e, const engine_track_t *t, int n);
 void engine_pause(engine_t *e, int on);
 void engine_stop(engine_t *e);                                      /* a stream disconnects */
 void engine_seek_ms(engine_t *e, uint32_t ms);

@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "library/library.h"
+#include "tmpdir.h"
 
 static int failures;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
@@ -52,7 +53,8 @@ static int write_flac(const char *path, int track)
 
 int main(void)
 {
-    char dir[] = "/tmp/fathom-test-works-XXXXXX";
+    char dir[200];
+    test_tmp(dir, sizeof dir, "fathom-test-works");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     char path[300], music[300], db[300], art[300];
     snprintf(music, sizeof music, "%s/music", dir);

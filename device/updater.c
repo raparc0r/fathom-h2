@@ -67,6 +67,7 @@ static void fail_locked(int err, const char *text)
 {
     U.st.state = UI_UPD_FAILED;
     snprintf(U.st.message, sizeof U.st.message, "%s", text ? text : update_error_text(err));
+    U.st.need_mb = 0;
     changed_locked();
 }
 
@@ -140,12 +141,12 @@ static void *check_thread(void *arg)
     return NULL;
 }
 
-/* Not enough room: says how much is needed, in MB. */
+/* Not enough room: says how much is needed, in MB (the UI puts the two
+ * together in its language: a text made here would never translate). */
 static void no_space_locked(int64_t need)
 {
-    char t[96];
-    snprintf(t, sizeof t, "%s: %d MB needed", update_error_text(UPDATE_ERR_SPACE), (int)((need + (1 << 20) - 1) >> 20));
-    fail_locked(UPDATE_ERR_SPACE, t);
+    fail_locked(UPDATE_ERR_SPACE, NULL);
+    U.st.need_mb = (int)((need + (1 << 20) - 1) >> 20);
 }
 
 static void *download_thread(void *arg)

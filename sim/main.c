@@ -8,6 +8,8 @@
  *   fathom-sim --screenshots DIR               headless: write DIR/<theme>-<screen>.bmp
  *   fathom-sim --motion DIR [--theme N]        headless: frames captured mid-animation
  *   fathom-sim --bench [SECONDS]               headless: the UI's wakeups, redraws and CPU per second
+ *   fathom-sim --lang-check FILE               headless: every screen's words through the menus, in
+ *                                              the language FILE (tools/lang/check.py)
  *
  * Keys: Up/Down = wheel, Enter = centre (OK), Esc/Backspace = Back,
  *       N = long-press Back (Now Playing), Space = play/pause,
@@ -105,9 +107,11 @@ static void sim_ssh_do(int what) { (void)what; }
 static int g_sim_bal, g_sim_limit;
 static void sim_sound_value(int what, char *out, size_t cap)
 {
-    if (what == UI_SOUND_BALANCE && !g_sim_bal) snprintf(out, cap, "Centre");
-    else if (what == UI_SOUND_BALANCE) snprintf(out, cap, "%d dB %s", abs(g_sim_bal), g_sim_bal < 0 ? "left" : "right");
-    else if (!g_sim_limit) snprintf(out, cap, "Off");
+    char n[16];   /* (translated, as the H2's) */
+    snprintf(n, sizeof n, "%d", abs(g_sim_bal));
+    if (what == UI_SOUND_BALANCE && !g_sim_bal) snprintf(out, cap, "%s", tr("Centre"));
+    else if (what == UI_SOUND_BALANCE) tr_fill(out, cap, g_sim_bal < 0 ? "%s dB left" : "%s dB right", n, NULL);
+    else if (!g_sim_limit) snprintf(out, cap, "%s", tr("Off"));
     else snprintf(out, cap, "%d dB", g_sim_limit);
 }
 static int sim_sound_adjust(int what, int dir)
@@ -131,16 +135,22 @@ static int sim_signal_path(int i, char *label, size_t lc, char *value, size_t vc
         {"Volume", "In the DAC -32.0 dB"}, {"Output", "ES9018K2M headphones"}, {"Sent as", "32-bit 96 kHz"},
         {"Result", "Bit-perfect"}};
     if (i < 0 || i >= (int)(sizeof rows / sizeof rows[0])) return -1;
-    snprintf(label, lc, "%s", rows[i][0]);
-    snprintf(value, vc, "%s", g_sim_pure && (i == 1 || i == 2 || i == 3) ? "Bypassed" : rows[i][1]);
+    snprintf(label, lc, "%s", tr(rows[i][0]));   /* (translated as the H2's are) */
+    if (g_sim_pure && (i == 1 || i == 2 || i == 3)) snprintf(value, vc, "%s", tr("Bypassed"));
+    else if (i == 4) tr_fill(value, vc, "In the DAC %s", "-32.0 dB", NULL);
+    else if (i == 5) snprintf(value, vc, "ES9018K2M %s", tr("headphones"));
+    else snprintf(value, vc, "%s", i == 0 || i == 6 ? rows[i][1] : tr(rows[i][1]));
     return 0;
 }
-static void sim_transport_toggle(void) { settings_set_int("sound.transport", !settings_get_int("sound.transport", 0)); }
-static void sim_battery_info(char *out, size_t cap) { snprintf(out, cap, "86 %%, charging"); }
-/* Settings > Display > Language: build/sim-data/lang */
+static void sim_transport_toggle(void) { settings_set_int("sound.transport", !settings_get_int("sound.transport", UI_TRANSPORT_DEFAULT)); }
+static void sim_battery_info(char *out, size_t cap) { tr_fill(out, cap, "%s, charging", "86 %", NULL); }
+/* Settings > Interface > Language: build/sim-data/lang */
 static int sim_languages(char names[][64], int max) { return lang_list("build/sim-data/lang", names, max); }
+/* --lang-check: the language stays the one given (Settings > Language does nothing) */
+static int g_lang_check;
 static void sim_language_set(const char *name)
 {
+    if (g_lang_check) return;
     char path[300];
     snprintf(path, sizeof path, "build/sim-data/lang/%s.txt", name ? name : "");
     lang_load(name && name[0] ? path : NULL);
@@ -154,6 +164,15 @@ static void sim_update_do(int what)
     int next[] = {[UI_UPD_CHECK] = UI_UPD_AVAILABLE, [UI_UPD_START] = UI_UPD_READY,
                   [UI_UPD_CANCEL] = UI_UPD_AVAILABLE, [UI_UPD_INSTALL] = UI_UPD_INSTALLING};
     g_sim_upd.state = next[what];
+}
+/* Settings > About > Uninstall Fathom: HiBy's V2.3 found; the steps go by at a press */
+static ui_uninstall_t g_sim_uni = {.state = UI_UNI_READY, .file = "H2-Firmware-V2.3.upt", .ver = "2025-11-11"};
+static void sim_uninstall_state(ui_uninstall_t *st) { *st = g_sim_uni; }
+static void sim_uninstall_do(int what)
+{
+    int next[] = {[UI_UNI_CHECK] = UI_UNI_READY, [UI_UNI_APPLY] = UI_UNI_PENDING,
+                  [UI_UNI_CANCEL] = UI_UNI_IDLE, [UI_UNI_RESTART] = UI_UNI_PENDING};
+    g_sim_uni.state = next[what];
 }
 /* A made-up week on battery, for Settings > Power > Battery: charged
  * overnight, mostly playing with the screen off, the screen on a little each
@@ -203,13 +222,14 @@ static const ui_hooks_t g_hooks = {.fonts = ui_theme_fonts, .icon = ui_theme_ico
                                    .transport_toggle = sim_transport_toggle, .battery_info = sim_battery_info,
                                    .languages = sim_languages, .language_set = sim_language_set,
                                    .update_state = sim_update_state, .update_do = sim_update_do,
+                                   .uninstall_state = sim_uninstall_state, .uninstall_do = sim_uninstall_do,
                                    .battery_report = sim_battery_report};
 
 static void cue_sample(void);
 
 /* ---- headless screenshots ---- */
 
-static uint8_t g_fb[UI_W * UI_H * 2];
+static uint8_t g_fb[UI_W * UI_H * 2] __attribute__((aligned(64)));   /* (LVGL asserts an aligned buffer) */
 
 static void null_flush(lv_display_t *d, const lv_area_t *a, uint8_t *px)
 {
@@ -258,7 +278,8 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                                           "rdirctx", "rdirerror", "rdirnp", "rdirnpmenu", "rdirrandom",
                                           "about", "update", "updatelatest", "updatefailed", "updateprogress",
                                           "updateready", "updateinstall", "battery", "battery7", "batterysince",
-                                          "batteryhistory"};
+                                          "batteryhistory", "uninstall", "uninstallchecking", "uninstallfailed",
+                                          "uninstallnone", "uninstallpending"};
     static const char *const slug[] = {"studio-mint", "studio-ember", "studio-pastel", "pixel-pastel"};
     for (int t = 0; t < 4 && t < g_n_themes; t++) {   /* the built-in themes */
         ui_set_theme(t);
@@ -313,7 +334,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 static const struct { const char *name; ui_update_t u; } st[] = {
                     {"update", {.state = UI_UPD_AVAILABLE}},
                     {"updatelatest", {.state = UI_UPD_LATEST}},
-                    {"updatefailed", {.state = UI_UPD_FAILED, .message = "Not enough space on the card: 63 MB needed"}},
+                    {"updatefailed", {.state = UI_UPD_FAILED, .message = "Not enough space on the card", .need_mb = 63}},
                     {"updateprogress", {.state = UI_UPD_DOWNLOADING, .done = 6815744, .total = 16234567}},
                     {"updateready", {.state = UI_UPD_READY}},
                     {"updateinstall", {.state = UI_UPD_INSTALLING}},
@@ -327,6 +348,17 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                         g_sim_upd = u;
                     }
                 ui_show("update");
+            } else if (!strncmp(screens[s], "uninstall", 9)) {   /* Uninstall Fathom, in each state */
+                static const struct { const char *name; ui_uninstall_t u; } st[] = {
+                    {"uninstall", {.state = UI_UNI_READY, .ver = "2025-11-11"}},
+                    {"uninstallchecking", {.state = UI_UNI_CHECKING, .done = 25000000, .total = 61400000}},
+                    {"uninstallfailed", {.state = UI_UNI_FAILED, .message = "This update is for another player"}},
+                    {"uninstallnone", {.state = UI_UNI_FAILED, .message = "No HiBy update file on the card", .no_file = 1}},
+                    {"uninstallpending", {.state = UI_UNI_PENDING}},
+                };
+                for (size_t k = 0; k < sizeof st / sizeof st[0]; k++)
+                    if (!strcmp(st[k].name, screens[s])) g_sim_uni = st[k].u;
+                ui_show("uninstall");
             } else if (!strcmp(screens[s], "toast")) {    /* a long one: it wraps */
                 ui_show("ssh");
                 ui_toast("Over USB and Wi-Fi, with the password", 3000);
@@ -334,7 +366,8 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 ui_show(screens[s]);
             }
             int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast") ||
-                         (g_sim_upd.state >= UI_UPD_DOWNLOADING && g_sim_upd.state <= UI_UPD_RESTARTING);   /* (the update's progress screen) */
+                         (g_sim_upd.state >= UI_UPD_DOWNLOADING && g_sim_upd.state <= UI_UPD_RESTARTING) ||
+                         !strcmp(screens[s], "uninstallpending") || !strcmp(screens[s], "uninstallnone");   /* (the update's progress screen) */
             lv_obj_t *what = on_top ? lv_layer_top() : lv_screen_active();
             lv_obj_update_layout(what);
             lv_draw_buf_t *img = lv_snapshot_take(what, LV_COLOR_FORMAT_RGB888);
@@ -384,6 +417,101 @@ static uint32_t fake_tick(void) { return g_fake_ms; }
 static void advance(uint32_t ms)
 {
     for (uint32_t t = 0; t < ms; t += 5) { g_fake_ms += 5; lv_timer_handler(); }
+}
+
+/* ---- headless translation check: every screen's words, through the menus ---- */
+
+static FILE *g_lc_out;
+
+static void lc_labels(lv_obj_t *o, const char *where)
+{
+    if (lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN)) return;
+    if (lv_obj_check_type(o, &lv_label_class)) {
+        const char *t = lv_label_get_text(o);
+        if (t && *t) fprintf(g_lc_out, "%s\t%s\n", where, t);
+    }
+    for (uint32_t i = 0; i < lv_obj_get_child_count(o); i++) lc_labels(lv_obj_get_child(o, (int32_t)i), where);
+}
+
+static void lc_settle(void)
+{
+    advance(600);   /* (slides and fades over) */
+    ui_tick();
+    lv_timer_handler();
+}
+
+static void lc_dump(const char *where)
+{
+    lc_settle();
+    lc_labels(lv_screen_active(), where);
+    lc_labels(lv_layer_top(), where);
+}
+
+/* From Home, down the rows given (their indexes), each opened with OK; 0 if the
+ * last one opened something (a deeper list or another screen) */
+static int lc_go(const int *path, int n)
+{
+    ui_show("home");
+    for (int k = 0; k < n; k++) {
+        int sel, rows, d = ui_list_state(&sel, &rows, NULL);
+        if (d < 1 || path[k] >= rows) return -1;
+        for (int g = 0; sel != path[k] && g < 200; g++) {
+            ui_key(sel < path[k] ? UI_KEY_DOWN : UI_KEY_UP);
+            ui_list_state(&sel, NULL, NULL);
+        }
+        if (sel != path[k]) return -1;
+        ui_key(UI_KEY_OK);
+        lc_settle();
+        if (k < n - 1 && ui_list_state(NULL, NULL, NULL) != d + 1) return -1;
+    }
+    return 0;
+}
+
+static void lc_walk(int *path, int n, const char *where)
+{
+    char here[512];
+    if (lc_go(path, n)) { if (getenv("LC_DEBUG")) fprintf(stderr, "can't reach %s\n", where); return; }
+    lc_dump(where);
+    int rows, fixed, d = ui_list_state(NULL, &rows, &fixed);
+    if (d != n + 1 || n >= 6) return;                         /* not a list (or deep enough) */
+    if (getenv("LC_DEBUG")) fprintf(stderr, "%s: depth %d, %d rows\n", where, d, rows);
+    int visit = rows > 30 ? 3 : rows;                         /* long lists: music, a few rows */
+    for (int i = 0; i < visit; i++) {
+        path[n] = i;
+        /* Menu on the row: its actions or its help */
+        if (lc_go(path, n) == 0) {
+            int sel;
+            for (int g = 0; ui_list_state(&sel, NULL, NULL) == d && sel != i && g < 200; g++) ui_key(sel < i ? UI_KEY_DOWN : UI_KEY_UP);
+            ui_key(UI_KEY_MENU);
+            snprintf(here, sizeof here, "%s > [%d] Menu", where, i);
+            lc_dump(here);
+        }
+        snprintf(here, sizeof here, "%s > [%d]", where, i);
+        if (!fixed) lc_walk(path, n + 1, here);
+    }
+}
+
+static int lang_check(const char *file, theme_t *themes, const ui_fonts_t *fonts)
+{
+    lv_tick_set_cb(fake_tick);
+    lv_display_t *d = lv_display_create(UI_W, UI_H);
+    lv_display_set_buffers(d, g_fb, NULL, sizeof g_fb, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(d, null_flush);
+    if (lang_load(file)) { fprintf(stderr, "cannot load %s\n", file); return 1; }
+    g_lang_check = 1;
+    ui_init(lv_screen_active(), themes, g_n_themes, fonts, 1, g_lib, g_player);
+    ui_set_hooks(&g_hooks);
+    ui_set_battery(86, 0);
+    ui_set_theme(0);
+    g_lc_out = stdout;
+    int path[8];
+    lc_walk(path, 0, "Home");
+    /* Now Playing, its menu, quick settings */
+    ui_show("nowplaying"); lc_dump("Now playing");
+    ui_key(UI_KEY_MENU); lc_dump("Now playing > Menu");
+    ui_show("nowplaying"); ui_key(UI_KEY_MENU_LONG); lc_dump("Quick settings");
+    ui_show("home"); ui_toast("Over USB and Wi-Fi, with the password", 3000); lc_dump("Toast");
+    return 0;
 }
 
 static int frame(const char *dir, const char *name)
@@ -510,7 +638,7 @@ static unsigned long bench_case(const char *name, int seconds, int max_wait)
     return g_still_px;
 }
 
-static uint16_t g_bench_fb[UI_W * UI_H];
+static uint16_t g_bench_fb[UI_W * UI_H] __attribute__((aligned(64)));   /* (LVGL asserts an aligned buffer) */
 
 /* The panel's pixels (only the parts redrawn since) against the screen drawn
  * whole: anything a render changed without LVGL redrawing it shows here. */
@@ -688,7 +816,7 @@ static void setup_player(const char *music, int silent)
 
 int main(int argc, char **argv)
 {
-    const char *shots = NULL, *motion_dir = NULL, *music = NULL;
+    const char *shots = NULL, *motion_dir = NULL, *music = NULL, *lang_file = NULL;
     int theme = 0, zoom = 3, bench_s = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--screenshots") && i + 1 < argc) shots = argv[++i];
@@ -696,6 +824,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--theme") && i + 1 < argc) theme = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--zoom") && i + 1 < argc) zoom = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--music") && i + 1 < argc) music = argv[++i];
+        else if (!strcmp(argv[i], "--lang-check") && i + 1 < argc) lang_file = argv[++i];
         else if (!strcmp(argv[i], "--bench")) { bench_s = i + 1 < argc && atoi(argv[i + 1]) > 0 ? atoi(argv[++i]) : 5; g_bench = 1; }
         else { fprintf(stderr, "usage: %s [--theme N] [--zoom Z] [--music DIR] | --screenshots DIR | --motion DIR | --bench [S]\n", argv[0]); return 2; }
     }
@@ -705,10 +834,11 @@ int main(int argc, char **argv)
     g_n_themes = ui_load_themes(FATHOM_ASSETS_DIR, "build/sim-data/themes", themes, UI_MAX_THEMES);
     const ui_fonts_t *fonts = g_n_themes > 0 ? ui_theme_fonts(&themes[0]) : NULL;
     if (!fonts) return 1;
-    setup_player(music, shots || motion_dir || bench_s);
+    setup_player(music, shots || motion_dir || bench_s || lang_file);
     if (bench_s) return bench(themes, fonts, bench_s);
     rdir_set_fetch(sim_dir_fetch);
     g_shots = shots != NULL;
+    if (lang_file) { g_shots = 1; return lang_check(lang_file, themes, fonts); }
     if (shots) return screenshots(shots, themes, fonts);
     if (motion_dir) return motion(motion_dir, themes, fonts, theme);
 

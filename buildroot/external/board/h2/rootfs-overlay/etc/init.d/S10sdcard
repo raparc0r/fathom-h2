@@ -4,6 +4,31 @@
 # listens to the kernel's uevents (asleep until one comes: no polling) and
 # runs fathom-sdcard for each, which stops Fathom when the card goes and
 # starts it again when it's back. After S01bootlog's mount, before the player.
+#
+# At shutdown (rcK, after the player, Wi-Fi and Bluetooth have stopped) the
+# card is let go of and unmounted here, so its FAT is left clean: init's own
+# "umount -a -r" comes after, and gave up on a card still busy (an SSH login
+# in a folder on it, an SFTP upload, the network drive).
+. /usr/lib/fathom/card.sh               # (MNT)
+
+# Everything still using the card stopped: SSH (dropbear: its server and every
+# session, and with them their shells and SFTP servers), the network drive,
+# then whatever else has a file or folder there, asked first, then made to.
+release() {
+    card_mounted || return 0
+    killall dropbear 2>/dev/null
+    rm -f /var/run/dropbear.pid
+    fathom-share off > /dev/null 2>&1
+    fuser -k -TERM -m $MNT > /dev/null 2>&1
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        fuser -m $MNT > /dev/null 2>&1 || break
+        sleep 0.2
+    done
+    fuser -k -m $MNT > /dev/null 2>&1
+    sync
+    umount $MNT 2>/dev/null || mount -o remount,ro $MNT 2>/dev/null
+}
+
 case "$1" in
 start)
     start-stop-daemon -S -b -m -p /var/run/sdcard.pid -x /sbin/uevent -- /usr/libexec/fathom-sdcard
@@ -12,5 +37,6 @@ start)
 stop)
     start-stop-daemon -K -q -p /var/run/sdcard.pid
     rm -f /var/run/sdcard.pid
+    release
     ;;
 esac

@@ -34,9 +34,13 @@ struct player {
     levelling_t levelling;    /* volume levelling: off (bit-perfect), track or album */
 
     uint32_t eng_seq;      /* engine seq we last acted on */
+    unsigned eng_stop;     /* engine stop_seq we last acted on */
     int      own_start;    /* we asked the engine to start a track: its next seq is ours */
+    int      fails;        /* tracks in a row that couldn't be played */
     uint32_t seq;          /* our track-change counter (for the UI) */
-    int      queued_pos;   /* order position lined up as the gapless next, -1 if none */
+    struct { int pos; uint32_t tag; } ahead[ENGINE_AHEAD];   /* lined up in the engine: order positions */
+    int      n_ahead;
+    uint32_t last_tag;
     lib_track_t cur;
     int      have_cur;
     uint32_t resume_ms;    /* cued track: start here (restored queue) */
@@ -75,7 +79,10 @@ player_t *player_new(library_t *lib, engine_t *eng)
     if (!p) return NULL;
     p->lib = lib;
     p->eng = eng;
-    p->queued_pos = -1;
+    eng_status_t st;                   /* (an engine that played before: what's past isn't ours) */
+    engine_status(eng, &st);
+    p->eng_seq = st.seq;
+    p->eng_stop = st.stop_seq;
     p->sprefs = (player_shuffle_prefs_t){.freshness = 1, .skip_interludes = 1};   /* the defaults */
     return p;
 }
@@ -104,6 +111,7 @@ static int grow(void **v, int *cap, int need, size_t elem)
 static void set_ctx(player_t *p, const int64_t *ids, int n)
 {
     p->n = 0;
+    p->n_ahead = 0;                     /* (positions in the old order) */
     if (grow((void **)&p->ctx, &p->cap_ctx, n ? n : 1, sizeof *p->ctx)) return;
     memcpy(p->ctx, ids, (size_t)n * sizeof *p->ctx);
     p->n = n;
@@ -160,30 +168,49 @@ static int64_t id_at(const player_t *p, int order_pos)
     return (order_pos >= 0 && order_pos < p->n_order) ? p->ctx[p->order[order_pos]] : -1;
 }
 
-/* Line up what plays after the current track, for gapless playback. */
 /* Volume levelling (ReplayGain): the factor to play a track at. */
 static float track_gain(player_t *p, int64_t id)
 {
     return p->levelling == LEVEL_OFF ? 1.0f : library_rg_gain(p->lib, id, p->levelling == LEVEL_ALBUM);
 }
 
+/* The order position that plays after `pos` by itself, or -1. */
+static int after(const player_t *p, int pos)
+{
+    if (p->stop_after) return -1;
+    if (p->repeat == REPEAT_ONE) return pos;
+    if (pos + 1 < p->n_order) return pos + 1;
+    if (p->repeat == REPEAT_ALL && !p->shuffle && p->n_order > 0) return 0;   /* wrap */
+    return -1;
+}
+
+/* Line up what plays after the current track, for gapless playback: the next
+ * one, and more after it while they add up to less than AHEAD_MS. The engine
+ * goes on through them by itself, so a run of very short tracks stays gapless
+ * however late the UI's tick comes to line up more (a busy H2: a scan). */
+#define AHEAD_MS 30000
+static void catch_up(player_t *p);
 static void queue_next(player_t *p)
 {
     if (p->radio) return;              /* the queue waits for the radio to be left */
-    int np = -1;
-    if (p->stop_after) np = -1;
-    else if (p->repeat == REPEAT_ONE) np = p->pos;
-    else if (p->pos + 1 < p->n_order) np = p->pos + 1;
-    else if (p->repeat == REPEAT_ALL && !p->shuffle && p->n_order > 0) np = 0;   /* wrap */
-    lib_track_t t;
-    if (np >= 0 && library_track(p->lib, id_at(p, np), &t) == 0 &&
-        !(p->sleep_album && t.album_id != p->sleep_album)) {    /* sleep timer: end of album */
-        engine_queue_next_gain(p->eng, t.path, t.id, track_gain(p, t.id));
-        p->queued_pos = np;
-    } else {
-        engine_queue_next(p->eng, NULL, -1);
-        p->queued_pos = -1;
+    engine_track_t q[ENGINE_AHEAD];
+    char path[ENGINE_AHEAD][sizeof ((lib_track_t *)0)->path];
+    int n = 0;
+    uint32_t ms = 0;
+    for (int np = after(p, p->pos); np >= 0 && n < ENGINE_AHEAD && ms < AHEAD_MS; np = after(p, np)) {
+        lib_track_t t;
+        if (library_track(p->lib, id_at(p, np), &t) != 0) break;
+        if (p->sleep_album && t.album_id != p->sleep_album) break;   /* sleep timer: end of album */
+        if (!++p->last_tag) p->last_tag = 1;   /* (0 is engine_play's) */
+        snprintf(path[n], sizeof path[n], "%s", t.path);
+        q[n] = (engine_track_t){path[n], t.id, track_gain(p, t.id), p->last_tag};
+        p->ahead[n].pos = np;
+        p->ahead[n].tag = p->last_tag;
+        ms += t.duration_ms;
+        n++;
     }
+    p->n_ahead = n;
+    engine_queue_ahead(p->eng, q, n);
 }
 
 static void set_pos(player_t *p, int order_pos)
@@ -212,6 +239,7 @@ static void start_at_opt(player_t *p, int order_pos, int resume)
     if (order_pos < 0 || order_pos >= p->n_order) return;
     radio_leave(p);
     remember_position(p);
+    p->fails = 0;
     set_pos(p, order_pos);
     if (library_track(p->lib, id_at(p, order_pos), &p->cur) != 0) return;
     p->have_cur = 1;
@@ -332,6 +360,7 @@ void player_next(player_t *p)
 {
     if (p->radio) { radio_station(p, (p->ri + 1) % p->rn); return; }
     if (!p->have_cur) return;
+    catch_up(p);
     record(p, 1);
     if (p->pos + 1 < p->n_order) start_at(p, p->pos + 1);
     else if (p->repeat == REPEAT_ALL && new_cycle(p) == 0) start_at(p, 0);
@@ -342,6 +371,7 @@ void player_prev(player_t *p)
 {
     if (p->radio) { radio_station(p, (p->ri + p->rn - 1) % p->rn); return; }
     if (!p->have_cur) return;
+    catch_up(p);
     eng_status_t st;
     engine_status(p->eng, &st);
     if (st.pos_ms > RESTART_MS || p->pos == 0) start_at_opt(p, p->pos, 0);   /* restart: from the top */
@@ -368,6 +398,7 @@ void player_set_shuffle_prefs(player_t *p, const player_shuffle_prefs_t *prefs)
 void player_set_shuffle(player_t *p, int on)
 {
     if (p->shuffle == on) return;
+    catch_up(p);
     p->shuffle = on;
     if (!p->have_cur || p->n == 0) return;
     /* keep the current track playing; rebuild the order around it */
@@ -385,6 +416,7 @@ int player_shuffle(const player_t *p) { return p->shuffle; }
 
 void player_set_repeat(player_t *p, repeat_t r)
 {
+    catch_up(p);
     p->repeat = r;
     if (p->have_cur) queue_next(p);
 }
@@ -393,6 +425,7 @@ repeat_t player_repeat(const player_t *p) { return p->repeat; }
 
 void player_set_stop_after(player_t *p, int on)
 {
+    catch_up(p);                        /* ("this track" is the one playing) */
     p->stop_after = !!on;
     if (p->have_cur) queue_next(p);
 }
@@ -401,6 +434,7 @@ int player_stop_after(const player_t *p) { return p->stop_after; }
 
 void player_set_sleep(player_t *p, int minutes)
 {
+    catch_up(p);
     int was_album = p->sleep_album != 0;
     p->sleep_album = 0;
     if (minutes == PLAYER_SLEEP_END_ALBUM && p->have_cur && p->cur.album_id) {
@@ -445,6 +479,7 @@ static int start_queue_if_empty(player_t *p, const int64_t *ids, int n)
 void player_play_next(player_t *p, const int64_t *ids, int n)
 {
     if (start_queue_if_empty(p, ids, n)) return;
+    catch_up(p);                        /* (after what plays now) */
     if (insert_at(p, p->pos + 1, ids, n)) return;
     p->user_end += n;
     queue_next(p);
@@ -453,6 +488,7 @@ void player_play_next(player_t *p, const int64_t *ids, int n)
 void player_add_to_queue(player_t *p, const int64_t *ids, int n)
 {
     if (start_queue_if_empty(p, ids, n)) return;
+    catch_up(p);
     int at = p->user_end > p->pos + 1 ? p->user_end : p->pos + 1;
     if (at > p->n_order) at = p->n_order;
     if (insert_at(p, at, ids, n)) return;
@@ -493,6 +529,7 @@ void player_queue_remove(player_t *p, int i)
 void player_queue_clear(player_t *p)
 {
     if (!p->have_cur) return;
+    catch_up(p);
     p->n_order = p->pos + 1;
     p->user_end = p->pos + 1;
     queue_next(p);
@@ -558,6 +595,7 @@ int player_restore(player_t *p, const char *path)
     free(p->ctx);
     free(p->order);
     p->ctx = ctx; p->n = p->cap_ctx = n;
+    p->n_ahead = 0;
     p->order = order; p->n_order = p->cap_order = no;
     p->shuffle = !!shuffle;
     p->repeat = repeat >= REPEAT_OFF && repeat <= REPEAT_ONE ? (repeat_t)repeat : REPEAT_OFF;
@@ -611,7 +649,7 @@ void player_radio_play(player_t *p, const radio_station_t *st, int n, int i)
         if (es.state != ENG_STOPPED && es.track_id == p->cur.id) p->resume_ms = es.pos_ms;
     }
     engine_queue_next(p->eng, NULL, -1);
-    p->queued_pos = -1;
+    p->n_ahead = 0;
     free(p->rst);
     p->rst = copy;
     p->rn = n;
@@ -667,6 +705,7 @@ static int image_url(const char *u)
 static void radio_tick(player_t *p, const eng_status_t *st)
 {
     p->eng_seq = st->seq;
+    p->eng_stop = st->stop_seq;
     p->own_start = 0;
     if (st->meta_seq != p->r_meta_seq) {
         p->r_meta_seq = st->meta_seq;
@@ -718,54 +757,110 @@ static void run_sleep_timer(player_t *p)
     }
 }
 
+/* The current track played to its end. */
+static void finished(player_t *p)
+{
+    record(p, 0);
+    if (p->cur.duration_ms >= LONG_FILE_MS) library_set_resume(p->lib, p->cur.id, 0);
+}
+
+/* The current track couldn't be played (gone, damaged, a format the output
+ * can't take: a 22 kHz MP3 over Bluetooth, 5.1): on to the next one. Not for
+ * ever: after a whole queue's worth in a row (an output that takes none of
+ * them, with repeat on), it stops there. */
+static void skip_failed(player_t *p)
+{
+    int np = p->pos + 1 < p->n_order ? p->pos + 1 : p->repeat == REPEAT_ALL ? 0 : -1;
+    int stop = np < 0 || ++p->fails >= p->n_order;
+    fprintf(stderr, "player: track %lld couldn't be played: %s\n", (long long)p->cur.id, stop ? "stopped" : "skipped");
+    if (stop) return;
+    if (np == 0 && p->shuffle && new_cycle(p)) return;
+    int fails = p->fails;
+    start_at(p, np);
+    p->fails = fails;
+}
+
+/* The engine started a track since we last looked: which one in the queue. */
+static void follow(player_t *p, const eng_status_t *st)
+{
+    if (st->starting || st->seq == p->eng_seq) return;
+    p->eng_seq = st->seq;
+    int ours = p->own_start, j = -1;
+    p->own_start = 0;
+    for (int i = 0; st->tag && i < p->n_ahead && j < 0; i++)
+        if (p->ahead[i].tag == st->tag && id_at(p, p->ahead[i].pos) == st->track_id) j = i;
+    if (j >= 0) {
+        /* it moved on by itself (gapless) through what we lined up: maybe
+         * several tracks, if they were short */
+        for (int i = 0; i <= j; i++) {
+            finished(p);
+            set_pos(p, p->ahead[i].pos);
+            library_track(p->lib, id_at(p, p->pos), &p->cur);
+        }
+        p->seq++;
+        queue_next(p);
+    } else if (ours && st->track_id == p->cur.id) {
+        /* the track we started ourselves */
+    } else if (st->track_id >= 0 && st->track_id != p->cur.id) {
+        /* the queue changed while the engine switched: find the track it plays */
+        for (int i = p->pos + 1; i < p->n_order; i++)
+            if (id_at(p, i) == st->track_id) { set_pos(p, i); break; }
+        library_track(p->lib, st->track_id, &p->cur);
+        p->seq++;
+        queue_next(p);
+    }
+}
+
+/* Before a change to the queue or a skip: the engine may have gone on since
+ * the last tick (short tracks; keys come before the tick after a busy spell),
+ * and "next" is after what plays now. */
+static void catch_up(player_t *p)
+{
+    if (p->radio) return;
+    eng_status_t st;
+    engine_status(p->eng, &st);
+    follow(p, &st);
+}
+
 void player_tick(player_t *p)
 {
     run_sleep_timer(p);
     eng_status_t st;
     engine_status(p->eng, &st);
     if (p->radio) { radio_tick(p, &st); return; }
-    if (st.seq == p->eng_seq) {
-        if (st.ended && p->have_cur && st.state == ENG_STOPPED) {
-            if (p->stop_after || p->sleep_album) {
-                /* stopped as asked: cue the next track, so Play carries on */
-                p->stop_after = 0;
-                p->sleep_album = 0;
-                if (p->sleep_min == PLAYER_SLEEP_END_ALBUM) p->sleep_min = 0;
-                record(p, 0);
-                if (p->pos + 1 < p->n_order) {
-                    set_pos(p, p->pos + 1);
-                    library_track(p->lib, id_at(p, p->pos), &p->cur);
-                    p->resume_ms = 0;
-                    p->seq++;
-                }
-                engine_stop(p->eng);   /* clears `ended` */
-            } else if (p->repeat == REPEAT_ALL && p->shuffle && p->pos + 1 >= p->n_order) {
-                record(p, 0);           /* shuffle cycle ran out: a fresh one */
-                if (new_cycle(p) == 0) start_at(p, 0);
-            }
+    if (st.starting) return;            /* (what it says is still about the last track) */
+    if (st.state == ENG_PLAYING) p->fails = 0;
+    follow(p, &st);
+    /* playback stopped by itself: once for each time */
+    if (st.stop_seq == p->eng_stop || st.state != ENG_STOPPED) return;
+    p->eng_stop = st.stop_seq;
+    if (!p->have_cur) return;
+    if (st.error) {
+        skip_failed(p);
+    } else if (p->stop_after || p->sleep_album) {
+        /* stopped as asked: cue the next track, so Play carries on */
+        p->stop_after = 0;
+        p->sleep_album = 0;
+        if (p->sleep_min == PLAYER_SLEEP_END_ALBUM) p->sleep_min = 0;
+        finished(p);
+        if (p->pos + 1 < p->n_order) {
+            set_pos(p, p->pos + 1);
+            library_track(p->lib, id_at(p, p->pos), &p->cur);
+            p->resume_ms = 0;
+            p->seq++;
         }
-        return;
-    }
-    p->eng_seq = st.seq;
-    if (p->own_start) {                 /* the track we started ourselves */
-        p->own_start = 0;
-        return;
-    }
-    /* the engine moved on by itself (gapless) to the track we lined up */
-    if (p->queued_pos >= 0 && st.track_id == id_at(p, p->queued_pos)) {
-        record(p, 0);
-        if (p->cur.duration_ms >= LONG_FILE_MS) library_set_resume(p->lib, p->cur.id, 0);   /* finished */
-        set_pos(p, p->queued_pos);
-        library_track(p->lib, st.track_id, &p->cur);
-        p->seq++;
-        queue_next(p);
-    } else if (st.track_id >= 0 && st.track_id != p->cur.id) {
-        /* the queue changed while the engine switched: find the track it plays */
-        for (int i = p->pos + 1; i < p->n_order; i++)
-            if (id_at(p, i) == st.track_id) { set_pos(p, i); break; }
-        library_track(p->lib, st.track_id, &p->cur);
-        p->seq++;
-        queue_next(p);
+        engine_stop(p->eng);
+    } else if (p->repeat == REPEAT_ALL && p->shuffle && p->pos + 1 >= p->n_order) {
+        finished(p);                    /* shuffle cycle ran out: a fresh one */
+        if (new_cycle(p) == 0) start_at(p, 0);
+    } else if (p->n_ahead > 0) {
+        /* it played all it had lined up before we came to line up more (more
+         * than ENGINE_AHEAD tracks, or AHEAD_MS, while the UI was held up):
+         * on with the next, after a gap rather than stopping */
+        finished(p);
+        start_at(p, p->ahead[0].pos);
+    } else {
+        finished(p);                    /* the end of the queue */
     }
 }
 
@@ -774,7 +869,8 @@ int player_idle(player_t *p)
     if (p->sleep_at || (p->radio && p->r_want)) return 0;
     eng_status_t st;
     engine_status(p->eng, &st);
-    return st.state != ENG_PLAYING && !st.starting && st.seq == p->eng_seq;
+    return st.state != ENG_PLAYING && !st.starting && st.seq == p->eng_seq &&
+           (st.stop_seq == p->eng_stop || st.state != ENG_STOPPED);
 }
 
 void player_now(player_t *p, player_now_t *now)
@@ -786,8 +882,13 @@ void player_now(player_t *p, player_now_t *now)
     now->playing = st.starting ? !st.start_paused : st.state == ENG_PLAYING;
     now->stopped = !p->have_cur || (st.state == ENG_STOPPED && st.ended);
     now->track = p->cur;
-    now->pos_ms = st.state == ENG_STOPPED ? p->resume_ms : st.pos_ms;
-    now->len_ms = st.len_ms && st.state != ENG_STOPPED ? st.len_ms : p->cur.duration_ms;
+    /* The engine's figures are for what it plays: not yet this item while it
+     * starts, or another one (from a radio station to an album, the station's
+     * time showed against the track's length until the album began). */
+    int64_t want = p->radio ? -2 - p->ri : p->cur.id;
+    int theirs = st.state != ENG_STOPPED && !st.starting && st.track_id == want;
+    now->pos_ms = theirs ? st.pos_ms : !p->radio && (st.state == ENG_STOPPED || st.starting) ? p->resume_ms : 0;
+    now->len_ms = theirs && st.len_ms ? st.len_ms : p->cur.duration_ms;
     now->shuffle = p->shuffle;
     now->repeat = p->repeat;
     now->stop_after = p->stop_after;
@@ -838,6 +939,7 @@ uint32_t player_seq(const player_t *p) { return p->seq; }
 
 void player_set_levelling(player_t *p, levelling_t mode)
 {
+    catch_up(p);
     p->levelling = mode;
     queue_next(p);   /* the next track, lined up already, takes the new setting */
 }

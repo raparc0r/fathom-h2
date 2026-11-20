@@ -85,7 +85,7 @@ int theme_parse(const char *text, theme_t *t, char *err, size_t errcap)
     uint32_t have = 0;   /* bitmask of required colours seen */
     enum { R_BG = 1, R_SURF = 2, R_TEXT = 4, R_MUTED = 8, R_SELBG = 16, R_SELFG = 32, R_SIG = 64 };
     int set_info = 0, set_mode = 0, set_batt = 0, set_warn = 0, set_danger = 0;
-    int set_artist = 0, set_album = 0, set_chip_bg = 0, set_chip_fg = 0;
+    int set_artist = 0, set_album = 0, set_chip_bg = 0, set_chip_fg = 0, set_icons = 0;
 
     char section[32] = "";
     char *copy = strdup(text ? text : "");
@@ -195,16 +195,13 @@ int theme_parse(const char *text, theme_t *t, char *err, size_t errcap)
             else if (!strcmp(k, "motion")) { r = pick(v, mo, 2); t->motion_stepped = r; }
             else { t->unknown_keys++; continue; }   /* a newer key: ignored */
             ok = r >= 0;
-        } else if (!strcmp(section, "art") && !strcmp(k, "style")) {
-            static const char *const st[] = {"normal", "pixelate"};
-            int r = pick(v, st, 2); t->art_pixelate = r; ok = r >= 0;
-        } else if (!strcmp(section, "decor")) {
-            static const char *const hp[] = {"none", "dots"}, *const ic[] = {"line", "pixel"};
-            int r = -1;
-            if (!strcmp(k, "header_pattern")) { r = pick(v, hp, 2); t->header_dots = r; }
-            else if (!strcmp(k, "icons")) { r = pick(v, ic, 2); t->icons_pixel = r; }
-            else { t->unknown_keys++; continue; }
-            ok = r >= 0;
+        } else if ((!strcmp(section, "art") && !strcmp(k, "style")) ||
+                   (!strcmp(section, "decor") && !strcmp(k, "header_pattern"))) {
+            continue;               /* once planned, never drawn: older themes have them (not "unknown") */
+        } else if (!strcmp(section, "decor") && !strcmp(k, "icons")) {
+            static const char *const ic[] = {"line", "pixel"};
+            int r = pick(v, ic, 2); t->icons_pixel = r; ok = r >= 0;
+            set_icons = 1;
         } else {
             t->unknown_keys++;      /* a newer format's section or key: ignored */
             continue;
@@ -223,6 +220,7 @@ int theme_parse(const char *text, theme_t *t, char *err, size_t errcap)
     if (!set_warn) t->warning = t->dark ? 0xFFC845 : 0x8A5A00;
     if (!set_danger) t->danger = t->dark ? 0xFF6B6B : 0xB3261E;
     if (!set_artist) t->artist = t->text_muted;
+    if (!set_icons) t->icons_pixel = !t->font_file[0] && !strcmp(t->font, "arkpixel");   /* (as before the key) */
     if (!set_album) t->album = t->text_muted;
     /* the format chip: a pale surface, or (stepped corners) a block of info colour */
     if (!set_chip_bg) t->chip_bg = t->corner == THEME_CORNER_STEPPED ? t->info : t->surface;

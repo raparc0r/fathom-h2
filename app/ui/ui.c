@@ -150,7 +150,7 @@ typedef enum {
     L_CONTEXT, L_INFO, L_QUEUE, L_PICK_PLAYLIST, L_SEARCH, L_RENAME, L_USB_ASK, L_WIFI_ASK, L_RADIO,
     /* Home > Radio > Find stations: its menu, genres, countries, a list of stations, search by name */
     L_RDIR, L_RDIR_GENRES, L_RDIR_COUNTRIES, L_RDIR_RESULTS, L_RDIR_SEARCH,
-    L_UPDATE, L_BATTERY, L_BAT_SPAN, L_BAT_HISTORY, L_PLACEHOLDER
+    L_UPDATE, L_BATTERY, L_BAT_SPAN, L_BAT_HISTORY, L_UNINSTALL, L_PLACEHOLDER
 } list_kind_t;
 
 typedef struct {
@@ -160,6 +160,7 @@ typedef struct {
     int64_t parent2;        /* L_CREDIT_TRACKS, L_COMPOSER_TRACKS: the album (parent: the artist, composer) */
     lib_list_t items;       /* library-backed levels: row ids */
     char title[128];
+    int title_ui;           /* the title is the UI's own words (translated), not a name */
     int back_to_np;         /* opened from Now Playing: closing it goes back there */
 } level_t;
 
@@ -206,6 +207,9 @@ static struct {
     lv_obj_t *np_next, *np_out, *np_pause, *empty;
     int lib_counts[4];      /* songs, albums, artists, playlists (Library screen) */
     uint32_t reset_armed;   /* About > Reset: first press time; a second within 3 s resets */
+    uint32_t uni_armed;     /* About > Uninstall Fathom > Uninstall: the same */
+    ui_uninstall_t uni;     /* its state, as the device last gave it */
+    lv_obj_t *uni_ov;       /* the screen while it waits for the H2 to be switched off */
     char output[80];
     int pure, bitperfect;   /* Pure mode for this output; ...and nothing changes the samples */
     uint32_t seek_last; int seek_streak;
@@ -408,6 +412,21 @@ static void set_text(lv_obj_t *l, const char *s)
     lv_obj_set_user_data(l, copy);
 }
 
+/* fmt with each %s filled in, a then b (a translated text's own order of
+ * words: only %s, never a printf format from a language file) */
+static void subst(char *out, size_t cap, const char *fmt, const char *a, const char *b)
+{
+    lang_fill(out, cap, fmt, a, b);
+}
+
+/* A translated text with a number in it: tr_num(b, n, "%s songs", 12) */
+static void tr_num(char *out, size_t cap, const char *fmt_en, long v)
+{
+    char num[24];
+    snprintf(num, sizeof num, "%ld", v);
+    subst(out, cap, tr(fmt_en), num, NULL);
+}
+
 static void set_pos_width(lv_obj_t *o, int x, int y, int w)
 {
     if (lv_obj_get_style_x(o, 0) != x || lv_obj_get_style_y(o, 0) != y) lv_obj_set_pos(o, x, y);
@@ -604,6 +623,44 @@ static void update_look(void)
     if (S.hooks.update_state) S.hooks.update_state(&S.upd);
 }
 
+static void uninstall_look(void)
+{
+    memset(&S.uni, 0, sizeof S.uni);
+    if (S.hooks.uninstall_state) S.hooks.uninstall_state(&S.uni);
+}
+
+/* About's rows: the device's, then Check for updates and Check automatically
+ * (with updates), Uninstall Fathom (when it can), Reset all settings. */
+enum { AB_INFO, AB_CHECK, AB_AUTO, AB_UNINSTALL, AB_RESET };
+static int about_row(int i)
+{
+    if (i < S.about_n) return AB_INFO;
+    i -= S.about_n;
+    if (S.hooks.update_do) {
+        if (i < 2) return i == 0 ? AB_CHECK : AB_AUTO;
+        i -= 2;
+    }
+    if (S.hooks.uninstall_do && i-- == 0) return AB_UNINSTALL;
+    return AB_RESET;
+}
+
+/* Uninstall Fathom's rows, by its state: what it found, then what to do. */
+enum { UR_STATUS, UR_LOOK, UR_VERSION, UR_GO };
+static int uninstall_rows(void)
+{
+    switch (S.uni.state) {
+    case UI_UNI_FAILED: return 2;               /* why, look again */
+    case UI_UNI_READY: return 2;                /* HiBy's release, uninstall */
+    default: return 1;                          /* checking, getting ready... */
+    }
+}
+static int uninstall_row(int i)
+{
+    if (S.uni.state == UI_UNI_FAILED) return i == 0 ? UR_STATUS : UR_LOOK;
+    if (S.uni.state == UI_UNI_READY) return i == 0 ? UR_VERSION : UR_GO;
+    return S.uni.state == UI_UNI_IDLE ? UR_LOOK : UR_STATUS;
+}
+
 static int sound_rows(setting_t *r);
 /* Settings > Wi-Fi's rows: on/off, then (while on) the connection, search
  * and the networks in range (*net: which). */
@@ -662,7 +719,8 @@ static int list_count(const level_t *l)
     }
     case L_ABOUT:
         about_look();
-        return S.about_n + 2 * (S.hooks.update_do != NULL) + 1;   /* + Check for updates and automatically, Reset settings */
+        return S.about_n + 2 * (S.hooks.update_do != NULL) + (S.hooks.uninstall_do != NULL) + 1;   /* about_row */
+    case L_UNINSTALL: uninstall_look(); return uninstall_rows();
     case L_UPDATE: update_look(); return S.upd.state == UI_UPD_AVAILABLE || S.upd.state == UI_UPD_FAILED ? 2 : 1;
     case L_BATTERY: return 3;                      /* the graph's range, since full charge, history */
     case L_BAT_SPAN: return 2 + BL_ACTS;            /* on battery, at this rate, each activity */
@@ -767,7 +825,7 @@ static int is_setting_level(list_kind_t k)
            k == L_USB || k == L_INTERFACE;
 }
 
-static const char *on_off(int v) { return v ? "On" : "Off"; }
+static const char *on_off(int v) { return tr(v ? "On" : "Off"); }
 
 /* Settings > Interface > Artist names in Albums: each album's artist after its
  * name (on), or its year on the right (off). */
@@ -794,7 +852,7 @@ static void eqe_row(int i, char *main, size_t mn, char *meta, size_t tn)
         const eq_band_t *b = &S.eqe.band[i - 1];
         char hz[24];
         fmt_hz(hz, sizeof hz, b->fc);
-        snprintf(main, mn, "%s %s", EQ_TYPE_NAME[b->type], hz);
+        snprintf(main, mn, "%s %s", tr(EQ_TYPE_NAME[b->type]), hz);
         snprintf(meta, tn, "%+.1f dB", b->gain_db);
     } else if (i == n + 1 && n < EQ_MAX_BANDS) {
         snprintf(main, mn, "Add a band");
@@ -810,7 +868,7 @@ static void eqe_band_row(int b, int i, char *main, size_t mn, char *meta, size_t
     int ed = S.editing && S.stack[S.depth - 1].sel == i;
     char v[32] = "";
     switch (i) {
-    case 0: snprintf(main, mn, "Type"); snprintf(v, sizeof v, "%s", EQ_TYPE_NAME[bd->type]); break;
+    case 0: snprintf(main, mn, "Type"); snprintf(v, sizeof v, "%s", tr(EQ_TYPE_NAME[bd->type])); break;
     case 1: snprintf(main, mn, "Frequency"); fmt_hz(v, sizeof v, bd->fc); break;
     case 2: snprintf(main, mn, "Gain"); snprintf(v, sizeof v, "%+.1f dB", bd->gain_db); break;
     case 3: snprintf(main, mn, "Q"); snprintf(v, sizeof v, "%.2f", bd->q); break;
@@ -857,7 +915,11 @@ static void eqe_adjust(const level_t *l, int d)
     eqe_changed(0);
 }
 
-static void push(list_kind_t kind, const char *title, int64_t parent);
+static void push_as(list_kind_t kind, const char *title, int64_t parent, int ui);
+/* A level titled with a name (an album, an artist, a device) */
+static void push(list_kind_t kind, const char *title, int64_t parent) { push_as(kind, title, parent, 0); }
+/* A level titled with the UI's own words ("Albums", "Settings"): translated */
+static void push_ui(list_kind_t kind, const char *title, int64_t parent) { push_as(kind, title, parent, 1); }
 static void about_look(void);
 enum { WT_NONE, WT_OK, WT_RDIR };   /* once Wi-Fi connects: nothing, OK again, ask the directory again */
 static int wifi_ask_if_off(int then);
@@ -893,174 +955,176 @@ static void eqe_new(void)
     eqe_open(name);
 }
 
+/* A setting's row, translated here (its list isn't translated whole: a
+ * network's, a device's or an EQ's name stays as it is) */
 static void setting_row(setting_t st, int editing, char *main, size_t mn, char *meta, size_t tn)
 {
     switch (st) {
     case ST_BRIGHTNESS:
-        snprintf(main, mn, "Brightness");
+        snprintf(main, mn, "%s", tr("Brightness"));
         snprintf(meta, tn, editing ? "< %d / %d >" : "%d / %d", brightness(), UI_BRIGHTNESS_LEVELS);
         break;
     case ST_SHUFFLE:
-        snprintf(main, mn, "Shuffle");
-        snprintf(meta, tn, "%s", S.player && player_shuffle(S.player) ? "On" : "Off");
+        snprintf(main, mn, "%s", tr("Shuffle"));
+        snprintf(meta, tn, "%s", on_off(S.player && player_shuffle(S.player)));
         break;
     case ST_REPEAT: {
         static const char *const R[] = {"Off", "All", "One"};
-        snprintf(main, mn, "Repeat");
-        snprintf(meta, tn, "%s", R[S.player ? player_repeat(S.player) : 0]);
+        snprintf(main, mn, "%s", tr("Repeat"));
+        snprintf(meta, tn, "%s", tr(R[S.player ? player_repeat(S.player) : 0]));
         break;
     }
     case ST_SLEEP:
-        snprintf(main, mn, "Sleep timer");
-        if (S.player && player_sleep_minutes(S.player) == PLAYER_SLEEP_END_ALBUM) snprintf(meta, tn, "End of album");
-        else if (S.now.sleep_s > 0) snprintf(meta, tn, "%d min left", (S.now.sleep_s + 59) / 60);
-        else snprintf(meta, tn, "Off");
+        snprintf(main, mn, "%s", tr("Sleep timer"));
+        if (S.player && player_sleep_minutes(S.player) == PLAYER_SLEEP_END_ALBUM) snprintf(meta, tn, "%s", tr("End of album"));
+        else if (S.now.sleep_s > 0) tr_num(meta, tn, "%s min left", (S.now.sleep_s + 59) / 60);
+        else snprintf(meta, tn, "%s", tr("Off"));
         break;
     case ST_STOP_AFTER:
-        snprintf(main, mn, "Stop after this track");
-        snprintf(meta, tn, "%s", S.player && player_stop_after(S.player) ? "On" : "Off");
+        snprintf(main, mn, "%s", tr("Stop after this track"));
+        snprintf(meta, tn, "%s", on_off(S.player && player_stop_after(S.player)));
         break;
     case ST_DIM:
-        snprintf(main, mn, "Dim before turning off");
-        snprintf(meta, tn, "%s", on_off(settings_get_int("display.dim", 1)));
+        snprintf(main, mn, "%s", tr("Dim before turning off"));
+        snprintf(meta, tn, "%s", on_off(settings_get_int("display.dim", UI_DIM_DEFAULT)));
         break;
     case ST_ON_CHARGING:
-        snprintf(main, mn, "Stay on while charging");
-        snprintf(meta, tn, "%s", on_off(settings_get_int("display.on_charging", 0)));
+        snprintf(main, mn, "%s", tr("Stay on while charging"));
+        snprintf(meta, tn, "%s", on_off(settings_get_int("display.on_charging", UI_ON_CHARGING_DEFAULT)));
         break;
     case ST_THEME:
-        snprintf(main, mn, "Theme");
+        snprintf(main, mn, "%s", tr("Theme"));
         snprintf(meta, tn, "%.*s", (int)tn - 1, S.cur_theme < S.n_themes ? S.themes[S.cur_theme].name : "");
         break;
     case ST_ALBUM_ARTISTS:
-        snprintf(main, mn, "Artist names in Albums");
+        snprintf(main, mn, "%s", tr("Artist names in Albums"));
         snprintf(meta, tn, "%s", on_off(album_artists_on()));
         break;
     case ST_COVERS: {
         static const char *const W[] = {"Off", "Albums", "Songs", "Albums, songs"};
-        snprintf(main, mn, "Covers in lists");
-        snprintf(meta, tn, "%s", W[settings_get_int("display.covers", UI_COVERS_DEFAULT) & 3]);
+        snprintf(main, mn, "%s", tr("Covers in lists"));
+        snprintf(meta, tn, "%s", tr(W[settings_get_int("display.covers", UI_COVERS_DEFAULT) & 3]));
         break;
     }
     case ST_OUTPUT:
-        snprintf(main, mn, "Output");
-        snprintf(meta, tn, "%.*s", (int)tn - 1, S.output[0] ? S.output : "-");   /* long names are cut */
+        snprintf(main, mn, "%s", tr("Output"));
+        snprintf(meta, tn, "%.*s", (int)tn - 1, S.output[0] ? tr(S.output) : "-");   /* long names are cut; (Headphones, Line out: translated) */
         break;
     case ST_LEVELLING: {
         static const char *const how[] = {"Off", "Track", "Album"};
         int v = settings_get_int("sound.levelling", LEVEL_OFF);
-        snprintf(main, mn, "Volume levelling");
-        snprintf(meta, tn, "%s", S.pure ? "Bypassed" : how[v >= 0 && v <= 2 ? v : 0]);
+        snprintf(main, mn, "%s", tr("Volume levelling"));
+        snprintf(meta, tn, "%s", tr(S.pure ? "Bypassed" : how[v >= 0 && v <= 2 ? v : 0]));
         break;
     }
     case ST_EQ:
-        snprintf(main, mn, "EQ");
-        snprintf(meta, tn, "%.*s", (int)tn - 1, S.pure ? "Bypassed" : S.eq_name[0] ? S.eq_name : "Off");
+        snprintf(main, mn, "%s", tr("EQ"));
+        snprintf(meta, tn, "%.*s", (int)tn - 1, S.pure ? tr("Bypassed") : S.eq_name[0] ? S.eq_name : tr("Off"));
         break;
     case ST_LANGUAGE: {
         const char *lang = settings_get("display.language", "");
-        snprintf(main, mn, "Language");
+        snprintf(main, mn, "%s", tr("Language"));
         snprintf(meta, tn, "%.*s", (int)tn - 1, lang[0] ? lang : "English");
         break;
     }
     case ST_BATTERY:
-        snprintf(main, mn, "Battery");
+        snprintf(main, mn, "%s", tr("Battery"));
         if (S.hooks.battery_info) S.hooks.battery_info(meta, tn);
         else snprintf(meta, tn, "-");
         break;
     case ST_PURE:
-        snprintf(main, mn, "Pure mode");
+        snprintf(main, mn, "%s", tr("Pure mode"));
         snprintf(meta, tn, "%s", on_off(S.pure));
         break;
     case ST_TRANSPORT:
-        snprintf(main, mn, "Transport mode");
-        snprintf(meta, tn, "%s", on_off(settings_get_int("sound.transport", 0)));
+        snprintf(main, mn, "%s", tr("Transport mode"));
+        snprintf(meta, tn, "%s", on_off(settings_get_int("sound.transport", UI_TRANSPORT_DEFAULT)));
         break;
     case ST_BALANCE:
     case ST_VOL_LIMIT: {
         char v[48] = "";
-        snprintf(main, mn, "%s", st == ST_BALANCE ? "Balance" : "Volume limit");
-        if (st == ST_BALANCE && S.pure) { snprintf(meta, tn, "Bypassed"); break; }
+        snprintf(main, mn, "%s", tr(st == ST_BALANCE ? "Balance" : "Volume limit"));
+        if (st == ST_BALANCE && S.pure) { snprintf(meta, tn, "%s", tr("Bypassed")); break; }
         if (S.hooks.sound_value) S.hooks.sound_value(st == ST_BALANCE ? UI_SOUND_BALANCE : UI_SOUND_LIMIT, v, sizeof v);
         snprintf(meta, tn, editing ? "< %s >" : "%s", v);
         break;
     }
     case ST_DAC_FILTER:
-        snprintf(main, mn, "DAC filter");
+        snprintf(main, mn, "%s", tr("DAC filter"));
         if (S.hooks.dac_filter_name) S.hooks.dac_filter_name(meta, tn);
         break;
     case ST_SHUF_BY:
-        snprintf(main, mn, "Shuffle by");
-        snprintf(meta, tn, "%s", settings_get_int("shuffle.albums", 0) ? "Albums" : "Songs");
+        snprintf(main, mn, "%s", tr("Shuffle by"));
+        snprintf(meta, tn, "%s", tr(settings_get_int("shuffle.albums", UI_SHUF_ALBUMS_DEFAULT) ? "Albums" : "Songs"));
         break;
     case ST_SHUF_FRESH:
-        snprintf(main, mn, "Favour unheard songs");
-        snprintf(meta, tn, "%s", on_off(settings_get_int("shuffle.freshness", 1)));
+        snprintf(main, mn, "%s", tr("Favour unheard songs"));
+        snprintf(meta, tn, "%s", on_off(settings_get_int("shuffle.freshness", UI_SHUF_FRESH_DEFAULT)));
         break;
     case ST_SHUF_INTERLUDES:
-        snprintf(main, mn, "Skip short interludes");
-        snprintf(meta, tn, "%s", on_off(settings_get_int("shuffle.skip_interludes", 1)));
+        snprintf(main, mn, "%s", tr("Skip short interludes"));
+        snprintf(meta, tn, "%s", on_off(settings_get_int("shuffle.skip_interludes", UI_SHUF_INTERLUDES_DEFAULT)));
         break;
     case ST_SHUF_WORKS:
-        snprintf(main, mn, "Keep works together");
-        snprintf(meta, tn, "%s", on_off(settings_get_int("shuffle.keep_works", 0)));
+        snprintf(main, mn, "%s", tr("Keep works together"));
+        snprintf(meta, tn, "%s", on_off(settings_get_int("shuffle.keep_works", UI_SHUF_WORKS_DEFAULT)));
         break;
     case ST_SHUF_SPOKEN:
-        snprintf(main, mn, "Leave out audiobooks");
+        snprintf(main, mn, "%s", tr("Leave out audiobooks"));
         snprintf(meta, tn, "%s", on_off(settings_get_int("shuffle.exclude_spoken", UI_EXCLUDE_SPOKEN_DEFAULT)));
         break;
     case ST_PAUSE_UNPLUG:
-        snprintf(main, mn, "Pause on unplug");
-        snprintf(meta, tn, "%s", on_off(settings_get_int("playback.pause_on_unplug", 1)));
+        snprintf(main, mn, "%s", tr("Pause on unplug"));
+        snprintf(meta, tn, "%s", on_off(settings_get_int("playback.pause_on_unplug", UI_PAUSE_ON_UNPLUG_DEFAULT)));
         break;
     case ST_AUTO_OFF: {
-        int m = settings_get_int("power.auto_off", 15);
-        snprintf(main, mn, "Power off when idle");
-        if (m <= 0) snprintf(meta, tn, "Never");
-        else snprintf(meta, tn, "%d min", m);
+        int m = settings_get_int("power.auto_off", UI_AUTO_OFF_DEFAULT);
+        snprintf(main, mn, "%s", tr("Power off when idle"));
+        if (m <= 0) snprintf(meta, tn, "%s", tr("Never"));
+        else tr_num(meta, tn, "%s min", m);
         break;
     }
-    case ST_RESCAN: snprintf(main, mn, "Rescan the music folder"); break;
-    case ST_USB_DRIVE: snprintf(main, mn, "USB drive mode"); break;
+    case ST_RESCAN: snprintf(main, mn, "%s", tr("Rescan the music folder")); break;
+    case ST_USB_DRIVE: snprintf(main, mn, "%s", tr("USB drive mode")); break;
     case ST_USB_COMPUTER: {
         static const char *const what[] = {"Ask", "USB drive", "Just charge", "USB DAC"};
         int v = settings_get_int("usb.computer", UI_USB_ASK);
-        snprintf(main, mn, "On a computer");
-        snprintf(meta, tn, "%s", what[v >= 0 && v <= 3 ? v : 0]);
+        snprintf(main, mn, "%s", tr("On a computer"));
+        snprintf(meta, tn, "%s", tr(what[v >= 0 && v <= 3 ? v : 0]));
         break;
     }
-    case ST_USB_DAC: snprintf(main, mn, "USB DAC mode"); break;
+    case ST_USB_DAC: snprintf(main, mn, "%s", tr("USB DAC mode")); break;
     case ST_BT:
-        snprintf(main, mn, "Bluetooth");
-        snprintf(meta, tn, "%s", S.bt_busy[0] && strcmp(S.bt_busy, "Searching") ? S.bt_busy : on_off(S.bt_on));
+        snprintf(main, mn, "%s", tr("Bluetooth"));
+        snprintf(meta, tn, "%s", S.bt_busy[0] && strcmp(S.bt_busy, "Searching") ? tr(S.bt_busy) : on_off(S.bt_on));
         break;
     case ST_WIFI:
-        snprintf(main, mn, "Wi-Fi");
-        snprintf(meta, tn, "%s", S.wifi_busy[0] && strcmp(S.wifi_busy, "Searching") ? S.wifi_busy : on_off(S.wifi_on));
+        snprintf(main, mn, "%s", tr("Wi-Fi"));
+        snprintf(meta, tn, "%s", S.wifi_busy[0] && strcmp(S.wifi_busy, "Searching") ? tr(S.wifi_busy) : on_off(S.wifi_on));
         break;
     case ST_WIFI_NET:
-        snprintf(main, mn, "Wi-Fi network");
+        snprintf(main, mn, "%s", tr("Wi-Fi network"));
         snprintf(meta, tn, "%.*s", (int)tn - 1, S.wifi_st.state == UI_WIFI_CONNECTED ? S.wifi_st.ssid
-                                                : S.wifi_on ? "None" : "");
+                                                : S.wifi_on ? tr("None") : "");
         break;
     case ST_BT_DEVICE: {
-        snprintf(main, mn, "Bluetooth device");
+        snprintf(main, mn, "%s", tr("Bluetooth device"));
         const char *c = NULL;
         for (int d = 0; d < S.bt_n; d++)
             if (S.bt[d].connected) c = S.bt[d].name[0] ? S.bt[d].name : S.bt[d].addr;
-        snprintf(meta, tn, "%s", c ? c : S.bt_on ? "None" : "");
+        snprintf(meta, tn, "%s", c ? c : S.bt_on ? tr("None") : "");
         break;
     }
-    case ST_N_SONGS: snprintf(main, mn, "Songs"); snprintf(meta, tn, "%d", S.lib_counts[0]); break;
-    case ST_N_ALBUMS: snprintf(main, mn, "Albums"); snprintf(meta, tn, "%d", S.lib_counts[1]); break;
-    case ST_N_ARTISTS: snprintf(main, mn, "Artists"); snprintf(meta, tn, "%d", S.lib_counts[2]); break;
-    case ST_N_PLAYLISTS: snprintf(main, mn, "Playlists"); snprintf(meta, tn, "%d", S.lib_counts[3]); break;
+    case ST_N_SONGS: snprintf(main, mn, "%s", tr("Songs")); snprintf(meta, tn, "%d", S.lib_counts[0]); break;
+    case ST_N_ALBUMS: snprintf(main, mn, "%s", tr("Albums")); snprintf(meta, tn, "%d", S.lib_counts[1]); break;
+    case ST_N_ARTISTS: snprintf(main, mn, "%s", tr("Artists")); snprintf(meta, tn, "%d", S.lib_counts[2]); break;
+    case ST_N_PLAYLISTS: snprintf(main, mn, "%s", tr("Playlists")); snprintf(meta, tn, "%d", S.lib_counts[3]); break;
     case ST_TIMEOUT: {
         int t = screen_timeout();
-        snprintf(main, mn, "Screen off after");
-        if (t <= 0) snprintf(meta, tn, "Never");
-        else if (t < 60) snprintf(meta, tn, "%d s", t);
-        else snprintf(meta, tn, "%d min", t / 60);
+        snprintf(main, mn, "%s", tr("Screen off after"));
+        if (t <= 0) snprintf(meta, tn, "%s", tr("Never"));
+        else if (t < 60) tr_num(meta, tn, "%s s", t);
+        else tr_num(meta, tn, "%s min", t / 60);
         break;
     }
     }
@@ -1069,7 +1133,7 @@ static void setting_row(setting_t st, int editing, char *main, size_t mn, char *
 static void info_row(int64_t track, int i, char *main, size_t mn, char *meta, size_t tn)
 {
     static const char *const LABEL[INFO_N] = {"Title", "Artist", "Album", "Track", "Format", "Length", "File"};
-    snprintf(meta, tn, "%s", LABEL[i]);
+    snprintf(meta, tn, "%s", tr(LABEL[i]));   /* (the song's own words in main: never translated) */
     lib_track_t t;
     if (!S.lib || library_track(S.lib, track, &t)) { snprintf(main, mn, "-"); return; }
     switch (i) {
@@ -1077,7 +1141,12 @@ static void info_row(int64_t track, int i, char *main, size_t mn, char *meta, si
     case INFO_ARTIST: snprintf(main, mn, "%s", t.artist); break;
     case INFO_ALBUM: snprintf(main, mn, "%s", t.album); break;
     case INFO_TRACK:
-        if (t.disc > 1) snprintf(main, mn, "Disc %d, track %d", t.disc, t.track);
+        if (t.disc > 1) {
+            char d[16], n[16];
+            snprintf(d, sizeof d, "%d", t.disc);
+            snprintf(n, sizeof n, "%d", t.track);
+            subst(main, mn, tr("Disc %s, track %s"), d, n);
+        }
         else snprintf(main, mn, "%d", t.track);
         break;
     case INFO_FORMAT:
@@ -1098,6 +1167,7 @@ static void info_row(int64_t track, int i, char *main, size_t mn, char *meta, si
 /* ---------- typing with the wheel ---------- */
 
 #define WHEEL_W 84             /* the typing row's letters, at its right */
+#define WHEEL_CAP 48           /* a wheel word (Results, space), translated */
 #define DOUBLE_CLICK_MS 350   /* OK twice within this: Results (Search) or Done (Rename) */
 
 static const char *entry_letters(list_kind_t k)
@@ -1110,8 +1180,8 @@ static void entry_glyph(list_kind_t k, int i, char *out, size_t cap)
     const char *letters = entry_letters(k);
     int n = (int)strlen(letters);
     i = ((i % (n + 1)) + n + 1) % (n + 1);
-    if (i == n) snprintf(out, cap, "%s", k == L_SEARCH ? "Results" : k == L_RDIR_SEARCH ? "Search" : k == L_WIFI_PASS ? "Join" : "Done");
-    else if (letters[i] == ' ') snprintf(out, cap, "space");
+    if (i == n) snprintf(out, cap, "%s", tr(k == L_SEARCH ? "Results" : k == L_RDIR_SEARCH ? "Search" : k == L_WIFI_PASS ? "Join" : "Done"));
+    else if (letters[i] == ' ') snprintf(out, cap, "%s", tr("space"));
     else if (k == L_WIFI_PASS) snprintf(out, cap, "%c", letters[i]);   /* exactly what's typed */
     else snprintf(out, cap, "%c", letters[i] >= 'a' && letters[i] <= 'z' ? letters[i] - 32 : letters[i]);
 }
@@ -1119,14 +1189,14 @@ static void entry_glyph(list_kind_t k, int i, char *out, size_t cap)
 /* The typing row: what's typed so far, and the wheel's letter with its
  * neighbours ("d E f", the wheel's letter drawn larger). A word (Results,
  * Done, space) is shown alone, with no neighbours. */
-static void entry_row(list_kind_t k, char *main, size_t mn, char wheel[3][16])
+static void entry_row(list_kind_t k, char *main, size_t mn, char wheel[3][WHEEL_CAP])
 {
-    if ((k == L_SEARCH || k == L_RDIR_SEARCH) && !S.entry[0]) snprintf(main, mn, "Type with the wheel");
-    else if (k == L_WIFI_PASS && !S.entry[0]) snprintf(main, mn, "Password");
+    if ((k == L_SEARCH || k == L_RDIR_SEARCH) && !S.entry[0]) snprintf(main, mn, "%s", tr("Type with the wheel"));
+    else if (k == L_WIFI_PASS && !S.entry[0]) snprintf(main, mn, "%s", tr("Password"));
     else snprintf(main, mn, "%s_", S.entry);
-    entry_glyph(k, S.entry_ch - 1, wheel[0], 16);
-    entry_glyph(k, S.entry_ch, wheel[1], 16);
-    entry_glyph(k, S.entry_ch + 1, wheel[2], 16);
+    entry_glyph(k, S.entry_ch - 1, wheel[0], WHEEL_CAP);
+    entry_glyph(k, S.entry_ch, wheel[1], WHEEL_CAP);
+    entry_glyph(k, S.entry_ch + 1, wheel[2], WHEEL_CAP);
     /* the neighbours in lower case, so the letter OK adds stands out */
     for (int w = 0; w < 3; w += 2) {
         if (strlen(wheel[1]) > 1 || strlen(wheel[w]) > 1) wheel[w][0] = '\0';
@@ -1155,8 +1225,8 @@ static void search_row(int r, char *main, size_t mn, char *meta, size_t tn)
     int64_t id;
     int kind = search_kind(r, &id);
     if (!S.lib || id < 0) return;
-    if (kind == 0) { library_row(S.lib, LIB_ARTISTS, id, main, mn, meta, tn); snprintf(meta, tn, "Artist"); }
-    else if (kind == 1) { library_row(S.lib, LIB_ALBUMS, id, main, mn, meta, tn); snprintf(meta, tn, "Album"); }
+    if (kind == 0) { library_row(S.lib, LIB_ARTISTS, id, main, mn, meta, tn); snprintf(meta, tn, "%s", tr("Artist")); }
+    else if (kind == 1) { library_row(S.lib, LIB_ALBUMS, id, main, mn, meta, tn); snprintf(meta, tn, "%s", tr("Album")); }
     else library_row(S.lib, LIB_PLAYLIST_TRACKS, id, main, mn, meta, tn);
 }
 
@@ -1206,6 +1276,13 @@ static void short_version(char *out, size_t cap, const char *v)
     snprintf(out, cap, "%.*s", (int)n, v);
 }
 
+/* Why an update failed, translated: the text, or the space it needs */
+static void update_failure(char *out, size_t cap)
+{
+    if (S.upd.need_mb > 0) tr_num(out, cap, "Not enough space on the card: %s MB needed", S.upd.need_mb);
+    else snprintf(out, cap, "%s", tr(S.upd.message));
+}
+
 static void update_row(int i, char *main, size_t mn, char *meta, size_t tn)
 {
     const ui_update_t *u = &S.upd;
@@ -1217,14 +1294,42 @@ static void update_row(int i, char *main, size_t mn, char *meta, size_t tn)
         short_version(meta, tn, u->current);
         break;
     case UI_UPD_AVAILABLE:
-        if (i == 0) { snprintf(main, mn, "Update to %s", u->latest); fmt_mb(meta, tn, (uint64_t)u->size); }
+        if (i == 0) { subst(main, mn, tr("Update to %s"), u->latest, NULL); fmt_mb(meta, tn, (uint64_t)u->size); }
         else { snprintf(main, mn, "This version"); short_version(meta, tn, u->current); }
         break;
     case UI_UPD_FAILED:
-        if (i == 0) snprintf(main, mn, "%s", u->message);
+        if (i == 0) update_failure(main, mn);
         else snprintf(main, mn, "Try again");
         break;
-    default: snprintf(main, mn, "Updating to %s", u->latest); break;   /* (under the progress screen) */
+    default: subst(main, mn, tr("Updating to %s"), u->latest, NULL); break;   /* (under the progress screen) */
+    }
+}
+
+/* Why Uninstall can't go on, translated: the text, or the space it needs */
+static void uninstall_failure(char *out, size_t cap)
+{
+    if (S.uni.need_mb > 0) tr_num(out, cap, "Not enough space on the card: %s MB needed", S.uni.need_mb);
+    else snprintf(out, cap, "%s", tr(S.uni.message));
+}
+
+static void uninstall_row_text(int i, char *main, size_t mn, char *meta, size_t tn)
+{
+    const ui_uninstall_t *u = &S.uni;
+    switch (uninstall_row(i)) {
+    case UR_LOOK: snprintf(main, mn, "%s", u->state == UI_UNI_IDLE ? "Look for HiBy's update file" : "Look again"); break;
+    case UR_VERSION:
+        snprintf(main, mn, "HiBy's update");
+        snprintf(meta, tn, "%s", u->ver);
+        break;
+    case UR_GO: snprintf(main, mn, "Uninstall Fathom"); break;
+    default:
+        if (u->state == UI_UNI_FAILED) { uninstall_failure(main, mn); break; }
+        snprintf(main, mn, "%s", u->state == UI_UNI_CHECKING ? "Checking the update file"
+                                 : u->state == UI_UNI_APPLYING ? "Getting the update ready"
+                                 : "Ready to uninstall");
+        if (u->total && u->state != UI_UNI_PENDING)
+            snprintf(meta, tn, "%d %%", (int)(u->done * 100 / u->total));
+        break;
     }
 }
 
@@ -1244,14 +1349,19 @@ static const char *const BAT_ACTS[BL_ACTS] = {"Playing", "Screen on", "Paused"};
 static void fmt_dur(char *b, size_t n, int64_t secs)
 {
     long m = (long)((secs + 30) / 60);
-    if (m < 60) snprintf(b, n, "%ld min", m);
-    else if (m % 60 == 0) snprintf(b, n, "%ld h", m / 60);
-    else snprintf(b, n, "%ld h %02ld min", m / 60, m % 60);
+    if (m < 60) tr_num(b, n, "%s min", m);
+    else if (m % 60 == 0) tr_num(b, n, "%s h", m / 60);
+    else {
+        char h[16], mm[16];
+        snprintf(h, sizeof h, "%ld", m / 60);
+        snprintf(mm, sizeof mm, "%02ld", m % 60);
+        subst(b, n, tr("%s h %s min"), h, mm);
+    }
 }
 
 static void fmt_full(char *b, size_t n, int h10)
 {
-    if (h10 > 0) snprintf(b, n, "about %d h from full", (h10 + 5) / 10);
+    if (h10 > 0) tr_num(b, n, "about %s h from full", (h10 + 5) / 10);
     else snprintf(b, n, "\xe2\x80\x93");             /* (too little to say) */
 }
 
@@ -1262,19 +1372,21 @@ static void bat_day(char *b, size_t n, int64_t t)
     int64_t now = S.bat.t1;
     if (!S.bat.clock_ok) {
         long d = (long)((now - t) / 86400);
-        if (d <= 0) snprintf(b, n, "Today");
-        else if (d == 1) snprintf(b, n, "Yesterday");
-        else snprintf(b, n, "%ld days ago", d);
+        if (d <= 0) snprintf(b, n, "%s", tr("Today"));
+        else if (d == 1) snprintf(b, n, "%s", tr("Yesterday"));
+        else tr_num(b, n, "%s days ago", d);
         return;
     }
     long dn = (long)(now / 86400), dt = (long)(t / 86400);
-    if (dt == dn) { snprintf(b, n, "Today"); return; }
-    if (dt == dn - 1) { snprintf(b, n, "Yesterday"); return; }
+    if (dt == dn) { snprintf(b, n, "%s", tr("Today")); return; }
+    if (dt == dn - 1) { snprintf(b, n, "%s", tr("Yesterday")); return; }
     static const char *const MON[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
     time_t tt = (time_t)t;
     struct tm tm;
     gmtime_r(&tt, &tm);
-    snprintf(b, n, "%d %s", tm.tm_mday, MON[tm.tm_mon]);
+    char day[8];
+    snprintf(day, sizeof day, "%d", tm.tm_mday);
+    snprintf(b, n, "%s %s", day, tr(MON[tm.tm_mon]));
 }
 
 static const batspan_t *bat_cur(void)
@@ -1309,15 +1421,15 @@ static void battery_row(list_kind_t k, int i, char *main, size_t mn, char *meta,
         } else if (i == 1) {
             snprintf(main, mn, "Since full charge");
             fmt_dur(d, sizeof d, S.bat.since.on_s);
-            snprintf(m1, sizeof m1, "%s, %d %%", d, S.bat.since.used);
+            snprintf(m1, sizeof m1, "%s, %d %%", d, S.bat.since.used);   /* (d translated) */
             snprintf(m2, sizeof m2, "%d %%", S.bat.since.used);
             const char *alts[] = {m1, m2, NULL};
             if (S.bat.have_since) bat_meta(main, meta, tn, alts);
             else snprintf(meta, tn, "%s", dash);
         } else {
             snprintf(main, mn, "History");
-            if (S.bat.total_spans == 1) snprintf(meta, tn, "1 charge");
-            else if (S.bat.total_spans) snprintf(meta, tn, "%d charges", S.bat.total_spans);
+            if (S.bat.total_spans == 1) snprintf(meta, tn, "%s", tr("1 charge"));
+            else if (S.bat.total_spans) tr_num(meta, tn, "%s charges", S.bat.total_spans);
             else snprintf(meta, tn, "%s", dash);
         }
         return;
@@ -1339,9 +1451,9 @@ static void battery_row(list_kind_t k, int i, char *main, size_t mn, char *meta,
             const char *alts[] = {m1, m2, NULL};
             bat_meta(main, meta, tn, alts);
         } else {
-            snprintf(main, mn, "Average");
+            snprintf(main, mn, "%s", tr("Average"));
             fmt_full(m1, sizeof m1, S.bat.avg_full_h10);
-            snprintf(m2, sizeof m2, "%d h", (S.bat.avg_full_h10 + 5) / 10);
+            tr_num(m2, sizeof m2, "%s h", (S.bat.avg_full_h10 + 5) / 10);
             const char *alts[] = {m1, m2, NULL};
             if (S.bat.avg_full_h10 > 0) bat_meta(main, meta, tn, alts);
             else snprintf(meta, tn, "%s", dash);
@@ -1353,7 +1465,9 @@ static void battery_row(list_kind_t k, int i, char *main, size_t mn, char *meta,
     if (i == 0) {
         snprintf(main, mn, "On battery");
         fmt_dur(d, sizeof d, x->on_s);
-        snprintf(m1, sizeof m1, "%s, %d %% used", d, x->used);
+        char pc[16];
+        snprintf(pc, sizeof pc, "%d %%", x->used);
+        subst(m1, sizeof m1, tr("%s, %s used"), d, pc);
         snprintf(m2, sizeof m2, "%s, %d %%", d, x->used);
         snprintf(m3, sizeof m3, "%s", d);
         const char *alts[] = {m1, m2, m3, NULL};
@@ -1361,8 +1475,8 @@ static void battery_row(list_kind_t k, int i, char *main, size_t mn, char *meta,
     } else if (i == 1) {
         snprintf(main, mn, "At this rate");
         fmt_full(m1, sizeof m1, x->full_h10);
-        snprintf(m2, sizeof m2, "%d h from full", (x->full_h10 + 5) / 10);
-        snprintf(m3, sizeof m3, "%d h", (x->full_h10 + 5) / 10);
+        tr_num(m2, sizeof m2, "%s h from full", (x->full_h10 + 5) / 10);
+        tr_num(m3, sizeof m3, "%s h", (x->full_h10 + 5) / 10);
         const char *alts[] = {m1, m2, m3, NULL};
         if (x->full_h10 > 0) bat_meta(main, meta, tn, alts);
         else snprintf(meta, tn, "%s", dash);
@@ -1370,8 +1484,10 @@ static void battery_row(list_kind_t k, int i, char *main, size_t mn, char *meta,
         int a = i - 2;
         snprintf(main, mn, "%s", BAT_ACTS[a]);
         fmt_dur(d, sizeof d, x->act_s[a]);
-        snprintf(m1, sizeof m1, "%s, 1 %%/%d min", d, x->min_per_pct[a]);
-        snprintf(m2, sizeof m2, "1 %%/%d min", x->min_per_pct[a]);
+        char per[32];
+        tr_num(per, sizeof per, "%s min", x->min_per_pct[a]);
+        snprintf(m1, sizeof m1, "%s, 1 %%/%s", d, per);
+        snprintf(m2, sizeof m2, "1 %%/%s", per);
         const char *alts[] = {m1, m2, NULL};
         if (!x->act_s[a]) snprintf(meta, tn, "%s", dash);
         else if (x->min_per_pct[a]) bat_meta(main, meta, tn, alts);
@@ -1400,13 +1516,13 @@ static void battery_labels(void)
     int64_t t0 = S.bat.t0, t1 = S.bat.t1, span = t1 - t0;
     if (span <= 0) return;
     lv_point_t nw;
-    lv_text_get_size(&nw, "now", S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    lv_text_get_size(&nw, tr("now"), S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
     int n = 3, last_x = BAT_GX0 + BATREP_COLS - nw.x - 6;   /* ("now" at the right end) */
     int lbl_y = BAT_GRAPH_H - lv_font_get_line_height(S.f->meta);   /* (the wider fonts are taller) */
     if (lbl_y < BAT_GY1 + 4) lbl_y = BAT_GY1 + 4;   /* (below the charging strip) */
     int64_t step = S.bat_days == 7 ? 86400 : 6 * 3600;
     int64_t first = (t0 / step + 1) * step;
-    char b[16];
+    char b[32];
     for (int64_t tt = first; tt < t1 && n < 8; tt += step) {
         int x = BAT_GX0 + (int)((tt - t0) * BATREP_COLS / span);
         lv_point_t sz;
@@ -1417,12 +1533,14 @@ static void battery_labels(void)
             time_t ttt = (time_t)tt;
             struct tm tm;
             gmtime_r(&ttt, &tm);
-            snprintf(b, sizeof b, "%s", WD[tm.tm_wday]);
+            snprintf(b, sizeof b, "%s", tr(WD[tm.tm_wday]));
         } else if (S.bat.clock_ok) {
             snprintf(b, sizeof b, "%02d:00", (int)((tt / 3600) % 24));
         } else {
-            snprintf(b, sizeof b, "-%d %s", (int)((t1 - tt + step / 2) / (S.bat_days == 7 ? 86400 : 3600)),
-                     S.bat_days == 7 ? "d" : "h");
+            char ago[24];
+            tr_num(ago, sizeof ago, S.bat_days == 7 ? "%s d" : "%s h",
+                   (t1 - tt + step / 2) / (S.bat_days == 7 ? 86400 : 3600));
+            snprintf(b, sizeof b, "-%s", ago);
         }
         set_text(S.bat_lbl[n], b);
         lv_obj_set_style_text_align(S.bat_lbl[n], LV_TEXT_ALIGN_CENTER, 0);
@@ -1431,7 +1549,7 @@ static void battery_labels(void)
         show(S.bat_lbl[n], 1);
         n++;
     }
-    set_text(S.bat_lbl[8], "now");
+    set_text(S.bat_lbl[8], tr("now"));
     lv_obj_set_style_text_align(S.bat_lbl[8], LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_set_width(S.bat_lbl[8], 64);
     lv_obj_set_pos(S.bat_lbl[8], BAT_GX0 + BATREP_COLS - 64, lbl_y);
@@ -1525,7 +1643,7 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
         if (S.lib) library_row(S.lib, view_of(l->kind), id, main, mn, meta, tn);
         if (covers_in(l->kind) && !(album_artists_on() && library_row_shows_artist(view_of(l->kind))))
             meta[0] = '\0';   /* (the cover takes the year's or length's place) */
-        if (S.moving && l->kind == L_PLAYLIST_TRACKS && i == l->sel) snprintf(meta, tn, "Moving");
+        if (S.moving && l->kind == L_PLAYLIST_TRACKS && i == l->sel) snprintf(meta, tn, "%s", tr("Moving"));
         if (S.now.active) {
             if (is_track_list(l->kind) || l->kind == L_FOLDER) *playing = id == S.now.track.id;
             else if (is_album_list(l->kind)) *playing = id == S.now.track.album_id;
@@ -1552,29 +1670,29 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
     }
     case L_SETTINGS: snprintf(main, mn, "%s", SETTINGS[i]); break;
     case L_BLUETOOTH:
-        if (!S.hooks.bt_state) { snprintf(main, mn, "Not available"); break; }
+        if (!S.hooks.bt_state) { snprintf(main, mn, "%s", tr("Not available")); break; }
         if (i == 0) {
-            snprintf(main, mn, "Bluetooth");
-            snprintf(meta, tn, "%s", S.bt_busy[0] && strcmp(S.bt_busy, "Searching") ? S.bt_busy : S.bt_on ? "On" : "Off");
+            snprintf(main, mn, "%s", tr("Bluetooth"));
+            snprintf(meta, tn, "%s", tr(S.bt_busy[0] && strcmp(S.bt_busy, "Searching") ? S.bt_busy : S.bt_on ? "On" : "Off"));
         } else if (i == 1) {
-            snprintf(main, mn, "Find headphones");
-            if (!strcmp(S.bt_busy, "Searching")) snprintf(meta, tn, "Searching");
+            snprintf(main, mn, "%s", tr("Find headphones"));
+            if (!strcmp(S.bt_busy, "Searching")) snprintf(meta, tn, "%s", tr("Searching"));
         } else if (i == 2) {                       /* sound quality or reach: the codec's bitrate */
-            snprintf(main, mn, "Audio");
-            snprintf(meta, tn, "%s", settings_get_int("bluetooth.range", 0) ? "Longer range" : "Best sound");
+            snprintf(main, mn, "%s", tr("Audio"));
+            snprintf(meta, tn, "%s", tr(settings_get_int("bluetooth.range", UI_BT_RANGE_DEFAULT) ? "Longer range" : "Best sound"));
         } else if (i - BT_DEV_ROW < S.bt_n) {
             const ui_bt_dev_t *d = &S.bt[i - BT_DEV_ROW];
             snprintf(main, mn, "%s", d->name[0] ? d->name : d->addr);
-            snprintf(meta, tn, "%s", d->connected ? "Connected" : d->paired ? "Paired" : "Pair");
+            snprintf(meta, tn, "%s", tr(d->connected ? "Connected" : d->paired ? "Paired" : "Pair"));
             *playing = d->connected;
         }
         break;
     case L_WIFI:
-        if (!S.hooks.wifi_state) { snprintf(main, mn, "Not available"); break; }
+        if (!S.hooks.wifi_state) { snprintf(main, mn, "%s", tr("Not available")); break; }
         int net, row = wifi_row(i, &net);
         if (row == WR_TOGGLE) {
-            snprintf(main, mn, "Wi-Fi");
-            snprintf(meta, tn, "%s", S.wifi_busy[0] && strcmp(S.wifi_busy, "Searching") ? S.wifi_busy : S.wifi_on ? "On" : "Off");
+            snprintf(main, mn, "%s", tr("Wi-Fi"));
+            snprintf(meta, tn, "%s", tr(S.wifi_busy[0] && strcmp(S.wifi_busy, "Searching") ? S.wifi_busy : S.wifi_on ? "On" : "Off"));
         } else if (row == WR_LINK) {
             const ui_wifi_status_t *st = &S.wifi_st;
             if (st->state == UI_WIFI_CONNECTED) {
@@ -1582,23 +1700,24 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
                 snprintf(meta, tn, "%s", st->ip);
                 *playing = 1;
             } else {
-                snprintf(main, mn, "%s", st->state == UI_WIFI_CONNECTING ? "Connecting" : "Not connected");
+                snprintf(main, mn, "%s", tr(st->state == UI_WIFI_CONNECTING ? "Connecting" : "Not connected"));
                 if (st->state == UI_WIFI_CONNECTING) snprintf(meta, tn, "%.*s", (int)tn - 1, st->ssid);
             }
         } else if (row == WR_SEARCH) {
-            snprintf(main, mn, "Search again");
-            if (!strcmp(S.wifi_busy, "Searching")) snprintf(meta, tn, "Searching");
+            snprintf(main, mn, "%s", tr("Search again"));
+            if (!strcmp(S.wifi_busy, "Searching")) snprintf(meta, tn, "%s", tr("Searching"));
         } else if (net < S.wifi_n) {
             const ui_wifi_net_t *w = &S.wifi[net];
             snprintf(main, mn, "%s", w->ssid);
             const char *sig = w->dbm >= -55 ? "Strong" : w->dbm >= -67 ? "Good" : w->dbm >= -78 ? "Fair" : "Weak";
-            if (w->connected) snprintf(meta, tn, "Connected");
-            else if (w->saved) snprintf(meta, tn, "Saved");
-            else snprintf(meta, tn, "%s%s", sig, w->secured ? "" : ", open");
+            if (w->connected) snprintf(meta, tn, "%s", tr("Connected"));
+            else if (w->saved) snprintf(meta, tn, "%s", tr("Saved"));
+            else if (w->secured) snprintf(meta, tn, "%s", tr(sig));
+            else subst(meta, tn, tr("%s, open"), tr(sig), NULL);
             *playing = w->connected;
         }
         break;
-    case L_WIFI_PASS: { char wheel[3][16]; entry_row(l->kind, main, mn, wheel); break; }
+    case L_WIFI_PASS: { char wheel[3][WHEEL_CAP]; entry_row(l->kind, main, mn, wheel); break; }
     case L_SHARE: {
         const ui_share_t *st = &S.share;
         if (!S.hooks.share_state) { snprintf(main, mn, "Not available"); break; }
@@ -1654,7 +1773,7 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
     }
     case L_HISTORY: snprintf(main, mn, "%s", HISTORY[i]); break;
     case L_RADIO:
-        if (i == 0) { snprintf(main, mn, "Find stations"); break; }
+        if (i == 0) { snprintf(main, mn, "%s", tr("Find stations")); break; }
         snprintf(main, mn, "%s", S.radio[i - 1].name);
         if (rd_on_air(&S.radio[i - 1])) {
             *playing = 1;
@@ -1678,7 +1797,7 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
     case L_RDIR_RESULTS:
     case L_RDIR_SEARCH: {
         int r = i - 1;
-        if (l->kind == L_RDIR_SEARCH && i == 0) { char wheel[3][16]; entry_row(l->kind, main, mn, wheel); break; }
+        if (l->kind == L_RDIR_SEARCH && i == 0) { char wheel[3][WHEEL_CAP]; entry_row(l->kind, main, mn, wheel); break; }
         if (l->kind == L_RDIR_RESULTS && i == 0) {
             snprintf(main, mn, "%s", tr("Random station"));
             if (S.rd_job == RD_JOB_RANDOM && S.rd_job_depth == S.depth) snprintf(meta, tn, "%s", tr("Searching"));
@@ -1700,60 +1819,67 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
         break;
     case L_SIGNAL: if (S.hooks.signal_path) S.hooks.signal_path(i, main, mn, meta, tn); break;
     case L_ABOUT:
-        if (i == list_count(l) - 1) snprintf(main, mn, "Reset all settings");
-        else if (S.hooks.update_do && i == list_count(l) - 2) {
+        switch (about_row(i)) {
+        case AB_RESET: snprintf(main, mn, "Reset all settings"); break;
+        case AB_UNINSTALL: snprintf(main, mn, "Uninstall Fathom"); break;
+        case AB_AUTO:
             snprintf(main, mn, "Check automatically");
             snprintf(meta, tn, "%s", on_off(settings_get_int("update.auto", UI_UPDATE_AUTO_DEFAULT)));
-        } else if (S.hooks.update_do && i == list_count(l) - 3) {
+            break;
+        case AB_CHECK: {
             const char *found = settings_get("update.found", "");   /* (the device's: newer than this one) */
             snprintf(main, mn, "%s", found[0] ? "Update available" : "Check for updates");
             snprintf(meta, tn, "%s", found);
-        } else if (i < S.about_n) {
+            break;
+        }
+        default:
             snprintf(main, mn, "%s", S.about_lbl[i]);
             snprintf(meta, tn, "%s", S.about_val[i]);
+            break;
         }
         break;
     case L_UPDATE: update_row(i, main, mn, meta, tn); break;
+    case L_UNINSTALL: uninstall_row_text(i, main, mn, meta, tn); break;
     case L_BATTERY: case L_BAT_SPAN: case L_BAT_HISTORY: battery_row(l->kind, i, main, mn, meta, tn); break;
     case L_CONTEXT: snprintf(main, mn, "%s", CTX_LABEL[S.ctx[i]]); break;
     case L_INFO: info_row(l->parent, i, main, mn, meta, tn); break;
     case L_SEARCH:
     case L_RENAME:
-        if (i == 0) { char wheel[3][16]; entry_row(l->kind, main, mn, wheel); }
+        if (i == 0) { char wheel[3][WHEEL_CAP]; entry_row(l->kind, main, mn, wheel); }
         else search_row(i - 1, main, mn, meta, tn);
         break;
     case L_PICK_PLAYLIST:
-        if (i == 0) snprintf(main, mn, "New playlist");
+        if (i == 0) snprintf(main, mn, "%s", tr("New playlist"));
         else if (S.lib) library_row(S.lib, LIB_PLAYLISTS, S.pick_pls.ids[i - 1], main, mn, meta, tn);
         break;
     case L_QUEUE: {
         int64_t id = S.player ? player_queue_at(S.player, i) : -1;
         if (S.lib && id >= 0) library_row(S.lib, LIB_PLAYLIST_TRACKS, id, main, mn, meta, tn);
-        if (S.moving && i == l->sel) snprintf(meta, tn, "Moving");
+        if (S.moving && i == l->sel) snprintf(meta, tn, "%s", tr("Moving"));
         break;
     }
     case L_EQ:
         if (i == 0) {
-            snprintf(main, mn, "Off");
-            snprintf(meta, tn, "bit-perfect");
+            snprintf(main, mn, "%s", tr("Off"));
+            snprintf(meta, tn, "%s", tr("bit-perfect"));
             *playing = !S.eq_name[0];
         } else if (i - 1 < S.eq_n) {
             snprintf(main, mn, "%s", S.eq_names[i - 1]);
             *playing = !strcmp(S.eq_names[i - 1], S.eq_name);
         } else {
-            snprintf(main, mn, "New EQ");
+            snprintf(main, mn, "%s", tr("New EQ"));
         }
         break;
     case L_EQ_EDIT: eqe_row(i, main, mn, meta, tn); break;
     case L_EQ_BAND: eqe_band_row((int)l->parent, i, main, mn, meta, tn); break;
     case L_THEMES:
         snprintf(main, mn, "%s", S.themes[i].name);
-        if (S.themes[i].status == THEME_ERROR) snprintf(meta, tn, "can't load");
-        else if (S.themes[i].status == THEME_WARN) snprintf(meta, tn, "warning");
-        else if (i == 0) snprintf(meta, tn, "default");
+        if (S.themes[i].status == THEME_ERROR) snprintf(meta, tn, "%s", tr("can't load"));
+        else if (S.themes[i].status == THEME_WARN) snprintf(meta, tn, "%s", tr("warning"));
+        else if (i == 0) snprintf(meta, tn, "%s", tr("default"));
         *playing = i == S.cur_theme;
         break;
-    default: snprintf(main, mn, "-"); break;
+    default: snprintf(main, mn, "%s", tr("-")); break;
     }
 }
 
@@ -1818,12 +1944,18 @@ static void apply_theme(void)
     style_label(S.h_mode, &lv_font_montserrat_14, t->mode);
     for (int i = 0; i < HDR_SLOTS; i++) style_label(S.h_slot_sym[i], &lv_font_montserrat_14, t->mode);
 
-    int radius = t->corner == THEME_CORNER_ROUND ? t->radius : 0;
+    /* the selection: a pill inside the margins, or a bar edge to edge (square) */
+    int bar = t->selection_bar, pw = bar ? UI_W : UI_W - 2 * ROW_MARGIN;
+    lv_obj_set_x(S.pill, bar ? 0 : ROW_MARGIN);
+    lv_obj_set_width(S.pill, pw);
+    lv_obj_set_x(S.pill_notch[1], pw - STEP);
+    lv_obj_set_x(S.pill_notch[3], pw - STEP);
+    int radius = t->corner == THEME_CORNER_ROUND && !bar ? t->radius : 0;
     lv_obj_set_style_radius(S.pill, radius, 0);
     fill(S.pill, t->select_bg);
     for (int k = 0; k < 4; k++) {
         fill(S.pill_notch[k], t->bg);
-        show(S.pill_notch[k], t->corner == THEME_CORNER_STEPPED);
+        show(S.pill_notch[k], t->corner == THEME_CORNER_STEPPED && !bar);
     }
     show(S.pill_cursor, t->cursor_arrow);
     style_label(S.pill_cursor, &lv_font_montserrat_14, t->select_fg);
@@ -2150,10 +2282,9 @@ static void utf8_of(uint32_t c, char out[5])
 static int ui_text_list(list_kind_t k)
 {
     switch (k) {
-    case L_HOME: case L_HOME_EDIT: case L_HISTORY: case L_SETTINGS: case L_QUICK: case L_DISPLAY: case L_SOUND:
-    case L_INTERFACE: case L_WIFI_ASK:
-    case L_EQ_EDIT: case L_EQ_BAND: case L_SHARE: case L_SSH: case L_USB: case L_PLAYBACK: case L_POWER:
-    case L_LIBRARY: case L_ABOUT: case L_SIGNAL: case L_CONTEXT: case L_INFO: case L_USB_ASK: case L_UPDATE:
+    case L_HOME: case L_HOME_EDIT: case L_HISTORY: case L_SETTINGS: case L_WIFI_ASK:
+    case L_EQ_EDIT: case L_EQ_BAND: case L_SHARE: case L_SSH: case L_ABOUT: case L_CONTEXT: case L_USB_ASK: case L_UPDATE:
+    case L_UNINSTALL:
     case L_RDIR: case L_RDIR_GENRES: case L_BATTERY: case L_BAT_SPAN:
         return 1;
     default:
@@ -2328,7 +2459,7 @@ static void fill_slots(const level_t *l, int n)
         if (ui_text_list(l->kind)) {               /* the UI's own words: translated */
             /* (only when there is a translation: copying a string onto itself is
              * undefined, and the H2's C library leaves it empty) */
-            const char *tm = tr(main), *tt = l->kind != L_INFO ? tr(meta) : meta;   /* (Info: the song's own) */
+            const char *tm = tr(main), *tt = tr(meta);
             if (tm != main) snprintf(main, sizeof main, "%s", tm);
             if (tt != meta) snprintf(meta, sizeof meta, "%s", tt);
         }
@@ -2362,7 +2493,7 @@ static void fill_slots(const level_t *l, int n)
          * while music plays, the equalizer (or dot) takes its place, centred in
          * the icons' column */
         int hid = l->kind == L_HOME ? S.home[i] : l->kind == L_HOME_EDIT ? S.home_order[i] : -1;
-        int pix = hid >= 0 && S.f->family && !strcmp(S.f->family, "arkpixel");
+        int pix = hid >= 0 && T()->icons_pixel;
         int glyph = hid >= 0 && !pix && S.f->icon;
         int col = pix || glyph;
         for (int k = 0; k < 3; k++) {          /* three bars, 11 px across */
@@ -2405,7 +2536,7 @@ static void fill_slots(const level_t *l, int n)
         int typing = is_typing_row(l, i);
         show(S.row_wheel[j], typing);
         if (typing) {
-            char wheel[3][16];
+            char wheel[3][WHEEL_CAP];
             entry_row(l->kind, main, sizeof main, wheel);
             for (int w = 0; w < 3; w++) {
                 set_text(S.row_ch[j][w], wheel[w]);
@@ -2462,8 +2593,8 @@ static void render_list(render_mode_t mode)
     if (l->sel < l->top) l->top = l->sel;
     if (l->sel >= l->top + ROWS) l->top = l->sel - ROWS + 1;
 
-    char head[96];
-    const char *title = ui_text_list(l->kind) || S.depth == 1 ? tr(l->title) : l->title;
+    char head[136];   /* "‹ " and a title of up to 127 bytes */
+    const char *title = l->title_ui ? tr(l->title) : l->title;
     if (S.depth > 1) snprintf(head, sizeof head, "\xe2\x80\xb9 %s", title);  /* "‹ Title" */
     else snprintf(head, sizeof head, "%s", title);
     set_text(S.h_left, head);
@@ -2582,7 +2713,7 @@ static void render_np_radio(void)
 {
     const lib_track_t *t = &S.now.track;
     int art = S.radio_art;
-    int pix = !art && S.f->family && !strcmp(S.f->family, "arkpixel");
+    int pix = !art && T()->icons_pixel;
     if (art && lv_image_get_src(S.np_img) != &S.art_dsc) lv_image_set_src(S.np_img, &S.art_dsc);
     show(S.np_img, art);
     show(S.np_radio_px, pix);
@@ -2901,11 +3032,11 @@ void ui_dac_screen_set(lv_obj_t *scr, const char *format, const char *note, int 
     const theme_t *t = T();
     lv_obj_t *h = lv_obj_get_child(scr, 1), *f = lv_obj_get_child(scr, 2), *n = lv_obj_get_child(scr, 3);
     lv_label_set_text(f, format);
-    lv_label_set_text(n, note);
+    lv_label_set_text(n, tr(note));
     lv_obj_set_style_text_color(n, C(exact ? (t->dark ? 0xA8F0D1 : 0x1E7A55) : t->text_muted), 0);   /* mint */
     show(f, format[0] != '\0');
     show(n, note[0] != '\0');
-    lv_label_set_text(h, hint);
+    lv_label_set_text(h, tr(hint));
     lv_obj_align(h, LV_ALIGN_TOP_MID, 0, format[0] ? 186 : 112);
 }
 
@@ -2922,18 +3053,6 @@ static void update_overlay_close(void)
 
 /* A translated text's "%s" filled in with a, then b: as text, never as a
  * printf format (a translation file could hold anything). */
-static void subst(char *out, size_t cap, const char *fmt, const char *a, const char *b)
-{
-    size_t n = 0;
-    for (const char *p = fmt; *p && n + 1 < cap; p++) {
-        const char *arg = p[0] == '%' && p[1] == 's' ? (a ? a : b ? b : "") : NULL;
-        if (!arg) { out[n++] = *p; continue; }
-        if (a) a = NULL; else b = NULL;
-        while (*arg && n + 1 < cap) out[n++] = *arg++;
-        p++;
-    }
-    out[n] = '\0';
-}
 
 static void update_overlay(void)
 {
@@ -3051,11 +3170,137 @@ static void update_ok(int sel)
     update_look();
     int st = S.upd.state;
     if (st == UI_UPD_AVAILABLE && sel == 0) S.hooks.update_do(UI_UPD_START);
-    else if (st == UI_UPD_FAILED && sel == 0) ui_toast(S.upd.message, 3000);   /* (whole, if the row cuts it) */
+    else if (st == UI_UPD_FAILED && sel == 0) {                  /* (whole, if the row cuts it) */
+        char why[200];
+        update_failure(why, sizeof why);
+        ui_toast(why, 3000);
+    }
     else if (st == UI_UPD_IDLE || st == UI_UPD_LATEST || st == UI_UPD_FAILED) {
         if (!wifi_ask_if_off(WT_OK)) S.hooks.update_do(UI_UPD_CHECK);
     }
     ui_update_changed();
+}
+
+static void pop(void);
+
+/* Uninstall Fathom, over everything:
+ *   made ready: what happens next, until the H2 restarts into HiBy's recovery
+ *   (OK) or it's cancelled (Back);
+ *   no update file on the card: where to get one (OK looks again, Back goes back). */
+static int uni_ov_pending;      /* which of the two is up */
+
+static void uninstall_overlay_close(void)
+{
+    if (S.uni_ov) lv_obj_delete(S.uni_ov);
+    S.uni_ov = NULL;
+}
+
+static void uninstall_overlay(void)
+{
+    level_t *l = &S.stack[S.depth - 1];
+    int pending = S.uni.state == UI_UNI_PENDING, none = S.uni.state == UI_UNI_FAILED && S.uni.no_file;
+    if ((!pending && !none) || l->kind != L_UNINSTALL) { uninstall_overlay_close(); return; }
+    if (S.uni_ov && uni_ov_pending == pending) return;
+    uninstall_overlay_close();
+    uni_ov_pending = pending;
+    const theme_t *t = T();
+    S.uni_ov = box(lv_layer_top(), 0, 0, UI_W, UI_H);
+    fill(S.uni_ov, t->bg);
+    lv_obj_t *col = box(S.uni_ov, 0, 0, UI_W, UI_H - 36);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(col, 12, 0);
+    lv_obj_t *title = lv_label_create(col);
+    style_label(title, S.f->title, t->text);
+    lv_obj_set_width(title, UI_W - 32);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(title, tr(pending ? "Ready to uninstall" : "No update file"));
+    lv_obj_t *body = lv_label_create(col);
+    style_label(body, S.f->body, t->text);
+    lv_obj_set_width(body, UI_W - 32);
+    lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+    /* (each text on one line: tools/lang/strings.py reads them so) */
+    static const char *const ready = "The H2 restarts into HiBy's recovery, which puts HiBy's firmware back. Don't turn it off meanwhile.";
+    static const char *const where = "Get the H2's firmware from HiFi Walker's website (its version or newer) and put the .upt file at the top of the card or in Music.";
+    lv_label_set_text(body, tr(pending ? ready : where));
+    lv_obj_t *hint = lv_label_create(S.uni_ov);
+    style_label(hint, S.f->meta, t->text_muted);
+    lv_obj_set_width(hint, UI_W - 32);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(hint, tr(pending ? "OK restarts, Back cancels" : "OK looks again"));
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -12);
+    /* the text centred in the room above the hint (two lines of it in a wide font) */
+    lv_obj_update_layout(hint);
+    lv_obj_set_height(col, UI_H - 12 - lv_obj_get_height(hint) - 8);
+    lv_obj_set_style_pad_row(col, 8, 0);
+    lv_obj_move_background(S.uni_ov);                /* toasts and the volume bar stay over it */
+}
+
+/* A key while that screen is up: 1 if it was the screen's. */
+static int uninstall_overlay_key(ui_key_t k)
+{
+    switch (k) {
+    case UI_KEY_PLAY: case UI_KEY_PREV: case UI_KEY_NEXT: case UI_KEY_SEEK_BACK: case UI_KEY_SEEK_FWD:
+    case UI_KEY_BRIGHTER: case UI_KEY_DIMMER:
+        return 0;                                   /* the music's and the screen's, as anywhere */
+    case UI_KEY_BACK: case UI_KEY_BACK_LONG:
+        if (uni_ov_pending) S.hooks.uninstall_do(UI_UNI_CANCEL);
+        uninstall_overlay_close();
+        pop();
+        if (uni_ov_pending) ui_toast("Uninstall cancelled", 2000);
+        render(R_ANIMATE);
+        return 1;
+    case UI_KEY_OK:
+        S.hooks.uninstall_do(uni_ov_pending ? UI_UNI_RESTART : UI_UNI_CHECK);
+        ui_uninstall_changed();
+        return 1;
+    default:
+        return 1;
+    }
+}
+
+static void uninstall_ok(int sel)
+{
+    if (!S.hooks.uninstall_do) return;
+    uninstall_look();
+    switch (uninstall_row(sel)) {
+    case UR_LOOK: S.hooks.uninstall_do(UI_UNI_CHECK); break;
+    case UR_GO: {                                   /* press twice */
+        uint32_t now = lv_tick_get();
+        if (S.uni_armed && now - S.uni_armed < 3000) {
+            S.uni_armed = 0;
+            S.hooks.uninstall_do(UI_UNI_APPLY);
+        } else {
+            S.uni_armed = now;
+            ui_toast("Press again to uninstall Fathom", 3000);
+        }
+        break;
+    }
+    case UR_STATUS:
+        if (S.uni.state == UI_UNI_FAILED) {         /* (whole, if the row cuts it) */
+            char why[200];
+            uninstall_failure(why, sizeof why);
+            ui_toast(why, 3000);
+        }
+        break;
+    default: break;
+    }
+    ui_uninstall_changed();
+}
+
+void ui_uninstall_changed(void)
+{
+    uninstall_look();
+    uninstall_overlay();
+    level_t *l = &S.stack[S.depth - 1];
+    if (l->kind != L_UNINSTALL || S.now_playing_view) return;
+    int n = list_count(l), sel = l->sel;
+    if (l->sel >= n) l->sel = n - 1;
+    if (l->sel < 0) l->sel = 0;
+    render(l->sel != sel ? R_SNAP : R_CONTENT);   /* (the list got shorter under the selection: it moves) */
 }
 
 void ui_update_changed(void)
@@ -3064,9 +3309,9 @@ void ui_update_changed(void)
     update_overlay();
     level_t *l = &S.stack[S.depth - 1];
     if (l->kind != L_UPDATE || S.now_playing_view) return;
-    int n = list_count(l);
+    int n = list_count(l), sel = l->sel;
     if (l->sel >= n) l->sel = n - 1;
-    render(R_CONTENT);
+    render(l->sel != sel ? R_SNAP : R_CONTENT);   /* (Try again: the list got shorter under the selection) */
 }
 
 void ui_set_radio_art(const uint16_t *px)
@@ -3218,12 +3463,25 @@ static const char *row_help(const level_t *l)
              : i == 3 || i == 4 ? "Username and password for SSH."
              : "Generate a new password.";
     case L_ABOUT:
-        if (i == n - 1) return "Reset all settings to defaults. Press <OK> twice.";
-        if (S.hooks.update_do && i == n - 2) return "Check for updates once a day over Wi-Fi.";
-        if (S.hooks.update_do && i == n - 3) return "Check for a newer version of Fathom.";
-        if (i < S.about_n && !strcmp(S.about_lbl[i], "Clock")) return "Set from the internet over Wi-Fi. In UTC.";
-        if (i < S.about_n && !strcmp(S.about_lbl[i], "Charge cycles")) return "Battery wear, in full charges used.";
-        return NULL;
+        if (i >= n) return NULL;
+        switch (about_row(i)) {
+        case AB_RESET: return "Reset all settings to defaults. Press <OK> twice.";
+        case AB_UNINSTALL: return "Put the H2 back on HiBy's own firmware.";
+        case AB_AUTO: return "Check for updates once a day over Wi-Fi.";
+        case AB_CHECK: return "Check for a newer version of Fathom.";
+        default:
+            if (!strcmp(S.about_lbl[i], "Clock")) return "Set from the internet over Wi-Fi. In UTC.";
+            if (!strcmp(S.about_lbl[i], "Charge cycles")) return "Battery wear, in full charges used.";
+            return NULL;
+        }
+    case L_UNINSTALL:
+        if (i >= n) return NULL;
+        switch (uninstall_row(i)) {
+        case UR_LOOK: return "Put HiBy's update file for the H2 at the top of the card or in Music.";
+        case UR_VERSION: return "Use your H2's version of HiBy's firmware, or a newer one.";
+        case UR_GO: return "Press <OK> twice. Your music stays on the card.";
+        default: return NULL;
+        }
     default:
         return is_setting_level(l->kind) && l->kind != L_QUICK && i < n ? setting_help(setting_at(l, i)) : NULL;
     }
@@ -3285,11 +3543,12 @@ void ui_level(const char *text, int value, int max, const char *value_text)
     lv_obj_set_style_bg_opa(S.lvl_bar, LV_OPA_COVER, LV_PART_INDICATOR);   /* (no theme to set it) */
     lv_bar_set_range(S.lvl_bar, 0, max);
     lv_bar_set_value(S.lvl_bar, value, LV_ANIM_OFF);
-    if (value_text) lv_label_set_text_fmt(S.lvl_lbl, "%s  %s", text, value_text);
-    else lv_label_set_text_fmt(S.lvl_lbl, "%s  %d / %d", text, value, max);
+    if (value_text) lv_label_set_text_fmt(S.lvl_lbl, "%s  %s", tr(text), value_text);
+    else lv_label_set_text_fmt(S.lvl_lbl, "%s  %d / %d", tr(text), value, max);
     lv_obj_remove_flag(S.lvl, LV_OBJ_FLAG_HIDDEN);
     lv_obj_align(S.lvl, LV_ALIGN_BOTTOM_MID, 0, -16);
     if (S.toast) lv_obj_add_flag(S.toast, LV_OBJ_FLAG_HIDDEN);   /* one overlay at a time */
+    S.help_shown = 0;   /* (a help it hid: the next Menu isn't "put it away") */
     if (S.lvl_timer) lv_timer_reset(S.lvl_timer);
     else {
         S.lvl_timer = lv_timer_create(level_hide, 1200, NULL);
@@ -3339,13 +3598,23 @@ static void render(render_mode_t mode)
 
 /* ---------- navigation ---------- */
 
-static void push(list_kind_t kind, const char *title, int64_t parent)
+static void push_as(list_kind_t kind, const char *title, int64_t parent, int ui)
 {
     if (S.depth >= (int)(sizeof S.stack / sizeof S.stack[0])) return;
+    /* A screen over a value being changed (quick settings, the USB question):
+     * the change ends as OK would end it, an EQ's saved. Left on, the wheel
+     * went on changing it from the new screen, and backing out of that
+     * dropped an EQ change. */
+    if (S.editing && S.depth > 0) {
+        list_kind_t under = S.stack[S.depth - 1].kind;
+        if (under == L_EQ_EDIT || under == L_EQ_BAND) eqe_changed(1);
+        S.editing = 0;
+    }
     level_t *l = &S.stack[S.depth++];
     memset(l, 0, sizeof *l);
     l->kind = kind;
     snprintf(l->title, sizeof l->title, "%s", title);
+    l->title_ui = ui;
     l->parent = parent;
     if (kind == L_CREDIT_TRACKS || kind == L_COMPOSER_TRACKS) return;   /* push_*_tracks() fills it */
     if (library_backed(kind) && S.lib) library_list(S.lib, view_of(kind), parent, &l->items);
@@ -3457,10 +3726,11 @@ static void rd_ask(const rdir_query_t *q)
 }
 
 /* Open a list of stations (a genre, a country, Popular); a genre or a country
- * is what Random station plays from next (by: "tag", "country"; NULL: any). */
-static void rd_open_results(const char *title, const rdir_query_t *q, const char *by)
+ * is what Random station plays from next (by: "tag", "country"; NULL: any);
+ * ui: the title is the UI's own words (Popular, a genre), not a country. */
+static void rd_open_results(const char *title, int ui, const rdir_query_t *q, const char *by)
 {
-    push(L_RDIR_RESULTS, title, 0);
+    push_as(L_RDIR_RESULTS, title, 0, ui);   /* (a genre's kept in English: shown translated) */
     rd_free_list();
     S.rd_q = *q;
     char v[160] = "";
@@ -3588,6 +3858,7 @@ static void pop_level(int stay)
     if (S.editing && (l->kind == L_EQ_EDIT || l->kind == L_EQ_BAND)) eqe_changed(1);   /* mid-edit: keep it */
     if (l->kind == L_EQ_BAND) qsort(S.eqe.band, (size_t)S.eqe.n, sizeof S.eqe.band[0], band_by_freq);
     if (l->kind == L_EQ_EDIT && S.hooks.eq_preview) S.hooks.eq_preview(NULL);         /* the output's own choice */
+    if (l->kind == L_UNINSTALL) uninstall_overlay_close();
     library_list_free(&l->items);
     S.depth--;
     S.editing = 0;
@@ -3602,11 +3873,11 @@ static void pop_level(int stay)
 static void pop(void) { pop_level(0); }
 
 /* Open an overlay-like level (quick settings, context menu) from wherever we are. */
-static void push_from_here(list_kind_t kind, const char *title, int64_t parent)
+static void push_from_here(list_kind_t kind, const char *title, int64_t parent, int ui)
 {
     int from_np = S.now_playing_view;
     S.now_playing_view = 0;
-    push(kind, title, parent);
+    push_as(kind, title, parent, ui);
     S.stack[S.depth - 1].back_to_np = from_np;
 }
 
@@ -3622,7 +3893,7 @@ static int wifi_ask_if_off(int then)
     if (S.stack[S.depth - 1].kind == L_WIFI_ASK) return 1;
     S.wifi_then.what = then;
     S.wifi_then.armed = 0;
-    push_from_here(L_WIFI_ASK, "Turn on Wi-Fi?", 0);
+    push_from_here(L_WIFI_ASK, "Turn on Wi-Fi?", 0, 1);
     return 1;
 }
 
@@ -3647,7 +3918,7 @@ void ui_usb_prompt(void)
 {
     if (S.stack[S.depth - 1].kind == L_USB_ASK) return;
     if (S.stack[S.depth - 1].kind == L_CONTEXT) pop_level(1);
-    push_from_here(L_USB_ASK, "Connected to a computer", 0);
+    push_from_here(L_USB_ASK, "Connected to a computer", 0, 1);
     render(R_ANIMATE);
 }
 
@@ -3658,11 +3929,20 @@ void ui_usb_prompt_close(void)
     render(R_ANIMATE);
 }
 
+static void reset_restart(lv_timer_t *t)
+{
+    (void)t;
+    if (S.hooks.restart) S.hooks.restart();
+}
+
 static void open_quick(void)
 {
-    if (S.stack[S.depth - 1].kind == L_QUICK) return;
+    if (S.stack[S.depth - 1].kind == L_QUICK) {   /* left open under Now Playing: show it */
+        S.now_playing_view = 0;
+        return;
+    }
     if (S.stack[S.depth - 1].kind == L_CONTEXT) pop_level(1);
-    push_from_here(L_QUICK, "Quick settings", 0);
+    push_from_here(L_QUICK, "Quick settings", 0, 1);
 }
 
 /* The tracks a context menu acts on (one track, an album, a playlist). */
@@ -3693,12 +3973,19 @@ static int open_context(void)
     S.ctx_plpos = -1;
     char title[128] = "";
     int on_np = S.now_playing_view;
+    /* A menu or quick settings left open under Now Playing (long Back): put
+     * it away first, or a second menu went on top and the first, uncovered
+     * later, showed one item's title with the other's actions. */
+    while (on_np && S.depth > 1 &&
+           (S.stack[S.depth - 1].kind == L_CONTEXT || S.stack[S.depth - 1].kind == L_QUICK))
+        pop_level(1);
+    l = &S.stack[S.depth - 1];
     if (l->kind == L_BLUETOOTH && !on_np) {   /* Settings > Bluetooth: forget a paired device */
         int d = l->sel - BT_DEV_ROW;
         if (d < 0 || d >= S.bt_n || !S.bt[d].paired) return -1;
         snprintf(S.ctx_bt, sizeof S.ctx_bt, "%s", S.bt[d].addr);
         CTX_ADD(CTX_BT_FORGET);
-        push_from_here(L_CONTEXT, S.bt[d].name[0] ? S.bt[d].name : S.bt[d].addr, 0);
+        push_from_here(L_CONTEXT, S.bt[d].name[0] ? S.bt[d].name : S.bt[d].addr, 0, 0);
         return 0;
     }
     if (l->kind == L_WIFI && !on_np) {        /* Settings > Wi-Fi: forget a saved network */
@@ -3706,7 +3993,7 @@ static int open_context(void)
         if (wifi_row(l->sel, &w) != WR_NET || w >= S.wifi_n || !S.wifi[w].saved) return -1;
         snprintf(S.ctx_wifi, sizeof S.ctx_wifi, "%s", S.wifi[w].ssid);
         CTX_ADD(CTX_WIFI_FORGET);
-        push_from_here(L_CONTEXT, S.wifi[w].ssid, 0);
+        push_from_here(L_CONTEXT, S.wifi[w].ssid, 0, 0);
         return 0;
     }
     if (l->kind == L_EQ && !on_np) {          /* Settings > Sound > EQ: edit one */
@@ -3716,7 +4003,7 @@ static int open_context(void)
     }
     if (l->kind == L_HOME_EDIT && !on_np) {   /* Settings > Home: move an item */
         CTX_ADD(CTX_HOME_MOVE);
-        push_from_here(L_CONTEXT, HOME[S.home_order[l->sel]], 0);
+        push_from_here(L_CONTEXT, HOME[S.home_order[l->sel]], 0, 1);
         return 0;
     }
     /* the radio: a station of yours, one in the directory, or the one playing */
@@ -3740,7 +4027,7 @@ static int open_context(void)
         else if (!yours && S.hooks.radio_add) CTX_ADD(CTX_RADIO_ADD);
         if (!S.ctx_n) return -1;
         S.rd_del_armed = 0;
-        push_from_here(L_CONTEXT, S.rd_ctx.name, 0);
+        push_from_here(L_CONTEXT, S.rd_ctx.name, 0, 0);
         return 0;
     }
     if (on_np && S.now.radio) return -1;
@@ -3792,7 +4079,7 @@ static int open_context(void)
         CTX_ADD(CTX_PLAY); CTX_ADD(CTX_PLAY_NEXT); CTX_ADD(CTX_ADD_QUEUE); CTX_ADD(CTX_ADD_PLAYLIST);
         if (S.ctx_artist && !(l->kind == L_ARTIST_ALBUMS && l->parent == S.ctx_artist)) CTX_ADD(CTX_GO_ARTIST);
     }
-    push_from_here(L_CONTEXT, title, 0);
+    push_from_here(L_CONTEXT, title, 0, 0);
     return 0;
 }
 
@@ -3815,7 +4102,7 @@ static void run_context(ctx_action_t a)
                 if (a == CTX_PLAY_NEXT) player_play_next(S.player, tr.ids, tr.n);
                 else player_add_to_queue(S.player, tr.ids, tr.n);
                 if (n == 1) snprintf(msg, sizeof msg, a == CTX_PLAY_NEXT ? "Playing next" : "Added to queue");
-                else snprintf(msg, sizeof msg, a == CTX_PLAY_NEXT ? "%d songs play next" : "%d songs added to queue", n);
+                else tr_num(msg, sizeof msg, a == CTX_PLAY_NEXT ? "%s songs play next" : "%s songs added to queue", n);
                 ui_toast(msg, 1500);
             }
         }
@@ -3824,7 +4111,7 @@ static void run_context(ctx_action_t a)
     }
     case CTX_SHOW_QUEUE:
         pop_level(1);
-        push(L_QUEUE, "Queue", 0);
+        push_ui(L_QUEUE, "Queue", 0);
         S.stack[S.depth - 1].back_to_np = from_np;
         break;
     case CTX_GO_ALBUM:
@@ -3847,7 +4134,7 @@ static void run_context(ctx_action_t a)
         break;
     case CTX_INFO:
         pop_level(1);
-        push(L_INFO, "Info", track);
+        push_ui(L_INFO, "Info", track);
         S.stack[S.depth - 1].back_to_np = from_np;
         break;
     case CTX_Q_PLAY:
@@ -3878,7 +4165,7 @@ static void run_context(ctx_action_t a)
         for (int i = 0; S.pick_pls.ids && i < all.n; i++)
             if (library_playlist_writable(S.lib, all.ids[i])) S.pick_pls.ids[S.pick_pls.n++] = all.ids[i];
         library_list_free(&all);
-        push(L_PICK_PLAYLIST, "Add to playlist", 0);
+        push_ui(L_PICK_PLAYLIST, "Add to playlist", 0);
         S.stack[S.depth - 1].back_to_np = from_np;
         break;
     }
@@ -3943,7 +4230,7 @@ static void run_context(ctx_action_t a)
         pop_level(1);
         library_playlist_name(S.lib, S.rename_id, S.entry, sizeof S.entry);
         S.entry_ch = 0;
-        push(L_RENAME, "Rename playlist", 0);
+        push_ui(L_RENAME, "Rename playlist", 0);
         break;
     case CTX_PL_DELETE: {
         uint32_t now = lv_tick_get();
@@ -3987,11 +4274,11 @@ static void shuffle_prefs_apply(void)
 {
     if (!S.player) return;
     player_shuffle_prefs_t sp = {
-        .albums = settings_get_int("shuffle.albums", 0),
-        .freshness = settings_get_int("shuffle.freshness", 1),
-        .skip_interludes = settings_get_int("shuffle.skip_interludes", 1),
+        .albums = settings_get_int("shuffle.albums", UI_SHUF_ALBUMS_DEFAULT),
+        .freshness = settings_get_int("shuffle.freshness", UI_SHUF_FRESH_DEFAULT),
+        .skip_interludes = settings_get_int("shuffle.skip_interludes", UI_SHUF_INTERLUDES_DEFAULT),
         .exclude_spoken = settings_get_int("shuffle.exclude_spoken", UI_EXCLUDE_SPOKEN_DEFAULT),
-        .keep_works = settings_get_int("shuffle.keep_works", 0),
+        .keep_works = settings_get_int("shuffle.keep_works", UI_SHUF_WORKS_DEFAULT),
     };
     player_set_shuffle_prefs(S.player, &sp);
 }
@@ -4002,7 +4289,7 @@ static void setting_ok(setting_t st)
     case ST_BATTERY:                       /* its history */
         if (!S.hooks.battery_report) break;
         battery_load();
-        push(L_BATTERY, "Battery", 0);
+        push_ui(L_BATTERY, "Battery", 0);
         break;
     case ST_BRIGHTNESS: S.editing = !S.editing; break;
     case ST_PURE: if (S.hooks.pure_toggle) S.hooks.pure_toggle(); break;
@@ -4019,7 +4306,7 @@ static void setting_ok(setting_t st)
         break;
     }
     case ST_TRANSPORT: if (S.hooks.transport_toggle) S.hooks.transport_toggle(); break;
-    case ST_OUTPUT: if (S.hooks.signal_path) push(L_SIGNAL, "Signal path", 0); break;
+    case ST_OUTPUT: if (S.hooks.signal_path) push_ui(L_SIGNAL, "Signal path", 0); break;
     case ST_BALANCE: case ST_VOL_LIMIT:
         if (st == ST_BALANCE && S.pure) { ui_toast("Bypassed in Pure mode", 1500); break; }
         if (S.hooks.sound_adjust && S.hooks.sound_adjust(st == ST_BALANCE ? UI_SOUND_BALANCE : UI_SOUND_LIMIT, 0) == 0)
@@ -4035,10 +4322,10 @@ static void setting_ok(setting_t st)
         break;
     }
     case ST_STOP_AFTER: if (S.player) player_set_stop_after(S.player, !player_stop_after(S.player)); break;
-    case ST_DIM: settings_set_int("display.dim", !settings_get_int("display.dim", 1)); break;
-    case ST_ON_CHARGING: settings_set_int("display.on_charging", !settings_get_int("display.on_charging", 0)); break;
+    case ST_DIM: settings_set_int("display.dim", !settings_get_int("display.dim", UI_DIM_DEFAULT)); break;
+    case ST_ON_CHARGING: settings_set_int("display.on_charging", !settings_get_int("display.on_charging", UI_ON_CHARGING_DEFAULT)); break;
     case ST_COVERS: settings_set_int("display.covers", (settings_get_int("display.covers", UI_COVERS_DEFAULT) + 1) & 3); break;
-    case ST_THEME: push(L_THEMES, "Theme", 0); break;
+    case ST_THEME: push_ui(L_THEMES, "Theme", 0); break;
     case ST_ALBUM_ARTISTS:
         settings_set_int("display.album_artists", !album_artists_on());
         library_set_album_artists(S.lib, album_artists_on());
@@ -4047,7 +4334,7 @@ static void setting_ok(setting_t st)
     case ST_EQ: {                          /* the profiles, for the output playing now */
         if (S.pure) { ui_toast("Bypassed in Pure mode", 1500); break; }
         char t[80];
-        snprintf(t, sizeof t, "EQ: %s", S.eq_out[0] ? S.eq_out : "this output");
+        subst(t, sizeof t, tr("EQ: %s"), S.eq_out[0] ? S.eq_out : tr("this output"), NULL);
         push(L_EQ, t, 0);
         break;
     }
@@ -4060,18 +4347,22 @@ static void setting_ok(setting_t st)
         if (S.lib) library_rg_progress(S.lib, &done, &total);
         if (v != LEVEL_OFF && done < total) {
             char msg[96];
-            snprintf(msg, sizeof msg, "%d of %d tracks measured: the rest while charging", done, total);
+            char d[16], n[16];
+            snprintf(d, sizeof d, "%d", done);
+            snprintf(n, sizeof n, "%d", total);
+            subst(msg, sizeof msg, tr("%s of %s tracks measured: the rest while charging"), d, n);
             ui_toast(msg, 3000);
         }
         break;
     }
     case ST_PAUSE_UNPLUG:
-        settings_set_int("playback.pause_on_unplug", !settings_get_int("playback.pause_on_unplug", 1));
+        settings_set_int("playback.pause_on_unplug", !settings_get_int("playback.pause_on_unplug", UI_PAUSE_ON_UNPLUG_DEFAULT));
         break;
     case ST_SHUF_BY: case ST_SHUF_FRESH: case ST_SHUF_INTERLUDES: case ST_SHUF_WORKS: case ST_SHUF_SPOKEN: {
         static const char *const key[] = {"shuffle.albums", "shuffle.freshness", "shuffle.skip_interludes",
                                           "shuffle.keep_works", "shuffle.exclude_spoken"};
-        static const int def[] = {0, 1, 1, 0, UI_EXCLUDE_SPOKEN_DEFAULT};
+        static const int def[] = {UI_SHUF_ALBUMS_DEFAULT, UI_SHUF_FRESH_DEFAULT, UI_SHUF_INTERLUDES_DEFAULT,
+                                  UI_SHUF_WORKS_DEFAULT, UI_EXCLUDE_SPOKEN_DEFAULT};
         int k = (int)(st - ST_SHUF_BY);
         settings_set_int(key[k], !settings_get_int(key[k], def[k]));
         shuffle_prefs_apply();
@@ -4079,7 +4370,7 @@ static void setting_ok(setting_t st)
         break;
     }
     case ST_AUTO_OFF: {
-        int cur = settings_get_int("power.auto_off", 15), n = (int)(sizeof AUTO_OFFS / sizeof AUTO_OFFS[0]), i = 0;
+        int cur = settings_get_int("power.auto_off", UI_AUTO_OFF_DEFAULT), n = (int)(sizeof AUTO_OFFS / sizeof AUTO_OFFS[0]), i = 0;
         while (i < n && AUTO_OFFS[i] != cur) i++;
         settings_set_int("power.auto_off", AUTO_OFFS[i < n ? (i + 1) % n : 1]);
         break;
@@ -4095,7 +4386,7 @@ static void setting_ok(setting_t st)
     }
     case ST_USB_DAC: if (S.hooks.usb_dac) S.hooks.usb_dac(); break;
     case ST_BT: if (S.hooks.bt_do) S.hooks.bt_do(UI_BT_TOGGLE, NULL); break;
-    case ST_BT_DEVICE: push(L_BLUETOOTH, "Bluetooth", 0); break;   /* the devices, and on/off */
+    case ST_BT_DEVICE: push_ui(L_BLUETOOTH, "Bluetooth", 0); break;   /* the devices, and on/off */
     case ST_WIFI:
         if (S.hooks.wifi_do) {
             S.hooks.wifi_do(UI_WIFI_TOGGLE, NULL, NULL);
@@ -4103,7 +4394,7 @@ static void setting_ok(setting_t st)
         }
         break;
     case ST_WIFI_NET:
-        push(L_WIFI, "Wi-Fi", 0);
+        push_ui(L_WIFI, "Wi-Fi", 0);
         if (S.hooks.wifi_do) S.hooks.wifi_do(UI_WIFI_SCAN, NULL, NULL);
         break;
     default: break;
@@ -4123,32 +4414,32 @@ static void open_selected(void)
         case H_SHUFFLE:
             if (S.player) { player_shuffle_all(S.player); S.now_playing_view = 1; }
             break;
-        case H_ALBUMS: push(L_ALBUMS, "Albums", 0); break;
-        case H_ARTISTS: push(L_ARTISTS, "Artists", 0); break;
-        case H_ALBUM_ARTISTS: push(L_ALBUM_ARTISTS, "Album artists", 0); break;
-        case H_SONGS: push(L_SONGS, "Songs", 0); break;
-        case H_PLAYLISTS: push(L_PLAYLISTS, "Playlists", 0); break;
-        case H_GENRES: push(L_GENRES, "Genres", 0); break;
-        case H_COMPOSERS: push(L_COMPOSERS, "Composers", 0); break;
-        case H_YEARS: push(L_YEARS, "Years", 0); break;
-        case H_FOLDERS: push(L_FOLDER, "Folders", 0); break;
+        case H_ALBUMS: push_ui(L_ALBUMS, "Albums", 0); break;
+        case H_ARTISTS: push_ui(L_ARTISTS, "Artists", 0); break;
+        case H_ALBUM_ARTISTS: push_ui(L_ALBUM_ARTISTS, "Album artists", 0); break;
+        case H_SONGS: push_ui(L_SONGS, "Songs", 0); break;
+        case H_PLAYLISTS: push_ui(L_PLAYLISTS, "Playlists", 0); break;
+        case H_GENRES: push_ui(L_GENRES, "Genres", 0); break;
+        case H_COMPOSERS: push_ui(L_COMPOSERS, "Composers", 0); break;
+        case H_YEARS: push_ui(L_YEARS, "Years", 0); break;
+        case H_FOLDERS: push_ui(L_FOLDER, "Folders", 0); break;
         case H_SEARCH:
             S.entry[0] = '\0';
             S.entry_ch = 0;
             search_run();
-            push(L_SEARCH, "Search", 0);
+            push_ui(L_SEARCH, "Search", 0);
             break;
-        case H_FAVOURITES: push(L_FAVOURITES, "Favourites", 0); break;
-        case H_RECENT_ADDED: push(L_RECENT_ADDED, "Recently added", 0); break;
-        case H_HISTORY: push(L_HISTORY, "History", 0); break;
+        case H_FAVOURITES: push_ui(L_FAVOURITES, "Favourites", 0); break;
+        case H_RECENT_ADDED: push_ui(L_RECENT_ADDED, "Recently added", 0); break;
+        case H_HISTORY: push_ui(L_HISTORY, "History", 0); break;
         case H_RADIO:   /* the station playing selected, else your first */
             S.radio_n = S.hooks.radio_stations ? S.hooks.radio_stations(S.radio, RADIO_MAX) : -1;
-            push(L_RADIO, "Radio", 0);
+            push_ui(L_RADIO, "Radio", 0);
             S.stack[S.depth - 1].sel = S.radio_n > 0 ? 1 : 0;
             for (int i = 0; i < S.radio_n; i++)
                 if (rd_on_air(&S.radio[i])) { S.stack[S.depth - 1].sel = i + 1; break; }
             break;
-        case H_SETTINGS: push(L_SETTINGS, "Settings", 0); break;
+        case H_SETTINGS: push_ui(L_SETTINGS, "Settings", 0); break;
         }
         break;
     case L_ALBUMS:
@@ -4183,10 +4474,10 @@ static void open_selected(void)
             free(songs);
         }
         break;
-    case L_HISTORY: push(l->sel == 0 ? L_RECENT_PLAYED : L_MOST_PLAYED, HISTORY[l->sel], 0); break;
+    case L_HISTORY: push_ui(l->sel == 0 ? L_RECENT_PLAYED : L_MOST_PLAYED, HISTORY[l->sel], 0); break;
     case L_RADIO: {
         if (l->sel == 0) {                       /* Find stations */
-            push(L_RDIR, "Find stations", 0);
+            push_ui(L_RDIR, "Find stations", 0);
             break;
         }
         int i = l->sel - 1;
@@ -4207,7 +4498,7 @@ static void open_selected(void)
             S.entry[0] = '\0';
             S.entry_ch = 0;
             S.ok_added = 0;
-            push(L_RDIR_SEARCH, tr("Search by name"), 0);
+            push_ui(L_RDIR_SEARCH, "Search by name", 0);
             rd_free_list();
             break;
         case RD_MENU_RANDOM: {
@@ -4218,12 +4509,12 @@ static void open_selected(void)
         }
         case RD_MENU_POPULAR: {
             rdir_query_t q = {.by = RDIR_POPULAR};
-            rd_open_results(tr("Popular"), &q, NULL);
+            rd_open_results("Popular", 1, &q, NULL);
             break;
         }
-        case RD_MENU_GENRES: push(L_RDIR_GENRES, "Genres", 0); break;
+        case RD_MENU_GENRES: push_ui(L_RDIR_GENRES, "Genres", 0); break;
         case RD_MENU_COUNTRIES:
-            push(L_RDIR_COUNTRIES, tr("Countries"), 0);
+            push_ui(L_RDIR_COUNTRIES, "Countries", 0);
             rd_ask(NULL);
             break;
         }
@@ -4232,7 +4523,7 @@ static void open_selected(void)
         if (l->sel < RDIR_N_GENRES) {
             rdir_query_t q = {.by = RDIR_TAG};
             rdir_genre_tag(l->sel, q.arg, sizeof q.arg);
-            rd_open_results(tr(RDIR_GENRES[l->sel]), &q, "tag");
+            rd_open_results(RDIR_GENRES[l->sel], 1, &q, "tag");
         }
         break;
     case L_RDIR_COUNTRIES:
@@ -4240,7 +4531,7 @@ static void open_selected(void)
             rdir_query_t q = {.by = RDIR_COUNTRY};
             snprintf(q.arg, sizeof q.arg, "%s", S.rd_cty[l->sel].code);
             snprintf(name, sizeof name, "%s", S.rd_cty[l->sel].name);
-            rd_open_results(name, &q, "country");
+            rd_open_results(name, 0, &q, "country");
         } else if (!S.rd_job && S.rd_state == RD_FAILED) {
             rd_ask(NULL);                        /* try again */
         }
@@ -4314,7 +4605,9 @@ static void open_selected(void)
         } else if (row == WR_LINK) {
             if (S.wifi_st.state == UI_WIFI_CONNECTED) {
                 char t[80];
-                snprintf(t, sizeof t, "%s, signal %d dBm", S.wifi_st.ip, S.wifi_st.dbm);
+                char dbm[16];
+                snprintf(dbm, sizeof dbm, "%d", S.wifi_st.dbm);
+                subst(t, sizeof t, tr("%s, signal %s dBm"), S.wifi_st.ip, dbm);
                 ui_toast(t, 2500);
             }
         } else if (row == WR_SEARCH) {
@@ -4328,7 +4621,7 @@ static void open_selected(void)
                 memset(S.entry, 0, sizeof S.entry);
                 S.entry_ch = 0;
                 char t[80];
-                snprintf(t, sizeof t, "Password for %s", w->ssid);
+                subst(t, sizeof t, tr("Password for %s"), w->ssid, NULL);
                 push(L_WIFI_PASS, t, 0);
                 ui_toast("Play adds a letter, Menu: a A 0 !", 2500);
             }
@@ -4375,7 +4668,7 @@ static void open_selected(void)
         else if (l->sel == 1) S.hooks.bt_do(UI_BT_SCAN, NULL);
         else if (l->sel == 2) {
             S.hooks.bt_do(UI_BT_RANGE, NULL);
-            ui_toast(settings_get_int("bluetooth.range", 0) ? "Longer range: lower bitrate, no aptX. Reconnecting"
+            ui_toast(settings_get_int("bluetooth.range", UI_BT_RANGE_DEFAULT) ? "Longer range: lower bitrate, no aptX. Reconnecting"
                                                             : "Best sound. Reconnecting", 2500);
         }
         else if (l->sel - BT_DEV_ROW < S.bt_n) S.hooks.bt_do(UI_BT_PRESS, S.bt[l->sel - BT_DEV_ROW].addr);
@@ -4383,22 +4676,28 @@ static void open_selected(void)
     case L_SETTINGS: {
         static const list_kind_t sub[] = {L_INTERFACE, L_HOME_EDIT, L_DISPLAY, L_SOUND, L_BLUETOOTH, L_WIFI, L_SHARE, L_SSH,
                                           L_USB, L_PLAYBACK, L_POWER, L_LIBRARY, L_ABOUT};
-        push(sub[l->sel], SETTINGS[l->sel], 0);
+        push_ui(sub[l->sel], SETTINGS[l->sel], 0);
         if (sub[l->sel] == L_HOME_EDIT) ui_toast("OK shows or hides. Menu: Move", 2500);
         if (sub[l->sel] == L_WIFI && S.hooks.wifi_do) S.hooks.wifi_do(UI_WIFI_SCAN, NULL, NULL);   /* fresh networks */
         break;
     }
     case L_ABOUT:
-        if (S.hooks.update_do && l->sel == list_count(l) - 3) {   /* Check for updates: from here, or */
+        if (about_row(l->sel) == AB_CHECK) {           /* Check for updates: from here, or */
             if (wifi_ask_if_off(WT_OK)) break;
             S.hooks.update_do(UI_UPD_CHECK);
-            push(L_UPDATE, "Updates", 0);
-        } else if (S.hooks.update_do && l->sel == list_count(l) - 2) {   /* by itself (off by default) */
+            push_ui(L_UPDATE, "Updates", 0);
+        } else if (about_row(l->sel) == AB_AUTO) {     /* by itself (on by default) */
             int on = !settings_get_int("update.auto", UI_UPDATE_AUTO_DEFAULT);
             settings_set_int("update.auto", on);
             settings_save();
             if (on) ui_toast("Once a day, while the H2 rests on Wi-Fi", 3000);
-        } else if (l->sel == list_count(l) - 1) {   /* Reset all settings: press twice */
+        } else if (about_row(l->sel) == AB_UNINSTALL) {
+            uninstall_look();
+            if (S.uni.state != UI_UNI_PENDING) S.hooks.uninstall_do(UI_UNI_CHECK);
+            S.uni_armed = 0;
+            push_ui(L_UNINSTALL, "Uninstall Fathom", 0);
+            ui_uninstall_changed();
+        } else if (about_row(l->sel) == AB_RESET) {   /* Reset all settings: press twice */
             uint32_t now = lv_tick_get();
             if (S.reset_armed && now - S.reset_armed < 3000) {
                 S.reset_armed = 0;
@@ -4411,7 +4710,15 @@ static void open_selected(void)
                 if (S.hooks.brightness) S.hooks.brightness(brightness());
                 if (S.hooks.screen_timeout) S.hooks.screen_timeout(screen_timeout());
                 ui_set_theme(0);
-                ui_toast("Settings reset", 1500);
+                if (S.hooks.restart) {
+                    /* the rest (language, sound, levelling, shuffle, Wi-Fi...) is
+                     * set at start: start again, once the message has been seen */
+                    ui_toast("Settings reset. Starting again", 2000);
+                    lv_timer_t *rt = lv_timer_create(reset_restart, 1500, NULL);
+                    if (rt) lv_timer_set_repeat_count(rt, 1);
+                } else {
+                    ui_toast("Settings reset", 1500);
+                }
             } else {
                 S.reset_armed = now;
                 ui_toast("Press again to reset all settings", 3000);
@@ -4419,6 +4726,7 @@ static void open_selected(void)
         }
         break;
     case L_UPDATE: update_ok(l->sel); break;
+    case L_UNINSTALL: uninstall_ok(l->sel); break;
     case L_BATTERY:
         if (l->sel == 0) {                         /* the range: 24 hours or 7 days */
             S.bat_days = S.bat_days == 7 ? 1 : 7;
@@ -4426,9 +4734,9 @@ static void open_selected(void)
         } else if (l->sel == 1) {
             if (!S.bat.have_since) { ui_toast("Not since a full charge yet", 2000); break; }
             S.bat_span = -1;
-            push(L_BAT_SPAN, "Since full charge", 0);
+            push_ui(L_BAT_SPAN, "Since full charge", 0);
         } else if (S.bat.nspans) {
-            push(L_BAT_HISTORY, "History", 0);
+            push_ui(L_BAT_HISTORY, "History", 0);
         }
         break;
     case L_BAT_HISTORY:
@@ -4451,13 +4759,16 @@ static void open_selected(void)
         else if (l->sel <= n) {
             char t[80], hz[24];
             fmt_hz(hz, sizeof hz, S.eqe.band[l->sel - 1].fc);
-            snprintf(t, sizeof t, "%s %s", EQ_TYPE_NAME[S.eqe.band[l->sel - 1].type], hz);
+            snprintf(t, sizeof t, "%s %s", tr(EQ_TYPE_NAME[S.eqe.band[l->sel - 1].type]), hz);
             push(L_EQ_BAND, t, l->sel - 1);
         } else if (l->sel == n + 1 && n < EQ_MAX_BANDS) {        /* a flat peak at 1 kHz, to shape */
             S.eqe.band[n] = (eq_band_t){EQ_PEAK, 1000, 0, 1};
             S.eqe.n++;
             eqe_changed(1);
-            push(L_EQ_BAND, "Peak 1.0 kHz", n);
+            char t[80], hz[24];
+            fmt_hz(hz, sizeof hz, 1000);
+            snprintf(t, sizeof t, "%s %s", tr(EQ_TYPE_NAME[EQ_PEAK]), hz);
+            push(L_EQ_BAND, t, n);
         } else {                                                 /* delete: press twice */
             uint32_t now = lv_tick_get();
             if (S.eqe_del_armed && now - S.eqe_del_armed < 3000) {
@@ -4533,7 +4844,7 @@ static void open_selected(void)
         if (pl > 0 && library_playlist_add(S.lib, pl, S.pick_ids.ids, S.pick_ids.n) == 0) {
             char nm[128] = "";
             library_playlist_name(S.lib, pl, nm, sizeof nm);
-            snprintf(msg, sizeof msg, "Added to %s", nm);
+            subst(msg, sizeof msg, tr("Added to %s"), nm, NULL);
         }
         pop();
         ui_toast(msg, 1500);
@@ -4794,6 +5105,7 @@ void ui_key(ui_key_t k)
     level_t *l = &S.stack[S.depth - 1];
     player_t *pl = S.player;
     if (S.upd_ov && update_overlay_key(k)) return;
+    if (S.uni_ov && uninstall_overlay_key(k)) return;
     /* keys that do the same thing everywhere */
     switch (k) {
     case UI_KEY_PLAY: if (pl) player_toggle_pause(pl); render(R_CONTENT); return;
@@ -5086,6 +5398,15 @@ static void rd_wait(void)
     }
 }
 
+int ui_list_state(int *sel, int *n, int *home_edit)
+{
+    const level_t *l = &S.stack[S.depth - 1];
+    if (sel) *sel = l->sel;
+    if (n) *n = list_count(l);
+    if (home_edit) *home_edit = l->kind == L_HOME_EDIT;
+    return S.now_playing_view ? 0 : S.depth;
+}
+
 void ui_show(const char *what)
 {
     S.scrubbing = 0;
@@ -5095,7 +5416,7 @@ void ui_show(const char *what)
     S.stack[0].sel = home_index(H_ALBUMS);
     S.now_playing_view = 0;
     if (!strcmp(what, "albums") || !strcmp(what, "tracks")) {
-        push(L_ALBUMS, "Albums", 0);
+        push_ui(L_ALBUMS, "Albums", 0);
         level_t *l = &S.stack[S.depth - 1];
         l->sel = l->items.n > 1 ? 1 : 0;
         char name[128];
@@ -5104,7 +5425,7 @@ void ui_show(const char *what)
             push(L_TRACKS, name, l->items.ids[l->sel]);
     } else if (!strcmp(what, "playlists") || !strcmp(what, "playlist")) {
         S.stack[0].sel = home_index(H_PLAYLISTS);
-        push(L_PLAYLISTS, "Playlists", 0);
+        push_ui(L_PLAYLISTS, "Playlists", 0);
         level_t *l = &S.stack[S.depth - 1];
         l->sel = l->items.n > 2 ? 2 : 0;
         char name[128];
@@ -5113,46 +5434,53 @@ void ui_show(const char *what)
             push(L_PLAYLIST_TRACKS, name, l->items.ids[l->sel]);
     } else if (!strcmp(what, "share")) {
         S.stack[0].sel = home_index(H_SETTINGS);
-        push(L_SETTINGS, "Settings", 0);
+        push_ui(L_SETTINGS, "Settings", 0);
         S.stack[S.depth - 1].sel = SET_SHARE;
-        push(L_SHARE, "Network drive", 0);
+        push_ui(L_SHARE, "Network drive", 0);
         S.stack[S.depth - 1].sel = 1;
     } else if (!strcmp(what, "ssh")) {
         S.stack[0].sel = home_index(H_SETTINGS);
-        push(L_SETTINGS, "Settings", 0);
+        push_ui(L_SETTINGS, "Settings", 0);
         S.stack[S.depth - 1].sel = SET_SSH;
-        push(L_SSH, "SSH", 0);
+        push_ui(L_SSH, "SSH", 0);
         S.stack[S.depth - 1].sel = 1;
     } else if (!strcmp(what, "about") || !strcmp(what, "update")) {
         S.stack[0].sel = home_index(H_SETTINGS);
-        push(L_SETTINGS, "Settings", 0);
+        push_ui(L_SETTINGS, "Settings", 0);
         S.stack[S.depth - 1].sel = SET_ABOUT;
-        push(L_ABOUT, "About", 0);
+        push_ui(L_ABOUT, "About", 0);
         level_t *l = &S.stack[S.depth - 1];
-        l->sel = list_count(l) - (S.hooks.update_do ? 3 : 1);   /* Check for updates */
-        if (!strcmp(what, "update")) push(L_UPDATE, "Updates", 0);
+        l->sel = S.about_n;                         /* Check for updates (or what follows) */
+        if (!strcmp(what, "update")) push_ui(L_UPDATE, "Updates", 0);
         ui_update_changed();
+    } else if (!strcmp(what, "uninstall")) {
+        S.stack[0].sel = home_index(H_SETTINGS);
+        push_ui(L_SETTINGS, "Settings", 0);
+        S.stack[S.depth - 1].sel = SET_ABOUT;
+        push_ui(L_ABOUT, "About", 0);
+        push_ui(L_UNINSTALL, "Uninstall Fathom", 0);
+        ui_uninstall_changed();
     } else if (!strncmp(what, "battery", 7)) {       /* "battery", "battery7", "batterysince", "batteryhistory" */
         S.stack[0].sel = home_index(H_SETTINGS);
-        push(L_SETTINGS, "Settings", 0);
+        push_ui(L_SETTINGS, "Settings", 0);
         S.stack[S.depth - 1].sel = SET_POWER;
-        push(L_POWER, "Power", 0);
+        push_ui(L_POWER, "Power", 0);
         S.bat_days = !strcmp(what, "battery7") ? 7 : 1;
         battery_load();
-        push(L_BATTERY, "Battery", 0);
+        push_ui(L_BATTERY, "Battery", 0);
         if (!strcmp(what, "battery7")) S.stack[S.depth - 1].sel = 0;
-        if (!strcmp(what, "batterysince")) { S.stack[S.depth - 1].sel = 1; S.bat_span = -1; push(L_BAT_SPAN, "Since full charge", 0); }
-        if (!strcmp(what, "batteryhistory")) { S.stack[S.depth - 1].sel = 2; push(L_BAT_HISTORY, "History", 0); }
+        if (!strcmp(what, "batterysince")) { S.stack[S.depth - 1].sel = 1; S.bat_span = -1; push_ui(L_BAT_SPAN, "Since full charge", 0); }
+        if (!strcmp(what, "batteryhistory")) { S.stack[S.depth - 1].sel = 2; push_ui(L_BAT_HISTORY, "History", 0); }
     } else if (!strcmp(what, "radio")) {
         S.stack[0].sel = home_index(H_RADIO);
         S.radio_n = S.hooks.radio_stations ? S.hooks.radio_stations(S.radio, RADIO_MAX) : -1;
-        push(L_RADIO, "Radio", 0);
+        push_ui(L_RADIO, "Radio", 0);
         if (S.radio_n > 1) S.stack[S.depth - 1].sel = 2;
     } else if (!strncmp(what, "rdir", 4)) {         /* Radio > Find stations, from saved answers */
         S.stack[0].sel = home_index(H_RADIO);
         S.radio_n = S.hooks.radio_stations ? S.hooks.radio_stations(S.radio, RADIO_MAX) : -1;
-        push(L_RADIO, "Radio", 0);
-        push(L_RDIR, "Find stations", 0);
+        push_ui(L_RADIO, "Radio", 0);
+        push_ui(L_RDIR, "Find stations", 0);
         level_t *m = &S.stack[S.depth - 1];
         if (!strcmp(what, "rdir")) {
             char v[32];
@@ -5193,10 +5521,10 @@ void ui_show(const char *what)
         snprintf(S.entry, sizeof S.entry, "bu");
         S.entry_ch = 'e' - 'a';
         search_run();
-        push(L_SEARCH, "Search", 0);
+        push_ui(L_SEARCH, "Search", 0);
     } else if (!strcmp(what, "artists") || !strcmp(what, "artist") || !strcmp(what, "artistsongs")) {
         S.stack[0].sel = home_index(H_ARTISTS);
-        push(L_ARTISTS, "Artists", 0);
+        push_ui(L_ARTISTS, "Artists", 0);
         level_t *l = &S.stack[S.depth - 1];
         const char *want = getenv("FATHOM_SIM_ARTIST");   /* a name to open, else the third */
         char name[128];
@@ -5213,23 +5541,23 @@ void ui_show(const char *what)
         }
     } else if (!strcmp(what, "albumartists")) {
         S.stack[0].sel = home_index(H_ALBUM_ARTISTS);
-        push(L_ALBUM_ARTISTS, "Album artists", 0);
+        push_ui(L_ALBUM_ARTISTS, "Album artists", 0);
     } else if (!strcmp(what, "homeend")) {    /* Home, at its last items */
         S.stack[0].sel = S.home_n > 0 ? S.home_n - 2 : 0;
     } else if (!strcmp(what, "homeall")) {    /* Settings > Home: every item, shown or not */
         S.stack[0].sel = home_index(H_SETTINGS);
-        push(L_SETTINGS, "Settings", 0);
-        push(L_HOME_EDIT, "Home", 0);
+        push_ui(L_SETTINGS, "Settings", 0);
+        push_ui(L_HOME_EDIT, "Home", 0);
         S.stack[S.depth - 1].sel = H_N - 2;
     } else if (!strcmp(what, "genres")) {
         S.stack[0].sel = home_index(H_GENRES);
-        push(L_GENRES, "Genres", 0);
+        push_ui(L_GENRES, "Genres", 0);
     } else if (!strcmp(what, "folders")) {
         S.stack[0].sel = home_index(H_FOLDERS);
-        push(L_FOLDER, "Folders", 0);
+        push_ui(L_FOLDER, "Folders", 0);
     } else if (!strcmp(what, "folder")) {     /* the first folder in Folders */
         S.stack[0].sel = home_index(H_FOLDERS);
-        push(L_FOLDER, "Folders", 0);
+        push_ui(L_FOLDER, "Folders", 0);
         level_t *l = &S.stack[S.depth - 1];
         char name[128];
         if (l->items.n && l->items.ids[0] < 0 && S.lib &&
@@ -5237,7 +5565,7 @@ void ui_show(const char *what)
             push(L_FOLDER, name, -l->items.ids[0]);
     } else if (!strcmp(what, "years")) {
         S.stack[0].sel = home_index(H_YEARS);
-        push(L_YEARS, "Years", 0);
+        push_ui(L_YEARS, "Years", 0);
     } else if (!strcmp(what, "scrub")) {       /* Now Playing with the marker moved on */
         S.now_playing_view = 1;
         render(R_SNAP);
@@ -5246,40 +5574,40 @@ void ui_show(const char *what)
     } else if (!strcmp(what, "usbask")) {
         ui_usb_prompt();
     } else if (!strcmp(what, "wifiask")) {          /* (as from a station, with Wi-Fi off) */
-        push(L_RADIO, "Radio", 0);
-        push(L_WIFI_ASK, "Turn on Wi-Fi?", 0);
+        push_ui(L_RADIO, "Radio", 0);
+        push_ui(L_WIFI_ASK, "Turn on Wi-Fi?", 0);
     } else if (!strcmp(what, "interface")) {
         S.stack[0].sel = home_index(H_SETTINGS);
-        push(L_SETTINGS, "Settings", 0);
-        push(L_INTERFACE, "Interface", 0);
+        push_ui(L_SETTINGS, "Settings", 0);
+        push_ui(L_INTERFACE, "Interface", 0);
     } else if (!strcmp(what, "sound")) {
         S.stack[0].sel = home_index(H_SETTINGS);
-        push(L_SETTINGS, "Settings", 0);
+        push_ui(L_SETTINGS, "Settings", 0);
         S.stack[S.depth - 1].sel = SET_SOUND;
-        push(L_SOUND, "Sound", 0);
+        push_ui(L_SOUND, "Sound", 0);
         S.stack[S.depth - 1].sel = 2;
     } else if (!strcmp(what, "signal")) {
         S.stack[0].sel = home_index(H_SETTINGS);
-        push(L_SETTINGS, "Settings", 0);
+        push_ui(L_SETTINGS, "Settings", 0);
         S.stack[S.depth - 1].sel = SET_SOUND;
-        push(L_SOUND, "Sound", 0);
-        push(L_SIGNAL, "Signal path", 0);
+        push_ui(L_SOUND, "Sound", 0);
+        push_ui(L_SIGNAL, "Signal path", 0);
     } else if (!strcmp(what, "homeedit")) {
         S.stack[0].sel = home_index(H_SETTINGS);
-        push(L_SETTINGS, "Settings", 0);
+        push_ui(L_SETTINGS, "Settings", 0);
         S.stack[S.depth - 1].sel = SET_HOME;
-        push(L_HOME_EDIT, "Home", 0);
+        push_ui(L_HOME_EDIT, "Home", 0);
         S.stack[S.depth - 1].sel = 5;
     } else if (!strcmp(what, "songs")) {
         S.stack[0].sel = home_index(H_SONGS);
-        push(L_SONGS, "Songs", 0);
+        push_ui(L_SONGS, "Songs", 0);
     } else if (!strcmp(what, "quick")) {
         open_quick();
     } else if (!strcmp(what, "queue")) {
         S.now_playing_view = 1;
         if (open_context() == 0) run_context(CTX_SHOW_QUEUE);
     } else if (!strcmp(what, "context") || !strcmp(what, "info")) {
-        push(L_ALBUMS, "Albums", 0);
+        push_ui(L_ALBUMS, "Albums", 0);
         level_t *l = &S.stack[S.depth - 1];
         l->sel = l->items.n > 1 ? 1 : 0;
         char name[128];
@@ -5290,8 +5618,8 @@ void ui_show(const char *what)
     } else if (!strcmp(what, "nowplaying")) {
         S.now_playing_view = 1;
     } else if (!strcmp(what, "themes")) {
-        push(L_SETTINGS, "Settings", 0);
-        push(L_THEMES, "Theme", 0);
+        push_ui(L_SETTINGS, "Settings", 0);
+        push_ui(L_THEMES, "Theme", 0);
     }
     render(R_SNAP);
 }
@@ -5492,6 +5820,7 @@ void ui_init(lv_obj_t *screen, const theme_t *themes, int n_themes,
     S.stack[0].kind = L_HOME;
     home_load();
     snprintf(S.stack[0].title, sizeof S.stack[0].title, "Fathom");
+    S.stack[0].title_ui = 1;
     S.depth = 1;
     S.last_depth = -1;          /* first render is a "new level" (snapped) */
 

@@ -1,9 +1,12 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* M3U parsing, path normalisation and loose keys (app/library/playlist.c). */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "library/playlist.h"
+#include "tmpdir.h"
 
 static int failures;
 
@@ -86,6 +89,38 @@ int main(void)
     CHECK_STR(f, "2000");
 
     CHECK(m3u_supported("/x/List.M3U8") && m3u_supported("a.m3u") && !m3u_supported("a.m3u8.txt"));
+
+    /* An .m3u from Windows, in its code page: lines that aren't UTF-8 are
+     * taken as Windows-1252 ("Café", "Don’t"); UTF-8 lines in it stay as
+     * they are; an .m3u8 is UTF-8 whatever it holds */
+    char dir[200], path[300];
+    test_tmp(dir, sizeof dir, "fathom-test-playlist");
+    if (mkdtemp(dir)) {
+        const char latin[] = "#EXTINF:200,Caf\xE9 Tacvba - Don\x92t Go\r\n"
+                             "Caf\xE9 Tacvba\\Album\\01.flac\r\n"
+                             "Bj\xC3\xB6rk/Post/02.flac\n"
+                             "plain/03.flac";
+        const char *names[2] = {"list.m3u", "list.m3u8"};
+        for (int i = 0; i < 2; i++) {
+            snprintf(path, sizeof path, "%s/%s", dir, names[i]);
+            FILE *pf = fopen(path, "wb");
+            if (pf) { fwrite(latin, 1, sizeof latin - 1, pf); fclose(pf); }
+            CHECK(m3u_read(path, &m) == 0 && m.n == 3);
+            if (m.n == 3) {
+                char want[400];
+                snprintf(want, sizeof want, "%s/%s", dir, i ? "Caf\xE9 Tacvba/Album/01.flac" : "Caf\xC3\xA9 Tacvba/Album/01.flac");
+                CHECK_STR(m.paths[0], want);
+                CHECK_STR(m.infos[0], i ? "Caf\xE9 Tacvba - Don\x92t Go" : "Caf\xC3\xA9 Tacvba - Don\xE2\x80\x99t Go");
+                snprintf(want, sizeof want, "%s/Bj\xC3\xB6rk/Post/02.flac", dir);
+                CHECK_STR(m.paths[1], want);
+                snprintf(want, sizeof want, "%s/plain/03.flac", dir);
+                CHECK_STR(m.paths[2], want);
+            }
+            m3u_free(&m);
+            unlink(path);
+        }
+        rmdir(dir);
+    }
 
     if (failures) fprintf(stderr, "%d failure(s)\n", failures);
     else printf("playlist: all checks passed\n");

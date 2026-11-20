@@ -31,9 +31,5 @@ cursor      = arrow
 playing     = equalizer
 motion      = stepped
 
-[art]
-style       = normal
-
 [decor]
-header_pattern = dots
-icons          = pixel
+icons = pixel

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Updates over Wi-Fi: versions, GitHub's answer, staging, installing (update.h). */
 #include "net/update.h"
+#include "core/lang.h"   /* N_(): the texts the UI translates */
 
 #include <ctype.h>
 #include <dirent.h>
@@ -93,6 +94,7 @@ int update_parse_release(const char *json, size_t len, update_release_t *r)
     while (json_next(assets, &at, &a)) {
         char name[128], url[512], state[32] = "", digest[80] = "";
         if (!json_member(a, "name", &v) || json_string(v, name, sizeof name) <= 0) continue;
+        if (strchr(name, '/')) continue;                              /* (it names a file in the stage) */
         int score = !strcmp(name, want) ? 2 : !strncmp(name, "fathom-h2-", 10) && has_suffix(name, ".zip") ? 1 : 0;
         if (score <= best) continue;
         if (json_member(a, "state", &v)) json_string(v, state, sizeof state);
@@ -122,16 +124,16 @@ const char *update_error_text(int err)
 {
     switch (err) {
     case UPDATE_OK: return "";
-    case UPDATE_ERR_NET: return "Couldn't reach GitHub";
-    case UPDATE_ERR_ANSWER: return "No update file in the latest release";
-    case UPDATE_ERR_SPACE: return "Not enough space on the card";
-    case UPDATE_ERR_DOWNLOAD: return "The download failed";
-    case UPDATE_ERR_DAMAGED: return "The download is damaged";
-    case UPDATE_ERR_ZIP: return "Couldn't unpack the update";
-    case UPDATE_ERR_WRITE: return "Couldn't write to the card";
-    case UPDATE_ERR_INSTALL: return "Couldn't install the update";
-    case UPDATE_ERR_CANCELLED: return "Update cancelled";
-    default: return "Couldn't update";
+    case UPDATE_ERR_NET: return N_("Couldn't reach GitHub");
+    case UPDATE_ERR_ANSWER: return N_("No update file in the latest release");
+    case UPDATE_ERR_SPACE: return N_("Not enough space on the card");
+    case UPDATE_ERR_DOWNLOAD: return N_("The download failed");
+    case UPDATE_ERR_DAMAGED: return N_("The download is damaged");
+    case UPDATE_ERR_ZIP: return N_("Couldn't unpack the update");
+    case UPDATE_ERR_WRITE: return N_("Couldn't write to the card");
+    case UPDATE_ERR_INSTALL: return N_("Couldn't install the update");
+    case UPDATE_ERR_CANCELLED: return N_("Update cancelled");
+    default: return N_("Couldn't update");
     }
 }
 

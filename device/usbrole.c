@@ -17,7 +17,12 @@
  *     or after 4 s if it can't be placed, e.g. a hub). A Mac takes 1-2 s
  *     to show up as a device, and as long again to supply VBUS once we're a
  *     sink: we wait 8 s for it before trying DRP again. Back to sink, where it becomes the source and we the
- *     device, and stay there until the cable comes out.
+ *     device, and stay there until the cable comes out;
+ *   - host with nothing on the bus after 10 s (something that takes power
+ *     but never shows up as a device: a broken DAC, a lamp, a charging
+ *     case): VBUS off, back to sink, and DRP again only after 30 s, then
+ *     60 s, then every 2 min while it stays that way (a battery drained
+ *     into it otherwise).
  *
  * Inputs: the PMIC's VBUS-present bit (battery "online") and our own VBUS
  * regulator's state, so our own 5 V never counts as someone else's. Neither
@@ -44,6 +49,9 @@
 #define AFTER_PC_MS   6000      /* the same, after a computer: a quick replug finds us a sink */
 #define HANDOVER_MS   8000      /* after handing a computer the host role: time to supply VBUS */
 #define NOT_AUDIO_MS  4000      /* host without an audio interface -> sink */
+#define NO_DEVICE_MS  10000     /* host with nothing on the bus -> sink */
+#define RETRY_MS      30000     /* ...and DRP again after this long, twice as long each time */
+#define RETRY_MAX_MS  120000
 
 static int g_cfg1 = -1, g_cfg0 = -1;
 static char g_vbus_state[300];   /* /sys/class/regulator/regulator.N/state of "usb-vbus" */
@@ -205,6 +213,7 @@ int main(void)
     int drp = 0, no_vbus_ms = 0, host_ms = 0;
     int wait_ms = NO_VBUS_MS;        /* how long without VBUS before DRP */
     int pc_seen = 0;                 /* in DRP, someone else supplied VBUS */
+    int retry_ms = RETRY_MS;         /* DRP again after a device that never showed up */
     say("%s", "sink only");
     long last = now_ms();
     int tick = IDLE_MS;
@@ -220,6 +229,7 @@ int main(void)
                 if (no_vbus_ms || wait_ms != AFTER_PC_MS) say("%s", "VBUS from the other side");
                 no_vbus_ms = 0;
                 wait_ms = AFTER_PC_MS;
+                retry_ms = RETRY_MS;
                 continue;
             }
             no_vbus_ms += dt;
@@ -240,7 +250,7 @@ int main(void)
         }
         host_ms += dt;
         int bus = bus_contents();
-        if (bus == 2) { host_ms = 0; continue; }                 /* a DAC: stay the host */
+        if (bus == 2) { host_ms = 0; retry_ms = RETRY_MS; continue; }   /* a DAC: stay the host */
         tick = TICK_MS;
         if (bus == 3 || (bus == 1 && host_ms >= NOT_AUDIO_MS)) { /* a computer, most likely */
             say("%s", "host, but no audio interface on the port: a computer?");
@@ -248,6 +258,16 @@ int main(void)
             drp = 0;
             no_vbus_ms = 0;
             wait_ms = HANDOVER_MS;
+            retry_ms = RETRY_MS;
+        } else if (bus == 0 && host_ms >= NO_DEVICE_MS) {        /* powered, but nothing answers */
+            char in[16];
+            snprintf(in, sizeof in, "%d s", retry_ms / 1000);
+            say("host, but no device on the port: VBUS off, dual role again in %s", in);
+            set_drp(0);
+            drp = 0;
+            no_vbus_ms = 0;
+            wait_ms = retry_ms;
+            retry_ms = retry_ms * 2 > RETRY_MAX_MS ? RETRY_MAX_MS : retry_ms * 2;
         }
     }
     /* Leave the port as a sink: safe with anything plugged in. */

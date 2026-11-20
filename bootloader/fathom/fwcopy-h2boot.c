@@ -214,3 +214,39 @@ void fathom_copy_firmware_menu(void)
 {
     fathom_copy_firmware(true);
 }
+
+/* Which stock firmware is in the flash, for Uninstall Fathom (Linux can't
+ * read the flash): the stock kernel's header as /fathom/stock-version, at
+ * every Linux start from a Fathom card, written only when it changed (after
+ * HiBy's recovery installed another release). 64 bytes read; nothing shown. */
+#define STOCK_NOTE "/fathom/stock-version"
+
+void fathom_note_stock_version(void)
+{
+    if(check_disk(false) != DISK_PRESENT || !has_dir("/fathom"))
+        return;
+    uint8_t h[FWC_UIMAGE_HDR];
+    struct nand_drv* ndrv = nand_init();
+    nand_lock(ndrv);
+    if(nand_open(ndrv) != NAND_SUCCESS) {
+        nand_unlock(ndrv);
+        return;
+    }
+    int r = nand_read_bytes(ndrv, FWC_KERNEL_ADDR, sizeof(h), h);
+    nand_close(ndrv);
+    nand_unlock(ndrv);
+    if(r != NAND_SUCCESS)
+        return;
+    char note[96], old[96];
+    int n = fwc_kernel_note(h, note, sizeof(note));
+    if(n < 0)
+        return;
+    int fd = open(STOCK_NOTE, O_RDONLY);
+    if(fd >= 0) {
+        ssize_t m = read(fd, old, sizeof(old));
+        close(fd);
+        if(m == n && !memcmp(old, note, n))
+            return;
+    }
+    write_file(STOCK_NOTE, (const uint8_t*)note, n);
+}

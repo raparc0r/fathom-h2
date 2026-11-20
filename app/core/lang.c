@@ -108,6 +108,25 @@ const char *tr(const char *en)
 
 int lang_count(void) { return L.n; }
 
+void lang_fill(char *out, size_t cap, const char *fmt, const char *a, const char *b)
+{
+    size_t n = 0;
+    if (!cap) return;
+    for (const char *p = fmt; *p && n + 1 < cap; p++) {
+        const char *arg = p[0] == '%' && p[1] == 's' ? (a ? a : b ? b : "") : NULL;
+        if (!arg) { out[n++] = *p; continue; }
+        if (a) a = NULL; else b = NULL;
+        while (*arg && n + 1 < cap) out[n++] = *arg++;
+        p++;
+    }
+    out[n] = '\0';
+}
+
+void tr_fill(char *out, size_t cap, const char *en, const char *a, const char *b)
+{
+    lang_fill(out, cap, tr(en), a, b);
+}
+
 static int by_name(const void *a, const void *b) { return strcasecmp((const char *)a, (const char *)b); }
 
 int lang_list(const char *dir, char names[][64], int max)

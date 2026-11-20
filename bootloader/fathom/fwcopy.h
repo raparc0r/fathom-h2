@@ -59,4 +59,16 @@ int fwc_check_hcd(const uint8_t *d, uint32_t n);          /* a chain of HCI vend
 int fwc_check_wifi_fw(const uint8_t *d, uint32_t n);
 int fwc_check_nvram(const uint8_t *d, uint32_t n);
 
+/* The stock kernel (partition 2, mtd2): its uImage header is the stock
+ * firmware's own record of its build. Each HiBy release builds its kernel
+ * within a minute of its version.txt date (V2.2: 2025-01-15, V2.3:
+ * 2025-11-11), so the header says which release is in the flash. */
+#define FWC_KERNEL_ADDR 0x300000u
+#define FWC_UIMAGE_HDR  64u
+
+/* The header h (FWC_UIMAGE_HDR bytes) as a note for the card,
+ * "name=Linux-3.10.14\ntime=1762858730\n" (its build time, seconds since
+ * 1970, UTC): its length, or <0 if h isn't a uImage header (magic and CRC). */
+int fwc_kernel_note(const uint8_t *h, char *out, uint32_t cap);
+
 #endif

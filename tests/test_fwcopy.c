@@ -13,13 +13,18 @@
 static int failures;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
 
-static uint8_t *g_flash;            /* the stock partition only */
+/* The stock partition (64 MiB): its first MiB held, the rest erased (0xFF).
+ * (All of it in RAM was more than the H2 has: the test crashed there.) */
+#define HELD (1u << 20)
+static uint8_t *g_flash;
 
 static int read_flash(void *ctx, uint32_t addr, void *buf, uint32_t len)
 {
     (void)ctx;
     if (addr < FWC_ROOTFS_ADDR || addr - FWC_ROOTFS_ADDR + len > FWC_ROOTFS_SIZE) return -1;
-    memcpy(buf, g_flash + (addr - FWC_ROOTFS_ADDR), len);
+    uint32_t off = addr - FWC_ROOTFS_ADDR, held = off < HELD ? (HELD - off < len ? HELD - off : len) : 0;
+    memcpy(buf, g_flash + off, held);
+    memset((uint8_t *)buf + held, 0xFF, len - held);
     return 0;
 }
 
@@ -94,10 +99,50 @@ static void data_lzo(uint32_t ino, uint32_t block, uint64_t sqnum, const uint8_t
     seal(p);
 }
 
+/* The stock kernel's uImage header as h2boot's note: a header made here (V2.3's
+ * name and time), a wrong magic, a wrong CRC, too little room; and with
+ * FATHOM_TEST_FLASH=backups/flash.img, the real one in a flash backup. */
+static void be(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (24 - 8 * i)); }
+
+static void test_kernel_note(void)
+{
+    uint8_t h[FWC_UIMAGE_HDR] = {0};
+    be(h, 0x27051956u);
+    be(h + 8, 1762858730u);                  /* 2025-11-11 10:58:50 UTC */
+    memcpy(h + 32, "Linux-3.10.14", 13);
+    uint32_t c = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < sizeof h; i++) {
+        c ^= h[i];
+        for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+    }
+    be(h + 4, ~c);
+    char out[96];
+    int n = fwc_kernel_note(h, out, sizeof out);
+    CHECK(n > 0 && !strcmp(out, "name=Linux-3.10.14\ntime=1762858730\n"));
+    CHECK(fwc_kernel_note(h, out, 20) < 0);
+    h[40] ^= 1;                              /* the CRC no longer matches */
+    CHECK(fwc_kernel_note(h, out, sizeof out) < 0);
+    h[40] ^= 1;
+    h[0] = 0;
+    CHECK(fwc_kernel_note(h, out, sizeof out) < 0);
+
+    const char *flash = getenv("FATHOM_TEST_FLASH");
+    FILE *f = flash && *flash ? fopen(flash, "rb") : NULL;
+    if (f) {
+        uint8_t r[FWC_UIMAGE_HDR];
+        CHECK(!fseek(f, FWC_KERNEL_ADDR, SEEK_SET) && fread(r, 1, sizeof r, f) == sizeof r);
+        fclose(f);
+        n = fwc_kernel_note(r, out, sizeof out);
+        CHECK(n > 0);
+        if (n > 0) printf("%s: %s", flash, out);
+    }
+}
+
 int main(void)
 {
-    g_flash = calloc(1, FWC_ROOTFS_SIZE);
-    memset(g_flash, 0xFF, FWC_ROOTFS_SIZE);    /* erased flash */
+    g_flash = malloc(HELD);
+    if (!g_flash) return 1;
+    memset(g_flash, 0xFF, HELD);               /* erased flash */
     memcpy(g_flash, "UBI#", 4);
 
     g_at = 0x1000;                             /* eraseblock 0, after UBI's headers */
@@ -148,6 +193,8 @@ int main(void)
     static const uint8_t hcd[] = {0x2e, 0xfc, 0x00, 0x4c, 0xfc, 0x02, 0x01, 0x02};
     CHECK(fwc_check_hcd(hcd, sizeof hcd));
     CHECK(!fwc_check_hcd(hcd, sizeof hcd - 1));
+
+    test_kernel_note();
 
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     printf("fwcopy: all good\n");

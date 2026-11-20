@@ -96,6 +96,61 @@ static void key(int code)
 
 /* ---- the player's state ---- */
 
+/* The length of the valid UTF-8 sequence at s (n bytes left), 0 if there's
+ * none: no overlong forms, surrogates or code points past U+10FFFF, as
+ * libdbus checks. */
+static size_t utf8_seq(const unsigned char *s, size_t n)
+{
+    unsigned c = s[0];
+    if (c < 0x80) return 1;
+    size_t len = c >= 0xc2 && c <= 0xdf ? 2 : c >= 0xe0 && c <= 0xef ? 3 : c >= 0xf0 && c <= 0xf4 ? 4 : 0;
+    if (!len || n < len) return 0;
+    unsigned lo = c == 0xe0 ? 0xa0 : c == 0xf0 ? 0x90 : 0x80;   /* (overlong) */
+    unsigned hi = c == 0xed ? 0x9f : c == 0xf4 ? 0x8f : 0xbf;   /* (surrogates, past U+10FFFF) */
+    if (s[1] < lo || s[1] > hi) return 0;
+    for (size_t i = 2; i < len; i++)
+        if ((s[i] & 0xc0) != 0x80) return 0;
+    return len;
+}
+
+/* s (cap bytes) made valid UTF-8, in place. libdbus aborts the program on a
+ * string that isn't, and the player's title can be anything a radio sends
+ * (Latin-1 is common), or cut in the middle of a character: a byte that
+ * starts no valid sequence is taken as Latin-1, an incomplete one at the
+ * end is left out, and what doesn't fit is cut between characters. */
+static void utf8_fix(char *s, size_t cap)
+{
+    size_t n = strlen(s), i = 0, k;
+    while (i < n && (k = utf8_seq((const unsigned char *)s + i, n - i))) i += k;
+    if (i == n) return;                          /* (nearly always: nothing to do) */
+    char out[sizeof ((now_t *)0)->title];
+    size_t o = 0;
+    if (cap > sizeof out) cap = sizeof out;
+    memcpy(out, s, i);
+    o = i;
+    while (i < n) {
+        const unsigned char *p = (const unsigned char *)s + i;
+        if ((k = utf8_seq(p, n - i))) {
+            if (o + k >= cap) break;
+            memcpy(out + o, p, k);
+            o += k;
+            i += k;
+            continue;
+        }
+        if (n + 1 == cap && *p >= 0xc2 && *p <= 0xf4 && n - i < 4) {   /* cut short by the buffer's end? */
+            size_t j = 1;
+            while (i + j < n && (p[j] & 0xc0) == 0x80) j++;
+            if (i + j == n) break;
+        }
+        if (o + 2 >= cap) break;                 /* Latin-1: U+0080..U+00FF in two bytes */
+        out[o++] = (char)(0xc0 | *p >> 6);
+        out[o++] = (char)(0x80 | (*p & 0x3f));
+        i++;
+    }
+    memcpy(s, out, o);
+    s[o] = '\0';
+}
+
 static void read_now(now_t *n)
 {
     memset(n, 0, sizeof *n);
@@ -117,6 +172,10 @@ static void read_now(now_t *n)
         else if (!strcmp(line, "album")) snprintf(n->album, sizeof n->album, "%s", v);
     }
     fclose(f);
+    utf8_fix(n->status, sizeof n->status);
+    utf8_fix(n->title, sizeof n->title);
+    utf8_fix(n->artist, sizeof n->artist);
+    utf8_fix(n->album, sizeof n->album);
 }
 
 /* ---- MPRIS-style properties ---- */

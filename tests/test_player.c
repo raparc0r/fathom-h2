@@ -19,17 +19,18 @@
 #include "library/library.h"
 #include "library/playlist.h"
 #include "player/player.h"
+#include "tmpdir.h"
 
 #define N 6
 static int failures;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
 
-static int write_flac(const char *path, int track)
+static int write_flac_rate(const char *path, int track, unsigned rate)
 {
     FLAC__StreamEncoder *e = FLAC__stream_encoder_new();
     FLAC__stream_encoder_set_channels(e, 2);
     FLAC__stream_encoder_set_bits_per_sample(e, 16);
-    FLAC__stream_encoder_set_sample_rate(e, 44100);
+    FLAC__stream_encoder_set_sample_rate(e, rate);
     FLAC__StreamMetadata *vc = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
     FLAC__StreamMetadata_VorbisComment_Entry en;
     char buf[64];
@@ -56,6 +57,8 @@ static int write_flac(const char *path, int track)
     FLAC__metadata_object_delete(vc);
     return 0;
 }
+
+static int write_flac(const char *path, int track) { return write_flac_rate(path, track, 44100); }
 
 static void sleep_ms(int ms)
 {
@@ -184,9 +187,63 @@ static void test_engine_eq(const char *dir)
     unlink(a);
 }
 
+/* An output that opens 44.1 kHz only (as Bluetooth can't play 22 kHz). */
+static audio_output_t g_inner;
+static int g_opens;
+static int only44_open(void *ctx, const audio_format_t *f)
+{
+    g_opens++;
+    return f->rate == 44100 ? g_inner.open(ctx, f) : -1;
+}
+
+/* Tracks the output can't take are skipped, as they start or gapless; a
+ * queue of nothing but those stops after one pass, even with repeat on. */
+static void test_unplayable(const char *dir)
+{
+    char music[300], path[400], db[300], art[300];
+    snprintf(music, sizeof music, "%s/rates", dir);
+    snprintf(db, sizeof db, "%s/rates.db", dir);
+    snprintf(art, sizeof art, "%s/rates-art", dir);
+    mkdir(music, 0755);
+    static const unsigned rates[] = {44100, 22050, 22050, 44100};   /* tracks 1..4 */
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof path, "%s/%02d.flac", music, i + 1);
+        CHECK(write_flac_rate(path, i + 1, rates[i]) == 0);
+    }
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 4);
+    lib_list_t albums, tr;
+    CHECK(library_list(lib, LIB_ALBUMS, 0, &albums) == 1);
+    CHECK(library_list(lib, LIB_ALBUM_TRACKS, albums.ids[0], &tr) == 4);
+    out_null_stats_t ns;
+    out_null_create(&g_inner, &ns);
+    audio_output_t out = g_inner;
+    out.open = only44_open;
+    engine_t *eng = engine_new(&out);
+    player_t *p = player_new(lib, eng);
+
+    player_play(p, tr.ids, 4, 0);                 /* 1 plays; 2 and 3 can't; on to 4 */
+    WAIT_FOR(p, cur_id(p) == tr.ids[3] && !playing(p), 3000);
+    CHECK(cur_id(p) == tr.ids[3] && ns.frames == 2 * 13230);
+
+    player_set_repeat(p, REPEAT_ALL);             /* nothing but tracks it can't play */
+    player_play(p, &tr.ids[1], 2, 0);
+    WAIT_FOR(p, 0, 500);
+    int opens = g_opens;
+    WAIT_FOR(p, 0, 300);
+    CHECK(!playing(p) && g_opens == opens && opens < 10);
+
+    player_free(p);
+    engine_free(eng);
+    library_list_free(&tr);
+    library_list_free(&albums);
+    library_close(lib);
+}
+
 int main(void)
 {
-    char dir[] = "/tmp/fathom-test-player-XXXXXX";
+    char dir[200];
+    test_tmp(dir, sizeof dir, "fathom-test-player");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     char path[256], music[300];
     snprintf(music, sizeof music, "%s/music", dir);
@@ -197,6 +254,7 @@ int main(void)
     }
     test_engine_depth(dir);
     test_engine_eq(dir);
+    test_unplayable(dir);
     char db[300], art[300], queue[300];
     snprintf(db, sizeof db, "%s/lib.db", dir);
     snprintf(art, sizeof art, "%s/art", dir);
@@ -353,6 +411,45 @@ int main(void)
     sleep_ms(100);
     player_tick(p);
     CHECK(!playing(p) && cur_id(p) == t[5]);
+
+    /* very short tracks and no tick from the UI meanwhile (busy): the engine
+     * goes on through all of them by itself, gapless, and stops once, at the
+     * end (with only the next one lined up, it stopped after that) */
+    {
+        player_play(p, t, N, 0);
+        eng_status_t before, after;
+        engine_status(eng, &before);
+        sleep_ms(2300);                                   /* six 0.3 s tracks */
+        engine_status(eng, &after);
+        CHECK(after.track_id == t[5] && after.stop_seq == before.stop_seq + 1 && after.ended && !after.error);
+        player_tick(p);
+        CHECK(cur_id(p) == t[5]);
+
+        /* a skip before the tick has caught up: past the track that plays
+         * now, not the one the player last saw */
+        player_play(p, t, N, 0);
+        sleep_ms(700);
+        engine_status(eng, &after);
+        int k = 0;
+        while (k < N - 1 && t[k] != after.track_id) k++;
+        player_next(p);
+        CHECK(k >= 1 && k < N - 1 && cur_id(p) == t[k + 1]);
+        WAIT_FOR(p, !playing(p), 3000);
+    }
+
+    /* a damaged next track: skipped, not the end of the queue */
+    {
+        char bad[320];
+        snprintf(bad, sizeof bad, "%s/04.flac", music);
+        FILE *f = fopen(bad, "wb");
+        CHECK(f && fwrite("not a flac file", 1, 15, f) == 15);
+        if (f) fclose(f);
+        player_set_repeat(p, REPEAT_OFF);
+        player_play(p, t, N, 2);                          /* 03, then 04 (damaged), 05 */
+        WAIT_FOR(p, cur_id(p) == t[4], 8000);
+        CHECK(cur_id(p) == t[4]);
+        CHECK(write_flac(bad, 4) == 0);                   /* (as it was, for what follows) */
+    }
 
     /* saved queue: restored paused on the same track, with the same queue */
     player_play(p, t, N, 1);

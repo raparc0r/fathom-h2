@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+#define _DEFAULT_SOURCE   /* getline, strdup (musl, glibc) */
 #include "core/settings.h"
 
 #include <stdio.h>
@@ -6,10 +7,12 @@
 #include <string.h>
 #include <unistd.h>
 
-#define MAX_ENTRIES 128
-
-static struct { char key[48]; char value[160]; } g_e[MAX_ENTRIES];
-static int g_n, g_dirty;
+/* As many entries, keys and values as long, as the file has: a fixed table
+ * once dropped what didn't fit, and the next save erased it from the file. */
+typedef struct { char *key, *value; } entry_t;
+static entry_t *g_e;
+static int g_n, g_cap, g_dirty;
+static int g_short;          /* an entry couldn't be held (out of memory): never save over the file */
 static unsigned g_changed_ms;
 static char g_path[512];
 
@@ -28,15 +31,41 @@ static int find(const char *key)
     return -1;
 }
 
+static void clear(void)
+{
+    for (int i = 0; i < g_n; i++) free(g_e[i].key), free(g_e[i].value);
+    g_n = 0;
+}
+
+/* key = value: replaced, or added. 0, or -1 (out of memory: unchanged). */
+static int put(const char *key, const char *value)
+{
+    char *v = strdup(value);
+    if (!v) return -1;
+    int i = find(key);
+    if (i >= 0) { free(g_e[i].value); g_e[i].value = v; return 0; }
+    if (g_n == g_cap) {
+        int cap = g_cap ? g_cap * 2 : 64;
+        entry_t *e = realloc(g_e, (size_t)cap * sizeof *e);
+        if (!e) { free(v); return -1; }
+        g_e = e, g_cap = cap;
+    }
+    char *k = strdup(key);
+    if (!k) { free(v); return -1; }
+    g_e[g_n++] = (entry_t){k, v};
+    return 0;
+}
+
 int settings_load(const char *path)
 {
     snprintf(g_path, sizeof g_path, "%s", path);
-    g_n = 0;
-    g_dirty = 0;
+    clear();
+    g_dirty = g_short = 0;
     FILE *f = fopen(path, "re");
     if (!f) return 0;
-    char line[256];
-    while (fgets(line, sizeof line, f) && g_n < MAX_ENTRIES) {
+    char *line = NULL;
+    size_t cap = 0;
+    while (getline(&line, &cap, f) >= 0) {
         char *s = trim(line);
         if (!*s || *s == ';' || *s == '#' || *s == '[') continue;
         char *eq = strchr(s, '=');
@@ -44,11 +73,9 @@ int settings_load(const char *path)
         *eq = '\0';
         char *k = trim(s), *v = trim(eq + 1);
         if (!*k) continue;
-        int i = find(k);
-        if (i < 0) i = g_n++;
-        snprintf(g_e[i].key, sizeof g_e[i].key, "%s", k);
-        snprintf(g_e[i].value, sizeof g_e[i].value, "%s", v);
+        if (put(k, v)) g_short = 1;
     }
+    free(line);
     fclose(f);
     return 0;
 }
@@ -72,12 +99,7 @@ void settings_set(const char *key, const char *value)
 {
     int i = find(key);
     if (i >= 0 && !strcmp(g_e[i].value, value)) return;
-    if (i < 0) {
-        if (g_n == MAX_ENTRIES) return;
-        i = g_n++;
-        snprintf(g_e[i].key, sizeof g_e[i].key, "%s", key);
-    }
-    snprintf(g_e[i].value, sizeof g_e[i].value, "%s", value);
+    if (put(key, value)) return;
     g_dirty = 1;
     g_changed_ms = 0;   /* settings_autosave() starts its quiet period from here */
 }
@@ -92,6 +114,7 @@ void settings_set_int(const char *key, int value)
 int settings_save(void)
 {
     if (!g_dirty || !g_path[0]) return 0;
+    if (g_short) return -1;
     char tmp[600];
     snprintf(tmp, sizeof tmp, "%s.tmp", g_path);
     FILE *f = fopen(tmp, "we");
@@ -107,8 +130,9 @@ int settings_save(void)
 
 int settings_reset(void)
 {
-    g_n = 0;
+    clear();
     g_dirty = 1;
+    g_short = 0;
     return settings_save();
 }
 

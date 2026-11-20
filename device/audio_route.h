@@ -7,6 +7,5 @@ typedef enum { ROUTE_HEADPHONES = 0, ROUTE_LINE_OUT = 1 } audio_route_t;
 
 int  audio_route_open(audio_route_t initial);   /* 0 on success */
 int  audio_route_set(audio_route_t r);
-void audio_route_close(void);
 
 #endif

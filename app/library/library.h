@@ -69,15 +69,18 @@ void       library_close(library_t *lib);
 void       library_release_memory(library_t *lib);
 
 /* Scan `root` (read-only): add new/changed files, drop missing ones, rebuild albums,
- * artists, playlists and the art cache. Returns the number of tracks, or -1 on error. */
+ * artists, playlists and the art cache. Returns the number of tracks, or -1 on error.
+ * Its writes go in short transactions: another connection's wait a fraction of
+ * a second at most, and a scan that finds nothing new writes nothing. */
 int library_scan(library_t *lib, const char *root, lib_progress_cb cb, void *ctx);
 /* The music folder is on FAT32 partition `dev` mounted at `mount`: scans first
  * read its FAT directly to tell quickly that nothing changed (fatwalk.h). */
 void library_set_fast_walk(library_t *lib, const char *dev, const char *mount);
 /* Tracks the last scan added, changed or dropped (0: the library is as it was). */
 int library_scan_changes(const library_t *lib);
-/* Stop a scan running on this library (from another thread): it returns -1
- * and the library is left as it was. */
+/* Stop a scan running on this library (from another thread): it returns -1.
+ * Nothing is dropped; the tracks it had read are kept, and the next scan
+ * puts them in their albums, playlists and search. */
 void library_scan_cancel(library_t *lib);
 
 int  library_list(library_t *lib, lib_view_t view, int64_t parent, lib_list_t *out);

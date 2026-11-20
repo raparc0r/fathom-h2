@@ -26,7 +26,7 @@ connection → USB drive mode). The card appears on the computer: copy your musi
 MP3, ALAC, AAC, WAV, AIFF, WavPack, APE, TTA, Opus, Ogg Vorbis and DSD, and albums ripped
 as one file with a CUE sheet.
 
-You can also take the card out and put it back: Fathom stops, shows "Card removed", and
+You can also take the card out and put it back: Fathom stops, shows "No/bad card", and
 starts again with your new music when the card is back. Over Wi-Fi, the network drive
 (below) lets you copy music while the H2 plays.
 
@@ -159,6 +159,32 @@ the previous one by itself (with the bootloader from Fathom 0.9.0 or later: see
 
 Without Wi-Fi, copy the new release's `sd/` folder over the old files on the card (USB
 drive mode works). Each release's notes say if anything else is needed.
+
+## Uninstalling Fathom
+
+HiBy's own firmware is still on the H2: hold **Play** while turning it on to start it, any
+time. To go back to it for good, its bootloader included, Fathom can do it from the H2:
+
+1. Download the firmware for the H2 from HiFi Walker's website: the version your H2 came
+   with, or a newer one (an older one can leave the screen blank). HiBy's firmware shows
+   its version in System Settings → About.
+2. Put its `.upt` file at the top of the card, or in the `Music` folder (where the network
+   drive puts files, from a phone too). There's no need to rename it.
+3. Settings → About → **Uninstall Fathom**. Fathom checks the file (a few seconds) and
+   shows its date. Choose **Uninstall Fathom** and press **OK** twice. The H2 needs half
+   its battery, or to be plugged in.
+4. **OK** restarts the H2 into HiBy's recovery, which installs HiBy's firmware and starts
+   it, in a few minutes. Don't turn the H2 off meanwhile. **Back** instead puts everything
+   back as it was.
+
+If the H2 starts Fathom again instead, turn it off, hold **Vol+** while turning it on and
+choose **Boot select → HibyOS Recovery**.
+
+Your music and Fathom's folder stay on the card. To install Fathom again later, on a
+computer rename HiBy's `update.upt` at the top of the card (back to its download name,
+say) and name Fathom's installer `update.upt` (Uninstall set it aside as
+`fathom-install.upt` if it was on the card), then run **System Settings → Firmware
+Update** as in [INSTALL.md](INSTALL.md). Your settings and library are where you left them.
 
 ## What's in the `fathom` folder
 

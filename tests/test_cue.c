@@ -24,6 +24,7 @@
 #include "audio/output.h"
 #include "library/cue.h"
 #include "library/library.h"
+#include "tmpdir.h"
 
 static int failures;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
@@ -289,7 +290,8 @@ int main(void)
 {
     test_parser();
 
-    char dir[] = "/tmp/fathom-test-cue-XXXXXX";
+    char dir[200];
+    test_tmp(dir, sizeof dir, "fathom-test-cue");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     char music[300], path[700], sheet[700], emb[700], single[700], db[300], art[300];
     snprintf(music, sizeof music, "%s/music", dir);

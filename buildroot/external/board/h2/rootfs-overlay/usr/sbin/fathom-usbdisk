@@ -5,8 +5,12 @@
 # there or the cable is unplugged, then mount it again. S90fathom runs this when
 # the player exits for it (exit code 42), so nothing has the card open.
 # Leaves /tmp/fathom-rescan for the player (new music), or a message in
-# /tmp/fathom-usbdisk.msg if the card couldn't be lent.
+# /tmp/fathom-usbdisk.msg if the card couldn't be lent. If the card comes
+# back unusable (formatted as exFAT, fathom/ deleted), the player can't run:
+# the card-out screen until a card is put in (card_wait), not a player
+# started every 2 s from a card that hasn't one.
 
+. /usr/lib/fathom/card.sh               # (card_disk, card_mount, card_wait, ...)
 LUN=/sys/kernel/config/usb_gadget/fathom/functions/mass_storage.0/lun.0
 # (the card mounted: after it's been out and back it may be another mmcblk)
 DEV=$(awk '$2 == "/mnt/sd" { print $1; exit }' /proc/mounts)
@@ -31,7 +35,7 @@ if ! umount /mnt/sd 2>/dev/null; then
 fi
 if ! echo $DEV > $LUN/file; then
     say "cannot lend $DEV"
-    mount -t vfat -o rw,noatime $DEV /mnt/sd
+    card_mount "$(card_disk)" > /dev/null
     echo "Couldn't start USB drive mode" > $MSG
     exit 1
 fi
@@ -60,8 +64,18 @@ echo $dlim > $VM/dirty_bytes
 echo $dbg > $VM/dirty_background_bytes
 say "card back ($(cat $STATE 2>/dev/null))"
 
+# (the computer may have partitioned it afresh: the card's disk, as at boot)
+dev=
 for i in 1 2 3; do
-    mount -t vfat -o rw,noatime $DEV /mnt/sd && break
+    dev=$(card_mount "$(card_disk)") && break
     sleep 1
 done
-touch /tmp/fathom-rescan
+if [ -z "$dev" ]; then
+    say "the card can't be mounted (not FAT?): waiting for a card"
+    card_wait
+elif ! card_has_fathom; then
+    say "the card is back ($dev), but without Fathom: waiting for a card"
+    card_wait
+else
+    touch /tmp/fathom-rescan
+fi

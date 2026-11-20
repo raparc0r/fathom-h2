@@ -4,15 +4,12 @@
  * the USB link and Wi-Fi alike. A worker thread runs it, so the UI never
  * waits on it (the first start makes the host key, about a second). */
 #include "ssh.h"
+#include "shell.h"
 
-#include <arpa/inet.h>
-#include <ifaddrs.h>
-#include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -34,24 +31,10 @@ static void set_state(int st)
     pthread_mutex_unlock(&S.mu);
 }
 
-/* s as one single-quoted shell word. */
-static void shell_quote(const char *s, char *out, size_t cap)
-{
-    size_t o = 0;
-    if (cap < 3) { if (cap) out[0] = '\0'; return; }
-    out[o++] = '\'';
-    for (; *s && o + 5 < cap; s++) {
-        if (*s == '\'') { memcpy(out + o, "'\\''", 4); o += 4; }
-        else out[o++] = *s;
-    }
-    out[o++] = '\'';
-    out[o] = '\0';
-}
-
 static int apply(int on, const char *password)
 {
     char qp[80], c[200];
-    shell_quote(password, qp, sizeof qp);
+    sh_quote(password, qp, sizeof qp);
     snprintf(c, sizeof c, "printf '%%s\\n' %s | " FATHOM_SSH " %s >/dev/null 2>&1", qp, on ? "on" : "off");
     memset(qp, 0, sizeof qp);
     int st = system(c);
@@ -107,20 +90,6 @@ void ssh_init(int on, const char *password)
 }
 
 void ssh_set(int on, const char *password) { request(on, password); }
-
-/* An interface's IPv4 address, "" without one. */
-static void if_ip(const char *name, char *out, size_t cap)
-{
-    out[0] = '\0';
-    struct ifaddrs *ifs;
-    if (getifaddrs(&ifs)) return;
-    for (struct ifaddrs *i = ifs; i; i = i->ifa_next) {
-        if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET || strcmp(i->ifa_name, name)) continue;
-        inet_ntop(AF_INET, &((struct sockaddr_in *)i->ifa_addr)->sin_addr, out, (socklen_t)cap);
-        break;
-    }
-    freeifaddrs(ifs);
-}
 
 int ssh_ui_state(ui_ssh_t *st)
 {

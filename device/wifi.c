@@ -2,8 +2,12 @@
 /* Wi-Fi for the player: a worker thread runs fathom-wifi (on, off, scan,
  * connect, forget) so nothing slow happens on the UI thread, and polls its
  * status (state, network, address, signal) while Wi-Fi is on. The UI thread
- * reads a snapshot (wifi_ui_*) and asks for things (wifi_ui_do). Like bt.c. */
+ * reads a snapshot (wifi_ui_*) and asks for things (wifi_ui_do). Like bt.c.
+ * Network names are their real text both ways (fathom-wifi undoes wpa_cli's
+ * escapes). */
 #include "wifi.h"
+#include "shell.h"
+#include "core/lang.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -14,10 +18,14 @@
 
 #define FATHOM_WIFI "/usr/sbin/fathom-wifi"
 #define MAX_NET 24
-/* Status every 2 s while it's joining, every 10 s once connected: each look
- * runs a shell and wpa_cli several times, which costs the H2's 23 MB more
- * than the news is worth when nothing is happening. */
+/* Status every 2 s while it's joining, every 10 s once connected; while it's
+ * on but not joined (nothing saved in range) 2 s, then twice as long after
+ * each look that brings nothing new, up to 30 s. Each look runs a shell and
+ * wpa_cli two or three times, which costs the H2's 23 MB more than the news
+ * is worth when nothing is happening; a network that comes in range is
+ * joined by wpa_supplicant all the same, only shown a little later. */
 #define POLL_MS 2000
+#define POLL_IDLE_MAX_MS 30000
 #define POLL_CONNECTED_MS 10000
 
 enum { CMD_NONE, CMD_START, CMD_STOP, CMD_SCAN, CMD_CONNECT, CMD_FORGET };
@@ -34,6 +42,7 @@ static struct {
     ui_wifi_net_t net[MAX_NET];
     int n_net;
     char msg[96];
+    char msg_name[33];   /* a network's name for msg's %s ("Wi-Fi: %s"), "" if none */
     unsigned seq;
 } W = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
 
@@ -47,64 +56,56 @@ static void set_busy(const char *b)
     pthread_mutex_unlock(&W.mu);
 }
 
-static void say(const char *m)
+/* A toast for the UI: text with a %s for name (translated when taken), or plain */
+static void say_name(const char *text, const char *name)
 {
     pthread_mutex_lock(&W.mu);
-    snprintf(W.msg, sizeof W.msg, "%s", m);
+    snprintf(W.msg, sizeof W.msg, "%s", text);
+    snprintf(W.msg_name, sizeof W.msg_name, "%s", name);
     changed_locked();
     pthread_mutex_unlock(&W.mu);
 }
 
-/* Runs a shell command; its first `cap` bytes of output to out. Returns the exit status. */
-static int run(const char *cmd, char *out, size_t cap)
+static void say(const char *m) { say_name(m, ""); }
+
+/* The last n '|'-separated fields of line into f[1..n], what comes before
+ * them into f[0]: a network's name may hold a '|' of its own. 0 if there are
+ * fewer fields. */
+static int split_right(char *line, char **f, int n)
 {
-    FILE *f = popen(cmd, "r");
-    if (!f) return -1;
-    size_t got = 0;
-    if (out && cap) {
-        size_t r;
-        while (got + 1 < cap && (r = fread(out + got, 1, cap - 1 - got, f)) > 0) got += r;
-        out[got] = '\0';
+    for (int i = n; i >= 1; i--) {
+        char *bar = strrchr(line, '|');
+        if (!bar) return 0;
+        *bar = '\0';
+        f[i] = bar + 1;
     }
-    char sink[256];
-    while (fread(sink, 1, sizeof sink, f) > 0) {}
-    int st = pclose(f);
-    return st < 0 ? -1 : (st >> 8) & 0xff;
+    f[0] = line;
+    return 1;
 }
 
-/* s as one single-quoted shell word ('it'\''s'). */
-static void shell_quote(const char *s, char *out, size_t cap)
-{
-    size_t o = 0;
-    if (cap < 3) { if (cap) out[0] = '\0'; return; }
-    out[o++] = '\'';
-    for (; *s && o + 5 < cap; s++) {
-        if (*s == '\'') { memcpy(out + o, "'\\''", 4); o += 4; }
-        else out[o++] = *s;
-    }
-    out[o++] = '\'';
-    out[o] = '\0';
-}
-
-static void poll_status(void)
+/* Returns 1 if anything the UI shows changed. */
+static int poll_status(void)
 {
     char out[256];
-    if (run(FATHOM_WIFI " status 2>/dev/null", out, sizeof out) != 0) return;
+    if (sh_run(FATHOM_WIFI " status 2>/dev/null", out, sizeof out) != 0) return 0;
     ui_wifi_status_t st = {0};
-    char state[16] = "", *f[4] = {0};
+    char *f[3];
     out[strcspn(out, "\n")] = '\0';
-    char *p = out;
-    for (int i = 0; i < 4; i++) { f[i] = p; p = strchr(p, '|'); if (!p) break; *p++ = '\0'; }
-    snprintf(state, sizeof state, "%s", f[0] ? f[0] : "");
+    if (!split_right(out, f, 2)) return 0;               /* STATE|SSID, IP, SIGNAL */
+    char *ssid = strchr(f[0], '|');
+    if (ssid) *ssid++ = '\0';
+    const char *state = f[0];
     st.state = !strcmp(state, "connected") ? UI_WIFI_CONNECTED : !strcmp(state, "connecting") ? UI_WIFI_CONNECTING
              : !strcmp(state, "off") ? UI_WIFI_OFF : UI_WIFI_ON;
-    if (f[1]) snprintf(st.ssid, sizeof st.ssid, "%s", f[1]);
-    if (f[2]) snprintf(st.ip, sizeof st.ip, "%s", f[2]);
-    st.dbm = f[3] && *f[3] ? atoi(f[3]) : 0;
+    snprintf(st.ssid, sizeof st.ssid, "%s", ssid ? ssid : "");
+    snprintf(st.ip, sizeof st.ip, "%s", f[1]);
+    st.dbm = *f[2] ? atoi(f[2]) : 0;
     pthread_mutex_lock(&W.mu);
-    if (memcmp(&st, &W.st, sizeof st)) {
+    int changed = memcmp(&st, &W.st, sizeof st) != 0;
+    if (changed) {
         if (st.state == UI_WIFI_CONNECTED && W.st.state != UI_WIFI_CONNECTED) {
-            snprintf(W.msg, sizeof W.msg, "Wi-Fi: %s", st.ssid);
+            snprintf(W.msg, sizeof W.msg, "%s", "Wi-Fi: %s");
+            snprintf(W.msg_name, sizeof W.msg_name, "%s", st.ssid);
             fprintf(stderr, "wifi: connected to %s (%s)\n", st.ssid, st.ip);
         }
         W.st = st;
@@ -112,19 +113,20 @@ static void poll_status(void)
         changed_locked();
     }
     pthread_mutex_unlock(&W.mu);
+    return changed;
 }
 
 static void scan(void)
 {
     set_busy("Searching");
-    char out[4096];
-    run(FATHOM_WIFI " scan 4 2>/dev/null", out, sizeof out);
+    char out[4096] = "", *save = NULL;
+    sh_run(FATHOM_WIFI " scan 4 2>/dev/null", out, sizeof out);   /* (out stays empty if it can't start) */
     ui_wifi_net_t net[MAX_NET];
     int n = 0;
-    for (char *line = strtok(out, "\n"); line && n < MAX_NET; line = strtok(NULL, "\n")) {
-        char *f[4] = {0}, *p = line;
-        for (int i = 0; i < 4 && p; i++) { f[i] = p; p = strchr(p, '|'); if (p) *p++ = '\0'; }
-        if (!f[3]) continue;
+    /* strtok_r: the Bluetooth worker parses its lists at the same time */
+    for (char *line = strtok_r(out, "\n", &save); line && n < MAX_NET; line = strtok_r(NULL, "\n", &save)) {
+        char *f[4];
+        if (!split_right(line, f, 3)) continue;           /* SSID, DBM, SECURED, SAVED */
         memset(&net[n], 0, sizeof net[n]);
         snprintf(net[n].ssid, sizeof net[n].ssid, "%s", f[0]);
         net[n].dbm = atoi(f[1]);
@@ -148,7 +150,7 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
     case CMD_START: {
         set_busy("Starting");
         char err[200] = "";
-        int ok = run(FATHOM_WIFI " on 2>&1 >/dev/null", err, sizeof err) == 0;
+        int ok = sh_run(FATHOM_WIFI " on 2>&1 >/dev/null", err, sizeof err) == 0;
         pthread_mutex_lock(&W.mu);
         W.on = ok;
         changed_locked();
@@ -167,7 +169,7 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
     }
     case CMD_STOP:
         set_busy("Stopping");
-        run(FATHOM_WIFI " off >/dev/null 2>&1", NULL, 0);
+        sh_run(FATHOM_WIFI " off >/dev/null 2>&1", NULL, 0);
         pthread_mutex_lock(&W.mu);
         W.on = 0;
         memset(&W.st, 0, sizeof W.st);
@@ -182,15 +184,21 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
         break;
     case CMD_CONNECT: {
         set_busy("Connecting");
-        shell_quote(ssid, q, sizeof q);
-        shell_quote(pass, qp, sizeof qp);
+        sh_quote(ssid, q, sizeof q);
+        sh_quote(pass, qp, sizeof qp);
         snprintf(c, sizeof c, FATHOM_WIFI " connect %s %s >/dev/null 2>&1", q, pass[0] ? qp : "");
-        int st = run(c, NULL, 0);               /* (not logged: it has the password) */
+        /* It waits for the join (up to 20 s): joined, or why not. A network
+         * it couldn't join isn't kept, nor one whose password is wrong. */
+        int st = sh_run(c, NULL, 0);             /* (not logged: it has the password) */
+        memset(c, 0, sizeof c);
+        memset(qp, 0, sizeof qp);
+        if (st) fprintf(stderr, "wifi: couldn't join %s (%d)\n", ssid, st);
         if (st == 3) say("That password isn't valid: 8 to 63 characters");
-        else if (st) say("Couldn't join it");
-        /* joining takes a few seconds: the status poll follows it */
-        for (int i = 0; i < 10; i++) {
-            usleep(1000 * 1000);
+        else if (st == 4) say_name("Wrong password for %s", ssid);
+        else if (st) say_name("Couldn't join %s", ssid);
+        /* joined: the address comes a few seconds later, which the status follows */
+        for (int i = 0; i < (st ? 1 : 10); i++) {
+            if (!st) usleep(1000 * 1000);
             poll_status();
             pthread_mutex_lock(&W.mu);
             int done = W.st.state == UI_WIFI_CONNECTED && !strcmp(W.st.ssid, ssid);
@@ -203,9 +211,9 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
     }
     case CMD_FORGET:
         set_busy("Forgetting");
-        shell_quote(ssid, q, sizeof q);
+        sh_quote(ssid, q, sizeof q);
         snprintf(c, sizeof c, FATHOM_WIFI " forget %s >/dev/null 2>&1", q);
-        run(c, NULL, 0);
+        sh_run(c, NULL, 0);
         set_busy("");
         scan();
         break;
@@ -215,14 +223,17 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
 static void *worker(void *arg)
 {
     (void)arg;
+    int idle_ms = POLL_MS;                       /* on, not joined: grows while nothing changes */
     for (;;) {
         pthread_mutex_lock(&W.mu);
         if (!W.cmd && !W.on) {
             pthread_cond_wait(&W.cv, &W.mu);     /* off: nothing to poll until a command */
         } else if (!W.cmd) {
+            int ms = W.st.state == UI_WIFI_CONNECTED ? POLL_CONNECTED_MS
+                   : W.st.state == UI_WIFI_CONNECTING ? POLL_MS : idle_ms;
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += (W.st.state == UI_WIFI_CONNECTED ? POLL_CONNECTED_MS : POLL_MS) / 1000;
+            ts.tv_sec += ms / 1000;
             pthread_cond_timedwait(&W.cv, &W.mu, &ts);
         }
         int cmd = W.cmd, on = W.on;
@@ -232,8 +243,13 @@ static void *worker(void *arg)
         W.cmd = CMD_NONE;
         memset(W.cmd_pass, 0, sizeof W.cmd_pass);
         pthread_mutex_unlock(&W.mu);
-        if (cmd) do_cmd(cmd, ssid, pass);
-        else if (on) poll_status();
+        if (cmd) {
+            do_cmd(cmd, ssid, pass);
+            idle_ms = POLL_MS;
+        } else if (on) {
+            int changed = poll_status();
+            idle_ms = changed ? POLL_MS : idle_ms * 2 > POLL_IDLE_MAX_MS ? POLL_IDLE_MAX_MS : idle_ms * 2;
+        }
         memset(pass, 0, sizeof pass);
     }
     return NULL;
@@ -325,8 +341,9 @@ int wifi_take_message(char *out, size_t cap)
 {
     pthread_mutex_lock(&W.mu);
     int have = W.msg[0] != '\0';
-    if (have) snprintf(out, cap, "%s", W.msg);
-    W.msg[0] = '\0';
+    if (have && W.msg_name[0]) tr_fill(out, cap, W.msg, W.msg_name, NULL);   /* (on the UI's thread: the language's) */
+    else if (have) snprintf(out, cap, "%s", W.msg);
+    W.msg[0] = W.msg_name[0] = '\0';
     pthread_mutex_unlock(&W.mu);
     return have;
 }

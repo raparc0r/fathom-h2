@@ -2,6 +2,7 @@
 #include "keys.h"
 
 #include <ctype.h>
+#include <stdio.h>
 #include <string.h>
 #include <strings.h>
 
@@ -61,9 +62,14 @@ void key_artist(const char *artist, const char *album_artist, char *out, size_t 
 void key_album(const char *artist, const char *album_artist, const char *album,
                char *out, size_t cap)
 {
-    const char *who = (album_artist && *album_artist) ? album_artist : artist;
     if (cap == 0) return;
-    normalize(who, out, cap);
+    /* The album artist's key, exactly as browsing makes it: without an
+     * ALBUMARTIST tag, "X" and "X feat. Y" (or "The X" and "X") on one album
+     * were two albums; "VA" and "Various Artists" too. */
+    const char *who = (album_artist && *album_artist) ? album_artist : artist;
+    if (key_is_various(album_artist)) snprintf(out, cap, "various artists");
+    else key_artist(who ? who : "", NULL, out, cap);
+    if (!*out) snprintf(out, cap, "unknown artist");
     size_t len = strlen(out);
     if (len + 2 < cap) {
         out[len++] = '\x1f';

@@ -50,9 +50,3 @@ int audio_route_set(audio_route_t r)
     struct gpio_v2_line_values v = {.bits = r == ROUTE_LINE_OUT, .mask = 1};
     return ioctl(g_line, GPIO_V2_LINE_SET_VALUES_IOCTL, &v) ? -1 : 0;
 }
-
-void audio_route_close(void)
-{
-    if (g_line >= 0) close(g_line);
-    g_line = -1;
-}

@@ -2,7 +2,8 @@
 /*
  * Updates over Wi-Fi for the player (see updater.c and app/net/update.h).
  * Only ever when asked (Settings > About > Check for updates), or a check by
- * itself when the owner turned on Check automatically (main.c says when):
+ * itself while Check automatically is on, as it is unless turned off (main.c
+ * says when):
  * nothing here downloads on its own. All of it is safe from the UI thread.
  */
 #ifndef FATHOM_UPDATER_H

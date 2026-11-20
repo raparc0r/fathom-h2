@@ -8,7 +8,7 @@
 #   remove   everything that runs from the card stops (the player, Bluetooth,
 #            Wi-Fi, the network drive), the card is unmounted (lazily: what
 #            still has it open lets go as it ends), and fathom-cardout shows
-#            "Card removed" until it's back
+#            "No/bad card" until it's back
 #   add      the card is mounted as at boot and the player started as at boot
 #            (S90fathom); it brings back Bluetooth, Wi-Fi and the network
 #            drive as their settings say, and looks for new music in the
@@ -31,20 +31,16 @@
 # (first, and cheap: most events are something else's)
 [ "$1" = check ] || [ "$SUBSYSTEM/$DEVTYPE" = block/disk ] || exit 0
 
-MNT=/mnt/sd
-OUT=/var/run/fathom-card-out          # (exists while the card is out or unreadable)
-CARDOUT=/var/run/fathom-cardout.pid
+. /usr/lib/fathom/card.sh               # (MNT, CARD_OUT, card_mount, card_wait, ...)
 LUN=/sys/kernel/config/usb_gadget/fathom/functions/mass_storage.0/lun.0
 
 say() { logger -t sdcard "$1"; echo "sdcard: $1" >> /tmp/fathom-player.log; }
-mounted() { grep -q " $MNT " /proc/mounts; }
-show() { start-stop-daemon -S -q -b -m -p $CARDOUT -x /usr/sbin/fathom-cardout; }
 
 # fathom-cardout gone (it gives the screen up as it exits: the player needs it)
 hide() {
-    [ -f $CARDOUT ] || return 0
-    p=$(cat $CARDOUT)
-    rm -f $CARDOUT
+    [ -f $CARDOUT_PID ] || return 0
+    p=$(cat $CARDOUT_PID)
+    rm -f $CARDOUT_PID
     kill "$p" 2>/dev/null || return 0
     for i in 1 2 3 4 5 6 7 8 9 10; do
         kill -0 "$p" 2>/dev/null || return 0
@@ -54,7 +50,7 @@ hide() {
 }
 
 stop_all() {
-    touch $OUT
+    touch $CARD_OUT
     # the restart loop first, so nothing starts again from the card; then the
     # card unmounted, so what's stopped below finds nothing there (rather
     # than I/O errors: Bluetooth's pairings can't be saved to a card that's gone)
@@ -73,24 +69,12 @@ stop_all() {
     fathom-wifi off > /dev/null 2>&1
 }
 
-# Mount the card on disk $1 (its first partition, or the whole disk) as at
-# boot (S01bootlog)
-mount_card() {
-    for d in /dev/${1}p1 /dev/$1; do
-        [ -b "$d" ] && mount -t vfat -o rw,noatime "$d" $MNT 2>/dev/null && { echo "$d"; return 0; }
-    done
-    return 1
-}
-
 if [ "$1" = check ]; then
-    mounted && exit 0
+    card_mounted && exit 0
     # a card that came after S01bootlog stopped waiting for it (S90fathom starts the player)
-    for b in /sys/block/mmcblk*; do
-        case "$(readlink -f "$b")" in */13450000.mmc/*) mount_card "${b##*/}" > /dev/null && exit 0 ;; esac
-    done
-    touch $OUT
+    card_mount "$(card_disk)" > /dev/null && exit 0
     say "no card at start-up"
-    show
+    card_wait
     exit 0
 fi
 
@@ -101,25 +85,26 @@ remove)
     say "card removed ($DEVNAME)"
     stop_all
     say "stopped; waiting for the card"
-    show
+    card_wait
     ;;
 add)
     # a new disk while one is mounted: the old one's removal was missed
-    if mounted; then
+    if card_mounted; then
         say "card added ($DEVNAME) while one was mounted: unmounting that first"
         stop_all
     fi
     # (the disk's uevent comes after its partitions are read: their nodes are there)
-    if ! dev=$(mount_card "$DEVNAME"); then
+    if ! dev=$(card_mount "$DEVNAME"); then
         say "card added ($DEVNAME), but it can't be mounted (not FAT?)"
-        show
+        card_wait
         exit 0
     fi
-    rm -f $OUT
-    if [ ! -x $MNT/fathom/bin/fathom-player ]; then
+    if ! card_has_fathom; then
         say "card back ($dev), but without Fathom (fathom/bin/fathom-player)"
-        exit 0                          # (the screen still asks for the card)
+        card_wait                       # (the screen still asks for the card)
+        exit 0
     fi
+    rm -f $CARD_OUT
     say "card back ($dev): starting Fathom"
     hide
     touch /tmp/fathom-rescan            # (the player: a scan once it's up)

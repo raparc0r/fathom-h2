@@ -16,6 +16,7 @@
 
 #include "audio/ff_util.h"
 #include "net/tls_wrap.h"
+#include "tmpdir.h"
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
@@ -79,7 +80,7 @@ static void *hammer(void *arg)
 
 int main(void)
 {
-    snprintf(dir, sizeof dir, "/tmp/test_tls_wrap.XXXXXX");
+    test_tmp(dir, sizeof dir, "test_tls_wrap");
     if (!mkdtemp(dir)) return 1;
     snprintf(bundle, sizeof bundle, "%s/ca.pem", dir);
     copy("tests/tls/bundle.pem", bundle);

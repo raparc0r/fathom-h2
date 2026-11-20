@@ -205,8 +205,8 @@ static int card_out(const char *font, const char *out)
 {
     g_levels = 1;
     drop(0xC3D3E4);
-    if (text(font, "Card removed", 30, 0, 124, 0xF1EDFF) ||
-        text(font, "Put it back to continue.", 19, 0, 160, 0xC3D3E4) ||
+    if (text(font, "No/bad card", 30, 0, 124, 0xF1EDFF) ||
+        text(font, "Put in a card with Fathom on it.", 19, 0, 160, 0xC3D3E4) ||
         text(font, "Hold Power to switch off.", 15, 0, 214, 0x717BA6)) {
         fprintf(stderr, "cannot use font %s\n", font);
         return 1;

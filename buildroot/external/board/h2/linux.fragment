@@ -17,16 +17,14 @@ CONFIG_CMA_SIZE_MBYTES=2
 CONFIG_PRINTK_TIME=y
 CONFIG_PANIC_TIMEOUT=10
 
-# Hardware the H2 doesn't have (or we don't touch yet)
-# CONFIG_CFG80211 is not set
-# CONFIG_BRCMFMAC is not set
+# Hardware the H2 doesn't have (Wi-Fi: modules, below)
 # CONFIG_STMMAC_ETH is not set
 # CONFIG_SERIAL_SC16IS7XX is not set
 # CONFIG_SPI is not set
 # CONFIG_SENSORS_ADS7828 is not set
 # CONFIG_SCSI is not set
 
-# Stage 1 bring-up: blue LED heartbeat, microSD, FAT, debugfs for clock/GPIO state
+# Blue LED heartbeat, microSD, FAT
 CONFIG_LEDS_TRIGGERS=y
 CONFIG_LEDS_TRIGGER_HEARTBEAT=y
 CONFIG_REGULATOR=y
@@ -54,8 +52,6 @@ CONFIG_BLK_DEV_INITRD=y
 # CONFIG_IKCONFIG is not set
 # CONFIG_SWAP is not set
 # CONFIG_IPV6 is not set
-# CONFIG_WIRELESS is not set
-# CONFIG_WLAN is not set
 # CONFIG_ETHERNET is not set
 # CONFIG_EXT4_FS is not set
 # CONFIG_NETWORK_FILESYSTEMS is not set
@@ -93,7 +89,7 @@ CONFIG_U_SERIAL_CONSOLE=y
 # Display (draft driver, device-tree node disabled until tested): X1000 smart LCD,
 # MIPI-DBI panel, PWM backlight on TCU channel 0. Built in so it's compile-checked.
 CONFIG_DRM=y
-# No fbdev emulation: nothing uses /dev/fb0 (the player and the "Card removed"
+# No fbdev emulation: nothing uses /dev/fb0 (the player and the card-out
 # screen draw through DRM), and it reserved a 150 KB framebuffer for fbcon.
 # CONFIG_DRM_FBDEV_EMULATION is not set
 CONFIG_TINYDRM_X1000_SLCD=y
@@ -140,7 +136,8 @@ CONFIG_INPUT_GPIO_ROTARY_ENCODER=y
 CONFIG_PSTORE=y
 CONFIG_PSTORE_RAM=y
 CONFIG_PSTORE_CONSOLE=y
-CONFIG_PSTORE_PMSG=y
+# No pmsg (userspace's records): nothing writes to it, and the DT gives it no room
+# CONFIG_PSTORE_PMSG is not set
 # Plain-text records: a record that partly decays over a power cut stays readable
 # CONFIG_PSTORE_COMPRESS is not set
 

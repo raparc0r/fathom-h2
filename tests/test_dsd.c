@@ -20,6 +20,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include "tmpdir.h"
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); fails++; } } while (0)
@@ -288,7 +289,8 @@ static int bench(void)
         dsd2pcm_free(c);
     }
     /* the whole decoder: reading (from the page cache here), bit order, interleaving */
-    char dir[] = "/tmp/fathom-bench-dsd-XXXXXX", path[2][64];
+    char dir[200], path[2][64];
+    test_tmp(dir, sizeof dir, "fathom-bench-dsd");
     if (mkdtemp(dir)) {
         uint8_t *ch[2] = {bits, bits};
         snprintf(path[0], sizeof path[0], "%s/b.dsf", dir);
@@ -344,7 +346,8 @@ static void path_in(char *out, size_t cap, const char *dir, const char *name) { 
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "--bench")) return bench();
-    char dir[] = "/tmp/fathom-test-dsd-XXXXXX";
+    char dir[200];
+    test_tmp(dir, sizeof dir, "fathom-test-dsd");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     char dsf[256], dff[256], a[256], b[256], dst[256], mono[256], d128[256];
     path_in(dsf, sizeof dsf, dir, "sine.dsf");
@@ -578,6 +581,7 @@ int main(int argc, char **argv)
         CHECK(!st.fmt.dop && !k.fmt.dop && st.state == ENG_PAUSED && st.pos_ms >= 400, "after the switch: dop %d %d, %u ms",
               st.fmt.dop, k.fmt.dop, st.pos_ms);
         engine_set_balance(e, 1.0f, 1.0f);
+        k.n = 0;                                      /* (what's played from here: a chunk may have gone out before the pause) */
         engine_pause(e, 0);
         for (int w = 0; w < 500; w++) {
             engine_status(e, &st);

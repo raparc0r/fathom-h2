@@ -7,25 +7,28 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
+#include <utime.h>
 
 #include <sqlite3.h>
 
 #include "library/library.h"
+#include "tmpdir.h"
 
 static int failures;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
 
-typedef struct { const char *dir, *file, *title, *artist, *album, *genre, *composer, *year; int track; } spec_t;
+typedef struct { const char *dir, *file, *title, *artist, *album, *genre, *composer, *year; int track; const char *album_artist; } spec_t;
 
 static const spec_t SPECS[] = {
-    {"Ana Ruiz/First Light", "01.flac", "Morning", "Ana Ruiz", "First Light", "Jazz", "", "2019", 1},
-    {"Ana Ruiz/First Light", "02.flac", "Noon", "Ana Ruiz", "First Light", "Jazz", "", "2019", 2},
-    {"Ana Ruiz/Second", "01.flac", "Evening", "Ana Ruiz", "Second", "jazz", "", "2022", 1},       /* same genre, other case */
-    {"Bach Works/Suites", "01.flac", "Suite 1: Prelude", "Some Ensemble", "Suites", "Classical", "J. S. Bach", "2019", 1},
-    {"Bach Works/Suites", "02.flac", "Suite 1: Air", "Some Ensemble", "Suites", "Classical", "J. S. Bach", "2019", 2},
-    {"Bach Works/Suites", "03.flac", "Bonus", "Some Ensemble", "Suites", "Classical", "Anon", "2019", 3},
-    {"", "loose.flac", "Loose Song", "Nobody", "Loose", "", "", "", 1},                             /* at the top */
+    {"Ana Ruiz/First Light", "01.flac", "Morning", "Ana Ruiz", "First Light", "Jazz", "", "2019", 1, NULL},
+    {"Ana Ruiz/First Light", "02.flac", "Noon", "Ana Ruiz", "First Light", "Jazz", "", "2019", 2, NULL},
+    {"Ana Ruiz/Second", "01.flac", "Evening", "Ana Ruiz", "Second", "jazz", "", "2022", 1, NULL},       /* same genre, other case */
+    {"Bach Works/Suites", "01.flac", "Suite 1: Prelude", "Some Ensemble", "Suites", "Classical", "J. S. Bach", "2019", 1, NULL},
+    {"Bach Works/Suites", "02.flac", "Suite 1: Air", "Some Ensemble", "Suites", "Classical", "J. S. Bach", "2019", 2, NULL},
+    {"Bach Works/Suites", "03.flac", "Bonus", "Some Ensemble", "Suites", "Classical", "Anon", "2019", 3, NULL},
+    {"", "loose.flac", "Loose Song", "Nobody", "Loose", "", "", "", 1, NULL},                             /* at the top */
 };
 #define N ((int)(sizeof SPECS / sizeof SPECS[0]))
 
@@ -49,6 +52,7 @@ static int write_flac(const char *path, const spec_t *sp)
     tag(vc, "TITLE", sp->title);
     tag(vc, "ARTIST", sp->artist);
     tag(vc, "ALBUM", sp->album);
+    tag(vc, "ALBUMARTIST", sp->album_artist);
     tag(vc, "GENRE", sp->genre);
     tag(vc, "COMPOSER", sp->composer);
     tag(vc, "DATE", sp->year);
@@ -83,7 +87,8 @@ static const char *row(library_t *lib, const lib_list_t *l, int i, char *meta)
 
 int main(void)
 {
-    char dir[] = "/tmp/fathom-test-groups-XXXXXX";
+    char dir[200];
+    test_tmp(dir, sizeof dir, "fathom-test-groups");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     char music[300], path[700], db[300], art[300], meta[64], name[128];
     snprintf(music, sizeof music, "%s/music", dir);
@@ -162,6 +167,38 @@ int main(void)
     CHECK(library_list(lib, LIB_GENRES, 0, &l) == 2 && l.ids[0] == before);
     library_list_free(&l);
 
+    /* Retagged with another spelling (case only): the names follow, ids kept */
+    for (int i = 0; i < 3; i++) {                 /* Ana Ruiz's three tracks */
+        spec_t sp = SPECS[i];
+        sp.artist = "ANA RUIZ";
+        if (i < 2) sp.genre = "JAZZ";             /* (the third was "jazz" already) */
+        snprintf(path, sizeof path, "%s/%s/%s", music, sp.dir, sp.file);
+        CHECK(write_flac(path, &sp) == 0);
+        struct utimbuf tb = {time(NULL) + 100, time(NULL) + 100};   /* (a new date, as a retag gives) */
+        utime(path, &tb);
+    }
+    CHECK(library_scan(lib, music, NULL, NULL) == N);
+    CHECK(library_list(lib, LIB_GENRES, 0, &l) == 2 && l.ids[0] == before && !strcmp(row(lib, &l, 1, NULL), "JAZZ"));   /* (Classical, JAZZ) */
+    library_list_free(&l);
+    CHECK(library_list(lib, LIB_ALBUM_ARTISTS, 0, &l) > 0 && !strcmp(row(lib, &l, 0, NULL), "ANA RUIZ"));
+    library_list_free(&l);
+    lib_search_t hits;
+    CHECK(library_search(lib, "ana ruiz", &hits) > 0 && hits.artists.n == 1);
+    library_search_free(&hits);
+
+    /* A soundtrack earlier in path order spelling her "ana ruiz" as a track
+     * artist: her albums' spelling stays */
+    spec_t ost = {"A Soundtrack", "01.flac", "Theme", "ana ruiz", "Film Music", "", "", "", 1, "Film Orchestra"};
+    snprintf(path, sizeof path, "%s/%s", music, ost.dir);
+    mkdir(path, 0755);
+    snprintf(path, sizeof path, "%s/%s/%s", music, ost.dir, ost.file);
+    CHECK(write_flac(path, &ost) == 0);
+    CHECK(library_scan(lib, music, NULL, NULL) == N + 1);
+    CHECK(library_list(lib, LIB_ALBUM_ARTISTS, 0, &l) > 1 && !strcmp(row(lib, &l, 0, NULL), "ANA RUIZ"));
+    library_list_free(&l);
+    unlink(path);
+    CHECK(library_scan(lib, music, NULL, NULL) == N);
+
     CHECK(!library_needs_tags(lib));
     library_close(lib);
 
@@ -187,6 +224,29 @@ int main(void)
     CHECK(sqlite3_step(q) == SQLITE_ROW && sqlite3_column_int(q, 0) == N);   /* the levelling kept */
     sqlite3_finalize(q);
     sqlite3_close(raw);
+
+    /* Two connections, as the player's and a background scan's: a row read on
+     * one mustn't pin it to an old snapshot (a statement left stepped keeps its
+     * read open), or it misses the other's changes and its own writes fail. */
+    {
+        library_t *la = library_open(db, art), *lb = library_open(db, art);
+        CHECK(la && lb);
+        lib_list_t songs, fav;
+        CHECK(library_list(la, LIB_SONGS, 0, &songs) == N);
+        char m[64], t2[256];
+        CHECK(library_row(la, LIB_SONGS, songs.ids[0], t2, sizeof t2, m, sizeof m) == 0);   /* a reads a row */
+        lib_track_t tr;
+        CHECK(library_track(la, songs.ids[1], &tr) == 0);
+        library_set_favourite(lb, songs.ids[0], 1);                                       /* b writes */
+        CHECK(library_list(la, LIB_FAVOURITES, 0, &fav) == 1);                            /* a sees it */
+        library_list_free(&fav);
+        library_set_favourite(la, songs.ids[1], 1);                                       /* a can write */
+        CHECK(library_list(lb, LIB_FAVOURITES, 0, &fav) == 2);
+        library_list_free(&fav);
+        library_list_free(&songs);
+        library_close(lb);
+        library_close(la);
+    }
 
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     printf("groups: all good\n");

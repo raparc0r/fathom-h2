@@ -2,6 +2,10 @@
 
 # Fathom
 
+Latest version: [0.10.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.10.0) released November 19th 2026
+
+[Features](#features) · [Compatibility](#compatibility) · [Installing](#installing) · [Internet access](#internet-access) · [Licence](#licence) · [How it was made](#how-it-was-made)
+
 Fathom is a new firmware for the HiFi Walker H2. I started it as a side project with
 Claude, just for myself, but it grew into a full-featured firmware, so I'm sharing it. It
 has its own kernel, system and player, built from source; the bootloader is built on
@@ -19,7 +23,8 @@ project, and if you haven't tried it, check it out: [rockbox.org](https://www.ro
 ## Features
 
 - **Easy to install, and to undo.** You copy it to the card and run the H2's own firmware
-  update. The stock firmware stays.
+  update. The stock firmware stays, and Settings → About → Uninstall Fathom puts the H2
+  back on it completely, from the H2 itself.
 - **Bit-perfect playback.** Pure mode turns off everything that could change the sound.
 - **Gapless playback**, so live albums and mixes play without breaks.
 - **Most formats**: FLAC, MP3, AAC, ALAC, WAV, AIFF, WavPack, APE, TTA, Opus, Ogg Vorbis
@@ -63,11 +68,12 @@ unzipped.
    Update**. The H2 restarts into Fathom, which reads your library. (If your H2 runs
    Rockbox, hold **Play** while turning it on to start the stock firmware first.)
 
-To start the stock firmware instead, hold **Play** while turning the H2 on.
+To start the stock firmware instead, hold **Play** while turning the H2 on. To remove
+Fathom, bootloader included: Settings → About → **Uninstall Fathom** ([GUIDE.md](GUIDE.md)).
 
 More: [INSTALL.md](INSTALL.md) (the full steps, and a recommended backup),
-[GUIDE.md](GUIDE.md) (using Fathom), [ADVANCED.md](ADVANCED.md) (recovery, SSH, removing
-Fathom, building it yourself).
+[GUIDE.md](GUIDE.md) (using Fathom, and uninstalling it), [ADVANCED.md](ADVANCED.md)
+(recovery, SSH, building it yourself).
 
 ## Internet access
 

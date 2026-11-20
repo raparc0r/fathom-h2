@@ -21,8 +21,6 @@ void mixer_close(mixer_t *m);
 int  mixer_db_range(mixer_t *m, long *min_cdb, long *max_cdb);
 /* The raw value closest to `cdb` (1/100 dB), assuming linear dB steps; -1 without a dB range. */
 int  mixer_value_for_db(mixer_t *m, long cdb);
-/* The level of raw `value` in 1/100 dB (linear dB steps); 0 without a dB range. */
-long mixer_db_for_value(mixer_t *m, int value);
 /* Name of the first integer "... Playback Volume" control on ctl_dev, into name (44 bytes). */
 int  mixer_find_playback_volume(const char *ctl_dev, char *name);
 

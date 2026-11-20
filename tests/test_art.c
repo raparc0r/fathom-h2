@@ -452,6 +452,21 @@ static void write_flac(const char *path, const char *album, const char *title, i
     fclose(f);
 }
 
+static int64_t album_id_of(const char *db, const char *title)
+{
+    sqlite3 *raw;
+    sqlite3_stmt *s = NULL;
+    int64_t id = -1;
+    if (sqlite3_open(db, &raw) != SQLITE_OK) return -1;
+    if (sqlite3_prepare_v2(raw, "SELECT id FROM albums WHERE title=?", -1, &s, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(s, 1, title, -1, SQLITE_STATIC);
+        if (sqlite3_step(s) == SQLITE_ROW) id = sqlite3_column_int64(s, 0);
+    }
+    sqlite3_finalize(s);
+    sqlite3_close(raw);
+    return id;
+}
+
 static int album_art(const char *db_path, const char *album)
 {
     sqlite3 *db;
@@ -559,6 +574,23 @@ static void test_library(void)
     CHECK(album_art(db, "Album B") == 1);
     CHECK(album_art(db, "Album C") == 1);
     CHECK(album_art(db, "Album D") == 2);
+    /* covers found before found covers had a signature (0): kept, noted */
+    {
+        sqlite3 *rw;
+        CHECK(sqlite3_open(db, &rw) == SQLITE_OK &&
+              sqlite3_exec(rw, "UPDATE albums SET art_sig=0 WHERE art=1", NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(rw);
+        lib = library_open(db, art);
+        CHECK(lib && library_scan(lib, music, NULL, NULL) == 6);
+        library_close(lib);
+        CHECK(album_art(db, "Album A") == 1 && album_art(db, "Album B") == 1 && album_art(db, "Album C") == 1);
+        sqlite3_stmt *z = NULL;
+        CHECK(sqlite3_open(db, &rw) == SQLITE_OK &&
+              sqlite3_prepare_v2(rw, "SELECT COUNT(*) FROM albums WHERE art=1 AND art_sig=0", -1, &z, NULL) == SQLITE_OK);
+        CHECK(sqlite3_step(z) == SQLITE_ROW && sqlite3_column_int(z, 0) == 0);
+        sqlite3_finalize(z);
+        sqlite3_close(rw);
+    }
     /* a library from before: D's fingerprint unknown, so a start scans once */
     sqlite3 *raw;
     CHECK(sqlite3_open(db, &raw) == SQLITE_OK && sqlite3_exec(raw, "UPDATE albums SET art_sig=0 WHERE art=2", NULL, NULL, NULL) == SQLITE_OK);
@@ -579,6 +611,54 @@ static void test_library(void)
     CHECK(lib && library_scan(lib, music, NULL, NULL) == 6);
     library_close(lib);
     CHECK(album_art(db, "Album D") == 1);
+    /* its cover.png replaced by another picture: the cover follows */
+    {
+        int64_t dd = album_id_of(db, "Album D");
+        size_t px_n = (size_t)LIB_ART_SMALL * LIB_ART_SMALL;
+        uint16_t *pxa = malloc(px_n * 2), *pxb = malloc(px_n * 2);
+        unsigned char *flat = malloc(400 * 400 * 3), *flat_expect = malloc(400 * 400 * 3);
+        for (int i = 0; i < 400 * 400; i++) flat[3 * i] = 220, flat[3 * i + 1] = 20, flat[3 * i + 2] = 20;
+        lib = library_open(db, art);
+        CHECK(lib && pxa && pxb && flat && flat_expect && library_art(lib, dd, LIB_ART_SMALL, pxa) == 0);
+        library_close(lib);
+        snprintf(q, sizeof q, "%s/D/cover.png", music);
+        write_png(q, flat, 400, 400, 2, 8, 0, 1 << 20, flat_expect);
+        lib = library_open(db, art);
+        CHECK(lib && library_scan(lib, music, NULL, NULL) == 6);
+        CHECK(library_art(lib, dd, LIB_ART_SMALL, pxb) == 0 && memcmp(pxa, pxb, px_n * 2));
+        library_close(lib);
+        CHECK(album_art(db, "Album D") == 1);
+        /* ...and removed: no cover, no thumbnails */
+        unlink(q);
+        lib = library_open(db, art);
+        CHECK(lib && library_scan(lib, music, NULL, NULL) == 6);
+        CHECK(library_art(lib, dd, LIB_ART_SMALL, pxb) == -1);
+        library_close(lib);
+        CHECK(album_art(db, "Album D") == 2);
+        free(pxa), free(pxb), free(flat), free(flat_expect);
+    }
+    /* D removed, then a coverless E: E takes D's id (the highest), and mustn't
+     * show D's cover (its thumbnails go with it) */
+    int64_t did = album_id_of(db, "Album D");
+    snprintf(q, sizeof q, "%s/D/01.flac", music);
+    unlink(q);
+    snprintf(q, sizeof q, "%s/D/cover.png", music);
+    unlink(q);
+    snprintf(q, sizeof q, "%s/D", music);
+    rmdir(q);
+    lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 5);   /* D gone */
+    library_close(lib);
+    mk("%s/music/%s", "E");
+    snprintf(p, sizeof p, "%s/E/01.flac", music);
+    write_flac(p, "Album E", "e1", 1, NULL, NULL, 0);
+    lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 6);
+    int64_t eid = album_id_of(db, "Album E");
+    uint16_t *px = malloc((size_t)LIB_ART_SMALL * LIB_ART_SMALL * 2);
+    CHECK(did > 0 && eid == did && px && library_art(lib, eid, LIB_ART_SMALL, px) == -1);
+    free(px);
+    library_close(lib);
     free(src), free(expect);
 }
 

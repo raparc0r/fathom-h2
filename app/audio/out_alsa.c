@@ -31,6 +31,7 @@ typedef struct {
     void    *conv;
     size_t   conv_cap;
     int      paused;
+    volatile int flushes;       /* a_flush()es: a retry must not write what one dropped */
     char     desc[96];
     FILE *tap;                  /* out_alsa_set_tap(): a copy of every byte written */
 } alsa_out_t;
@@ -120,7 +121,7 @@ static int a_open(void *ctx, const audio_format_t *fmt)
     alsa_out_t *a = ctx;
     a_close(a);
     a->fd = open(a->dev, O_RDWR | O_CLOEXEC);
-    if (a->fd < 0) { perror(a->dev); return -1; }
+    if (a->fd < 0) { perror(a->dev); return -2; }   /* (gone: unplugged) */
 
     a->fmt = *fmt;
     unsigned rate = fmt->rate;
@@ -136,7 +137,7 @@ static int a_open(void *ctx, const audio_format_t *fmt)
                                SNDRV_PCM_FORMAT_S16_LE};
     const int *try = fmt->bits && fmt->bits <= 16 ? shallow : fmt->bits > 24 ? full : deep;
     struct snd_pcm_hw_params hp;
-    int ok = 0;
+    int ok = 0, err = 0;
     /* a stream: the deep buffer, else (a device that won't) the usual one */
     for (int k = 0; k < 8 && !ok; k++) {
         int i = k % 4, deep = fmt->stream && k < 4;
@@ -154,12 +155,14 @@ static int a_open(void *ctx, const audio_format_t *fmt)
         if (ioctl(a->fd, SNDRV_PCM_IOCTL_HW_PARAMS, &hp) == 0) {
             ok = 1;
             a->format = try[i];
+        } else {
+            err = errno;
         }
     }
     if (!ok) {
-        fprintf(stderr, "alsa: hw_params %u Hz %u-bit %u ch: %s\n", rate, fmt->bits, fmt->channels, strerror(errno));
+        fprintf(stderr, "alsa: hw_params %u Hz %u-bit %u ch: %s\n", rate, fmt->bits, fmt->channels, strerror(err));
         a_close(a);
-        return -1;
+        return err == ENODEV ? -2 : -1;              /* unplugged meanwhile, or not a format it takes */
     }
     a->sample_bytes = format_bytes(a->format);
     a->period = hp_int(&hp, SNDRV_PCM_HW_PARAM_PERIOD_SIZE)->min;
@@ -186,9 +189,10 @@ static int a_open(void *ctx, const audio_format_t *fmt)
     sp.silence_threshold = 0;
     sp.silence_size = boundary;
     if (ioctl(a->fd, SNDRV_PCM_IOCTL_SW_PARAMS, &sp) || ioctl(a->fd, SNDRV_PCM_IOCTL_PREPARE)) {
-        fprintf(stderr, "alsa: sw_params/prepare: %s\n", strerror(errno));
+        err = errno;
+        fprintf(stderr, "alsa: sw_params/prepare: %s\n", strerror(err));
         a_close(a);
-        return -1;
+        return err == ENODEV ? -2 : -1;
     }
     a->paused = 0;
     const char *fname = a->format == SNDRV_PCM_FORMAT_S16_LE ? "S16_LE"
@@ -239,6 +243,7 @@ static long a_write(void *ctx, const int32_t *frames, long n)
     size_t frame_bytes = (size_t)a->fmt.channels * (size_t)a->sample_bytes;
     if (a->tap) fwrite(buf, frame_bytes, (size_t)n, a->tap);   /* exactly what the card gets */
     long left = n;
+    int tries = 0, flushes = a->flushes;
     while (left > 0) {
         struct snd_xferi x = {.buf = (void *)buf, .frames = (snd_pcm_uframes_t)left};
         if (ioctl(a->fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &x) == 0) {
@@ -252,8 +257,21 @@ static long a_write(void *ctx, const int32_t *frames, long n)
             fprintf(stderr, "alsa: underrun %u\n", ++underruns);
             if (ioctl(a->fd, SNDRV_PCM_IOCTL_PREPARE) == 0) continue;
         }
-        fprintf(stderr, "alsa: write: %s\n", strerror(errno));
-        return -1;
+        /* The start failing (EIO; the kernel's -ENOMEM when its DMA can't
+         * get memory at that moment, seen in the first seconds after boot)
+         * isn't the device gone: prepared again and retried a few times
+         * before the engine is told (an unplugged DAC fails the prepare) */
+        int e = errno;
+        if ((e == EIO || e == ENOMEM) && tries < 3 && a->flushes == flushes &&
+            ioctl(a->fd, SNDRV_PCM_IOCTL_PREPARE) == 0) {
+            fprintf(stderr, "alsa: write: %s, again\n", strerror(e));
+            tries++;
+            usleep(20000);
+            if (a->flushes == flushes) continue;
+            return n;                                /* (dropped meanwhile: as written) */
+        }
+        if (a->flushes == flushes) fprintf(stderr, "alsa: write: %s\n", strerror(e));
+        return -1;                                   /* (cut short by a flush, a skip or a stop: not logged) */
     }
     return n;
 }
@@ -278,6 +296,7 @@ static void a_flush(void *ctx)
 {
     alsa_out_t *a = ctx;
     if (a->fd < 0) return;
+    a->flushes++;
     ioctl(a->fd, SNDRV_PCM_IOCTL_DROP);
     ioctl(a->fd, SNDRV_PCM_IOCTL_PREPARE);
     a->paused = 0;

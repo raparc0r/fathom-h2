@@ -12,6 +12,7 @@
 #include <sqlite3.h>
 
 #include "library/library.h"
+#include "tmpdir.h"
 
 static int failures;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
@@ -67,7 +68,8 @@ static void check_order(library_t *lib)
 
 int main(void)
 {
-    char dir[] = "/tmp/fathom-test-sort-XXXXXX";
+    char dir[200];
+    test_tmp(dir, sizeof dir, "fathom-test-sort");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     char music[300], path[400], db[300], art[300];
     snprintf(music, sizeof music, "%s/music", dir);
@@ -83,10 +85,12 @@ int main(void)
     check_order(lib);
     library_close(lib);
 
-    /* a library from before: songs by title, albums by the old sort */
+    /* a library from before: songs by title, albums by the old sort (and
+     * its schema's version then: opening upgrades only what's older) */
     sqlite3 *raw = NULL;
     CHECK(sqlite3_open(db, &raw) == SQLITE_OK);
-    CHECK(sqlite3_exec(raw, "UPDATE tracks SET sort=NULL; UPDATE albums SET sort=lower(title);", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(sqlite3_exec(raw, "UPDATE tracks SET sort=NULL; UPDATE albums SET sort=lower(title); PRAGMA user_version=4;",
+                       NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(raw);
     lib = library_open(db, art);
     CHECK(lib != NULL);

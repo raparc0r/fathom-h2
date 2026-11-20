@@ -4,10 +4,27 @@
 # Which Wi-Fi network the address came from: fathom-wifi status compares it with
 # the network joined now, and asks for a new address when wpa_supplicant has
 # moved to another one (udhcpc alone would keep the old one until it's due).
+#
+# And no asking while no network is joined: udhcpc (-A 3) would try again every
+# 12 s for as long as Wi-Fi is on with nothing saved in range, this script and
+# its hooks each time. A try that fails with no network joined puts it to rest
+# instead (SIGUSR2: released, no timer at all); fathom-wifi status wakes it
+# (SIGUSR1) once a network is joined. (udhcpc reads the signal once this script
+# is done.)
 [ "$interface" = wlan0 ] || exit 0
 RUN=/var/run/fathom-wifi
+CARRIER=/sys/class/net/wlan0/carrier       # 1 while a network is joined
 case "$1" in
 bound|renew) s=$(/usr/sbin/fathom-wifi ssid); [ -n "$s" ] && printf '%s\n' "$s" > $RUN/lease-ssid ;;
-deconfig|leasefail|nak) rm -f $RUN/lease-ssid ;;
+deconfig|nak) rm -f $RUN/lease-ssid ;;
+leasefail)
+    rm -f $RUN/lease-ssid
+    c=; read -r c 2>/dev/null < $CARRIER
+    if [ "$c" != 1 ] && [ -f $RUN/udhcpc.pid ]; then
+        read -r p < $RUN/udhcpc.pid
+        rm -f $RUN/asked                       # (status asks again once joined)
+        kill -USR2 "$p" 2>/dev/null
+    fi
+    ;;
 esac
 exit 0

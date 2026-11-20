@@ -31,9 +31,5 @@ cursor      = none
 playing     = dot
 motion      = smooth
 
-[art]
-style       = normal
-
 [decor]
-header_pattern = none
-icons          = line
+icons = line

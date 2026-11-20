@@ -31,21 +31,60 @@ needed() { "$readelf" -d "$1" 2>/dev/null | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/
 libpath() { for d in usr/lib lib; do [ -e "$t/$d/$1" ] && { echo "$d/$1"; return 0; }; done; return 0; }
 # (libraries from staging: post-build never touches it, so every run sees them all)
 staged() { for d in usr/lib lib; do [ -e "$STAGING_DIR/$d/$1" ] && { echo "$d/$1"; return 0; }; done; return 0; }
+# The card's stages (Bluetooth, Wi-Fi, the network drive) are made alike by
+# these two. Programs (or modules) into the stage NEW from the target, or from
+# the last stage OLD when an earlier run already moved them, stripped if STRIP
+# isn't empty; the paths copied are added to $staged_in.
+stage_progs() { # NEW OLD STRIP PATH...
+    sp_new=$1 sp_old=$2 sp_strip=$3
+    shift 3
+    for p in "$@"; do
+        src=
+        [ -e "$t/$p" ] && src="$t/$p"
+        [ -z "$src" ] && [ -e "$sp_old/$p" ] && src="$sp_old/$p"
+        [ -n "$src" ] || continue
+        mkdir -p "$sp_new/$(dirname "$p")"
+        cp -L "$src" "$sp_new/$p"
+        [ -z "$sp_strip" ] || "$strip" --strip-unneeded "$sp_new/$p" 2>/dev/null || true
+        staged_in="$staged_in $p"
+    done
+}
+# The shared libraries FILES (in NEW) need, and theirs, into NEW by their
+# sonames (FAT has no symlinks: the real file), stripped: none that one of the
+# stages in HAVE already has; from staging, else from each folder in FROM in
+# turn (a library only installed to the target, or in the last stage).
+stage_libs() { # NEW "FILES" "HAVE" "FROM"
+    sl_new=$1 sl_todo=$2 sl_have=$3 sl_from=$4 sl_done=
+    while [ -n "$sl_todo" ]; do
+        sl_next=
+        for f in $sl_todo; do
+            for n in $(needed "$sl_new/$f"); do
+                case "$n" in libc.so|ld-musl*) continue ;; esac
+                sl_had=
+                for h in $sl_have; do [ -e "$h/usr/lib/$n" ] || [ -e "$h/lib/$n" ] && sl_had=1; done
+                [ -z "$sl_had" ] || continue
+                l=$(staged "$n") from=$STAGING_DIR
+                for s in $sl_from; do
+                    for d in usr/lib lib; do [ -z "$l" ] && [ -e "$s/$d/$n" ] && l=$d/$n from=$s; done
+                done
+                [ -n "$l" ] || { echo "post-build: $f needs $n, not in staging" >&2; exit 1; }
+                case " $sl_done " in *" $l "*) continue ;; esac
+                sl_done="$sl_done $l"; sl_next="$sl_next $l"
+                mkdir -p "$sl_new/$(dirname "$l")"
+                cp -L "$from/$l" "$sl_new/$l"
+                "$strip" --strip-unneeded "$sl_new/$l" 2>/dev/null || true
+            done
+        done
+        sl_todo=$sl_next
+    done
+}
 # A fresh stage: programs and configuration from the target, or from the last
 # stage when an earlier run already moved them; libraries from staging.
 new="$bt.new"
 rm -rf "$new"
-progs_in=
-for p in $progs; do
-    src=
-    [ -e "$t/$p" ] && src="$t/$p"
-    [ -z "$src" ] && [ -e "$bt/$p" ] && src="$bt/$p"
-    [ -n "$src" ] || continue
-    mkdir -p "$new/$(dirname "$p")"
-    cp -L "$src" "$new/$p"
-    progs_in="$progs_in $p"
-done
-if [ -n "$progs_in" ]; then
+staged_in=
+stage_progs "$new" "$bt" strip $progs
+if [ -n "$staged_in" ]; then
     # merged: a package reinstalled alone (bluez-alsa) brings back only its own
     # files to the target, the others are in the last stage
     for d in $confs; do
@@ -60,23 +99,7 @@ if [ -n "$progs_in" ]; then
     find "$new/usr/share/alsa/cards" -type f ! -name aliases.conf -delete 2>/dev/null || true
     # bluez-alsa's ALSA plugins, from staging too
     [ -d "$STAGING_DIR/usr/lib/alsa-lib" ] && { mkdir -p "$new/usr/lib"; cp -rL "$STAGING_DIR/usr/lib/alsa-lib" "$new/usr/lib/"; }
-    libs= todo=$(cd "$new" && find . -type f | sed 's|^\./||')
-    while [ -n "$todo" ]; do
-        next=
-        for f in $todo; do
-            for n in $(needed "$new/$f"); do
-                case "$n" in libc.so|ld-musl*) continue ;; esac
-                l=$(staged "$n")
-                [ -n "$l" ] || { echo "post-build: $f needs $n, not in staging" >&2; exit 1; }
-                case " $libs " in *" $l "*) continue ;; esac
-                libs="$libs $l"; next="$next $l"
-                mkdir -p "$new/$(dirname "$l")"
-                cp -L "$STAGING_DIR/$l" "$new/$l"        # FAT has no symlinks: the real file, by its soname
-                "$strip" --strip-unneeded "$new/$l" 2>/dev/null || true
-            done
-        done
-        todo=$next
-    done
+    stage_libs "$new" "$(cd "$new" && find . -type f | sed 's|^\./||')" "" ""
     # Their licences go along (fathom/bt/LICENSES): package, licence, files
     lic="$new/LICENSES"
     mkdir -p "$lic"
@@ -148,17 +171,9 @@ mkdir -p "$t"/usr/libexec && : > "$t"/usr/libexec/dbus-daemon-launch-helper
 wifi="$BINARIES_DIR/wifi"
 wnew="$wifi.new"
 rm -rf "$wnew"
-wprogs_in=
-for p in usr/sbin/wpa_supplicant usr/sbin/wpa_cli usr/sbin/iw; do
-    src=
-    [ -e "$t/$p" ] && src="$t/$p"
-    [ -z "$src" ] && [ -e "$wifi/$p" ] && src="$wifi/$p"
-    [ -n "$src" ] || continue
-    mkdir -p "$wnew/$(dirname "$p")"
-    cp -L "$src" "$wnew/$p"
-    "$strip" --strip-unneeded "$wnew/$p" 2>/dev/null || true
-    wprogs_in="$wprogs_in $p"
-done
+staged_in=
+stage_progs "$wnew" "$wifi" strip usr/sbin/wpa_supplicant usr/sbin/wpa_cli usr/sbin/iw
+wprogs_in=$staged_in
 mods=$(find "$t/lib/modules" -name '*.ko' 2>/dev/null || true)   # (none once an earlier run removed the folder)
 if [ -n "$mods" ]; then
     mkdir -p "$wnew/modules"
@@ -167,24 +182,7 @@ elif [ -d "$wifi/modules" ]; then
     mkdir -p "$wnew" && cp -r "$wifi/modules" "$wnew/"
 fi
 if [ -n "$wprogs_in" ]; then
-    wlibs= todo=$wprogs_in
-    while [ -n "$todo" ]; do
-        next=
-        for f in $todo; do
-            for n in $(needed "$wnew/$f"); do
-                case "$n" in libc.so|ld-musl*) continue ;; esac
-                [ -e "$bt/usr/lib/$n" ] || [ -e "$bt/lib/$n" ] && continue   # Bluetooth's stage has it
-                l=$(staged "$n")
-                [ -n "$l" ] || { echo "post-build: $f needs $n, not in staging" >&2; exit 1; }
-                case " $wlibs " in *" $l "*) continue ;; esac
-                wlibs="$wlibs $l"; next="$next $l"
-                mkdir -p "$wnew/$(dirname "$l")"
-                cp -L "$STAGING_DIR/$l" "$wnew/$l"
-                "$strip" --strip-unneeded "$wnew/$l" 2>/dev/null || true
-            done
-        done
-        todo=$next
-    done
+    stage_libs "$wnew" "$wprogs_in" "$bt" ""             # (not those Bluetooth's stage has)
     wl="$wnew/LICENSES"
     mkdir -p "$wl"
     : > "$wl/README.txt"
@@ -229,58 +227,22 @@ rm -f "$t"/usr/bin/nl-* "$t"/usr/bin/genl-ctrl-list "$t"/usr/bin/idiag-socket-de
 share="$BINARIES_DIR/share"
 snew="$share.new"
 rm -rf "$snew"
-sprogs_in=
-for p in usr/sbin/lighttpd usr/sbin/mdnsd usr/libexec/gesftpserver; do
-    src=
-    [ -e "$t/$p" ] && src="$t/$p"
-    [ -z "$src" ] && [ -e "$share/$p" ] && src="$share/$p"
-    [ -n "$src" ] || continue
-    mkdir -p "$snew/$(dirname "$p")"
-    cp -L "$src" "$snew/$p"
-    "$strip" --strip-unneeded "$snew/$p" 2>/dev/null || true
-    sprogs_in="$sprogs_in $p"
-done
-for m in mod_webdav mod_auth mod_authn_file mod_accesslog mod_mbedtls; do
-    src=
-    [ -e "$t/usr/lib/lighttpd/$m.so" ] && src="$t/usr/lib/lighttpd/$m.so"
-    [ -z "$src" ] && [ -e "$share/usr/lib/lighttpd/$m.so" ] && src="$share/usr/lib/lighttpd/$m.so"
-    [ -n "$src" ] || continue
-    mkdir -p "$snew/usr/lib/lighttpd"
-    cp -L "$src" "$snew/usr/lib/lighttpd/"
-    "$strip" --strip-unneeded "$snew/usr/lib/lighttpd/$m.so" 2>/dev/null || true
-    sprogs_in="$sprogs_in usr/lib/lighttpd/$m.so"
-done
+staged_in=
+stage_progs "$snew" "$share" strip usr/sbin/lighttpd usr/sbin/mdnsd usr/libexec/gesftpserver \
+    usr/lib/lighttpd/mod_webdav.so usr/lib/lighttpd/mod_auth.so usr/lib/lighttpd/mod_authn_file.so \
+    usr/lib/lighttpd/mod_accesslog.so usr/lib/lighttpd/mod_mbedtls.so
+sprogs_in=$staged_in
 # The certificate authorities' bundle, for the player's HTTPS (radio)
 ca="$t/etc/ssl/certs/ca-certificates.crt"
 [ -s "$ca" ] || ca="$share/ca-certificates.crt"
-if [ -s "$ca" ]; then
-    mkdir -p "$snew"
-    cp -L "$ca" "$snew/ca-certificates.crt"
-fi
+# (required: updates are checked against it, and HTTPS refuses without it)
+[ -s "$ca" ] || { echo "post-build: no CA certificates bundle" >&2; exit 1; }
+mkdir -p "$snew"
+cp -L "$ca" "$snew/ca-certificates.crt"
 if [ -n "$sprogs_in" ]; then
-    slibs= todo=$sprogs_in
-    while [ -n "$todo" ]; do
-        next=
-        for f in $todo; do
-            for n in $(needed "$snew/$f"); do
-                case "$n" in libc.so|ld-musl*) continue ;; esac
-                [ -e "$bt/usr/lib/$n" ] || [ -e "$bt/lib/$n" ] && continue
-                [ -e "$wifi/usr/lib/$n" ] || [ -e "$wifi/lib/$n" ] && continue
-                # (from staging; libmdnsd is only installed to the target, or
-                # is in the last stage once an earlier run moved it)
-                l=$(staged "$n") from=$STAGING_DIR
-                [ -z "$l" ] && l=$(libpath "$n") && from=$t
-                [ -z "$l" ] && for d in usr/lib lib; do [ -e "$share/$d/$n" ] && l=$d/$n from=$share; done
-                [ -n "$l" ] || { echo "post-build: $f needs $n, not in staging" >&2; exit 1; }
-                case " $slibs " in *" $l "*) continue ;; esac
-                slibs="$slibs $l"; next="$next $l"
-                mkdir -p "$snew/$(dirname "$l")"
-                cp -L "$from/$l" "$snew/$l"
-                "$strip" --strip-unneeded "$snew/$l" 2>/dev/null || true
-            done
-        done
-        todo=$next
-    done
+    # (not those the other stages have; libmdnsd is only installed to the
+    # target, or is in the last stage once an earlier run moved it)
+    stage_libs "$snew" "$sprogs_in" "$bt $wifi" "$t $share"
     sl="$snew/LICENSES"
     mkdir -p "$sl"
     : > "$sl/README.txt"

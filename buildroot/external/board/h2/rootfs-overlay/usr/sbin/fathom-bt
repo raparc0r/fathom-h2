@@ -20,6 +20,8 @@ BT=/mnt/sd/fathom/bt
 STATE=/mnt/sd/fathom/bluetooth-pairings.tar
 RUN=/var/run/fathom-bt
 SETTINGS=/mnt/sd/fathom/settings.ini
+nl='
+'
 setting() { sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" $SETTINGS 2>/dev/null | tail -1 | tr -d '\r' | sed 's/[[:space:]]*$//'; }
 export LD_LIBRARY_PATH=$BT/usr/lib:$BT/lib
 export DBUS_SYSTEM_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket
@@ -39,14 +41,43 @@ bluealsa() {
     else echo $BT/usr/bin/bluealsa; fi
 }
 
-# ADDR|NAME|ICON for every known device that plays audio
+# bluetoothctl's "info" (one device or several) read: ADDR|NAME|ICON|PAIRED|CONNECTED
+# for each device that plays audio, ADDR| for each that doesn't. (Fed on its
+# input, bluetoothctl is interactive: its prompt and echo, carriage returns
+# and any colours are left out with everything that isn't a device's line.)
+parse_info() {
+    tr '\r' '\n' | awk '
+    function out() {
+        if (a != "" && n != "") print a "|" (au ? n "|" (ic != "" ? ic : "audio") "|" p "|" c : "")
+        a = ""
+    }
+    BEGIN { e = sprintf("%c", 27) "\\[[0-9;?]*[A-Za-z]"; m = "[" sprintf("%c%c", 1, 2) "]" }
+    { gsub(e, ""); gsub(m, "") }
+    /^Device [0-9A-F][0-9A-F]:/ { out(); a = substr($2, 1, 17); n = ic = ""; p = c = au = 0; next }
+    a == "" || !/^\t/ { next }
+    { sub(/^\t/, "") }
+    /^Alias: / { n = substr($0, 8) }
+    /^Icon: / { ic = substr($0, 7); if (ic ~ /^audio-/) au = 1 }
+    /^Paired: yes/ { p = 1 }
+    /^Connected: yes/ { c = 1 }
+    /^UUID: Audio Sink/ { au = 1 }
+    END { out() }'
+}
+
+# ADDR|NAME|ICON|PAIRED|CONNECTED for every known device that plays audio ($1:
+# devices' filter, Paired). Every device's details from one bluetoothctl,
+# asked on its input, instead of one each; a device missing from what it
+# printed is asked on its own, as before.
 audio_devices() {
-    ctl devices $1 | sed -n 's/^Device \([0-9A-F:]\{17\}\) \(.*\)/\1|\2/p' |
-    while IFS='|' read -r addr name; do
-        info=$(ctl info "$addr")
-        echo "$info" | grep -q -E "Audio Sink|Icon: audio-" || continue
-        icon=$(echo "$info" | sed -n 's/^\s*Icon: //p')
-        echo "$addr|$name|${icon:-audio}"
+    list=$(ctl devices $1 | sed -n 's/^Device \([0-9A-F:]\{17\}\) .*/\1/p')
+    [ -n "$list" ] || return 0
+    seen=$nl$(for a in $list; do echo "info $a"; done | TERM=dumb $BT/usr/bin/bluetoothctl 2>/dev/null | parse_info)
+    for a in $list; do
+        case "$seen" in
+        *"$nl$a|"*) l=${seen#*"$nl$a|"}; l=$a\|${l%%"$nl"*} ;;
+        *) l=$(ctl info "$a" | parse_info) ;;
+        esac
+        case "$l" in *"|"?*) printf '%s\n' "$l" ;; esac   # (ADDR| alone: not audio)
     done
 }
 
@@ -114,20 +145,12 @@ status)
     ;;
 scan)
     running || exit 1
-    T=${2:-8} ctl scan on > /dev/null
-    paired=$(ctl devices Paired | cut -d' ' -f2)
-    audio_devices | while IFS='|' read -r a n i; do
-        case " $(echo $paired) " in *" $a "*) p=1 ;; *) p=0 ;; esac
-        echo "$a|$n|$i|$p"
-    done
+    T=${2:-8}; ctl scan on > /dev/null; T=     # (not "T=8 ctl": some shells keep T after a function)
+    audio_devices | sed 's/|[01]$//'               # (ADDR|NAME|ICON|PAIRED)
     ;;
 paired)
     running || exit 1
-    connected=$(ctl devices Connected | cut -d' ' -f2)
-    audio_devices Paired | while IFS='|' read -r a n i; do
-        case " $(echo $connected) " in *" $a "*) c=1 ;; *) c=0 ;; esac
-        echo "$a|$n|$i|$c"
-    done
+    audio_devices Paired | sed 's/|[01]\(|[01]\)$/\1/'   # (ADDR|NAME|ICON|CONNECTED)
     ;;
 pair)
     running && [ -n "$2" ] || exit 1

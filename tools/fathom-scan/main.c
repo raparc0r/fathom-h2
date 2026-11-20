@@ -7,6 +7,7 @@
  * Defaults: build/sim-data/library.db and build/sim-data/art.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -29,6 +30,12 @@ int main(int argc, char **argv)
     const char *db = argc > 2 ? argv[2] : "build/sim-data/library.db";
     const char *art = argc > 3 ? argv[3] : "build/sim-data/art";
     mkdir("build/sim-data", 0755);
+    /* SQLite's temporary files beside the library (on the H2 /tmp is RAM) */
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s", db);
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = '\0';
+    setenv("SQLITE_TMPDIR", slash ? dir : ".", 0);
 
     library_t *lib = library_open(db, art);
     if (!lib) return 1;

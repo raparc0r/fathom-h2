@@ -4,12 +4,14 @@
  * on the H2). Keys are dotted ("display.brightness"). Comments start with ';'
  * or '#'. Unknown keys are kept, so a newer file survives an older firmware.
  * Saved atomically (temporary file, then rename) and only when something changed.
+ * Any number of entries, keys and values of any length.
  */
 #ifndef FATHOM_SETTINGS_H
 #define FATHOM_SETTINGS_H
 
 /* Loads `path` (a missing file is fine: everything has a default). */
 int         settings_load(const char *path);
+/* (The value's good until that key is set again, a load or a reset.) */
 const char *settings_get(const char *key, const char *def);
 int         settings_get_int(const char *key, int def);
 void        settings_set(const char *key, const char *value);

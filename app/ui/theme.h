@@ -46,9 +46,7 @@ typedef struct {
     int  cursor_arrow;
     int  playing_equalizer;
     int  motion_stepped;
-    int  art_pixelate;
-    int  header_dots;
-    int  icons_pixel;
+    int  icons_pixel;       /* Home's and the radio's icons drawn on the pixel grid (Pixel Pastel's) */
 
     /* set by whoever loads it */
     char dir[256];          /* the theme's folder (its fonts are relative to it); "" = built in */

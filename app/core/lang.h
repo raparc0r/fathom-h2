@@ -2,7 +2,7 @@
 /*
  * Translations of the UI's own text (not the music's). A language is a UTF-8
  * file, fathom/lang/NAME.txt on the card, its name the one shown in Settings >
- * Display > Language, with one line per text:
+ * Interface > Language, with one line per text:
  *
  *     # comments start with '#'
  *     Now playing = Reproduciendo
@@ -25,5 +25,13 @@ int  lang_load(const char *path);
 const char *tr(const char *en);
 /* How many texts the loaded language translates (0: English). */
 int  lang_count(void);
+/* fmt with each %s filled in, a then b: tr("%s of %s") with the numbers or
+ * names in a translation's own order of words. Only %s: a translation is
+ * never used as a printf format. */
+void lang_fill(char *out, size_t cap, const char *fmt, const char *a, const char *b);
+/* The translation of en with its %s filled in (lang_fill). */
+void tr_fill(char *out, size_t cap, const char *en, const char *a, const char *b);
+/* A text for tools/lang/strings.py's list, translated later (tables) */
+#define N_(s) s
 
 #endif

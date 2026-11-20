@@ -11,7 +11,9 @@
  * from the card each time and woke bluez-alsa and D-Bus: in the H2's 23 MB,
  * with Wi-Fi on too, that kept pushing the player's own code out of memory
  * (radio stuttered). */
+#define _GNU_SOURCE   /* pipe2 */
 #include "bt.h"
+#include "shell.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -84,45 +86,27 @@ static void say(const char *m)
     pthread_mutex_unlock(&B.mu);
 }
 
-/* Runs a shell command; its first `cap` bytes of output to out. Returns the exit status. */
-static int run(const char *cmd, char *out, size_t cap)
-{
-    FILE *f = popen(cmd, "r");
-    if (!f) return -1;
-    size_t got = 0;
-    if (out && cap) {
-        size_t r;
-        while (got + 1 < cap && (r = fread(out + got, 1, cap - 1 - got, f)) > 0) got += r;
-        out[got] = '\0';
-    }
-    char sink[256];
-    while (fread(sink, 1, sizeof sink, f) > 0) {}
-    int st = pclose(f);
-    return st < 0 ? -1 : (st >> 8) & 0xff;
-}
-
-/* ADDR|NAME|...|FLAG lines into devices (paired = 1 for the paired list). */
+/* ADDR|NAME|ICON|FLAG lines into devices (paired = 1 for the paired list).
+ * The name is what's between the address and the last two fields: it may
+ * hold a '|' of its own. */
 static int parse_devices(char *text, ui_bt_dev_t *out, int max, int paired_list)
 {
     int n = 0;
-    for (char *line = strtok(text, "\n"); line && n < max; line = strtok(NULL, "\n")) {
-        char *f[4] = {0};
-        int k = 0;
-        for (char *p = line; k < 4; k++) {
-            f[k] = p;
-            char *bar = strchr(p, '|');
-            if (!bar) { k++; break; }
-            *bar = '\0';
-            p = bar + 1;
-        }
-        if (!addr_ok(f[0])) continue;
+    char *save = NULL;   /* (strtok_r: the Wi-Fi worker parses at the same time) */
+    for (char *line = strtok_r(text, "\n", &save); line && n < max; line = strtok_r(NULL, "\n", &save)) {
+        if (strlen(line) < 18 || line[17] != '|') continue;
+        line[17] = '\0';
+        char *name = line + 18, *flag = strrchr(name, '|'), *icon;
+        if (!addr_ok(line) || !flag) continue;
+        *flag++ = '\0';
+        if ((icon = strrchr(name, '|'))) *icon = '\0';
         ui_bt_dev_t *d = &out[n++];
         memset(d, 0, sizeof *d);
-        snprintf(d->addr, sizeof d->addr, "%s", f[0]);
-        snprintf(d->name, sizeof d->name, "%s", f[1] ? f[1] : "");
-        int flag = f[3] && f[3][0] == '1';
-        d->paired = paired_list ? 1 : flag;
-        d->connected = paired_list ? flag : 0;
+        snprintf(d->addr, sizeof d->addr, "%s", line);
+        snprintf(d->name, sizeof d->name, "%s", name);
+        int on = flag[0] == '1';
+        d->paired = paired_list ? 1 : on;
+        d->connected = paired_list ? on : 0;
     }
     return n;
 }
@@ -133,7 +117,7 @@ static void refresh_paired(const ui_bt_dev_t *found, int n_found)
     char text[2048];
     ui_bt_dev_t list[MAX_DEV];
     int n = 0;
-    if (run(FATHOM_BT " paired 2>/dev/null", text, sizeof text) == 0) n = parse_devices(text, list, MAX_DEV, 1);
+    if (sh_run(FATHOM_BT " paired 2>/dev/null", text, sizeof text) == 0) n = parse_devices(text, list, MAX_DEV, 1);
     for (int i = 0; i < n_found && n < MAX_DEV; i++) {
         int dup = 0;
         for (int j = 0; j < n; j++) dup |= !strcmp(list[j].addr, found[i].addr);
@@ -150,7 +134,7 @@ static void refresh_paired(const ui_bt_dev_t *found, int n_found)
 static void poll_pcm(void)
 {
     char out[256] = "", addr[18] = "";
-    if (run(FATHOM_BT " pcm 2>/dev/null", out, sizeof out) == 0) {
+    if (sh_run(FATHOM_BT " pcm 2>/dev/null", out, sizeof out) == 0) {
         out[strcspn(out, "\r\n")] = '\0';
         const char *d = strstr(out, "/dev_");
         if (d && strlen(d) >= 22) {
@@ -164,7 +148,7 @@ static void poll_pcm(void)
     if (out[0] && strcmp(out, B.pcm)) {          /* a new link: its volume */
         char cmd[400], v[128] = "";
         snprintf(cmd, sizeof cmd, CLI " volume %s 2>/dev/null", out);
-        if (run(cmd, v, sizeof v) == 0) {
+        if (sh_run(cmd, v, sizeof v) == 0) {
             const char *p = strpbrk(v, "0123456789");
             if (p) vol = atoi(p);
         }
@@ -195,7 +179,7 @@ static void do_cmd(int cmd, const char *addr)
         break;
     case CMD_START: {
         set_busy("Starting");
-        int ok = run(FATHOM_BT " start 2>/dev/null", out, sizeof out) == 0;
+        int ok = sh_run(FATHOM_BT " start 2>/dev/null", out, sizeof out) == 0;
         pthread_mutex_lock(&B.mu);
         B.on = ok;
         pthread_cond_broadcast(&B.cv);          /* (the monitor waits for it) */
@@ -209,13 +193,13 @@ static void do_cmd(int cmd, const char *addr)
             set_busy("Connecting");
             snprintf(c, sizeof c, FATHOM_BT " connect %s 2>/dev/null", last);
             /* right after a start the first try can fail where the next works */
-            for (int i = 0; i < 3 && run(c, NULL, 0) != 0; i++) sleep(3);
+            for (int i = 0; i < 3 && sh_run(c, NULL, 0) != 0; i++) sleep(3);
         }
         break;
     }
     case CMD_STOP:
         set_busy("Stopping");
-        run(FATHOM_BT " stop 2>/dev/null", NULL, 0);
+        sh_run(FATHOM_BT " stop 2>/dev/null", NULL, 0);
         pthread_mutex_lock(&B.mu);
         B.on = 0;
         if (B.mon_pid > 0) kill(B.mon_pid, SIGTERM);   /* its memory back too */
@@ -229,7 +213,7 @@ static void do_cmd(int cmd, const char *addr)
         char text[2048] = "";
         ui_bt_dev_t found[MAX_DEV];
         int n = 0;
-        if (run(FATHOM_BT " scan 8 2>/dev/null", text, sizeof text) == 0) n = parse_devices(text, found, MAX_DEV, 0);
+        if (sh_run(FATHOM_BT " scan 8 2>/dev/null", text, sizeof text) == 0) n = parse_devices(text, found, MAX_DEV, 0);
         refresh_paired(found, n);
         if (!n) say("No headphones found: are they in pairing mode?");
         break;
@@ -237,7 +221,7 @@ static void do_cmd(int cmd, const char *addr)
     case CMD_PAIR: {
         set_busy("Pairing");
         snprintf(c, sizeof c, FATHOM_BT " pair %s 2>/dev/null", addr);
-        int st = run(c, NULL, 0);
+        int st = sh_run(c, NULL, 0);
         say(st == 0 ? "Paired and connected" : st == 2 ? "Paired: turn the headphones on to connect"
                                                        : "Pairing didn't work: try pairing mode again");
         refresh_paired(NULL, 0);
@@ -246,17 +230,17 @@ static void do_cmd(int cmd, const char *addr)
     case CMD_CONNECT:
         set_busy("Connecting");
         snprintf(c, sizeof c, FATHOM_BT " connect %s 2>/dev/null", addr);
-        if (run(c, NULL, 0) != 0) say("Couldn't connect: are the headphones on?");
+        if (sh_run(c, NULL, 0) != 0) say("Couldn't connect: are the headphones on?");
         break;
     case CMD_DISCONNECT:
         set_busy("Disconnecting");
         snprintf(c, sizeof c, FATHOM_BT " disconnect %s 2>/dev/null", addr);
-        run(c, NULL, 0);
+        sh_run(c, NULL, 0);
         break;
     case CMD_FORGET:
         set_busy("Forgetting");
         snprintf(c, sizeof c, FATHOM_BT " forget %s 2>/dev/null", addr);
-        run(c, NULL, 0);
+        sh_run(c, NULL, 0);
         pthread_mutex_lock(&B.mu);
         if (!strcmp(B.last, addr)) B.last[0] = '\0';
         pthread_mutex_unlock(&B.mu);
@@ -293,7 +277,7 @@ static void *worker(void *arg)
         if (vol >= 0 && pcm[0]) {
             char c[400];
             snprintf(c, sizeof c, CLI " volume %s %d 2>/dev/null", pcm, vol);
-            run(c, NULL, 0);
+            sh_run(c, NULL, 0);
         }
         if (cmd) do_cmd(cmd, addr);
         else if (on && look) poll_pcm();
@@ -316,8 +300,8 @@ static void *monitor(void *arg)
             pthread_mutex_unlock(&B.mu);
             continue;
         }
-        int fd[2];
-        if (pipe(fd)) { sleep(5); continue; }
+        int fd[2];   /* (close-on-exec: programs started meanwhile mustn't hold it) */
+        if (pipe2(fd, O_CLOEXEC)) { sleep(5); continue; }
         posix_spawn_file_actions_t fa;
         posix_spawn_file_actions_init(&fa);
         posix_spawn_file_actions_adddup2(&fa, fd[1], 1);

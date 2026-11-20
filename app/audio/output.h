@@ -7,7 +7,9 @@
 #include "audio/eq.h"
 
 typedef struct {
-    /* Prepare for a stream format. Backends that can play it exactly must. */
+    /* Prepare for a stream format. Backends that can play it exactly must.
+     * 0; -1: not this format (the track can't be played here); -2: the
+     * device isn't there (unplugged, the link down: playback pauses). */
     int  (*open)(void *ctx, const audio_format_t *fmt);
     /* Left-justified int32 frames. Blocks until accepted. Returns frames or -1. */
     long (*write)(void *ctx, const int32_t *frames, long n);

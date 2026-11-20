@@ -128,6 +128,7 @@ static int png_stream(FILE *f, long off, int min_side, const art_limits_t *lim, 
         if (fread(hd, 1, 8, f) != 8) goto out;
         uint32_t len = be32(hd);
         if (!memcmp(hd + 4, "IHDR", 4)) {
+            if (have_hdr) goto out;                   /* (a second one: damaged; it would allocate all again) */
             unsigned char b[13];
             if (len != 13 || fread(b, 1, 13, f) != 13) goto out;
             p.w = be32(b), p.h = be32(b + 4), p.depth = b[8], p.ctype = b[9];

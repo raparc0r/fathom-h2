@@ -108,13 +108,6 @@ int mixer_value_for_db(mixer_t *m, long cdb)
     return m->min + (int)(((cdb - lo) * (long)(m->max - m->min) + (hi - lo) / 2) / (hi - lo));
 }
 
-long mixer_db_for_value(mixer_t *m, int value)
-{
-    long lo, hi;
-    if (mixer_db_range(m, &lo, &hi) || m->max <= m->min) return 0;
-    return lo + (hi - lo) * (long)(value - m->min) / (m->max - m->min);
-}
-
 int mixer_find_playback_volume(const char *ctl_dev, char *name)
 {
     int fd = open(ctl_dev ? ctl_dev : "/dev/snd/controlC0", O_RDWR | O_CLOEXEC);

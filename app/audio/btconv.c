@@ -175,12 +175,14 @@ static unsigned gcd(unsigned a, unsigned b) { while (b) { unsigned t = a % b; a 
 static const int32_t *rational_table(unsigned fam, unsigned link, int *L, int *M, int *K)
 {
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
-    static struct { unsigned fam, link; int L, M, K; int32_t *poly; } cache[3];
+    /* (room for every pair: 3 families to 3 link rates, 6 that differ; with
+     * 3, a fourth pair's table was made again at each start and never freed) */
+    static struct { unsigned fam, link; int L, M, K; int32_t *poly; } cache[6];
     unsigned g = gcd(fam, link);
     *L = (int)(link / g);
     *M = (int)(fam / g);
     pthread_mutex_lock(&mu);
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 6; i++)
         if (cache[i].poly && cache[i].fam == fam && cache[i].link == link) {
             *K = cache[i].K;
             pthread_mutex_unlock(&mu);
@@ -200,7 +202,7 @@ static const int32_t *rational_table(unsigned fam, unsigned link, int *L, int *M
                 poly[p * k + j] = i < n ? h[i] : 0;
             }
     free(h);
-    for (int i = 0; poly && i < 3; i++)
+    for (int i = 0; poly && i < 6; i++)
         if (!cache[i].poly) {
             cache[i].fam = fam;
             cache[i].link = link;

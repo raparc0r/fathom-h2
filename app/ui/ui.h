@@ -50,6 +50,16 @@ struct ui_fonts {
 /* Defaults of settings read in more than one place (settings.ini keeps
  * only what was changed: someone who never changed one gets a new default) */
 #define UI_COVERS_DEFAULT          1   /* display.covers: 1 Albums, 2 Songs, 3 both */
+#define UI_DIM_DEFAULT             1   /* display.dim: dimmed 5 s before the screen goes off */
+#define UI_ON_CHARGING_DEFAULT     0   /* display.on_charging: the screen stays on while plugged in */
+#define UI_TRANSPORT_DEFAULT       0   /* sound.transport: the USB DAC's transport mode */
+#define UI_PAUSE_ON_UNPLUG_DEFAULT 1   /* playback.pause_on_unplug: headphones out pause */
+#define UI_AUTO_OFF_DEFAULT        15  /* power.auto_off: minutes idle and paused; 0 = never */
+#define UI_BT_RANGE_DEFAULT        0   /* bluetooth.range: 1 longer range, 0 best sound */
+#define UI_SHUF_ALBUMS_DEFAULT     0   /* shuffle.albums: shuffle albums, not songs */
+#define UI_SHUF_FRESH_DEFAULT      1   /* shuffle.freshness: the less played first */
+#define UI_SHUF_INTERLUDES_DEFAULT 1   /* shuffle.skip_interludes */
+#define UI_SHUF_WORKS_DEFAULT      0   /* shuffle.keep_works: a work's movements together */
 #define UI_EXCLUDE_SPOKEN_DEFAULT  1   /* shuffle.exclude_spoken: audiobooks out of shuffle */
 #define UI_UPDATE_AUTO_DEFAULT     1   /* update.auto: ask GitHub once a day, never download */
 
@@ -83,9 +93,25 @@ typedef struct {
     char current[48], latest[32];
     int64_t size;
     uint64_t done, total;
-    char message[96];       /* UI_UPD_FAILED: why */
+    char message[96];       /* UI_UPD_FAILED: why (English: the UI translates it) */
+    int need_mb;            /* and for want of space: how many MB it needs (0: not that) */
 } ui_update_t;
 enum { UI_UPD_CHECK, UI_UPD_START, UI_UPD_CANCEL, UI_UPD_INSTALL };
+/* Uninstall Fathom (Settings > About > Uninstall Fathom): HiBy's update file
+ * found on the card and checked (progress: bytes read of total), then made
+ * ready (its bootloader listed, named update.upt); then it waits for the
+ * restart into HiBy's recovery, which installs it. */
+enum { UI_UNI_IDLE, UI_UNI_CHECKING, UI_UNI_FAILED, UI_UNI_READY, UI_UNI_APPLYING, UI_UNI_PENDING };
+typedef struct {
+    int state;
+    char file[64];          /* the file's name on the card */
+    char ver[16];           /* HiBy's release, by date: "2025-11-11" */
+    uint64_t done, total;
+    char message[96];       /* UI_UNI_FAILED: why (English: the UI translates it) */
+    int need_mb;            /* and for want of space: how many MB it needs (0: not that) */
+    int no_file;            /* and for want of a file: none on the card (where to get one is shown) */
+} ui_uninstall_t;
+enum { UI_UNI_CHECK, UI_UNI_APPLY, UI_UNI_CANCEL, UI_UNI_RESTART };
 
 typedef struct {
     void (*brightness)(int level);        /* 1..UI_BRIGHTNESS_LEVELS: apply now */
@@ -132,8 +158,11 @@ typedef struct {
     int  (*eq_put)(const char *name, const eq_profile_t *p);
     void (*eq_preview)(const eq_profile_t *p);
     int  (*eq_remove)(const char *name);
-    /* Library > Rescan: scan the music folder now (blocking, with its own progress screen). */
+    /* Library > Rescan: look for new music now (in the background). */
     void (*rescan)(void);
+    /* Start the player again (after Reset all settings: everything from the
+     * defaults, the language, the EQ and levelling included). NULL: no restart. */
+    void (*restart)(void);
     /* USB drive mode: lend the card to the computer (the player exits for it). */
     void (*usb_drive)(void);
     /* USB DAC mode: play the computer's audio through the H2 (Sound > USB DAC mode). */
@@ -181,6 +210,12 @@ typedef struct {
      * when the state changes with ui_update_changed(). */
     void (*update_state)(ui_update_t *st);
     void (*update_do)(int what);
+    /* About > Uninstall Fathom (NULL hides it). uninstall_do: UI_UNI_CHECK
+     * (find HiBy's update file and check it), UI_UNI_APPLY (make it ready),
+     * UI_UNI_CANCEL (put it back as it was), UI_UNI_RESTART (into HiBy's recovery). The device
+     * says when the state changes with ui_uninstall_changed(). */
+    void (*uninstall_state)(ui_uninstall_t *st);
+    void (*uninstall_do)(int what);
     /* Settings > Power > Battery: the history for a graph of `days` (1 or 7),
      * from core/batlog.c. 0, or -1 (none: Battery shows only the charge). */
     int  (*battery_report)(batrep_t *rep, int days);
@@ -200,6 +235,7 @@ void ui_wifi_changed(void);     /* Wi-Fi state or networks changed: refresh its 
 void ui_share_changed(void);    /* the network drive's state changed: refresh its screen */
 void ui_ssh_changed(void);      /* SSH's state changed: refresh its screen */
 void ui_update_changed(void);   /* the update's state or progress changed: refresh its screens */
+void ui_uninstall_changed(void);   /* Uninstall Fathom's state or progress changed */
 /* The library changed (a rescan): the open lists are read again, in place. */
 void ui_library_changed(void);
 /* Connected to a computer: ask what to be (USB drive, USB DAC, or keep playing). */
@@ -245,5 +281,9 @@ int  ui_theme_count(void);
  * Radio > Find stations: "rdir", "rdirgenres", "rdircountries", "rdirresults", "rdirsearch",
  * "rdirctx", "rdirbusy" (still asking), "rdirerror" (when the directory can't be reached). */
 void ui_show(const char *what);
+/* For the simulator's checks: how deep the lists go (1: Home; 0: Now Playing
+ * shown), the open list's selected row and its number of rows; home_edit: 1
+ * when it is Settings > Home (OK there changes Home's rows). */
+int ui_list_state(int *sel, int *n, int *home_edit);
 
 #endif

@@ -199,31 +199,190 @@ static void test_top_up_and_history(void)
     CHECK(rep.days == 7);
 }
 
+/* 150 days of a busy log: a record every 3 minutes. The days kept aren't a
+ * constant: the file is trimmed when it passes its limit (to 60 days, or less
+ * when 60 don't fit), then grows until it passes again. So right after each
+ * trim: 60 days at most; and never far past the limit. (This once checked the
+ * age at day 150 alone, true only because a trim happened to come just
+ * before: the file holds 51 to 68 days in turn.) */
 static void test_trim(void)
 {
     unlink(g_path);
     h2_t h = {.wall_true = 1790000000, .level = 100};
-    /* 150 days of a busy log: a record every 3 minutes */
-    for (int day = 0; day < 150; day++) {
-        start(&h, h.wall_true);
-        for (int k = 0; k < 480; k++) {
-            h.mono += 180, h.wall_true += 180;
-            batlog_note(&h.log, h.mono, 50 + k % 40, flags_of(k % 3, 0));
+    long most = 0, last = 0;
+    int trims = 0;
+    for (int day = 0; day <= 150; day++) {
+        for (int at = 0; at < 2; at++) {              /* after the start, after switching off: trimmed? */
+            if (at == 0) start(&h, h.wall_true);
+            else {
+                for (int k = 0; k < 480; k++) {
+                    h.mono += 180, h.wall_true += 180;
+                    batlog_note(&h.log, h.mono, 50 + k % 40, flags_of(k % 3, 0));
+                }
+                batlog_off(&h.log, h.mono);
+            }
+            struct stat st;
+            if (stat(g_path, &st)) continue;
+            if (st.st_size < last) {
+                trims++;
+                batrec_t *r;
+                int n = batlog_load(g_path, NULL, 0, &r);
+                CHECK(n > 0 && r[0].kind == BL_BOOT && h.wall_true - r[0].t <= (int64_t)(BATLOG_KEEP_DAYS + 1) * 86400);
+                CHECK(st.st_size <= BATLOG_TRIM_BYTES * 3 / 4 + 4096);
+                if (day > 130) printf("trim: day %d, %ld bytes -> %ld, the oldest %.1f days back\n", day, last,
+                                      (long)st.st_size, n > 0 ? (h.wall_true - r[0].t) / 86400.0 : -1.0);
+                free(r);
+            }
+            last = (long)st.st_size, most = last > most ? last : most;
         }
-        batlog_off(&h.log, h.mono);
         h.wall_true += 24 * 3600 - 480 * 180;
     }
-    struct stat st;
-    stat(g_path, &st);
-    long before = (long)st.st_size;
+    printf("trim: %d trims, at most %ld bytes\n", trims, most);
+    CHECK(most <= BATLOG_TRIM_BYTES + 4096);          /* (trimmed at each start past it) */
+    CHECK(trims >= 5);
+}
+
+/* Heavy use: past the limit within the 60 days, a record every 15 s for 16 h a
+ * day. The trim used to keep every start inside the 60 days: nothing went. */
+static void test_trim_heavy(void)
+{
+    unlink(g_path);
+    h2_t h = {.wall_true = 1790000000, .level = 100};
+    long most = 0;
+    int64_t off = 0;
+    for (int day = 0; day < 30; day++) {
+        start(&h, h.wall_true);
+        for (int k = 0; k < 16 * 240; k++) {
+            h.mono += 15, h.wall_true += 15;
+            batlog_note(&h.log, h.mono, 20 + k % 80, flags_of(k % 3, 0));
+        }
+        batlog_off(&h.log, h.mono);
+        off = h.wall_true;
+        h.wall_true += 8 * 3600;
+        struct stat st;
+        if (stat(g_path, &st) == 0 && st.st_size > most) most = (long)st.st_size;
+    }
     start(&h, h.wall_true);
-    stat(g_path, &st);
     batrec_t *r;
     int n = batlog_load(g_path, NULL, 0, &r);
-    printf("trim: %ld bytes -> %ld, the oldest %.0f days back\n", before, (long)st.st_size,
+    printf("trim, heavy use: at most %ld bytes, %d records, the oldest %.1f days back\n", most, n,
            n > 0 ? (h.wall_true - r[0].t) / 86400.0 : -1.0);
-    CHECK(st.st_size <= BATLOG_TRIM_BYTES && before <= BATLOG_TRIM_BYTES + 4096);   /* (trimmed at each start past it) */
-    CHECK(n > 0 && r[0].kind == BL_BOOT && h.wall_true - r[0].t <= (int64_t)(BATLOG_KEEP_DAYS + 1) * 86400);
+    CHECK(most <= BATLOG_TRIM_BYTES + BATLOG_BUF * 8 + 8);
+    CHECK(n > BATLOG_TRIM_BYTES / 8 / 2 && r[0].kind == BL_BOOT);
+    int ordered = 1;
+    for (int i = 1; i < n; i++) ordered &= r[i].t >= r[i - 1].t;
+    CHECK(ordered && r[n - 1].kind == BL_OFF && off - r[n - 1].t < 60);
+    free(r);
+}
+
+/* One start of 12 days, its clock 40 days behind until Wi-Fi sets it on the
+ * 11th: trimmed as it's written (no start to trim at), cut inside the start,
+ * the records kept still moved to the true time. */
+static void test_trim_one_start(void)
+{
+    unlink(g_path);
+    h2_t h = {.wall_true = 1790000000, .level = 100};
+    int64_t first = h.wall_true;
+    start(&h, h.wall_true - 40 * 86400);
+    long most = 0;
+    for (int k = 0; k < 12 * 8640; k++) {
+        h.mono += 10, h.wall_true += 10;
+        if (k == 11 * 8640) batlog_clock_set(&h.log, h.wall_true, h.mono);
+        batlog_note(&h.log, h.mono, 20 + k % 80, flags_of(k % 3, 0));
+        struct stat st;
+        if (k % 600 == 0 && stat(g_path, &st) == 0 && st.st_size > most) most = (long)st.st_size;
+    }
+    batlog_off(&h.log, h.mono);
+    batrec_t *r;
+    int n = batlog_load(g_path, NULL, 0, &r);
+    printf("trim, one start: at most %ld bytes, %d records, from %.1f days in to %.0f s before now\n", most, n,
+           n > 0 ? (r[0].t - first) / 86400.0 : -1.0, n > 0 ? (double)(h.wall_true - r[n - 1].t) : -1.0);
+    CHECK(most <= BATLOG_TRIM_BYTES + BATLOG_BUF * 8 + 8);
+    CHECK(n > BATLOG_TRIM_BYTES / 8 / 2 && r[0].kind == BL_BOOT);
+    CHECK(r[0].t > first && r[0].t < h.wall_true - 86400);   /* (true times, not 40 days back) */
+    int ordered = 1;
+    for (int i = 1; i < n; i++) ordered &= r[i].t >= r[i - 1].t;
+    CHECK(ordered && h.wall_true - r[n - 1].t < 60);
+    free(r);
+}
+
+/* The file's headers in it: one, however many flushes */
+static int headers(void)
+{
+    FILE *f = fopen(g_path, "rb");
+    if (!f) return -1;
+    unsigned char b[8];
+    int n = 0;
+    while (fread(b, 1, 8, f) == 8) n += !memcmp(b, "FBATLOG1", 8);
+    fclose(f);
+    return n;
+}
+
+/* The file again, a header after every `every` records (as 0.9.0 wrote it on
+ * the H2, one at each flush), and an unknown record */
+static void add_stray_headers(int every)
+{
+    FILE *f = fopen(g_path, "rb");
+    struct stat st;
+    if (!f || fstat(fileno(f), &st)) { CHECK(0); if (f) fclose(f); return; }
+    unsigned char *d = malloc((size_t)st.st_size), *o = malloc((size_t)st.st_size * 2 + 16);
+    size_t got = fread(d, 1, (size_t)st.st_size, f), w = 8;
+    fclose(f);
+    memcpy(o, d, 8);
+    for (size_t i = 8, k = 0; i + 8 <= got; i += 8, k++) {
+        if (k && k % (size_t)every == 0) memcpy(o + w, "FBATLOG1", 8), w += 8;
+        memcpy(o + w, d + i, 8), w += 8;
+    }
+    memcpy(o + w, "\x10\x20\x30\x40\x32\x00\x09\x00", 8), w += 8;   /* (a kind not known) */
+    f = fopen(g_path, "wb");
+    CHECK(f && fwrite(o, 1, w, f) == w);
+    if (f) fclose(f);
+    free(d), free(o);
+}
+
+/* A night's playing, written at every 10 minutes: a header once; and a file
+ * with stray headers reads as the same history, and loses them when trimmed */
+static void test_stray_headers(void)
+{
+    unlink(g_path);
+    h2_t h = {.wall_true = 1790000000, .level = 100};
+    start(&h, h.wall_true);
+    run(&h, 9 * 3600, BL_ACT_PLAYING, 0);
+    batlog_off(&h.log, h.mono);
+    CHECK(headers() == 1);
+    batrec_t *r;
+    int n = batlog_load(g_path, NULL, 0, &r);
+    batrep_t a, b;
+    batlog_report(r, n, 1, &a);
+    free(r);
+    CHECK(a.nspans == 1 && near(a.avg_full_h10, 250, 0.1));   /* (4 %/h: 25 h) */
+
+    add_stray_headers(3);
+    CHECK(headers() > 5);
+    int m = batlog_load(g_path, NULL, 0, &r);
+    batlog_report(r, m, 1, &b);
+    free(r);
+    CHECK(m == n && b.nspans == a.nspans && b.avg_full_h10 == a.avg_full_h10 && b.span[0].used == a.span[0].used);
+
+    /* past the limit: trimmed at the next start, without them */
+    for (int day = 0; day < 40; day++) {
+        start(&h, h.wall_true);
+        for (int k = 0; k < 1000; k++) {
+            h.mono += 15, h.wall_true += 15;
+            batlog_note(&h.log, h.mono, 20 + k % 80, flags_of(k % 3, 0));
+        }
+        batlog_off(&h.log, h.mono);
+        h.wall_true += 86400;
+    }
+    add_stray_headers(5);
+    struct stat st;
+    CHECK(stat(g_path, &st) == 0 && st.st_size > BATLOG_TRIM_BYTES);
+    start(&h, h.wall_true);
+    CHECK(headers() == 1);
+    n = batlog_load(g_path, NULL, 0, &r);
+    int known = n > 0;
+    for (int i = 0; i < n; i++) known &= r[i].kind <= BL_CLOCK && r[i].t > 1700000000;
+    CHECK(known);
     free(r);
 }
 
@@ -235,6 +394,9 @@ int main(void)
     test_restart_and_backwards();
     test_top_up_and_history();
     test_trim();
+    test_trim_heavy();
+    test_trim_one_start();
+    test_stray_headers();
     unlink(g_path);
     if (failures) { fprintf(stderr, "%d failures\n", failures); return 1; }
     printf("batlog: ok\n");

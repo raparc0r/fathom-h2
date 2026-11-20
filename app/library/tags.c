@@ -262,9 +262,9 @@ int tags_read_flac_reference(const char *path, tags_t *t)
 /* ---------- ID3v2 (MP3, DSF, DFF) ---------- */
 
 typedef struct {
-    unsigned char *buf;  /* whole tag body (after the 10-byte header) */
+    unsigned char *buf;  /* whole tag body (after the 10-byte header and any extended header) */
     size_t len;
-    int version;         /* 3 or 4 */
+    int version;         /* 2, 3 or 4 */
 } id3_t;
 
 static uint32_t syncsafe(const unsigned char *p)
@@ -276,13 +276,14 @@ static int id3_load(FILE *f, id3_t *id)
 {
     unsigned char h[10];
     memset(id, 0, sizeof *id);
-    if (fread(h, 1, 10, f) != 10 || memcmp(h, "ID3", 3) || h[3] < 3 || h[3] > 4) return -1;
+    if (fread(h, 1, 10, f) != 10 || memcmp(h, "ID3", 3) || h[3] < 2 || h[3] > 4) return -1;
+    if (h[3] == 2 && (h[5] & 0x40)) return -1;   /* v2.2 compressed: no scheme was ever defined */
     id->version = h[3];
     id->len = syncsafe(h + 6);
     if (id->len > 64 * 1024 * 1024) return -1;
     id->buf = malloc(id->len ? id->len : 1);
     if (!id->buf || fread(id->buf, 1, id->len, f) != id->len) { free(id->buf); id->buf = NULL; return -1; }
-    if (h[5] & 0x80) {  /* whole-tag unsynchronisation (v2.3): undo FF 00 -> FF */
+    if (h[5] & 0x80) {  /* whole-tag unsynchronisation (v2.2, v2.3): undo FF 00 -> FF */
         size_t w = 0;
         for (size_t r = 0; r < id->len; r++) {
             id->buf[w++] = id->buf[r];
@@ -290,20 +291,49 @@ static int id3_load(FILE *f, id3_t *id)
         }
         id->len = w;
     }
+    if (id->version > 2 && (h[5] & 0x40) && id->len >= 4) {
+        /* an extended header (a CRC, restrictions) before the frames: its
+         * size excludes its own 4 bytes in v2.3, includes them (syncsafe) in
+         * v2.4. Read as frames, it ended the tag: no tags at all. */
+        size_t skip = id->version == 3 ? 4 + ((size_t)id->buf[0] << 24 | (size_t)id->buf[1] << 16 |
+                                              (size_t)id->buf[2] << 8 | id->buf[3])
+                                       : syncsafe(id->buf);
+        if (skip > id->len) skip = id->len;
+        memmove(id->buf, id->buf + skip, id->len - skip);
+        id->len -= skip;
+    }
     return 0;
 }
 
-/* Iterate frames: returns pointer to next frame body, fills id/size. */
+/* v2.2's three-letter frames by their v2.3 names (iTunes wrote v2.2 for years) */
+static const char *const ID3_V22[][2] = {
+    {"TT2", "TIT2"}, {"TP1", "TPE1"}, {"TP2", "TPE2"}, {"TAL", "TALB"}, {"TCO", "TCON"}, {"TCM", "TCOM"},
+    {"TRK", "TRCK"}, {"TPA", "TPOS"}, {"TYE", "TYER"}, {"TXX", "TXXX"},
+};
+
+/* Iterate frames: returns pointer to next frame body, fills id/size. A v2.2
+ * frame comes with its v2.3 name, but its picture as "PIC" (laid out
+ * differently from APIC). */
 static const unsigned char *id3_next(const id3_t *id, size_t *pos, char fid[5], size_t *size)
 {
-    while (*pos + 10 <= id->len) {
+    size_t hl = id->version == 2 ? 6 : 10;
+    while (*pos + hl <= id->len) {
         const unsigned char *h = id->buf + *pos;
         if (h[0] == 0) return NULL;  /* padding */
-        memcpy(fid, h, 4);
-        fid[4] = '\0';
-        uint32_t sz = id->version == 4 ? syncsafe(h + 4)
-                                       : ((uint32_t)h[4] << 24 | (uint32_t)h[5] << 16 | (uint32_t)h[6] << 8 | h[7]);
-        *pos += 10;
+        uint32_t sz;
+        if (id->version == 2) {
+            memcpy(fid, h, 3);
+            fid[3] = '\0';
+            for (size_t i = 0; i < sizeof ID3_V22 / sizeof ID3_V22[0]; i++)
+                if (!strcmp(fid, ID3_V22[i][0])) { memcpy(fid, ID3_V22[i][1], 5); break; }
+            sz = (uint32_t)h[3] << 16 | (uint32_t)h[4] << 8 | h[5];
+        } else {
+            memcpy(fid, h, 4);
+            fid[4] = '\0';
+            sz = id->version == 4 ? syncsafe(h + 4)
+                                  : ((uint32_t)h[4] << 24 | (uint32_t)h[5] << 16 | (uint32_t)h[6] << 8 | h[7]);
+        }
+        *pos += hl;
         if (*pos + sz > id->len) return NULL;
         const unsigned char *body = id->buf + *pos;
         *pos += sz;
@@ -351,6 +381,40 @@ static void id3_text(const unsigned char *b, size_t n, char *out, size_t cap)
     while (w > 0 && out[w - 1] == ' ') out[--w] = '\0';
 }
 
+/* ID3v1's genres by number (with Winamp's additions), which v2.2 and v2.3
+ * tags also give as "(17)" or "17". */
+static const char *const ID3_GENRES[] = {
+    "Blues", "Classic Rock", "Country", "Dance", "Disco", "Funk", "Grunge", "Hip-Hop", "Jazz", "Metal",
+    "New Age", "Oldies", "Other", "Pop", "R&B", "Rap", "Reggae", "Rock", "Techno", "Industrial",
+    "Alternative", "Ska", "Death Metal", "Pranks", "Soundtrack", "Euro-Techno", "Ambient", "Trip-Hop", "Vocal", "Jazz+Funk",
+    "Fusion", "Trance", "Classical", "Instrumental", "Acid", "House", "Game", "Sound Clip", "Gospel", "Noise",
+    "Alternative Rock", "Bass", "Soul", "Punk", "Space", "Meditative", "Instrumental Pop", "Instrumental Rock", "Ethnic", "Gothic",
+    "Darkwave", "Techno-Industrial", "Electronic", "Pop-Folk", "Eurodance", "Dream", "Southern Rock", "Comedy", "Cult", "Gangsta",
+    "Top 40", "Christian Rap", "Pop/Funk", "Jungle", "Native American", "Cabaret", "New Wave", "Psychedelic", "Rave", "Showtunes",
+    "Trailer", "Lo-Fi", "Tribal", "Acid Punk", "Acid Jazz", "Polka", "Retro", "Musical", "Rock & Roll", "Hard Rock",
+    "Folk", "Folk-Rock", "National Folk", "Swing", "Fast Fusion", "Bebop", "Latin", "Revival", "Celtic", "Bluegrass",
+    "Avantgarde", "Gothic Rock", "Progressive Rock", "Psychedelic Rock", "Symphonic Rock", "Slow Rock", "Big Band", "Chorus",
+    "Easy Listening", "Acoustic", "Humour", "Speech", "Chanson", "Opera", "Chamber Music", "Sonata", "Symphony", "Booty Bass",
+    "Primus", "Porn Groove", "Satire", "Slow Jam", "Club", "Tango", "Samba", "Folklore", "Ballad", "Power Ballad",
+    "Rhythmic Soul", "Freestyle", "Duet", "Punk Rock", "Drum Solo", "A Cappella", "Euro-House", "Dance Hall",
+};
+#define ID3_NGENRES ((int)(sizeof ID3_GENRES / sizeof ID3_GENRES[0]))
+
+/* A genre as text: "(17)" and "17" are Rock, "(17)Rock 'n' Roll" is its text. */
+static void id3_genre(char *g, size_t cap)
+{
+    const char *p = g;
+    int paren = *p == '(';
+    if (paren) p++;
+    if (!isdigit((unsigned char)*p)) return;
+    int n = 0;
+    while (isdigit((unsigned char)*p) && n < 1000) n = n * 10 + (*p++ - '0');
+    if (paren && *p++ != ')') return;
+    if (paren && *p) { memmove(g, p, strlen(p) + 1); return; }   /* its own words after the number */
+    if (*p || n >= ID3_NGENRES) return;
+    snprintf(g, cap, "%s", ID3_GENRES[n]);
+}
+
 /* The tag at f's position. */
 static void read_id3_file(FILE *f, tags_t *t)
 {
@@ -364,7 +428,7 @@ static void read_id3_file(FILE *f, tags_t *t)
             else if (!strcmp(fid, "TPE1")) id3_text(b, sz, t->artist, sizeof t->artist);
             else if (!strcmp(fid, "TPE2")) id3_text(b, sz, t->album_artist, sizeof t->album_artist);
             else if (!strcmp(fid, "TALB")) id3_text(b, sz, t->album, sizeof t->album);
-            else if (!strcmp(fid, "TCON")) id3_text(b, sz, t->genre, sizeof t->genre);
+            else if (!strcmp(fid, "TCON")) { id3_text(b, sz, t->genre, sizeof t->genre); id3_genre(t->genre, sizeof t->genre); }
             else if (!strcmp(fid, "TCOM")) id3_text(b, sz, t->composer, sizeof t->composer);
             else if (!strcmp(fid, "TRCK")) { id3_text(b, sz, tmp, sizeof tmp); t->track = leading_int(tmp); }
             else if (!strcmp(fid, "TPOS")) { id3_text(b, sz, tmp, sizeof tmp); t->disc = leading_int(tmp); }
@@ -385,7 +449,7 @@ static void read_id3_file(FILE *f, tags_t *t)
                     }
                 }
             }
-            else if (!strcmp(fid, "APIC")) t->has_picture = 1;
+            else if (!strcmp(fid, "APIC") || !strcmp(fid, "PIC")) t->has_picture = 1;
         }
         free(id.buf);
     }
@@ -399,6 +463,39 @@ static void read_id3(const char *path, tags_t *t)
     fclose(f);
 }
 
+/* An ID3v1 field: Latin-1, padded with NULs or spaces. */
+static void id3v1_field(const unsigned char *b, size_t n, char *out, size_t cap)
+{
+    size_t w = 0;
+    for (size_t i = 0; i < n && b[i] && w + 3 < cap; i++) {
+        if (b[i] >= 0x80) { out[w++] = (char)(0xC0 | (b[i] >> 6)); out[w++] = (char)(0x80 | (b[i] & 0x3F)); }
+        else out[w++] = (char)b[i];
+    }
+    while (w > 0 && out[w - 1] == ' ') w--;
+    out[w] = '\0';
+}
+
+/* ID3v1 (the last 128 bytes: "TAG", title, artist, album, year, comment,
+ * genre; v1.1: the comment's last byte the track number), for what an ID3v2
+ * tag didn't give: files with only that gave no tags. */
+static void read_id3v1(const char *path, tags_t *t)
+{
+    FILE *f = fopen(path, "rbe");
+    if (!f) return;
+    unsigned char b[128];
+    int got = fseeko(f, -128, SEEK_END) == 0 && fread(b, 1, sizeof b, f) == sizeof b && !memcmp(b, "TAG", 3);
+    fclose(f);
+    if (!got) return;
+    char v[32];
+    if (!t->title[0]) id3v1_field(b + 3, 30, t->title, sizeof t->title);
+    if (!t->artist[0]) id3v1_field(b + 33, 30, t->artist, sizeof t->artist);
+    if (!t->album[0]) id3v1_field(b + 63, 30, t->album, sizeof t->album);
+    id3v1_field(b + 93, 4, v, sizeof v);
+    if (!t->year) t->year = atoi(v);
+    if (!t->track && b[125] == 0 && b[126] != 0) t->track = b[126];
+    if (!t->genre[0] && b[127] < ID3_NGENRES) snprintf(t->genre, sizeof t->genre, "%s", ID3_GENRES[b[127]]);
+}
+
 static int g_exact_mp3 = 1;
 void tags_set_exact_mp3_length(int exact) { g_exact_mp3 = exact; }
 
@@ -406,6 +503,7 @@ static int read_mp3(const char *path, tags_t *t)
 {
     strcpy(t->codec, "MP3");
     read_id3(path, t);
+    if (!t->title[0] || !t->artist[0] || !t->album[0]) read_id3v1(path, t);   /* (a seek to the end only then) */
     mpg123_handle *mh = mpg123_new(NULL, NULL);
     if (!mh) return 0;
     mpg123_param(mh, MPG123_ADD_FLAGS, MPG123_QUIET | MPG123_GAPLESS, 0);
@@ -965,12 +1063,17 @@ int tags_picture(const char *path, unsigned char **data, size_t *len)
             char fid[5];
             const unsigned char *b;
             while ((b = id3_next(&id, &pos, fid, &sz))) {
-                if (strcmp(fid, "APIC") || sz < 4) continue;
-                /* enc, mime\0, type, description\0 (encoding-dependent), data */
+                int pic = !strcmp(fid, "PIC");
+                if ((strcmp(fid, "APIC") && !pic) || sz < 6) continue;
+                /* enc, mime\0, type, description\0 (encoding-dependent), data;
+                 * v2.2's PIC: enc, a 3-letter format ("JPG"), type, ... */
                 int enc = b[0];
                 size_t i = 1;
-                while (i < sz && b[i]) i++;
-                i += 2;  /* NUL + picture type */
+                if (pic) i = 5;
+                else {
+                    while (i < sz && b[i]) i++;
+                    i += 2;  /* NUL + picture type */
+                }
                 if (enc == 1 || enc == 2) { while (i + 1 < sz && (b[i] || b[i + 1])) i += 2; i += 2; }
                 else { while (i < sz && b[i]) i++; i++; }
                 if (i >= sz || sz - i > g_max_picture) continue;

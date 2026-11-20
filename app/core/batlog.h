@@ -8,7 +8,7 @@
  * 8-byte record is kept whenever the percentage or the state (charging, the
  * screen, playing, the output, Wi-Fi, Bluetooth) changes, held in RAM and
  * written every 10 minutes, when charging starts or stops, and at power-off.
- * About 3 KB a day; 60 days are kept.
+ * About 3 KB a day; 60 days are kept (up to 256 KB: a heavy user keeps less).
  *
  * Times: records carry the wall clock as this start of the H2 had it (its
  * base: the clock at CLOCK_MONOTONIC 0, plus the monotonic seconds). The H2's
@@ -40,7 +40,7 @@ enum { BL_KNOWN_RESTART = 1, BL_KNOWN_CLOCK = 2 };   /* the player again, the H2
 
 #define BATLOG_BUF 256
 #define BATLOG_KEEP_DAYS 60
-#define BATLOG_TRIM_BYTES (256 * 1024)   /* trimmed to BATLOG_KEEP_DAYS when the file passes this */
+#define BATLOG_TRIM_BYTES (256 * 1024)   /* past this, trimmed to BATLOG_KEEP_DAYS and 3/4 of this at most */
 
 typedef struct {
     char path[512];
@@ -53,7 +53,7 @@ typedef struct {
 } batlog_t;
 
 /* At start (the clock as good as it gets: restored or set): trims the file if
- * it's grown past BATLOG_TRIM_BYTES, and notes the start. */
+ * it's grown past BATLOG_TRIM_BYTES (a flush does too), and notes the start. */
 void batlog_open(batlog_t *b, const char *path, int64_t wall_now, int64_t mono_now);
 /* Every few seconds: the charge and the state (BL_* | output << BL_OUT_SHIFT).
  * Recorded if either changed; written every 10 minutes, and at once when

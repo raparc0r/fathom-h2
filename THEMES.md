@@ -1,6 +1,6 @@
 # Making a Fathom theme
 
-A theme changes how Fathom looks: colours, the selection shape, corners, motion, art style and,
+A theme changes how Fathom looks: colours, the selection shape, corners, motion, icons and,
 if you like, its own font. It can't change the layout or how the keys work, so every theme
 stays familiar and legible. Themes are plain text: no code runs.
 
@@ -71,9 +71,6 @@ cursor    = none             ; none | arrow
 playing   = dot              ; dot | equalizer
 motion    = smooth           ; smooth | stepped
 
-[art]
-style = normal               ; normal | pixelate
-
 [icons]                      ; optional: your own header icons, 16x16 PNG with transparency
 play       = icons/play.png
 pause      = icons/pause.png
@@ -85,15 +82,15 @@ stop       = icons/stop.png       ; nothing playing
 bluetooth  = icons/bluetooth.png  ; headphones connected (drawn faded while connecting)
 
 [decor]
-header_pattern = none        ; none | dots
-icons          = line        ; line | pixel
+icons = line                 ; line | pixel (Home's icons; pixel by default with arkpixel)
 ```
 
 Any icon you leave out is drawn with the built-in symbol, in your `mode` colour. Your icons are
 drawn as they are (their own colours).
 
 Keys this firmware doesn't know are ignored (the theme list says so), so a theme written for a
-newer firmware still loads.
+newer firmware still loads. `[art] style` and `[decor] header_pattern`, in older themes, are
+ignored without a word: they were never drawn.
 
 ## Rules
 

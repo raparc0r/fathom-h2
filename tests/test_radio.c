@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "tmpdir.h"
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
@@ -52,7 +53,8 @@ int main(void)
     CHECK(a[0] == '\0' && !strcmp(ti, "Artist"));
 
     /* changing the list from the H2 */
-    char dir[] = "/tmp/fathom-radio-XXXXXX", path[128], path2[128];
+    char dir[200], path[128], path2[128];
+    test_tmp(dir, sizeof dir, "fathom-radio");
     CHECK(mkdtemp(dir) != NULL);
     snprintf(path, sizeof path, "%s/radio.txt", dir);
     snprintf(path2, sizeof path2, "%s/other.txt", dir);

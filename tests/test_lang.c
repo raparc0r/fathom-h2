@@ -7,13 +7,15 @@
 #include <unistd.h>
 
 #include "core/lang.h"
+#include "tmpdir.h"
 
 static int failures;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
 
 int main(void)
 {
-    char dir[] = "/tmp/fathom-test-lang-XXXXXX";
+    char dir[200];
+    test_tmp(dir, sizeof dir, "fathom-test-lang");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     char path[300], other[300];
     snprintf(path, sizeof path, "%s/Espa\xC3\xB1ol.txt", dir);
@@ -25,7 +27,10 @@ int main(void)
           "Two\\nlines = Dos\\nl\xC3\xADneas\n"
           "no separator here\n"
           "A = B = C\n"                   /* the first \" = \" splits */
-          "Empty = \n", f);
+          "Empty = \n"
+          "%s songs = %s canciones\n"
+          "%s of %s = %s de %s\n"
+          "Bad %s = %d %n %s\n", f);
     fclose(f);
     f = fopen(other, "w");
     fputs("Settings = Einstellungen\n", f);
@@ -40,11 +45,27 @@ int main(void)
     CHECK(!strcmp(tr("Empty"), "Empty"));                 /* no translation: English */
     CHECK(!strcmp(tr("Albums"), "Albums"));
     CHECK(tr(NULL) == NULL && !strcmp(tr(""), ""));
-    CHECK(lang_count() == 4);
+    CHECK(lang_count() == 7);
 
     char names[8][64];
     CHECK(lang_list(dir, names, 8) == 2);
     CHECK(!strcmp(names[0], "Deutsch") && !strcmp(names[1], "Espa\xC3\xB1ol"));
+
+    /* Texts with numbers or names: each %s filled in, in the translation's
+     * own order; nothing else in a translation is a format (a "%d" stays) */
+    char out[64];
+    tr_fill(out, sizeof out, "%s songs", "12", NULL);
+    CHECK(!strcmp(out, "12 canciones"));
+    tr_fill(out, sizeof out, "%s of %s", "3", "40");
+    CHECK(!strcmp(out, "3 de 40"));
+    tr_fill(out, sizeof out, "Untranslated %s", "x", NULL);
+    CHECK(!strcmp(out, "Untranslated x"));                /* English, filled in */
+    tr_fill(out, sizeof out, "Bad %s", "x", NULL);
+    CHECK(!strcmp(out, "%d %n x"));                       /* (never handed to printf) */
+    lang_fill(out, 8, "%s and %s", "abcdef", "ghi");
+    CHECK(!strcmp(out, "abcdef "));                       /* cut to the buffer */
+    lang_fill(out, sizeof out, "%s %s %s", "a", NULL);
+    CHECK(!strcmp(out, "a  "));                           /* a missing one: empty */
 
     CHECK(lang_load(other) == 0 && !strcmp(tr("Settings"), "Einstellungen") && !strcmp(tr("Now playing"), "Now playing"));
     CHECK(lang_load(NULL) == 0 && !strcmp(tr("Settings"), "Settings") && lang_count() == 0);

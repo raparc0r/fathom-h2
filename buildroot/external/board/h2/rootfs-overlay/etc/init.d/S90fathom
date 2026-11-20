@@ -11,6 +11,7 @@
 # this loop looks once a minute, and a log in /tmp over 256 KB keeps its last
 # 128 KB (cut in place: whoever writes it appends, so carries on at its end).
 
+. /usr/lib/fathom/card.sh               # (CARD_OUT, card_wait)
 bin=/mnt/sd/fathom/bin/fathom-player
 pidfile=/var/run/fathom.pid
 log=/tmp/fathom-player.log
@@ -25,13 +26,24 @@ trim_logs() {
 
 case "$1" in
 start)
+    # One loop only: a card put in during the start (fathom-sdcard's add) can
+    # start it before rcS does, and two players would fight over everything
+    [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null && exit 0
     /usr/sbin/fathom-ssh boot           # root's password, and SSH if it's on (even if the player isn't there)
     [ -x "$bin" ] || { echo "fathom: $bin not found"; exit 0; }
     [ -e /mnt/sd/fathom/no-autostart ] && { echo "fathom: autostart disabled"; exit 0; }
     (
         cd /                            # not on the card: USB drive mode unmounts it
         while :; do
-            [ -e /var/run/fathom-card-out ] && break   # (fathom-sdcard starts this again)
+            [ -e $CARD_OUT ] && break   # (fathom-sdcard starts this again)
+            # No player on the card any more (a computer had it, in USB drive
+            # mode): the card-out screen until a card is put in, not
+            # a missing player started every 2 s
+            if [ ! -x "$bin" ]; then
+                echo "fathom: $bin not found: waiting for a card" >> $log
+                card_wait
+                break
+            fi
             "$bin" >> $log 2>&1 &
             p=$!
             # Until it exits, a look at the logs each minute. The player's exit

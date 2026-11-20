@@ -1,0 +1,36 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] x1000: h2boot: note which stock firmware is in the flash (Eros Q)
+
+When it boots Linux from a Fathom card, h2boot reads the stock kernel's
+uImage header in the flash (64 bytes at 0x300000, partition mtd2), and
+writes its name and build time to /fathom/stock-version when they differ
+from what's there ("name=Linux-3.10.14", "time=1762858730"). Linux can't
+read the flash; Fathom's Uninstall uses the note to refuse a HiBy update
+older than the firmware in the flash (an older U-Boot can leave the screen
+blank on a newer H2). Each HiBy release builds its kernel within a minute
+of its version.txt date.
+
+The code is Fathom's bootloader/fathom/fwcopy.c (the header, tested on the
+host by tests/test_fwcopy.c) and fwcopy-h2boot.c (the flash and the card).
+---
+--- a/bootloader/x1000/boot.c	2026-11-19 20:09:15
++++ b/bootloader/x1000/boot.c	2026-11-19 20:09:15
+@@ -136,6 +136,8 @@
+     /* Fathom: first, the Bluetooth and Wi-Fi firmware onto the card, from
+      * the stock system in the flash, if it isn't there yet */
+     fathom_copy_firmware(false);
++    /* Fathom: which stock firmware is in the flash, for Uninstall Fathom */
++    fathom_note_stock_version();
+     show_boot_logo();   /* Fathom: on screen while the kernel loads */
+     /* Fathom: an update's kernel gets two starts to reach the player, then
+      * the one before it goes back in place (bootpick.c) */
+--- a/bootloader/x1000/x1000bootloader.h	2026-11-19 20:09:15
++++ b/bootloader/x1000/x1000bootloader.h	2026-11-19 20:09:15
+@@ -200,6 +200,7 @@
+  * the flash onto the card (fwcopy-h2boot.c); asked: from the menu */
+ void fathom_copy_firmware(bool asked);
+ void fathom_copy_firmware_menu(void);
++void fathom_note_stock_version(void);
+ #endif
+ 
+ #endif /* __X1000BOOTLOADER_H__ */

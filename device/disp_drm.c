@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "disp_drm.h"
+#include "hw_paths.h"
 
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
@@ -12,7 +13,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define BL_PATH "/sys/class/backlight/backlight/brightness"
+#define BL_PATH HW_BACKLIGHT "brightness"
 
 static struct {
     int fd;
@@ -126,7 +127,7 @@ int disp_drm_backlight_max(void)
 {
     static int max;
     if (!max) {
-        FILE *f = fopen("/sys/class/backlight/backlight/max_brightness", "re");
+        FILE *f = fopen(HW_BACKLIGHT "max_brightness", "re");
         if (!f || fscanf(f, "%d", &max) != 1 || max <= 0) max = 255;
         if (f) fclose(f);
     }

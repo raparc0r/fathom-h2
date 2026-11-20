@@ -40,14 +40,45 @@ static int vol_held;              /* +1, -1 or 0 */
 static uint32_t vol_next;         /* next repeat time */
 
 static int jack_hp, jack_lo;
+/* A jack change that found the queue full (a fast turn of the wheel fills it)
+ * waits here, and goes in ahead of anything newer, with the latest state:
+ * never dropped (headphones out pause playback). An unplug is always told,
+ * even if they're back in since. */
+static int jack_late, jack_late_out;
 
+static int put(input_kind_t kind, int key, int hp, int lo)
+{
+    int next = (q_tail + 1) % QUEUE;
+    if (next == q_head) return -1;
+    queue[q_tail] = (input_event_t){kind, key, hp, lo};
+    q_tail = next;
+    return 0;
+}
+
+/* The jack change that waits, if there's room for it now. */
+static int put_late_jacks(void)
+{
+    if (!jack_late) return 0;
+    if (jack_late_out && jack_hp) {           /* out and back in: the out first */
+        if (put(IN_JACKS, 0, 0, jack_lo)) return -1;
+        jack_late_out = 0;
+    }
+    if (put(IN_JACKS, 0, jack_hp, jack_lo)) return -1;
+    jack_late = jack_late_out = 0;
+    return 0;
+}
 
 static void push(input_kind_t kind, int key)
 {
-    int next = (q_tail + 1) % QUEUE;
-    if (next == q_head) return;   /* full: drop */
-    queue[q_tail] = (input_event_t){kind, key, jack_hp, jack_lo};
-    q_tail = next;
+    if (put_late_jacks()) return;             /* full: a key (or the wheel) is dropped */
+    put(kind, key, jack_hp, jack_lo);
+}
+
+static void push_jacks(int out)
+{
+    if (!jack_late && !put(IN_JACKS, 0, jack_hp, jack_lo)) return;
+    jack_late = 1;
+    jack_late_out |= out;
 }
 
 /* Read the switch state of every device (gpio-keys carries the jack detects). */
@@ -215,7 +246,7 @@ int input_next(input_event_t *ev, uint32_t now)
             else if (ie.type == EV_SW && (ie.code == SW_HEADPHONE_INSERT || ie.code == SW_LINEOUT_INSERT)) {
                 if (ie.code == SW_HEADPHONE_INSERT) jack_hp = !!ie.value;
                 else jack_lo = !!ie.value;
-                push(IN_JACKS, 0);
+                push_jacks(ie.code == SW_HEADPHONE_INSERT && !ie.value);
             }
             else if (ie.type == EV_REL && ie.value) {
                 /* clockwise = down the list; with Menu held: brighter */
@@ -251,6 +282,7 @@ int input_next(input_event_t *ev, uint32_t now)
         back_long_fired = 1;
         push(IN_UI, UI_KEY_BACK_LONG);
     }
+    put_late_jacks();                         /* (room since the last call) */
     if (q_head == q_tail) return 0;
     *ev = queue[q_head];
     q_head = (q_head + 1) % QUEUE;
