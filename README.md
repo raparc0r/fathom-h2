@@ -37,6 +37,7 @@ I recommend you check it out: [rockbox.org](https://www.rockbox.org).
 - **Internet radio.** You can search and browse thousands of stations on the H2 itself.
 - **Podcasts.** Find shows on the H2, or import them from another app; new episodes
   download while it charges.
+- **Smart playlists.**  Never played, On repeat, Not heard in a while, Forgotten favorites, Often skipped
 - **A network drive**, so you can copy music to the H2 over Wi-Fi while it plays.
 - **Bluetooth headphones** (SBC and aptX), and their buttons work.
 - **USB DACs.** The H2 can play through one, or be your computer's sound card.
@@ -53,6 +54,7 @@ I recommend you check it out: [rockbox.org](https://www.rockbox.org).
 - **Battery history**, a sleep timer and automatic power-off.
 - **Updates over Wi-Fi.** It tells you when a new version is out.
 - **SSH and SFTP**, if you like to poke around (off by default).
+- 
 
 | | | |
 |---|---|---|
