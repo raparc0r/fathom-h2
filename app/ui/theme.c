@@ -286,3 +286,164 @@ int theme_validate(const theme_t *t, char *err, size_t errcap)
         }
     return fails;
 }
+
+/* ---------- writing a theme out (the theme editor) ---------- */
+
+typedef struct { char *p; size_t cap, len; int over; } out_t;
+
+static void put(out_t *o, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(o->p + o->len, o->len < o->cap ? o->cap - o->len : 0, fmt, ap);
+    va_end(ap);
+    if (n < 0 || o->len + (size_t)n >= o->cap) o->over = 1;
+    else o->len += (size_t)n;
+}
+
+/* A value as the parser reads it back: one line, no ';' (a comment there) */
+static void put_text(out_t *o, const char *key, const char *v)
+{
+    char s[128];
+    size_t n = 0;
+    for (; *v && n + 1 < sizeof s; v++) s[n++] = *v == ';' ? ',' : *v == '\n' || *v == '\r' ? ' ' : *v;
+    s[n] = '\0';
+    put(o, "%-8s = %s\n", key, s);
+}
+
+int theme_format(const theme_t *t, char *out, size_t cap)
+{
+    if (!out || !cap) return -1;
+    out_t o = {out, cap, 0, 0};
+    out[0] = '\0';
+    put(&o, "; Made on the H2 with Fathom's theme editor (THEMES.md explains every key)\n\n[theme]\n");
+    put_text(&o, "name", t->name);
+    if (t->author[0]) put_text(&o, "author", t->author);
+    if (t->licence[0]) put_text(&o, "licence", t->licence);
+    put(&o, "format   = 1\nbase     = %s\n\n[color]\n", t->dark ? "dark" : "light");
+    const struct { const char *k; uint32_t v; } col[] = {
+        {"bg", t->bg}, {"surface", t->surface}, {"text", t->text}, {"text_muted", t->text_muted},
+        {"select_bg", t->select_bg}, {"select_fg", t->select_fg}, {"signal", t->signal}, {"info", t->info},
+        {"mode", t->mode}, {"battery", t->battery}, {"warning", t->warning}, {"danger", t->danger},
+        {"artist", t->artist}, {"album", t->album}, {"chip_bg", t->chip_bg}, {"chip_fg", t->chip_fg},
+    };
+    for (size_t i = 0; i < sizeof col / sizeof col[0]; i++) put(&o, "%-11s = #%06X\n", col[i].k, (unsigned)(col[i].v & 0xFFFFFF));
+    put(&o, "\n[font]\n");
+    if (t->font_file[0]) {
+        put_text(&o, "file", t->font_file);
+        if (t->font_file_title[0]) put_text(&o, "file_title", t->font_file_title);
+    } else {
+        put_text(&o, "family", t->font);
+    }
+    static const char *const roles[THEME_PX_N] = {"meta", "body", "sub", "title", "head"};
+    for (int r = 0; r < THEME_PX_N; r++)
+        if (t->font_px[r]) put(&o, "%-8s = %d\n", roles[r], t->font_px[r]);
+    static const char *const cor[] = {"round", "stepped", "square"};
+    put(&o, "\n[shape]\nselection = %s\ncorner    = %s\nradius    = %d\nshadow    = %s\nprogress  = %s\n"
+            "cursor    = %s\nplaying   = %s\nmotion    = %s\n",
+        t->selection_bar ? "bar" : "pill", cor[t->corner >= 0 && t->corner <= 2 ? t->corner : 0], t->radius,
+        t->shadow_hard ? "hard" : "none", t->progress_segments ? "segments" : "bar", t->cursor_arrow ? "arrow" : "none",
+        t->playing_equalizer ? "equalizer" : "dot", t->motion_stepped ? "stepped" : "smooth");
+    int icons = 0;
+    for (int i = 0; i < THEME_ICON_N; i++) icons |= t->icon[i][0] != '\0';
+    if (icons) {
+        put(&o, "\n[icons]\n");
+        for (int i = 0; i < THEME_ICON_N; i++)
+            if (t->icon[i][0]) put_text(&o, THEME_ICON_KEYS[i], t->icon[i]);
+    }
+    put(&o, "\n[decor]\nicons = %s\n", t->icons_pixel ? "pixel" : "line");
+    return o.over ? -1 : (int)o.len;
+}
+
+/* ---------- colours by hue, saturation and lightness ---------- */
+
+void theme_to_hsl(uint32_t rgb, int *h, int *s, int *l)
+{
+    double r = ((rgb >> 16) & 0xff) / 255.0, g = ((rgb >> 8) & 0xff) / 255.0, b = (rgb & 0xff) / 255.0;
+    double mx = r > g ? (r > b ? r : b) : (g > b ? g : b), mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    double L = (mx + mn) / 2, d = mx - mn, H = 0, S = 0;
+    if (d > 1e-9) {
+        S = d / (1 - fabs(2 * L - 1));
+        if (mx == r) H = fmod((g - b) / d + 6, 6);
+        else if (mx == g) H = (b - r) / d + 2;
+        else H = (r - g) / d + 4;
+        H *= 60;
+    }
+    *h = (int)lround(H) % 360;
+    *s = (int)lround(S * 100);
+    *l = (int)lround(L * 100);
+}
+
+uint32_t theme_from_hsl(int h, int s, int l)
+{
+    h = ((h % 360) + 360) % 360;
+    if (s < 0) s = 0;
+    if (s > 100) s = 100;
+    if (l < 0) l = 0;
+    if (l > 100) l = 100;
+    double S = s / 100.0, L = l / 100.0, C = (1 - fabs(2 * L - 1)) * S, X = C * (1 - fabs(fmod(h / 60.0, 2) - 1)),
+           m = L - C / 2, r = 0, g = 0, b = 0;
+    if (h < 60) { r = C; g = X; }
+    else if (h < 120) { r = X; g = C; }
+    else if (h < 180) { g = C; b = X; }
+    else if (h < 240) { g = X; b = C; }
+    else if (h < 300) { r = X; b = C; }
+    else { r = C; b = X; }
+    uint32_t R = (uint32_t)lround((r + m) * 255), G = (uint32_t)lround((g + m) * 255), B = (uint32_t)lround((b + m) * 255);
+    return (R << 16) | (G << 8) | B;
+}
+
+uint32_t theme_fit(uint32_t c, uint32_t bg, double min)
+{
+    if (theme_contrast(c, bg) >= min) return c;
+    double lc = luminance(c), lb = luminance(bg);
+    int up = lc > lb || (lc == lb && lb < 0.18);   /* away from bg */
+    int h, s, l;
+    theme_to_hsl(c, &h, &s, &l);
+    for (int pass = 0; pass < 2; pass++, up = !up)   /* (no room that way: the other) */
+        for (int i = l; up ? i <= 100 : i >= 0; i += up ? 1 : -1) {
+            uint32_t x = theme_from_hsl(h, s, i);
+            if (theme_contrast(x, bg) >= min) return x;
+        }
+    return luminance(bg) < 0.18 ? 0xFFFFFF : 0x000000;
+}
+
+void theme_accent(theme_t *t, int hue, int sat)
+{
+    /* the selection's text: near black on a light accent (dark themes), near
+     * white on a dark one; the accent moves until both read */
+    uint32_t fg = t->dark ? theme_from_hsl(hue, 60, 8) : theme_from_hsl(hue, 30, 97);
+    uint32_t acc = theme_from_hsl(hue, sat, t->dark ? 62 : 36);
+    acc = theme_fit(acc, t->bg, 4.6);
+    acc = theme_fit(acc, fg, 7.1);
+    t->select_bg = t->signal = t->mode = acc;
+    t->select_fg = theme_fit(fg, acc, 7.1);
+}
+
+void theme_make(theme_t *t, int dark, int hue, int sat)
+{
+    t->dark = dark;
+    if (dark) {
+        t->bg = theme_from_hsl(hue, 14, 7);
+        t->surface = theme_from_hsl(hue, 14, 15);
+        t->text = theme_from_hsl(hue, 20, 94);
+        t->text_muted = theme_from_hsl(hue, 10, 68);
+        t->warning = 0xFFC845;
+        t->danger = 0xFF6B6B;
+    } else {
+        t->bg = theme_from_hsl(hue, 20, 96);
+        t->surface = theme_from_hsl(hue, 14, 88);
+        t->text = theme_from_hsl(hue, 20, 10);
+        t->text_muted = theme_from_hsl(hue, 8, 36);
+        t->warning = 0x8A5A00;
+        t->danger = 0xB3261E;
+    }
+    t->text = theme_fit(theme_fit(t->text, t->bg, 7.1), t->surface, 7.1);
+    t->text_muted = theme_fit(t->text_muted, t->bg, 4.6);
+    t->warning = theme_fit(t->warning, t->bg, 4.6);
+    t->danger = theme_fit(t->danger, t->bg, 4.6);
+    t->info = t->battery = t->artist = t->album = t->text_muted;
+    t->chip_bg = t->surface;
+    t->chip_fg = t->text;
+    theme_accent(t, hue, sat);
+}

@@ -43,5 +43,10 @@ int   eq_channels(const eq_t *e);
 
 /* The profile's response in dB at f Hz (double precision; for tests and the UI). */
 double eq_response_db(const eq_profile_t *p, unsigned rate, double f);
+/* The bands' response (preamp left out) at n frequencies f[] into db[]: the
+ * same as eq_response_db() minus the preamp, with each band designed once and
+ * the trigonometry done once a frequency (the UI's curve, redrawn as a value
+ * is turned, on a CPU without an FPU). */
+void eq_curve_db(const eq_profile_t *p, unsigned rate, const double *f, int n, float *db);
 
 #endif

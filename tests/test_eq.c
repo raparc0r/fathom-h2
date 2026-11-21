@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); fails++; } } while (0)
@@ -73,6 +74,36 @@ int main(void)
     eq_run(e, s, 2048);
     CHECK(!memcmp(s, c, sizeof s), "a flat profile isn't bit for bit");
     eq_destroy(e);
+
+    /* the UI's curve: the same as eq_response_db() without the preamp */
+    {
+        eq_parse(AUTOEQ, &p, err, sizeof err);
+        double fq[64];
+        float db[64];
+        for (int i = 0; i < 64; i++) fq[i] = 20 * pow(1000, i / 63.0);
+        eq_curve_db(&p, 48000, fq, 64, db);
+        double worst = 0;
+        for (int i = 0; i < 64; i++) {
+            double d = fabs(db[i] - (eq_response_db(&p, 48000, fq[i]) - p.preamp_db));
+            if (d > worst) worst = d;
+        }
+        CHECK(worst < 1e-3, "the curve differs from the response by %.4f dB", worst);
+        eq_curve_db(&flat, 48000, fq, 64, db);
+        CHECK(db[0] == 0 && db[63] == 0, "a flat profile's curve is flat");
+        /* how long the editor's curve takes, the most bands at its 100 points (on
+         * the H2 it's worked out again at each turn of the wheel) */
+        eq_profile_t big = {.preamp_db = -6, .n = EQ_MAX_BANDS};
+        for (int i = 0; i < EQ_MAX_BANDS; i++) big.band[i] = (eq_band_t){EQ_PEAK, 30.0 * pow(2, i * 0.6), 3, 1.4};
+        double f100[100];
+        float d100[100];
+        for (int i = 0; i < 100; i++) f100[i] = 20 * pow(1000, i / 99.0);
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int r = 0; r < 10; r++) eq_curve_db(&big, 48000, f100, 100, d100);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        printf("the editor's curve, %d bands at 100 points: %.2f ms\n", EQ_MAX_BANDS,
+               ((t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6) / 10);
+    }
 
     /* the integer filters follow the design, at 44.1 and 192 kHz */
     eq_parse(AUTOEQ, &p, err, sizeof err);

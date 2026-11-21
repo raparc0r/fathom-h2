@@ -73,6 +73,9 @@ add_executable(fathom-player
   ${ROOT}/app/net/http.c
   ${ROOT}/app/net/json.c
   ${ROOT}/app/net/radiodir.c
+  ${ROOT}/app/net/podcast.c
+  ${ROOT}/app/net/podsync.c
+  ${ROOT}/app/net/coverfind.c
   ${ROOT}/app/net/sha256.c
   ${ROOT}/app/net/unzip.c
   ${ROOT}/app/net/update.c
@@ -81,7 +84,7 @@ add_executable(fathom-player
   ${ROOT}/app/sys/uninstall.c
   ${ROOT}/app/audio/engine.c
   ${ROOT}/app/audio/loudness.c
-  ${ROOT}/app/audio/btconv.c ${ROOT}/app/audio/eq.c
+  ${ROOT}/app/audio/btconv.c ${ROOT}/app/audio/eq.c ${ROOT}/app/audio/tempo.c
   ${ROOT}/app/audio/out_null.c
   ${ROOT}/app/audio/out_clock.c
   ${ROOT}/app/audio/out_alsa.c
@@ -124,6 +127,7 @@ set_property(SOURCE main.c bt.c wifi.c share.c ssh.c shell.c tlscert.c radiometa
   ${ROOT}/app/library/tags.c ${ROOT}/app/library/cue.c ${ROOT}/app/library/playlist.c
   ${ROOT}/app/shuffle/shuffle.c
   ${ROOT}/app/net/http.c ${ROOT}/app/net/json.c ${ROOT}/app/net/radiodir.c
+  ${ROOT}/app/net/podcast.c ${ROOT}/app/net/podsync.c ${ROOT}/app/net/coverfind.c
   ${ROOT}/app/net/unzip.c ${ROOT}/app/net/update.c
   ${ROOT}/app/player/player.c ${ROOT}/app/player/radio.c ${ROOT}/app/player/rfmeta.c
   ${ROOT}/app/ui/theme.c ${ROOT}/app/ui/fonts.c ${ROOT}/app/ui/assets.c ${ROOT}/app/ui/ui.c
@@ -158,6 +162,7 @@ add_executable(fathom-bitperfect
   ${ROOT}/app/net/json.c
   ${ROOT}/app/audio/engine.c
   ${ROOT}/app/audio/eq.c
+  ${ROOT}/app/audio/tempo.c
   ${ROOT}/app/audio/out_alsa.c
   ${ROOT}/app/audio/mixer_alsa.c)
 target_include_directories(fathom-bitperfect PRIVATE ${ROOT}/app ${DEPS_STATIC_INCLUDE_DIRS})

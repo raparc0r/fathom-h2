@@ -62,7 +62,16 @@ struct player {
     unsigned r_meta_seq;
     char     r_meta[256], r_meta_url[512];
     char     r_artist[256], r_title[256], r_art[512];   /* player_radio_set_info; title "" = none */
+
+    /* a podcast episode */
+    int      pod;          /* on: the engine plays ep */
+    player_episode_t ep;
+    uint32_t ep_pos;       /* where it was last seen (playing), or cued */
+    int      ep_ended;     /* it played to its end: said once */
+    int      speed;        /* episodes' speed, percent */
 };
+
+#define POD_ENGINE_ID (-1000)   /* the engine's id for an episode */
 
 static int64_t now_s(void) { return (int64_t)time(NULL); }
 
@@ -192,7 +201,7 @@ static int after(const player_t *p, int pos)
 static void catch_up(player_t *p);
 static void queue_next(player_t *p)
 {
-    if (p->radio) return;              /* the queue waits for the radio to be left */
+    if (p->radio || p->pod) return;    /* the queue waits for the radio (or an episode) to be left */
     engine_track_t q[ENGINE_AHEAD];
     char path[ENGINE_AHEAD][sizeof ((lib_track_t *)0)->path];
     int n = 0;
@@ -233,11 +242,14 @@ static void remember_position(player_t *p)
 
 /* Start the track at order_pos; a long file resumes where it was left (if `resume`). */
 static void radio_leave(player_t *p);
+static void pod_leave(player_t *p);
 
-static void start_at_opt(player_t *p, int order_pos, int resume)
+/* resume: a long file from where it was left (library_resume); at: from there (ms; 0 none) */
+static void start_at_opt(player_t *p, int order_pos, int resume, uint32_t at)
 {
     if (order_pos < 0 || order_pos >= p->n_order) return;
     radio_leave(p);
+    pod_leave(p);
     remember_position(p);
     p->fails = 0;
     set_pos(p, order_pos);
@@ -245,16 +257,13 @@ static void start_at_opt(player_t *p, int order_pos, int resume)
     p->have_cur = 1;
     p->resume_ms = 0;
     p->own_start = 1;
-    engine_play_gain(p->eng, p->cur.path, p->cur.id, track_gain(p, p->cur.id));
-    if (resume && p->cur.duration_ms >= LONG_FILE_MS) {
-        uint32_t at = library_resume(p->lib, p->cur.id);
-        if (at) engine_seek_ms(p->eng, at);
-    }
+    if (!at && resume && p->cur.duration_ms >= LONG_FILE_MS) at = library_resume(p->lib, p->cur.id);
+    engine_play_at(p->eng, p->cur.path, p->cur.id, track_gain(p, p->cur.id), at);   /* (from there: nothing before it heard) */
     p->seq++;
     queue_next(p);
 }
 
-static void start_at(player_t *p, int order_pos) { start_at_opt(p, order_pos, 1); }
+static void start_at(player_t *p, int order_pos) { start_at_opt(p, order_pos, 1, 0); }
 
 void player_play(player_t *p, const int64_t *ids, int n, int start)
 {
@@ -267,6 +276,7 @@ void player_play(player_t *p, const int64_t *ids, int n, int start)
 void player_cue(player_t *p, const int64_t *ids, int n, int start)
 {
     if (p->radio) { engine_stop(p->eng); radio_leave(p); }
+    if (p->pod) { engine_stop(p->eng); pod_leave(p); }
     set_ctx(p, ids, n);
     build_order(p, p->shuffle ? start : -1, NULL, 0);
     p->user_end = 0;
@@ -292,16 +302,21 @@ void player_shuffle_all(player_t *p)
 /* Start the cued track (from where a restored queue left off). */
 static void start_cued(player_t *p)
 {
-    uint32_t at = p->resume_ms;
-    start_at(p, p->pos);
-    if (at) engine_seek_ms(p->eng, at);
+    start_at_opt(p, p->pos, 1, p->resume_ms);
 }
 
 static void radio_connect(player_t *p);
+static void pod_start(player_t *p);
 
 void player_toggle_pause(player_t *p)
 {
     if (p->radio) { player_pause(p, p->r_want); return; }
+    if (p->pod) {
+        eng_status_t st;
+        engine_status(p->eng, &st);
+        player_pause(p, st.starting ? !st.start_paused : st.state == ENG_PLAYING);
+        return;
+    }
     eng_status_t st;
     engine_status(p->eng, &st);
     if (st.starting) engine_pause(p->eng, !st.start_paused);   /* about to start: flip how */
@@ -325,6 +340,13 @@ void player_pause(player_t *p, int on)
     }
     eng_status_t st;
     engine_status(p->eng, &st);
+    if (p->pod) {
+        if (st.starting) engine_pause(p->eng, on);
+        else if (on && st.state == ENG_PLAYING) engine_pause(p->eng, 1);
+        else if (!on && st.state == ENG_PAUSED) engine_pause(p->eng, 0);
+        else if (!on && st.state == ENG_STOPPED) pod_start(p);   /* from where it was left (or the start) */
+        return;
+    }
     if (st.starting) engine_pause(p->eng, on);           /* about to start: start paused or not */
     else if (on && st.state == ENG_PLAYING) engine_pause(p->eng, 1);
     else if (!on && st.state == ENG_PAUSED) engine_pause(p->eng, 0);
@@ -334,7 +356,7 @@ void player_pause(player_t *p, int on)
 /* The current track is being left: record it as played or as an early skip. */
 static void record(player_t *p, int skipped_by_user)
 {
-    if (!p->have_cur || p->radio) return;
+    if (!p->have_cur || p->radio || p->pod) return;
     eng_status_t st;
     engine_status(p->eng, &st);
     int early = skipped_by_user && st.pos_ms < EARLY_SKIP_MS;
@@ -359,6 +381,7 @@ static void radio_station(player_t *p, int i);
 void player_next(player_t *p)
 {
     if (p->radio) { radio_station(p, (p->ri + 1) % p->rn); return; }
+    if (p->pod) { player_seek_by(p, PLAYER_SKIP_FWD_MS); return; }
     if (!p->have_cur) return;
     catch_up(p);
     record(p, 1);
@@ -370,11 +393,12 @@ void player_next(player_t *p)
 void player_prev(player_t *p)
 {
     if (p->radio) { radio_station(p, (p->ri + p->rn - 1) % p->rn); return; }
+    if (p->pod) { player_seek_by(p, -PLAYER_SKIP_BACK_MS); return; }
     if (!p->have_cur) return;
     catch_up(p);
     eng_status_t st;
     engine_status(p->eng, &st);
-    if (st.pos_ms > RESTART_MS || p->pos == 0) start_at_opt(p, p->pos, 0);   /* restart: from the top */
+    if (st.pos_ms > RESTART_MS || p->pos == 0) start_at_opt(p, p->pos, 0, 0);   /* restart: from the top */
     else start_at(p, p->pos - 1);
 }
 
@@ -382,7 +406,7 @@ void player_seek_by(player_t *p, int delta_ms)
 {
     eng_status_t st;
     engine_status(p->eng, &st);
-    if (st.state == ENG_STOPPED || !st.len_ms || p->radio) return;
+    if (st.state == ENG_STOPPED || !st.len_ms || p->radio || (p->pod && st.stream)) return;
     int64_t to = (int64_t)st.pos_ms + delta_ms;
     if (to < 0) to = 0;
     if (to > (int64_t)st.len_ms - 500) to = (int64_t)st.len_ms - 500;
@@ -550,7 +574,7 @@ int player_save(player_t *p, const char *path)
     if (!p->have_cur || !p->n_order) return 0;
     eng_status_t st;
     engine_status(p->eng, &st);
-    uint32_t at = st.state == ENG_STOPPED || p->radio ? p->resume_ms : st.pos_ms;
+    uint32_t at = st.state == ENG_STOPPED || p->radio || p->pod ? p->resume_ms : st.pos_ms;
     char tmp[600];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "we");
@@ -592,6 +616,7 @@ int player_restore(player_t *p, const char *path)
     if (!ok) { free(ctx); free(order); return -1; }
 
     if (p->radio) { engine_stop(p->eng); radio_leave(p); }
+    if (p->pod) { engine_stop(p->eng); pod_leave(p); }
     free(p->ctx);
     free(p->order);
     p->ctx = ctx; p->n = p->cap_ctx = n;
@@ -641,6 +666,7 @@ void player_radio_play(player_t *p, const radio_station_t *st, int n, int i)
     radio_station_t *copy = malloc((size_t)n * sizeof *copy);
     if (!copy) return;
     memcpy(copy, st, (size_t)n * sizeof *copy);
+    pod_leave(p);
     if (!p->radio && p->have_cur) {
         /* the queue is kept, cued where it was (saved queues too) */
         eng_status_t es;
@@ -741,6 +767,92 @@ static void radio_tick(player_t *p, const eng_status_t *st)
     }
 }
 
+/* ---------- podcast episodes ---------- */
+
+static void pod_start(player_t *p)
+{
+    int stream = !strncmp(p->ep.path, "http://", 7) || !strncmp(p->ep.path, "https://", 8);
+    engine_set_speed(p->eng, p->speed ? p->speed : 100);
+    p->own_start = 1;
+    p->ep_ended = 0;
+    engine_play_at(p->eng, p->ep.path, POD_ENGINE_ID, 1.0f, stream ? 0 : p->ep_pos);   /* (from there: nothing before it heard) */
+    p->seq++;
+}
+
+void player_episode_play(player_t *p, const player_episode_t *e)
+{
+    if (p->radio) radio_leave(p);
+    else if (!p->pod && p->have_cur) {
+        /* the queue is kept, cued where it was */
+        eng_status_t es;
+        engine_status(p->eng, &es);
+        remember_position(p);
+        if (es.state != ENG_STOPPED && es.track_id == p->cur.id) p->resume_ms = es.pos_ms;
+    }
+    engine_queue_next(p->eng, NULL, -1);
+    p->n_ahead = 0;
+    eng_status_t now;
+    engine_status(p->eng, &now);
+    p->eng_stop = now.stop_seq;                   /* (a stop before this one isn't its end) */
+    p->pod = 1;
+    p->ep = *e;
+    p->ep_pos = e->start_ms;
+    pod_start(p);
+}
+
+static void pod_leave(player_t *p)
+{
+    if (!p->pod) return;
+    engine_set_speed(p->eng, 100);                /* music as it is */
+    p->pod = 0;
+    p->ep_ended = 0;
+    p->seq++;
+}
+
+const player_episode_t *player_episode(player_t *p, uint32_t *pos_ms, uint32_t *len_ms)
+{
+    if (!p->pod) return NULL;
+    eng_status_t st;
+    engine_status(p->eng, &st);
+    int theirs = st.state != ENG_STOPPED && !st.starting && st.track_id == POD_ENGINE_ID;
+    if (pos_ms) *pos_ms = theirs ? st.pos_ms : p->ep_pos;
+    if (len_ms) *len_ms = theirs && st.len_ms ? st.len_ms : p->ep.len_ms;
+    return &p->ep;
+}
+
+void player_set_speed(player_t *p, int pct)
+{
+    p->speed = pct < 50 ? 50 : pct > 300 ? 300 : pct;
+    if (p->pod) engine_set_speed(p->eng, p->speed);
+}
+
+int player_speed(const player_t *p) { return p->speed ? p->speed : 100; }
+
+int player_episode_ended(player_t *p)
+{
+    if (!p->pod || !p->ep_ended) return 0;
+    p->ep_ended = 0;
+    return 1;
+}
+
+static void pod_tick(player_t *p, const eng_status_t *st)
+{
+    p->eng_seq = st->seq;
+    p->own_start = 0;
+    if (st->starting) return;
+    if (st->state != ENG_STOPPED && st->track_id == POD_ENGINE_ID) {
+        p->ep_pos = st->pos_ms;
+        if (st->len_ms) p->ep.len_ms = st->len_ms;
+    }
+    if (st->stop_seq == p->eng_stop || st->state != ENG_STOPPED) return;
+    p->eng_stop = st->stop_seq;
+    if (st->track_id != POD_ENGINE_ID) return;    /* (what played before it) */
+    if (st->error) { p->seq++; return; }          /* (it couldn't be played: it stays cued) */
+    p->ep_pos = 0;                                /* played to its end */
+    p->ep_ended = 1;
+    p->seq++;
+}
+
 /* ---------- following the engine ---------- */
 
 static void run_sleep_timer(player_t *p)
@@ -816,7 +928,7 @@ static void follow(player_t *p, const eng_status_t *st)
  * and "next" is after what plays now. */
 static void catch_up(player_t *p)
 {
-    if (p->radio) return;
+    if (p->radio || p->pod) return;
     eng_status_t st;
     engine_status(p->eng, &st);
     follow(p, &st);
@@ -828,6 +940,7 @@ void player_tick(player_t *p)
     eng_status_t st;
     engine_status(p->eng, &st);
     if (p->radio) { radio_tick(p, &st); return; }
+    if (p->pod) { pod_tick(p, &st); return; }
     if (st.starting) return;            /* (what it says is still about the last track) */
     if (st.state == ENG_PLAYING) p->fails = 0;
     follow(p, &st);
@@ -885,9 +998,11 @@ void player_now(player_t *p, player_now_t *now)
     /* The engine's figures are for what it plays: not yet this item while it
      * starts, or another one (from a radio station to an album, the station's
      * time showed against the track's length until the album began). */
-    int64_t want = p->radio ? -2 - p->ri : p->cur.id;
+    int64_t want = p->radio ? -2 - p->ri : p->pod ? POD_ENGINE_ID : p->cur.id;
     int theirs = st.state != ENG_STOPPED && !st.starting && st.track_id == want;
-    now->pos_ms = theirs ? st.pos_ms : !p->radio && (st.state == ENG_STOPPED || st.starting) ? p->resume_ms : 0;
+    /* not started yet (or stopped): where it starts; an episode's own place, not the music's */
+    uint32_t parked = st.starting && st.start_ms ? st.start_ms : p->pod ? p->ep_pos : p->resume_ms;
+    now->pos_ms = theirs ? st.pos_ms : !p->radio && (st.state == ENG_STOPPED || st.starting) ? parked : 0;
     now->len_ms = theirs && st.len_ms ? st.len_ms : p->cur.duration_ms;
     now->shuffle = p->shuffle;
     now->repeat = p->repeat;
@@ -931,6 +1046,29 @@ void player_now(player_t *p, player_now_t *now)
         now->len_ms = 0;
         now->index = p->ri;
         now->count = p->rn;
+        now->stop_after = 0;
+    }
+    if (p->pod) {
+        lib_track_t *t = &now->track;
+        memset(t, 0, sizeof *t);
+        t->id = t->album_id = t->artist_id = -1;
+        snprintf(t->path, sizeof t->path, "%s", p->ep.path);
+        snprintf(t->title, sizeof t->title, "%s", p->ep.title);
+        snprintf(t->artist, sizeof t->artist, "%s", p->ep.show);
+        snprintf(t->album, sizeof t->album, "%s", p->ep.show);
+        snprintf(t->codec, sizeof t->codec, "%s", st.fmt.codec);
+        t->sample_rate = st.fmt.rate;
+        t->bits = st.fmt.bits;
+        t->channels = st.fmt.channels;
+        now->active = 1;
+        now->podcast = 1;
+        now->podcast_stream = !strncmp(p->ep.path, "http://", 7) || !strncmp(p->ep.path, "https://", 8);
+        now->stopped = st.state == ENG_STOPPED && !st.starting;
+        now->pos_ms = theirs ? st.pos_ms : p->ep_pos;
+        now->len_ms = theirs && st.len_ms ? st.len_ms : p->ep.len_ms;
+        t->duration_ms = now->len_ms;
+        now->index = 0;
+        now->count = 1;
         now->stop_after = 0;
     }
 }

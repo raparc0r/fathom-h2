@@ -4,6 +4,12 @@ A theme changes how Fathom looks: colours, the selection shape, corners, motion,
 if you like, its own font. It can't change the layout or how the keys work, so every theme
 stays familiar and legible. Themes are plain text: no code runs.
 
+You don't need a computer for most themes: on the H2, Settings → Interface → Theme →
+**New theme** (or **Menu** on a theme) opens the theme editor. Pick dark or light and an
+accent, pick any colour from 80 named ones, and choose the shapes, the font and the text
+size; a preview shows it as you go, and it warns when text gets too faint
+to read. **Save** writes it here as `Name.theme`, which you can then edit as below.
+
 ## Where themes go
 
 On the H2's microSD card, in `fathom/themes/`:

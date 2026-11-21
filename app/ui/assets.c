@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "stb/stb_image.h"
 #include "ui/fonts.h"
@@ -314,7 +315,7 @@ static void check_theme(theme_t *t)
         snprintf(t->note, sizeof t->note, "%d setting(s) ignored", t->unknown_keys);
 }
 
-static int load_one(const char *path, const char *dir, const char *fallback_name, theme_t *t)
+static int load_one(const char *path, const char *dir, const char *file, const char *fallback_name, theme_t *t)
 {
     char msg[1024];
     if (theme_load_file(path, t, msg, sizeof msg)) {
@@ -324,6 +325,7 @@ static int load_one(const char *path, const char *dir, const char *fallback_name
         note(t, THEME_ERROR, msg[0] ? msg : "can't be read");
     }
     snprintf(t->dir, sizeof t->dir, "%s", dir);
+    snprintf(t->file, sizeof t->file, "%s", file);
     if (t->status != THEME_ERROR) check_theme(t);
     return 0;
 }
@@ -339,7 +341,7 @@ int ui_load_themes(const char *assets_dir, const char *user_dir, theme_t *themes
         snprintf(dir, sizeof dir, "%s/themes", assets_dir);
         snprintf(path, sizeof path, "%s/%s", dir, BUILTIN[i]);
         memset(&themes[n], 0, sizeof themes[n]);
-        load_one(path, "", BUILTIN[i], &themes[n]);
+        load_one(path, "", "", BUILTIN[i], &themes[n]);
         if (themes[n].status != THEME_OK) fprintf(stderr, "%s: %s\n", path, themes[n].note);
         usable += themes[n].status != THEME_ERROR;
         n++;
@@ -366,16 +368,65 @@ int ui_load_themes(const char *assets_dir, const char *user_dir, theme_t *themes
             snprintf(dir, sizeof dir, "%.999s", path);
             snprintf(path, sizeof path, "%s/theme.ini", dir);
             if (stat(path, &st) == 0) {
+                char file[300];
+                snprintf(file, sizeof file, "%.250s/theme.ini", names[i]);
                 memset(&themes[n], 0, sizeof themes[n]);
-                load_one(path, dir, names[i], &themes[n]);
+                load_one(path, dir, file, names[i], &themes[n]);
                 n++;
             }
         } else if (n < max && dot && !strcmp(dot, ".theme")) {
             memset(&themes[n], 0, sizeof themes[n]);
-            load_one(path, user_dir, names[i], &themes[n]);
+            load_one(path, user_dir, names[i], names[i], &themes[n]);
             n++;
         }
         free(names[i]);
     }
     return n;
+}
+
+/* ---------- the theme editor's files ---------- */
+
+int ui_theme_write(const char *user_dir, const theme_t *t, const char *file, char *saved, size_t cap)
+{
+    static char text[8192];
+    char rel[300], path[1200], tmp[1300];
+    if (!user_dir || theme_format(t, text, sizeof text) < 0) return -1;
+    if (file && file[0]) {
+        if (strstr(file, "..") || file[0] == '/') return -1;
+        snprintf(rel, sizeof rel, "%s", file);
+    } else {                                   /* a new file, named after the theme (as the card allows) */
+        char base[64];
+        size_t n = 0;
+        for (const char *c = t->name; *c && n + 1 < sizeof base; c++) {
+            if (n == 0 && (*c == '.' || *c == ' ')) continue;
+            base[n++] = (unsigned char)*c < 32 || strchr("/\\:*?\"<>|", *c) ? '-' : *c;
+        }
+        while (n && base[n - 1] == ' ') n--;
+        base[n] = '\0';
+        if (!n) snprintf(base, sizeof base, "Theme");
+        mkdir(user_dir, 0755);
+        for (int k = 1; k < 100; k++) {
+            if (k == 1) snprintf(rel, sizeof rel, "%s.theme", base);
+            else snprintf(rel, sizeof rel, "%s %d.theme", base, k);
+            snprintf(path, sizeof path, "%s/%s", user_dir, rel);
+            if (access(path, F_OK) != 0) break;
+        }
+    }
+    snprintf(path, sizeof path, "%s/%s", user_dir, rel);
+    snprintf(tmp, sizeof tmp, "%s.new", path);
+    FILE *f = fopen(tmp, "we");
+    if (!f) return -1;
+    int ok = fputs(text, f) >= 0 && fflush(f) == 0 && fsync(fileno(f)) == 0;
+    ok &= fclose(f) == 0;
+    if (!ok || rename(tmp, path) != 0) { unlink(tmp); return -1; }
+    snprintf(saved, cap, "%s", rel);
+    return 0;
+}
+
+int ui_theme_delete(const char *user_dir, const char *file)
+{
+    char path[1200];
+    if (!user_dir || !file || !file[0] || strchr(file, '/') || strstr(file, "..")) return -1;
+    snprintf(path, sizeof path, "%s/%s", user_dir, file);
+    return unlink(path);
 }

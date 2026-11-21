@@ -659,6 +659,110 @@ static void test_library(void)
     CHECK(did > 0 && eid == did && px && library_art(lib, eid, LIB_ART_SMALL, px) == -1);
     free(px);
     library_close(lib);
+
+    /* E: a cover found online (net/coverfind.h), kept in its own folder */
+    {
+        char found_dir[600], jpg[1200], none[1200];
+        snprintf(found_dir, sizeof found_dir, "%s/covers", g_tmp);
+        library_set_found_covers(found_dir);
+        lib = library_open(db, art);
+        lib_album_t *list = NULL, e;
+        int nl = lib ? library_albums_without_cover(lib, &list) : -1;
+        CHECK(nl == 1 && list && list[0].id == eid && !strcmp(list[0].title, "Album E"));
+        free(list);
+        CHECK(lib && library_album_info(lib, eid, &e) == 0 && library_album_cover(lib, eid) == LIB_COVER_NONE);
+        CHECK(library_found_cover_path(e.key, "jpg", jpg, sizeof jpg) == 0 &&
+              library_found_cover_path(e.key, "none", none, sizeof none) == 0);
+        unsigned char *fsrc = picture(500, 500);
+        long fl = write_jpeg(jpg, fsrc, 500, 500, J_BASELINE, 0, 2, 0);
+        free(fsrc);
+        long el;
+        unsigned char *fenc = slurp(jpg, &el);
+        uint16_t *lg = malloc((size_t)LIB_ART_LARGE * LIB_ART_LARGE * 2), *sm = malloc((size_t)LIB_ART_SMALL * LIB_ART_SMALL * 2);
+        uint16_t *back = malloc((size_t)LIB_ART_SMALL * LIB_ART_SMALL * 2);
+        CHECK(fl > 0 && fenc && lg && sm && back && library_art_decode(fenc, (size_t)el, LIB_ART_LARGE, lg) == 0 &&
+              library_art_decode(fenc, (size_t)el, LIB_ART_SMALL, sm) == 0);
+        free(fenc);
+        CHECK(library_store_found_cover(lib, eid, lg, sm) == 0 && library_album_cover(lib, eid) == LIB_COVER_FOUND);
+        CHECK(library_art(lib, eid, LIB_ART_SMALL, back) == 0 && !memcmp(back, sm, (size_t)LIB_ART_SMALL * LIB_ART_SMALL * 2));
+        nl = library_albums_without_cover(lib, &list);
+        CHECK(nl == 0);
+        free(list);
+        /* a scan, nothing changed: kept */
+        CHECK(library_scan(lib, music, NULL, NULL) == 6 && album_art(db, "Album E") == LIB_COVER_FOUND);
+        library_close(lib);
+        /* its track rewritten (looked at again): the found cover again */
+        snprintf(p, sizeof p, "%s/E/01.flac", music);
+        sleep(1);
+        write_flac(p, "Album E", "e1", 1, NULL, NULL, 0);
+        lib = library_open(db, art);
+        CHECK(lib && library_scan(lib, music, NULL, NULL) == 6);
+        CHECK(album_art(db, "Album E") == LIB_COVER_FOUND && library_art(lib, eid, LIB_ART_SMALL, back) == 0);
+        library_close(lib);
+        /* a new library (the database lost): found again at the first scan */
+        char db2[600], art2[600];
+        snprintf(db2, sizeof db2, "%s/lib2.db", g_tmp);
+        snprintf(art2, sizeof art2, "%s/art2", g_tmp);
+        mkdir(art2, 0755);
+        library_t *l2 = library_open(db2, art2);
+        CHECK(l2 && library_scan(l2, music, NULL, NULL) == 6);
+        library_close(l2);
+        CHECK(album_art(db2, "Album E") == LIB_COVER_FOUND);
+        /* its own cover put in its folder: that wins; taken away: the found one again */
+        snprintf(q, sizeof q, "%s/E/cover.png", music);
+        write_png(q, src, 400, 400, 2, 8, 0, 1 << 20, expect);
+        lib = library_open(db, art);
+        CHECK(lib && library_scan(lib, music, NULL, NULL) == 6);
+        library_close(lib);
+        CHECK(album_art(db, "Album E") == LIB_COVER_OWN);
+        unlink(q);
+        lib = library_open(db, art);
+        CHECK(lib && library_scan(lib, music, NULL, NULL) == 6);
+        CHECK(album_art(db, "Album E") == LIB_COVER_FOUND);
+        /* removed: no cover, marked so the batch leaves it, and so it stays */
+        CHECK(library_remove_found_cover(lib, eid) == 0 && library_album_cover(lib, eid) == LIB_COVER_NONE);
+        struct stat st;
+        CHECK(stat(jpg, &st) != 0 && stat(none, &st) == 0 && library_art(lib, eid, LIB_ART_SMALL, back) == -1);
+        CHECK(library_scan(lib, music, NULL, NULL) == 6 && album_art(db, "Album E") == LIB_COVER_NONE);
+
+        /* A: a cover of its own, another picked over it (Find another cover) */
+        int64_t aid = album_id_of(db, "Album A");
+        lib_album_t aa;
+        char ajpg[1200], aover[1200], anone[1200];
+        uint16_t *own = malloc((size_t)LIB_ART_SMALL * LIB_ART_SMALL * 2);
+        CHECK(own && library_album_info(lib, aid, &aa) == 0 && library_album_cover(lib, aid) == LIB_COVER_OWN &&
+              library_art(lib, aid, LIB_ART_SMALL, own) == 0);
+        library_found_cover_path(aa.key, "jpg", ajpg, sizeof ajpg);
+        library_found_cover_path(aa.key, "over", aover, sizeof aover);
+        library_found_cover_path(aa.key, "none", anone, sizeof anone);
+        {                                              /* the picture found (not A's own) */
+            unsigned char *other = picture(500, 500);
+            for (int i = 0; i < 500 * 500 * 3; i += 3) other[i] = 255;
+            write_jpeg(ajpg, other, 500, 500, J_BASELINE, 0, 2, 0);
+            free(other);
+        }
+        CHECK(library_store_found_cover(lib, aid, lg, sm) == 0 && library_album_cover(lib, aid) == LIB_COVER_PICKED);
+        CHECK(stat(aover, &st) == 0);
+        CHECK(library_art(lib, aid, LIB_ART_SMALL, back) == 0 && !memcmp(back, sm, (size_t)LIB_ART_SMALL * LIB_ART_SMALL * 2));
+        CHECK(library_scan(lib, music, NULL, NULL) == 6 && album_art(db, "Album A") == LIB_COVER_PICKED);
+        library_close(lib);
+        /* its track rewritten (looked at again): the picked one still wins over its own */
+        snprintf(p, sizeof p, "%s/A/01.flac", music);
+        sleep(1);
+        write_flac(p, "Album A", "a1", 1, t_other, one, 1);
+        lib = library_open(db, art);
+        CHECK(lib && library_scan(lib, music, NULL, NULL) == 6 && album_art(db, "Album A") == LIB_COVER_PICKED);
+        CHECK(library_art(lib, aid, LIB_ART_SMALL, back) == 0 && memcmp(back, own, (size_t)LIB_ART_SMALL * LIB_ART_SMALL * 2));
+        /* removed: back to its own, as it was; nothing marked */
+        CHECK(library_remove_found_cover(lib, aid) == 0 && library_album_cover(lib, aid) == LIB_COVER_OWN);
+        CHECK(library_art(lib, aid, LIB_ART_SMALL, back) == 0 && !memcmp(back, own, (size_t)LIB_ART_SMALL * LIB_ART_SMALL * 2));
+        CHECK(stat(ajpg, &st) != 0 && stat(aover, &st) != 0 && stat(anone, &st) != 0);
+        CHECK(library_scan(lib, music, NULL, NULL) == 6 && album_art(db, "Album A") == LIB_COVER_OWN);
+        free(own);
+        library_close(lib);
+        library_set_found_covers(NULL);
+        free(lg), free(sm), free(back);
+    }
     free(src), free(expect);
 }
 

@@ -36,6 +36,9 @@ add_library(fathom_player STATIC
   app/net/http.c
   app/net/json.c
   app/net/radiodir.c
+  app/net/podcast.c
+  app/net/podsync.c
+  app/net/coverfind.c
   app/net/sha256.c
   app/net/unzip.c
   app/net/update.c
@@ -54,6 +57,7 @@ add_library(fathom_player STATIC
   app/audio/loudness.c
   app/audio/btconv.c
   app/audio/eq.c
+  app/audio/tempo.c
   app/audio/out_null.c
   app/audio/out_clock.c
   app/player/player.c
@@ -143,6 +147,34 @@ add_executable(test_btconv tests/test_btconv.c)
 target_link_libraries(test_btconv PRIVATE fathom_player)
 target_compile_options(test_btconv PRIVATE ${FATHOM_WARNINGS})
 add_test(NAME btconv COMMAND test_btconv)
+
+add_executable(test_podcast tests/test_podcast.c)
+target_link_libraries(test_podcast PRIVATE fathom_player)
+target_include_directories(test_podcast PRIVATE tests)
+target_compile_options(test_podcast PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME podcast COMMAND test_podcast WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_podsync tests/test_podsync.c)
+target_link_libraries(test_podsync PRIVATE fathom_player)
+target_include_directories(test_podsync PRIVATE tests)
+target_compile_options(test_podsync PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME podsync COMMAND test_podsync WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_coverfind tests/test_coverfind.c)
+target_link_libraries(test_coverfind PRIVATE fathom_player)
+target_include_directories(test_coverfind PRIVATE tests)
+target_compile_options(test_coverfind PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME coverfind COMMAND test_coverfind WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_tempo tests/test_tempo.c)
+target_link_libraries(test_tempo PRIVATE fathom_player m)
+target_compile_options(test_tempo PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME tempo COMMAND test_tempo)
+
+add_executable(test_theme tests/test_theme.c)
+target_link_libraries(test_theme PRIVATE fathom_core)
+target_compile_options(test_theme PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME theme COMMAND test_theme WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_executable(test_eq tests/test_eq.c)
 target_link_libraries(test_eq PRIVATE fathom_player)

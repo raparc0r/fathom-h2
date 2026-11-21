@@ -11,7 +11,7 @@
  *   fathom-sim --lang-check FILE               headless: every screen's words through the menus, in
  *                                              the language FILE (tools/lang/check.py)
  *
- * Keys: Up/Down = wheel, Enter = centre (OK), Esc/Backspace = Back,
+ * Keys: Up/Down = wheel, Enter = centre (Play), Esc/Backspace = Back,
  *       N = long-press Back (Now Playing), Space = play/pause,
  *       Left/Right = previous/next, M = Menu (context menu), H = hold Menu (quick settings),
  *       [ / ] = hold Menu + wheel (brightness), , / . = hold Prev / Next (seek),
@@ -29,9 +29,13 @@
 #include "core/lang.h"
 #include "core/settings.h"
 #include "audio/engine.h"
+#include "audio/eq.h"
 #include "audio/output.h"
 #include "library/library.h"
 #include "net/radiodir.h"
+#include "net/podcast.h"
+#include "net/podsync.h"
+#include "net/coverfind.h"
 #include "lvgl.h"
 #include "player/player.h"
 #include "ui/theme.h"
@@ -88,6 +92,157 @@ static long sim_dir_fetch(const char *url, char *buf, size_t cap, const volatile
     buf[n] = '\0';
     return more ? -2 : (long)n;
 }
+/* Podcasts: feeds and Apple's search from tests/data/podcasts (no network
+ * here); a download is a small stand-in file. The screenshots start from
+ * sample shows of their own (sim_pod_seed). */
+static long sim_pod_fetch(const char *url, char *buf, size_t cap, const volatile int *abort)
+{
+    (void)abort;
+    const char *file = strstr(url, "itunes.apple.com") ? "tests/data/podcasts/search.json" : "tests/data/podcasts/feed.xml";
+    FILE *f = fopen(file, "rb");
+    if (!f) return -1;
+    size_t n = fread(buf, 1, cap - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return (long)n;
+}
+static int64_t sim_pod_download(const char *url, const char *path, http_progress_fn progress, void *ctx,
+                                const volatile int *abort)
+{
+    for (int i = 1; i <= 20 && !(abort && *abort); i++) {
+        if (progress) progress((uint64_t)i * 5, 100, ctx);
+        struct timespec t = {0, 100 * 1000 * 1000L};
+        nanosleep(&t, NULL);
+    }
+    if (abort && *abort) return -1;
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    fprintf(f, "%s\n", url);
+    fclose(f);
+    return 1;
+}
+/* Covers found online: MusicBrainz "finds" the album asked for (its title and
+ * artist read back from the question), and once more live; Apple nothing;
+ * every picture is tests/data/covers/cover.jpg */
+static void sim_unquote(const char *url, const char *field, char *out, size_t cap)
+{
+    char dec[1600];
+    size_t o = 0;
+    for (const char *p = url; *p && o + 1 < sizeof dec; p++) {
+        if (*p == '%' && p[1] && p[2]) { char h[3] = {p[1], p[2], 0}; dec[o++] = (char)strtol(h, NULL, 16); p += 2; }
+        else dec[o++] = *p;
+    }
+    dec[o] = '\0';
+    out[0] = '\0';
+    const char *f = strstr(dec, field);
+    if (!f || f[strlen(field)] != '"') return;
+    size_t k = 0;
+    for (const char *p = f + strlen(field) + 1; *p && *p != '"' && k + 2 < cap; p++) {
+        if (*p == '\\' && p[1]) p++;
+        if (*p == '"' || *p == '\\') out[k++] = '\\';   /* (back into JSON) */
+        out[k++] = *p;
+    }
+    out[k] = '\0';
+}
+static long sim_cf_fetch(const char *url, char *buf, size_t cap, const volatile int *abort)
+{
+    (void)abort;
+    if (!strstr(url, "musicbrainz.org")) return snprintf(buf, cap, "{\"resultCount\":0,\"results\":[]}");
+    char t[600], a[600];
+    sim_unquote(url, "releasegroup:", t, sizeof t);
+    sim_unquote(url, "artist:", a, sizeof a);
+    return snprintf(buf, cap,
+        "{\"release-groups\":[{\"id\":\"sim-1\",\"score\":100,\"title\":\"%s\",\"first-release-date\":\"2002\","
+        "\"artist-credit\":[{\"name\":\"%s\"}]},{\"id\":\"sim-2\",\"score\":90,\"title\":\"%s (Live)\","
+        "\"first-release-date\":\"2004\",\"artist-credit\":[{\"name\":\"%s\"}]}]}", t, a, t, a);
+}
+static int64_t sim_cf_download(const char *url, const char *path, http_progress_fn progress, void *ctx,
+                               const volatile int *abort)
+{
+    (void)url; (void)progress; (void)ctx; (void)abort;
+    FILE *in = fopen("tests/data/covers/cover.jpg", "rb"), *out = in ? fopen(path, "wb") : NULL;
+    char b[8192];
+    size_t n, total = 0;
+    while (out && (n = fread(b, 1, sizeof b, in)) > 0) total += fwrite(b, 1, n, out);
+    if (in) fclose(in);
+    if (out) fclose(out);
+    return out && total ? (int64_t)total : -1;
+}
+static int sim_pod_opml(char *path, size_t cap)
+{
+    snprintf(path, cap, "build/sim-data/podcasts/subscriptions.opml");
+    FILE *f = fopen(path, "rb");
+    if (f) fclose(f);
+    return f ? 1 : 0;
+}
+/* Sample shows for the screenshots: one read (three episodes: the newest not
+ * on the card, one half heard and downloaded, one played), two with new episodes */
+static void sim_pod_seed(const char *dir)
+{
+    char cmd[300];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (system(cmd)) {}
+    static const char *const SHOWS[][2] = {{"The Slow & Steady Show", "https://feeds.example.com/slow.xml"},
+                                          {"Radiolab", "https://feeds.simplecast.com/EmVW7VGp"},
+                                          {"Caf\xc3\xa9 Talk", "https://example.com/cafe.rss"}};
+    for (int i = 0; i < 3; i++) {
+        pod_show_t s = {0};
+        snprintf(s.title, sizeof s.title, "%s", SHOWS[i][0]);
+        snprintf(s.url, sizeof s.url, "%s", SHOWS[i][1]);
+        pod_hash(s.url, s.id);
+        pod_shows_add(dir, &s);
+        s.refreshed = 1795064400;
+        s.latest = 1795064400;
+        pod_show_save(dir, &s);
+        pod_show_seen(dir, s.id, i == 0 ? 1795064400 : 1795000000);
+    }
+    char buf[8192];
+    FILE *f = fopen("tests/data/podcasts/feed.xml", "rb");
+    size_t n = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
+    if (f) fclose(f);
+    pod_show_t s = {0};
+    pod_episode_t e[8];
+    snprintf(s.url, sizeof s.url, "%s", SHOWS[0][1]);
+    pod_hash(s.url, s.id);
+    int ne = pod_parse_feed(buf, n, &s, e, 8);
+    if (ne < 3) return;
+    pod_episodes_save(dir, s.id, e, ne);
+    pod_state_t st = {0};
+    snprintf(st.key, sizeof st.key, "%s", e[1].key);
+    st.pos_ms = 23 * 60 * 1000;
+    st.len_ms = (uint32_t)e[1].dur_s * 1000;
+    pod_state_put(dir, s.id, &st);
+    snprintf(st.key, sizeof st.key, "%s", e[2].key);
+    st.pos_ms = 0;
+    st.played = 1;
+    st.played_at = 1795064400;
+    pod_state_put(dir, s.id, &st);
+    char p[800];
+    pod_episode_path(dir, s.id, &e[1], p, sizeof p);
+    f = fopen(p, "wb");
+    if (f) { fputs("stand-in", f); fclose(f); }
+    /* its cover (an album's from the library stands in for the show's image) */
+    lib_list_t al;
+    static uint16_t px[LIB_ART_LARGE * LIB_ART_LARGE];
+    if (g_lib && library_list(g_lib, LIB_ALBUMS, 0, &al) > 0) {
+        for (int i = 0; i < al.n; i++)
+            if (library_art(g_lib, al.ids[i], LIB_ART_LARGE, px) == 0) {
+                pod_cover_path(dir, s.id, p, sizeof p);
+                FILE *c = fopen(p, "wb");
+                if (c) { fwrite(px, 1, sizeof px, c); fclose(c); }
+                break;
+            }
+        library_list_free(&al);
+    }
+    /* and its chapters, as fetched with the download */
+    pod_chapters_path(dir, s.id, e[1].key, p, sizeof p);
+    FILE *in = fopen("tests/data/podcasts/chapters.json", "rb"), *out = fopen(p, "wb");
+    size_t k;
+    while (in && out && (k = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, k, out);
+    if (in) fclose(in);
+    if (out) fclose(out);
+}
+
 /* Settings > Network drive, as on an H2 serving over Wi-Fi */
 static int sim_share_state(ui_share_t *st)
 {
@@ -174,6 +329,43 @@ static void sim_uninstall_do(int what)
                   [UI_UNI_CANCEL] = UI_UNI_IDLE, [UI_UNI_RESTART] = UI_UNI_PENDING};
     g_sim_uni.state = next[what];
 }
+/* Settings > Sound > EQ: one profile, an AutoEQ one (for the EQ editor's screens) */
+static const char SIM_EQ[] = "Preamp: -6.0 dB\n"
+                             "Filter 1: ON LSC Fc 105 Hz Gain 2.6 dB Q 0.70\n"
+                             "Filter 2: ON PK Fc 514 Hz Gain -4.4 dB Q 0.68\n"
+                             "Filter 3: ON PK Fc 8903 Hz Gain 6.0 dB Q 1.66\n"
+                             "Filter 4: ON PK Fc 183 Hz Gain 2.0 dB Q 0.77\n"
+                             "Filter 5: ON PK Fc 4613 Hz Gain 3.4 dB Q 2.46\n"
+                             "Filter 6: ON HSC Fc 10000 Hz Gain -0.5 dB Q 0.70\n"
+                             "Filter 7: ON PK Fc 1517 Hz Gain -1.0 dB Q 2.33\n"
+                             "Filter 8: ON PK Fc 929 Hz Gain 1.2 dB Q 2.75\n"
+                             "Filter 9: ON PK Fc 44 Hz Gain -0.5 dB Q 2.16\n"
+                             "Filter 10: ON PK Fc 618 Hz Gain -0.5 dB Q 2.86\n";
+static int sim_eq_list(char names[][64], int max)
+{
+    if (max < 1) return 0;
+    snprintf(names[0], 64, "AirPods Pro");
+    return 1;
+}
+static int sim_eq_get(const char *name, eq_profile_t *p)
+{
+    char err[128];
+    (void)name;
+    return eq_parse(SIM_EQ, p, err, sizeof err);
+}
+static int sim_eq_put(const char *name, const eq_profile_t *p) { (void)name; (void)p; return 0; }
+static void sim_eq_preview(const eq_profile_t *p) { (void)p; }
+
+/* The theme editor: themes saved in the simulator's own themes folder */
+#define SIM_THEMES "build/sim-data/themes"
+static theme_t *g_themes;
+static int sim_theme_save(const theme_t *t, const char *file, char *saved, size_t cap)
+{
+    return ui_theme_write(SIM_THEMES, t, file, saved, cap);
+}
+static int sim_themes_reload(void) { return g_n_themes = ui_load_themes(FATHOM_ASSETS_DIR, SIM_THEMES, g_themes, UI_MAX_THEMES); }
+static int sim_theme_remove(const char *file) { return ui_theme_delete(SIM_THEMES, file); }
+
 /* A made-up week on battery, for Settings > Power > Battery: charged
  * overnight, mostly playing with the screen off, the screen on a little each
  * hour, paused late; one day switched off for three hours (not known how
@@ -223,6 +415,11 @@ static const ui_hooks_t g_hooks = {.fonts = ui_theme_fonts, .icon = ui_theme_ico
                                    .languages = sim_languages, .language_set = sim_language_set,
                                    .update_state = sim_update_state, .update_do = sim_update_do,
                                    .uninstall_state = sim_uninstall_state, .uninstall_do = sim_uninstall_do,
+                                   .eq_list = sim_eq_list, .eq_get = sim_eq_get, .eq_put = sim_eq_put,
+                                   .eq_preview = sim_eq_preview,
+                                   .podcast_opml = sim_pod_opml,
+                                   .theme_save = sim_theme_save, .themes_reload = sim_themes_reload,
+                                   .theme_remove = sim_theme_remove,
                                    .battery_report = sim_battery_report};
 
 static void cue_sample(void);
@@ -279,7 +476,10 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                                           "about", "update", "updatelatest", "updatefailed", "updateprogress",
                                           "updateready", "updateinstall", "battery", "battery7", "batterysince",
                                           "batteryhistory", "uninstall", "uninstallchecking", "uninstallfailed",
-                                          "uninstallnone", "uninstallpending", "homeupdate", "askupdate", "askignore", "askinstall"};
+                                          "uninstallnone", "uninstallpending", "homeupdate", "askupdate", "askignore", "askinstall", "eqedit", "eqband",
+                                          "themesnew", "themeedit", "themecolours", "themecolour", "themesave",
+                                          "podcasts", "podshow", "podsearch", "podnp", "podchapters", "podmenu", "podsettings",
+                                          "libsettings", "libhelp", "covermenu", "covermenuown", "coverfind"};
     static const char *const slug[] = {"studio-mint", "studio-ember", "studio-pastel", "pixel-pastel"};
     for (int t = 0; t < 4 && t < g_n_themes; t++) {   /* the built-in themes */
         ui_set_theme(t);
@@ -374,13 +574,16 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 if (!strcmp(screens[s], "askinstall")) ui_key(UI_KEY_OK);   /* Install: About > Updates */
                 ui_set_theme(t);                            /* (the slide finished) */
                 settings_set("update.found", "");
+            } else if (!strcmp(screens[s], "libhelp")) {  /* Menu on Find missing covers: its help */
+                ui_show("libsettings");
+                ui_key(UI_KEY_MENU);
             } else if (!strcmp(screens[s], "toast")) {    /* a long one: it wraps */
                 ui_show("ssh");
                 ui_toast("Over USB and Wi-Fi, with the password", 3000);
             } else {
                 ui_show(screens[s]);
             }
-            int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast") ||
+            int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp") ||
                          (g_sim_upd.state >= UI_UPD_DOWNLOADING && g_sim_upd.state <= UI_UPD_RESTARTING) ||
                          !strcmp(screens[s], "uninstallpending") || !strcmp(screens[s], "uninstallnone");   /* (the update's progress screen) */
             lv_obj_t *what = on_top ? lv_layer_top() : lv_screen_active();
@@ -401,7 +604,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 g_sim_upd.state = UI_UPD_IDLE;
                 ui_update_changed();
             }
-            if (!strcmp(screens[s], "toast"))      /* (gone before the next screens) */
+            if (!strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp"))   /* (gone before the next screens) */
                 for (uint32_t c = 0; c < lv_obj_get_child_count(lv_layer_top()); c++)
                     lv_obj_add_flag(lv_obj_get_child(lv_layer_top(), (int32_t)c), LV_OBJ_FLAG_HIDDEN);
             printf("%s\n", path);
@@ -846,13 +1049,24 @@ int main(int argc, char **argv)
 
     lv_init();
     static theme_t themes[UI_MAX_THEMES];
-    g_n_themes = ui_load_themes(FATHOM_ASSETS_DIR, "build/sim-data/themes", themes, UI_MAX_THEMES);
+    g_themes = themes;
+    g_n_themes = ui_load_themes(FATHOM_ASSETS_DIR, SIM_THEMES, themes, UI_MAX_THEMES);
     const ui_fonts_t *fonts = g_n_themes > 0 ? ui_theme_fonts(&themes[0]) : NULL;
     if (!fonts) return 1;
     setup_player(music, shots || motion_dir || bench_s || lang_file);
     if (bench_s) return bench(themes, fonts, bench_s);
     rdir_set_fetch(sim_dir_fetch);
     g_shots = shots != NULL;
+    podsync_set_fetch(sim_pod_fetch);
+    podsync_set_download(sim_pod_download);
+    if (shots || lang_file) sim_pod_seed("build/sim-data/podcasts-shots");
+    podsync_start(shots || lang_file ? "build/sim-data/podcasts-shots" : "build/sim-data/podcasts");
+    const char *covers = shots || lang_file ? "build/sim-data/covers-shots" : "build/sim-data/covers";
+    library_set_found_covers(covers);
+    cf_set_fetch(sim_cf_fetch);
+    cf_set_download(sim_cf_download);
+    if (shots || lang_file) cf_set_mb_gap_ms(0);
+    cf_start(covers);
     if (lang_file) { g_shots = 1; return lang_check(lang_file, themes, fonts); }
     if (shots) return screenshots(shots, themes, fonts);
     if (motion_dir) return motion(motion_dir, themes, fonts, theme);

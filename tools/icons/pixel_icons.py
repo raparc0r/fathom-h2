@@ -11,7 +11,7 @@ import sys
 
 # Home items in the UI's order: now playing, shuffle, search, albums, artists,
 # album artists, songs, playlists, favourites, recently added, history, radio,
-# settings, then genres, composers, years, folders
+# settings, then genres, composers, years, folders, podcasts
 ICONS = {
     'nowplaying': [
         '..........',
@@ -200,6 +200,17 @@ ICONS = {
         '.X......X.',
         '.XXXXXXXX.',
         '..........'],
+    'podcasts': [
+        '..XXXXXX..',
+        '.X......X.',
+        'X..XXXX..X',
+        'X.X....X.X',
+        '..X.XX.X..',
+        '....XX....',
+        '....XX....',
+        '....XX....',
+        '...XXXX...',
+        '..........'],
     # Home's "Update available!", shown only while there's one: not a Home item
     # Settings > Home can show or move (H_UPDATE, after the items)
     'update': [
@@ -217,7 +228,7 @@ ICONS = {
 # (in the UI's H_* order: items added later come after settings)
 ORDER = ['nowplaying', 'shuffle', 'search', 'albums', 'artists', 'albumartists', 'songs',
          'playlists', 'favourites', 'recent', 'history', 'radio', 'settings',
-         'genres', 'composers', 'years', 'folders', 'update']
+         'genres', 'composers', 'years', 'folders', 'podcasts', 'update']
 
 
 def main(out, preview):

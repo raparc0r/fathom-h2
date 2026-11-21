@@ -50,6 +50,8 @@ typedef struct {
 
     /* set by whoever loads it */
     char dir[256];          /* the theme's folder (its fonts are relative to it); "" = built in */
+    char file[128];         /* its file, relative to the card's themes folder ("Name.theme",
+                             * "Name/theme.ini"); "" = built in */
     theme_status_t status;  /* loads fine / loads with a legibility warning / can't be used */
     char note[160];         /* the first warning or the error, for the theme list */
     int  unknown_keys;      /* keys this firmware doesn't know (ignored) */
@@ -63,6 +65,24 @@ int theme_load_file(const char *path, theme_t *t, char *err, size_t errcap);
  * (for themes without their own font file) a vetted built-in family.
  * Returns the number of failures; each one is described in err (newline separated). */
 int theme_validate(const theme_t *t, char *err, size_t errcap);
+
+/* The theme as a file theme_parse reads back the same (every key written out).
+ * Returns the length, or -1 if it doesn't fit in cap. */
+int theme_format(const theme_t *t, char *out, size_t cap);
+
+/* Colours as hue (0..359), saturation and lightness (0..100), and back. */
+void theme_to_hsl(uint32_t rgb, int *h, int *s, int *l);
+uint32_t theme_from_hsl(int h, int s, int l);
+
+/* The colour c, made lighter or darker (away from bg) until it reads at min
+ * contrast on bg, keeping its hue; c itself if it already does. */
+uint32_t theme_fit(uint32_t c, uint32_t bg, double min);
+
+/* Made from a few choices (the theme editor): dark or light, and an accent hue
+ * and saturation. theme_make sets every colour from them; theme_accent only
+ * the selection, its text, signal and mode, against the theme's own bg. */
+void theme_make(theme_t *t, int dark, int hue, int sat);
+void theme_accent(theme_t *t, int hue, int sat);
 
 /* WCAG contrast ratio between two colours after RGB565 quantization. */
 double theme_contrast(uint32_t a, uint32_t b);

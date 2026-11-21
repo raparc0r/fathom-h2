@@ -9,7 +9,7 @@ does.
 | Key | Press | Hold |
 |---|---|---|
 | Wheel | move through a list | |
-| Play | choose (OK); on Now Playing, play or pause | |
+| Play | choose; on Now Playing, play or pause | |
 | Back | go back | jump to Now Playing, and back |
 | Menu | options for what's selected (play next, add to a playlist, go to the album...) | quick settings: brightness, shuffle, repeat, EQ, Bluetooth, Wi-Fi, sleep timer |
 | Menu + wheel | | brightness: hold Menu and turn the wheel |
@@ -45,6 +45,30 @@ Settings → USB connection → On a computer chooses what happens when you plug
 Settings → Interface holds the look: the theme, album covers in the lists, artist names
 in Albums, and the language. Your own themes go in the card's `fathom/themes/` folder
 ([THEMES.md](THEMES.md) explains every option); restart the H2 to see a new one.
+To make your own theme on the H2: Settings → Interface → Theme → **New theme**, or
+**Menu** on a theme to change it (a built-in one opens as a copy). Choose dark or light and
+an accent colour, then, if you like, each colour (Play, then turn the wheel through 80
+named colours: greys, and each accent from pale to night), the shapes, the font and the
+text size. The strip at the top
+shows the theme as you make it, and says when some text would be too faint to read.
+**Save** switches to it; a new text size shows once it's saved. Back without saving asks
+you to press it twice.
+
+**Missing covers.** On an album without a cover (in Albums, on one of its songs, or on
+Now Playing), **Menu → Find cover** looks it up online, on MusicBrainz and then Apple,
+and shows what it finds one at a time: turn the wheel for another, **Play** to use it.
+Settings → Library → **Find missing covers** does it for every album without a cover, once,
+and keeps only sure matches (the same artist and title, from a year that fits). When it's
+done it says how many it found and how many it wasn't sure of; Find cover shows you those.
+Found covers are saved in the card's `fathom/covers/` folder, never beside your music.
+A cover of your own (a `cover.jpg` in the album's folder, or one in its files) comes first,
+unless it's wrong: on an album with a cover, **Menu → Find another cover** looks one up the
+same way, and the one you pick stays ahead of the album's own. **Menu → Remove cover**
+takes a found one away: back to the album's own cover if it had one; if it had none, Find
+missing covers then leaves that album alone. Your music files are never changed, so other
+players still show their own covers. Finding covers needs Wi-Fi, and sends the album's
+artist and title.
+
 Translations go in `fathom/lang/`, one `English text = translation` per line.
 
 ## EQ
@@ -60,8 +84,11 @@ quick settings can switch between Off and your EQs as you listen.
 
 To make your own or change one: in Settings → Sound → EQ, **New EQ** starts five flat
 bands, and **Menu** on any EQ opens it. Choose the preamp or a band, press Play, and turn
-the wheel; press Play again when it's right. You hear each change as you make it. A band's
-Type switches between peak, low shelf and high shelf.
+the wheel; press Play again when it's right. You hear each change as you make it, and see
+it: the EQ's curve, from 20 Hz to 20 kHz, sits above the list, each band a dot on it, the
+selected one highlighted. If the curve with the preamp goes above 0 dB, it says by how
+much: lower the preamp by that, or loud passages may clip. A band's Type switches between
+peak, low shelf and high shelf.
 
 **Pure mode** (Settings → Sound) turns off the EQ, balance and volume levelling in one go,
 and Now Playing shows "Bit+" while the music reaches the DAC exactly as in the file.
@@ -109,6 +136,31 @@ Radio Paradise = https://stream.radioparadise.com/flacm
 The address can be the stream itself (MP3, AAC, FLAC, Ogg, over http or https) or the
 station's playlist link (`.m3u`, `.pls`, `.m3u8`).
 
+## Podcasts
+
+Home → **Podcasts**. To add shows: **Find podcasts** and type a name with the wheel (it
+searches Apple's podcast directory), then Play on a show to add it. Or bring your shows
+from another podcast app: export them as an OPML file, put it at the top of the card, in
+`Music` or in `fathom/podcasts`, and choose **Import NAME.opml** at the bottom of the list.
+Shows are kept in `fathom/podcasts/shows.txt`, one `Title = feed address` per line, which
+you can also edit on a computer.
+
+A show's episodes are newest first. Each says how it stands: **New**, **12 min left**,
+**Played**, or its length, and one on the card has a small arrow onto a line beside that.
+Play on an episode on the card goes on from where you left it; one that isn't is played over Wi-Fi from its
+start (download it to skip around and pick up where you left off). On an episode, Prev
+and Next skip 15 seconds back and 30 forward. **Menu** on an episode downloads it,
+cancels or deletes its download, and marks it played or not; Menu on a show checks it for
+new episodes, or unsubscribes (press twice: its downloads go too).
+
+While the H2 charges on Wi-Fi, each show's two newest unplayed episodes download by
+themselves, and a played episode's download is deleted a week later. Settings →
+**Podcasts** changes how many, how long, or turns it off.
+
+On Now Playing, the show's cover, and the chapter you're in when the episode has
+chapters: **Menu** → **Chapters** jumps to one. Menu → **Speed** plays episodes faster
+(1.25× to 2×) without the voices going up; music always plays as it is.
+
 ## Network drive
 
 Copy music to the H2 over Wi-Fi, while it plays. Turn on Settings → Network drive; once
@@ -144,9 +196,10 @@ stops the music after a while or at the end of the album.
 Once a day, while the H2 rests on a Wi-Fi network it has joined before, Fathom asks GitHub
 whether there's a newer version, tells you the next time you wake the H2, and puts
 **Update available!** at the top of Home. Choose it, then **Install new version** to get
-it, or **Ignore** to hide it until a newer one comes out. That's the only thing Fathom
-contacts by itself, besides a time server when Wi-Fi connects; turn it off in Settings →
-About → Check automatically.
+it, or **Ignore** to hide it until a newer one comes out. Turn it off in Settings → About
+→ Check automatically. Besides that, Fathom only contacts a time server when Wi-Fi
+connects, and, if you've added podcasts, their feeds and new episodes (Settings →
+Podcasts).
 
 To update: Settings → About → **Check for updates**, then **Update to vX.Y.Z**. It
 downloads (about 14 MB) while the music plays on, checks every file, then asks: **Play**
@@ -173,9 +226,9 @@ time. To go back to it for good, its bootloader included, Fathom can do it from 
 2. Put its `.upt` file at the top of the card, or in the `Music` folder (where the network
    drive puts files, from a phone too). There's no need to rename it.
 3. Settings → About → **Uninstall Fathom**. Fathom checks the file (a few seconds) and
-   shows its date. Choose **Uninstall Fathom** and press **OK** twice. The H2 needs half
+   shows its date. Choose **Uninstall Fathom** and press **Play** twice. The H2 needs half
    its battery, or to be plugged in.
-4. **OK** restarts the H2 into HiBy's recovery, which installs HiBy's firmware and starts
+4. **Play** restarts the H2 into HiBy's recovery, which installs HiBy's firmware and starts
    it, in a few minutes. Don't turn the H2 off meanwhile. **Back** instead puts everything
    back as it was.
 
@@ -192,7 +245,7 @@ Update** as in [INSTALL.md](INSTALL.md). Your settings and library are where you
 
 Fathom keeps its settings, library and cover cache in the card's `fathom` folder, and
 that's where you add things of your own: `radio.txt`, `eq/`, `themes/` and `lang/` (all
-above). Wi-Fi passwords and the network drive's password are kept there too, so anyone
+above). `podcasts/` holds your shows, their episodes' downloads and where you left each. Wi-Fi passwords and the network drive's password are kept there too, so anyone
 holding the card can read them.
 
 More for the technically minded (SSH, logs, recovery): [ADVANCED.md](ADVANCED.md).

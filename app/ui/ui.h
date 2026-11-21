@@ -158,6 +158,19 @@ typedef struct {
     int  (*eq_put)(const char *name, const eq_profile_t *p);
     void (*eq_preview)(const eq_profile_t *p);
     int  (*eq_remove)(const char *name);
+    /* The theme editor (Settings > Interface > Theme, Menu on a theme; NULL:
+     * none). theme_save writes t to the card's themes folder, over `file`
+     * (relative to it, as theme_t.file) or, with file "", to a new file named
+     * after the theme; the file it wrote goes in saved (0 = saved).
+     * themes_reload reads the catalogue again into the array ui_init was
+     * given and returns how many there are; theme_remove deletes a theme's
+     * file (0 = deleted). */
+    /* Home > Podcasts (net/podsync.h, started by the caller): an OPML file to
+     * offer to import ("Import NAME.opml"): 1 and its path, or 0 (none). */
+    int  (*podcast_opml)(char *path, size_t cap);
+    int  (*theme_save)(const theme_t *t, const char *file, char *saved, size_t cap);
+    int  (*themes_reload)(void);
+    int  (*theme_remove)(const char *file);
     /* Library > Rescan: look for new music now (in the background). */
     void (*rescan)(void);
     /* Start the player again (after Reset all settings: everything from the
@@ -229,6 +242,9 @@ void ui_key(ui_key_t k);
 int ui_tick(void);              /* ~10x per second: follows the player; 0 when it needn't until a key */
 void ui_tick_1s(void);          /* refreshes position and progress */
 void ui_set_theme(int index);
+/* Before the player exits: what the UI keeps on the card now and then (where
+ * a podcast episode was left), kept now. */
+void ui_save_state(void);
 void ui_set_hooks(const ui_hooks_t *h);
 void ui_bt_changed(void);       /* Bluetooth state or devices changed: refresh its screen */
 void ui_wifi_changed(void);     /* Wi-Fi state or networks changed: refresh its screens and the header */

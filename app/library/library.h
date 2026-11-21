@@ -125,6 +125,36 @@ int64_t library_album_artist(library_t *lib, int64_t album_id);   /* 0 if unknow
 
 /* Cached cover art for an album as RGB565 (size*size*2 bytes). 0 if present. */
 int library_art(library_t *lib, int64_t album_id, int size, uint16_t *pixels);
+
+/* Covers found online (net/coverfind.h), kept on the card in their own folder
+ * (fathom/covers), never beside the music: an album's as KEYHASH.jpg, with
+ * KEYHASH.over when it was picked over the album's own cover (it stays ahead
+ * of it); KEYHASH.none when one that filled a gap was removed (not looked for
+ * again unless asked). Set once, for every library handle. */
+void library_set_found_covers(const char *dir);
+/* Where album `key`'s is: ext "jpg", "over" or "none". 0, or -1 (no folder set). */
+int  library_found_cover_path(const char *key, const char *ext, char *out, size_t cap);
+/* Where an album's cover came from */
+enum { LIB_COVER_UNKNOWN, LIB_COVER_OWN, LIB_COVER_NONE, LIB_COVER_FOUND, LIB_COVER_PICKED };
+int  library_album_cover(library_t *lib, int64_t album_id);
+/* An album as a cover search needs it */
+typedef struct {
+    int64_t id;
+    char key[512];
+    char title[256], artist[256];   /* its album artist ("Various Artists": a compilation) */
+    int year;                       /* 0: unknown */
+} lib_album_t;
+int  library_album_info(library_t *lib, int64_t album_id, lib_album_t *out);
+/* Every album no cover was found for (malloc'd into *out): how many, or -1. */
+int  library_albums_without_cover(library_t *lib, lib_album_t **out);
+/* A found cover (its file already in the folder) as the album's: its
+ * thumbnails (LIB_ART_LARGE and LIB_ART_SMALL squares, RGB565) written. Over
+ * a cover of its own (or one picked before): picked, ahead of its own from
+ * now on; otherwise found, filling the gap. 0, -1. */
+int  library_store_found_cover(library_t *lib, int64_t album_id, const uint16_t *large, const uint16_t *small);
+/* The album's found cover removed: one picked over its own goes back to its
+ * own; one that filled a gap leaves no cover (and is marked: KEYHASH.none). 0, -1. */
+int  library_remove_found_cover(library_t *lib, int64_t album_id);
 /* A track's album (its cover in Songs): the id, 0 if unknown. */
 int64_t library_track_album(library_t *lib, int64_t track_id);
 /* An image file's contents (JPEG, PNG) as a square cover, centre-cropped, as

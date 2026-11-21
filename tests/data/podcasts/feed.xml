@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- a feed with the awkward parts real ones have -->
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:podcast="https://podcastindex.org/namespace/1.0">
+<channel>
+  <title><![CDATA[The Slow & Steady Show]]></title>
+  <link>https://example.com</link>
+  <itunes:author>Ana &amp; Bo</itunes:author>
+  <image><url>https://example.com/rss-cover.jpg</url><title>Cover title (not the show's)</title></image>
+  <itunes:image href="https://example.com/cover.jpg"/>
+  <description><![CDATA[<p>About the <b>show</b></p>]]></description>
+  <item>
+    <title>Episode 2: Caf&#233; &#x2014; &quot;Live&quot;</title>
+    <guid isPermaLink="false">ep-2</guid>
+    <pubDate>Tue, 19 Nov 2026 05:00:00 +0000</pubDate>
+    <itunes:duration>1:02:03</itunes:duration>
+    <enclosure url="https://cdn.example.com/ep2.mp3?src=rss&amp;x=1" length="61234567" type="audio/mpeg"/>
+    <podcast:chapters url="https://example.com/ep2/chapters.json" type="application/json+chapters"/>
+    <description><![CDATA[Links: <a href="x">here</a> </item> not really]]></description>
+  </item>
+  <item>
+    <title>Episode 3 (newest, listed out of order)</title>
+    <guid>ep-3</guid>
+    <pubDate>Wed, 20 Nov 2026 09:30:00 PST</pubDate>
+    <itunes:duration>3600</itunes:duration>
+    <enclosure type="audio/x-m4a" url='https://cdn.example.com/ep3.m4a' length="0"/>
+  </item>
+  <item>
+    <title>A video episode (left out)</title>
+    <guid>vid-1</guid>
+    <enclosure url="https://cdn.example.com/v.mp4" type="video/mp4" length="1"/>
+  </item>
+  <item>
+    <title>Episode 1</title>
+    <pubDate>Mon, 4 Nov 2026 12:00:00 GMT</pubDate>
+    <itunes:duration>59:12</itunes:duration>
+    <enclosure url="https://cdn.example.com/ep1.mp3" type="audio/mpeg"/>
+  </item>
+  <item>
+    <title>Episode 2 again (same guid)</title>
+    <guid>ep-2</guid>
+    <pubDate>Mon, 18 Nov 2026 05:00:00 +0000</pubDate>
+    <enclosure url="https://cdn.example.com/ep2b.mp3" type="audio/mpeg"/>
+  </item>
+  <item>
+    <title>No audio (a blog post)</title>
+  </item>
+  <item>
+    <title>Cut off mid-way</title>
+    <enclosure url="https://cdn.example.com/cut.mp3" type="audio/mpeg"/>

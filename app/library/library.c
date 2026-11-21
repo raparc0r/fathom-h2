@@ -1294,17 +1294,26 @@ static int parent_dir(const char *dir, char *out, size_t cap)
     return 0;
 }
 
-/* The album's cover, best first: an image named like a cover in its folder
- * (or, for a disc's folder, in the album's above it); the first track's
- * embedded one, then up to four other tracks' that have one; any other image
- * in the folder (a scan or a booklet page loses to an embedded cover). Each
- * is tried until one decodes. */
-static int make_art(library_t *lib, sqlite3_stmt *others, int64_t album_id, const char *dir, const char *first_track)
+/* The album's cover, best first: one found online that you picked over its
+ * own (Find another cover: KEYHASH.over beside it); an image named like a
+ * cover in its folder (or, for a disc's folder, in the album's above it);
+ * the first track's embedded one, then up to four other tracks' that have
+ * one; one found online and kept (coverfind.h); any other image in the
+ * folder (a scan or a booklet page loses to an embedded cover, and to a
+ * found one). Each is tried until one decodes. 0: its own; 1: the found one;
+ * 2: the one picked over its own; -1: none. */
+static int make_art(library_t *lib, sqlite3_stmt *others, int64_t album_id, const char *dir, const char *first_track,
+                    const char *key)
 {
-    char file[2048], up[2048], pfile[2048];
+    char file[2048], up[2048], pfile[2048], found[1200], over[1200];
+    int was_found = 0;
     int w = 0, h = 0;
     unsigned char *img = NULL;
-    int rank = find_cover_file(dir, file, sizeof file);
+    struct stat ost;
+    if (key && library_found_cover_path(key, "over", over, sizeof over) == 0 && stat(over, &ost) == 0 &&
+        library_found_cover_path(key, "jpg", found, sizeof found) == 0 && (img = art_from_file(found, &w, &h)) != NULL)
+        was_found = 2;
+    int rank = img ? -1 : find_cover_file(dir, file, sizeof file);
     int prank = -1;
     if ((rank < 0 || rank > 4) && disc_folder(dir) && parent_dir(dir, up, sizeof up) == 0) {
         prank = find_cover_file(up, pfile, sizeof pfile);
@@ -1321,6 +1330,8 @@ static int make_art(library_t *lib, sqlite3_stmt *others, int64_t album_id, cons
             img = art_from_track((const char *)sqlite3_column_text(others, 0), &w, &h);
         sqlite3_reset(others);
     }
+    if (!img && key && library_found_cover_path(key, "jpg", found, sizeof found) == 0 &&
+        (img = art_from_file(found, &w, &h)) != NULL) was_found = 1;
     if (!img && rank > 4) img = art_from_file(file, &w, &h);
     if (!img) return -1;
     const int sizes[2] = {LIB_ART_LARGE, LIB_ART_SMALL};
@@ -1337,7 +1348,7 @@ static int make_art(library_t *lib, sqlite3_stmt *others, int64_t album_id, cons
         free(px);
     }
     free(img);
-    return ok == 2 ? 0 : -1;
+    return ok == 2 ? was_found : -1;
 }
 
 /* What an album's cover comes from (or could), as one number: the images in
@@ -1399,14 +1410,14 @@ static int64_t art_sig(const pathvec_t *iv, sqlite3_stmt *tracks, int64_t album_
 static void build_art(library_t *lib, const pathvec_t *iv, batch_t *b, lib_progress_cb cb, void *ctx)
 {
     sqlite3_stmt *q = prep(lib->db,
-        "SELECT al.id, al.dir, t.path, al.art, al.art_sig FROM albums al LEFT JOIN tracks t ON t.id=al.first_track"
+        "SELECT al.id, al.dir, t.path, al.art, al.art_sig, al.key FROM albums al LEFT JOIN tracks t ON t.id=al.first_track"
         " WHERE al.id>? ORDER BY al.id LIMIT " LIB_STR(ART_PAGE));
     sqlite3_stmt *u = prep(lib->db, "UPDATE albums SET art=?, art_sig=? WHERE id=?");
     sqlite3_stmt *others = prep(lib->db,
         "SELECT path FROM tracks WHERE album_id=? AND has_pic=1 AND path<>? ORDER BY disc, track LIMIT 4");
     sqlite3_stmt *tracks = prep(lib->db,
         "SELECT COUNT(*), TOTAL(mtime), TOTAL(has_pic) FROM tracks WHERE album_id=?");
-    struct { int64_t id, was; int art; char *dir, *first; } page[ART_PAGE];
+    struct { int64_t id, was; int art; char *dir, *first, *key; } page[ART_PAGE];
     int n = 0, retried = 0, found = 0, got;
     int64_t after = 0;
     if (!q || !u || !others || !tracks) goto out;
@@ -1421,6 +1432,8 @@ static void build_art(library_t *lib, const pathvec_t *iv, batch_t *b, lib_progr
             page[got].first = f ? strdup((const char *)f) : NULL;
             page[got].art = sqlite3_column_int(q, 3);
             page[got].was = sqlite3_column_int64(q, 4);
+            const unsigned char *ky = sqlite3_column_text(q, 5);
+            page[got].key = ky ? strdup((const char *)ky) : NULL;
             after = page[got].id;
             got++;
         }
@@ -1434,10 +1447,10 @@ static void build_art(library_t *lib, const pathvec_t *iv, batch_t *b, lib_progr
             int r = 0;
             if (!(art == 1 && was == 0)) {          /* (found before signatures: kept, its signature noted) */
                 batch_end(b);
-                r = make_art(lib, others, id, dir, page[k].first);
+                r = make_art(lib, others, id, dir, page[k].first, page[k].key);
                 if (art != 0) retried++;
-                if (r == 0) found++;
-                else if (art == 1) {                /* its cover is gone: so are the thumbnails */
+                if (r >= 0) found++;
+                else if (art == LIB_COVER_OWN || art == LIB_COVER_FOUND || art == LIB_COVER_PICKED) {   /* its cover is gone: so are the thumbnails */
                     static const int sizes[2] = {LIB_ART_LARGE, LIB_ART_SMALL};
                     char path[1200];
                     for (int i = 0; i < 2; i++) {
@@ -1449,7 +1462,7 @@ static void build_art(library_t *lib, const pathvec_t *iv, batch_t *b, lib_progr
             }
             batch_write(b);
             sqlite3_reset(u);
-            sqlite3_bind_int(u, 1, r == 0 ? 1 : 2);   /* 2 = looked, none found */
+            sqlite3_bind_int(u, 1, r == 0 ? LIB_COVER_OWN : r == 1 ? LIB_COVER_FOUND : r == 2 ? LIB_COVER_PICKED : LIB_COVER_NONE);
             sqlite3_bind_int64(u, 2, sig);
             sqlite3_bind_int64(u, 3, id);
             sqlite3_step(u);
@@ -1459,6 +1472,7 @@ static void build_art(library_t *lib, const pathvec_t *iv, batch_t *b, lib_progr
         for (int k = 0; k < got; k++) {
             free(page[k].dir);
             free(page[k].first);
+            free(page[k].key);
         }
     } while (got == ART_PAGE && !lib->cancel);
     batch_end(b);
@@ -2784,6 +2798,160 @@ int library_art(library_t *lib, int64_t album_id, int size, uint16_t *pixels)
     size_t n = fread(pixels, 2, (size_t)size * size, f);
     fclose(f);
     return n == (size_t)size * size ? 0 : -1;
+}
+
+/* ---------- covers found online ---------- */
+
+static char g_found_dir[512];
+
+void library_set_found_covers(const char *dir)
+{
+    snprintf(g_found_dir, sizeof g_found_dir, "%s", dir ? dir : "");
+    if (g_found_dir[0]) mkdir(g_found_dir, 0755);
+}
+
+int library_found_cover_path(const char *key, const char *ext, char *out, size_t cap)
+{
+    if (!g_found_dir[0] || !key) return -1;
+    uint64_t h = fnv(14695981039346656037ULL, key, strlen(key));
+    snprintf(out, cap, "%s/%016llx.%s", g_found_dir, (unsigned long long)h, ext);
+    return 0;
+}
+
+int library_album_cover(library_t *lib, int64_t album_id)
+{
+    sqlite3_stmt *s = prep(lib->db, "SELECT art FROM albums WHERE id=?");
+    if (!s) return LIB_COVER_UNKNOWN;
+    sqlite3_bind_int64(s, 1, album_id);
+    int art = sqlite3_step(s) == SQLITE_ROW ? sqlite3_column_int(s, 0) : LIB_COVER_UNKNOWN;
+    sqlite3_finalize(s);
+    return art;
+}
+
+#define ALBUM_INFO_SQL "SELECT al.id, al.key, al.title, al.year, ar.name FROM albums al" \
+                       " LEFT JOIN artists ar ON ar.id=al.artist_id"
+
+static void album_info_row(sqlite3_stmt *s, lib_album_t *a)
+{
+    memset(a, 0, sizeof *a);
+    a->id = sqlite3_column_int64(s, 0);
+    copy_col(s, 1, a->key, sizeof a->key);
+    copy_col(s, 2, a->title, sizeof a->title);
+    a->year = sqlite3_column_int(s, 3);
+    copy_col(s, 4, a->artist, sizeof a->artist);
+}
+
+int library_album_info(library_t *lib, int64_t album_id, lib_album_t *out)
+{
+    sqlite3_stmt *s = prep(lib->db, ALBUM_INFO_SQL " WHERE al.id=?");
+    if (!s) return -1;
+    sqlite3_bind_int64(s, 1, album_id);
+    int ok = sqlite3_step(s) == SQLITE_ROW;
+    if (ok) album_info_row(s, out);
+    sqlite3_finalize(s);
+    return ok ? 0 : -1;
+}
+
+int library_albums_without_cover(library_t *lib, lib_album_t **out)
+{
+    *out = NULL;
+    sqlite3_stmt *s = prep(lib->db, ALBUM_INFO_SQL " WHERE al.art=2 ORDER BY al.sort"   /* (2: LIB_COVER_NONE) */);
+    if (!s) return -1;
+    int n = 0, cap = 0;
+    lib_album_t *v = NULL;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        if (n == cap) {
+            cap = cap ? cap * 2 : 64;
+            lib_album_t *nv = realloc(v, (size_t)cap * sizeof *v);
+            if (!nv) { free(v); sqlite3_finalize(s); return -1; }
+            v = nv;
+        }
+        album_info_row(s, &v[n]);
+        if (v[n].title[0]) n++;            /* (no album title: nothing to look for) */
+    }
+    sqlite3_finalize(s);
+    *out = v;
+    return n;
+}
+
+static int set_cover_state(library_t *lib, int64_t album_id, int art)
+{
+    sqlite3_stmt *s = prep(lib->db, "UPDATE albums SET art=? WHERE id=?");
+    if (!s) return -1;
+    sqlite3_bind_int(s, 1, art);
+    sqlite3_bind_int64(s, 2, album_id);
+    int rc = sqlite3_step(s) == SQLITE_DONE ? 0 : -1;
+    sqlite3_finalize(s);
+    return rc;
+}
+
+int library_store_found_cover(library_t *lib, int64_t album_id, const uint16_t *large, const uint16_t *small)
+{
+    lib_album_t a;
+    char over[1200];
+    if (library_album_info(lib, album_id, &a) || library_found_cover_path(a.key, "over", over, sizeof over)) return -1;
+    int cur = library_album_cover(lib, album_id);
+    int picked = cur == LIB_COVER_OWN || cur == LIB_COVER_PICKED;   /* over a cover of its own: it stays ahead of it */
+    if (picked) {
+        FILE *f = fopen(over, "we");
+        if (!f) return -1;
+        fclose(f);
+    } else {
+        remove(over);
+    }
+    const int sizes[2] = {LIB_ART_LARGE, LIB_ART_SMALL};
+    const uint16_t *px[2] = {large, small};
+    int ok = 0;
+    for (int i = 0; i < 2; i++) {
+        char path[1200];
+        size_t n = (size_t)sizes[i] * sizes[i];
+        art_path(lib, album_id, sizes[i], path, sizeof path);
+        FILE *f = fopen(path, "wbe");
+        if (f) { ok += fwrite(px[i], 2, n, f) == n; ok -= fclose(f) != 0; }
+    }
+    if (ok != 2) return -1;
+    return set_cover_state(lib, album_id, picked ? LIB_COVER_PICKED : LIB_COVER_FOUND);
+}
+
+int library_remove_found_cover(library_t *lib, int64_t album_id)
+{
+    lib_album_t a;
+    char path[1200];
+    if (library_album_info(lib, album_id, &a)) return -1;
+    int picked = library_album_cover(lib, album_id) == LIB_COVER_PICKED;
+    if (library_found_cover_path(a.key, "jpg", path, sizeof path) == 0) remove(path);
+    if (library_found_cover_path(a.key, "over", path, sizeof path) == 0) remove(path);
+    if (picked) {                                    /* back to its own cover, made again from where it is */
+        sqlite3_stmt *q = prep(lib->db, "SELECT al.dir, t.path FROM albums al LEFT JOIN tracks t ON t.id=al.first_track"
+                                        " WHERE al.id=?");
+        sqlite3_stmt *others = prep(lib->db,
+            "SELECT path FROM tracks WHERE album_id=? AND has_pic=1 AND path<>? ORDER BY disc, track LIMIT 4");
+        char dir[1024] = "", first[1024] = "";
+        int have = 0;
+        if (q) {
+            sqlite3_bind_int64(q, 1, album_id);
+            if (sqlite3_step(q) == SQLITE_ROW) {
+                copy_col(q, 0, dir, sizeof dir);
+                have = sqlite3_column_type(q, 1) != SQLITE_NULL;
+                copy_col(q, 1, first, sizeof first);
+            }
+            sqlite3_finalize(q);
+        }
+        int r = make_art(lib, others, album_id, dir, have ? first : NULL, a.key);
+        sqlite3_finalize(others);
+        if (r >= 0) return set_cover_state(lib, album_id, r == 0 ? LIB_COVER_OWN : LIB_COVER_FOUND);
+        /* (its own is gone meanwhile: no cover, as below) */
+    }
+    if (library_found_cover_path(a.key, "none", path, sizeof path) == 0) {
+        FILE *f = fopen(path, "we");
+        if (f) fclose(f);
+    }
+    const int sizes[2] = {LIB_ART_LARGE, LIB_ART_SMALL};
+    for (int i = 0; i < 2; i++) {
+        art_path(lib, album_id, sizes[i], path, sizeof path);
+        remove(path);
+    }
+    return set_cover_state(lib, album_id, LIB_COVER_NONE);
 }
 
 int library_shuffle_tracks(library_t *lib, shuf_track_t **out)

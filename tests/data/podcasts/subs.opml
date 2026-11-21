@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<opml version="1.0"><head><title>My subscriptions</title></head>
+<body>
+  <outline text="feeds">
+    <outline type="rss" text="First &amp; Best" xmlUrl="https://feeds.example.com/first.xml"/>
+    <outline type="rss" title="Only a title" xmlurl="http://feeds.example.com/second"/>
+    <outline text="Not a feed" htmlUrl="https://example.com"/>
+  </outline>
+</body></opml>

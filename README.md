@@ -2,7 +2,7 @@
 
 # Fathom
 
-Latest version: [0.11.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.11.0) released November 19th 2026
+Latest version: [0.12.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.12.0) released November 20th 2026
 
 [Features](#features) · [Compatibility](#compatibility) · [Installing](#installing) · [Internet access](#internet-access) · [Licence](#licence) · [How it was made](#how-it-was-made)
 
@@ -32,6 +32,8 @@ project, and if you haven't tried it, check it out: [rockbox.org](https://www.ro
 - **Most formats**: FLAC, MP3, AAC, ALAC, WAV, AIFF, WavPack, APE, TTA, Opus, Ogg Vorbis
   and DSD, and albums ripped as one file with a CUE sheet.
 - **Internet radio.** You can search and browse thousands of stations on the H2 itself.
+- **Podcasts.** Find shows on the H2, or import them from another app; new episodes
+  download while it charges.
 - **A network drive**, so you can copy music to the H2 over Wi-Fi while it plays.
 - **Bluetooth headphones** (SBC and aptX), and their buttons work.
 - **USB DACs.** The H2 can play through one, or be your computer's sound card.
@@ -39,7 +41,9 @@ project, and if you haven't tried it, check it out: [rockbox.org](https://www.ro
   H2. Each output remembers its own.
 - **A better shuffle.** It spreads songs across artists and albums, and plays what you
   haven't heard in a while first.
-- **Themes**, use one of the four default themes or make your own.
+- **Themes**: use one of the four built-in themes, or make your own on the H2 itself.
+- **Missing album covers**, found online and saved on the card, never in your music
+  folder.
 - **Lots of ways to browse**: artists, albums, genres, composers, years, folders,
   playlists, favourites, history and search.
 - **Volume levelling**, from ReplayGain tags, or measured on the H2 when tags are missing.
@@ -78,15 +82,19 @@ More: [INSTALL.md](INSTALL.md) (the full steps, and a recommended backup),
 
 ## Internet access
 
-Fathom goes online only over Wi-Fi, and by itself only for two things:
+Fathom goes online only over Wi-Fi, and by itself only for these:
 
 - **the time**, from a time server when Wi-Fi connects, because the H2 has no clock that
   keeps running while it's off;
 - **updates**, by asking GitHub once a day whether a new version is out. It never
   downloads or installs anything unless you choose to. Settings → About → Check
-  automatically turns this off.
+  automatically turns this off;
+- **your podcasts**, if you've added any: their feeds every few hours, and new episodes
+  while the H2 charges. Settings → Podcasts turns the downloads off.
 
-Everything else, such as radio and finding stations, connects only when you use it.
+Everything else, such as radio, finding stations, finding podcasts (which asks Apple's
+podcast directory for the words you type) and finding covers (which sends an album's artist
+and title to MusicBrainz and Apple), connects only when you use it.
 
 ## Licence
 

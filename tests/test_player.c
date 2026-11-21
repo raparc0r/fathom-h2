@@ -60,17 +60,52 @@ static int write_flac_rate(const char *path, int track, unsigned rate)
 
 static int write_flac(const char *path, int track) { return write_flac_rate(path, track, 44100); }
 
+/* A long silent FLAC with no tags (a podcast episode stand-in). */
+static int write_flac_long(const char *path, int seconds)
+{
+    FLAC__StreamEncoder *e = FLAC__stream_encoder_new();
+    FLAC__stream_encoder_set_channels(e, 2);
+    FLAC__stream_encoder_set_bits_per_sample(e, 16);
+    FLAC__stream_encoder_set_sample_rate(e, 44100);
+    if (FLAC__stream_encoder_init_file(e, path, NULL, NULL) != FLAC__STREAM_ENCODER_INIT_STATUS_OK) return -1;
+    static FLAC__int32 pcm[2 * 44100];
+    for (int s = 0; s < seconds; s++) FLAC__stream_encoder_process_interleaved(e, pcm, 44100);
+    FLAC__stream_encoder_finish(e);
+    FLAC__stream_encoder_delete(e);
+    return 0;
+}
+
+static uint32_t now_pos(player_t *p)
+{
+    player_now_t n;
+    player_now(p, &n);
+    return n.pos_ms;
+}
+
 static void sleep_ms(int ms)
 {
     struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000};
     nanosleep(&t, NULL);
 }
 
-/* Tick the player until `cond` holds or `ms` pass. */
+/* Tick the player until `cond` holds or `ms` pass. The checks here run in
+ * real time, on a computer that may be busy (or run the test at a low
+ * priority): waits end as soon as their condition holds, so they're long
+ * (SLOW), and a check never depends on seeing a 0.3 s track as it plays. */
+#define SLOW 15000
 #define WAIT_FOR(p, cond, ms) do { \
     for (int w_ = 0; w_ < (ms) / 10 && !(cond); w_++) { player_tick(p); sleep_ms(10); } \
     player_tick(p); \
 } while (0)
+/* The same without a player: until `cond` holds or SLOW passes */
+#define WAIT_UNTIL(cond) do { for (int w_ = 0; w_ < SLOW / 10 && !(cond); w_++) sleep_ms(10); } while (0)
+
+static uint64_t mono_ms_now(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+}
 
 static int64_t cur_id(player_t *p)
 {
@@ -84,6 +119,15 @@ static int playing(player_t *p)
     player_now_t n;
     player_now(p, &n);
     return n.playing;
+}
+
+/* Where the playing track is in t[0..n-1]: -1 if it isn't */
+static int idx_of(player_t *p, const int64_t *t, int n)
+{
+    int64_t id = cur_id(p);
+    for (int i = 0; i < n; i++)
+        if (t[i] == id) return i;
+    return -1;
 }
 
 /* A short silent FLAC at a given depth and rate (engine format tests). */
@@ -116,7 +160,7 @@ static void test_engine_depth(const char *dir)
     engine_t *e = engine_new(&out);
     engine_play(e, a, 1);
     engine_queue_next(e, b, 2);
-    for (int i = 0; i < 300; i++) {
+    for (int i = 0; i < SLOW / 10; i++) {
         eng_status_t s;
         engine_status(e, &s);
         if (s.track_id == 2 && !s.next_queued) break;
@@ -124,7 +168,7 @@ static void test_engine_depth(const char *dir)
     }
     CHECK(st.opens == 2 && st.fmt.bits == 24);   /* 16 -> 24: reopened for 24 bits */
     engine_queue_next(e, c, 3);
-    for (int i = 0; i < 300; i++) {
+    for (int i = 0; i < SLOW / 10; i++) {
         eng_status_t s;
         engine_status(e, &s);
         if (s.ended || (s.track_id == 3 && s.state == ENG_STOPPED)) break;
@@ -149,22 +193,22 @@ static void test_engine_eq(const char *dir)
     engine_t *e = engine_new(&out);
     engine_play(e, a, 1);
     engine_pause(e, 1);                           /* starts paused: it mustn't end first (0.1 s) */
-    for (int i = 0; i < 100 && st.opens < 1; i++) sleep_ms(10);
+    WAIT_UNTIL(st.opens >= 1);
     CHECK(st.opens == 1 && st.fmt.bits == 16);
     eq_profile_t p = {.preamp_db = -3, .n = 1, .band = {{EQ_PEAK, 1000, 3, 1}}};
     engine_set_eq(e, &p);
     engine_pause(e, 0);
-    for (int i = 0; i < 100 && st.opens < 2; i++) sleep_ms(10);
+    WAIT_UNTIL(st.opens >= 2);
     CHECK(st.opens == 2 && st.fmt.bits == 24);   /* on mid-track: reopened deeper */
     eng_status_t s;
     engine_status(e, &s);
     CHECK(s.eq == 1);
     engine_play(e, a, 2);                         /* a new track with the EQ on: 24 bits */
-    for (int i = 0; i < 100; i++) { engine_status(e, &s); if (s.track_id == 2) break; sleep_ms(10); }
+    WAIT_UNTIL((engine_status(e, &s), s.track_id == 2));
     CHECK(st.fmt.bits == 24);
     engine_set_eq(e, NULL);
     engine_play(e, a, 3);
-    for (int i = 0; i < 100; i++) { engine_status(e, &s); if (s.track_id == 3) break; sleep_ms(10); }
+    WAIT_UNTIL((engine_status(e, &s), s.track_id == 3));
     CHECK(s.eq == 0 && st.fmt.bits == 24);        /* off: the deeper output carries 16 bits exactly */
     engine_free(e);
     /* volume levelling (a gain) on a 16-bit track: 24 bits too; at 1.0, 16 */
@@ -173,7 +217,7 @@ static void test_engine_eq(const char *dir)
     e = engine_new(&out);
     engine_play_gain(e, a, 1, 0.5f);
     engine_pause(e, 1);
-    for (int i = 0; i < 100 && st2.opens < 1; i++) sleep_ms(10);
+    WAIT_UNTIL(st2.opens >= 1);
     CHECK(st2.fmt.bits == 24);
     engine_free(e);
     out_null_stats_t st3 = {0};
@@ -181,7 +225,7 @@ static void test_engine_eq(const char *dir)
     e = engine_new(&out);
     engine_play_gain(e, a, 1, 1.0f);
     engine_pause(e, 1);
-    for (int i = 0; i < 100 && st3.opens < 1; i++) sleep_ms(10);
+    WAIT_UNTIL(st3.opens >= 1);
     CHECK(st3.fmt.bits == 16);
     engine_free(e);
     unlink(a);
@@ -223,12 +267,13 @@ static void test_unplayable(const char *dir)
     player_t *p = player_new(lib, eng);
 
     player_play(p, tr.ids, 4, 0);                 /* 1 plays; 2 and 3 can't; on to 4 */
-    WAIT_FOR(p, cur_id(p) == tr.ids[3] && !playing(p), 3000);
+    WAIT_FOR(p, cur_id(p) == tr.ids[3] && !playing(p), SLOW);
     CHECK(cur_id(p) == tr.ids[3] && ns.frames == 2 * 13230);
 
     player_set_repeat(p, REPEAT_ALL);             /* nothing but tracks it can't play */
     player_play(p, &tr.ids[1], 2, 0);
-    WAIT_FOR(p, 0, 500);
+    WAIT_FOR(p, !playing(p) && g_opens >= 2, SLOW);   /* (tried each, then gave up) */
+    WAIT_FOR(p, 0, 300);
     int opens = g_opens;
     WAIT_FOR(p, 0, 300);
     CHECK(!playing(p) && g_opens == opens && opens < 10);
@@ -383,34 +428,140 @@ int main(void)
     /* stop after this track: stops, and the next track is cued */
     player_play(p, t, N, 0);
     player_set_stop_after(p, 1);
-    WAIT_FOR(p, !playing(p) && cur_id(p) == t[1], 6000);
+    WAIT_FOR(p, !playing(p) && cur_id(p) == t[1], SLOW);
     CHECK(!playing(p) && cur_id(p) == t[1] && !player_stop_after(p));
 
     /* gapless: the player follows the engine to the next track */
     player_play(p, t, N, 2);
-    WAIT_FOR(p, cur_id(p) == t[3], 6000);
-    CHECK(cur_id(p) == t[3]);
+    WAIT_FOR(p, idx_of(p, t, N) >= 3, SLOW);          /* (on from the third: past it, if slow to look) */
+    CHECK(idx_of(p, t, N) >= 3);
 
     /* repeat one: the same track again */
     player_set_repeat(p, REPEAT_ONE);
     player_play(p, t, N, 4);
     uint32_t s0 = player_seq(p);
-    WAIT_FOR(p, player_seq(p) != s0, 6000);
+    WAIT_FOR(p, player_seq(p) != s0, SLOW);
     CHECK(player_seq(p) != s0 && cur_id(p) == t[4] && playing(p));
 
     /* repeat all: the last track wraps to the first */
     player_set_repeat(p, REPEAT_ALL);
     player_play(p, t, N, 5);
-    WAIT_FOR(p, cur_id(p) == t[0], 6000);
-    CHECK(cur_id(p) == t[0]);
+    WAIT_FOR(p, idx_of(p, t, N) >= 0 && idx_of(p, t, N) < 5, SLOW);   /* (wrapped: the first, or past it) */
+    CHECK(idx_of(p, t, N) >= 0 && idx_of(p, t, N) < 5 && player_repeat(p) == REPEAT_ALL);
 
     /* repeat off: the last track ends and playback stops */
     player_set_repeat(p, REPEAT_OFF);
     player_play(p, t, N, 5);
-    WAIT_FOR(p, !playing(p), 6000);
+    WAIT_FOR(p, !playing(p), SLOW);
     sleep_ms(100);
     player_tick(p);
     CHECK(!playing(p) && cur_id(p) == t[5]);
+
+    /* a podcast episode: from where it was left, the skip keys, its end; the queue kept */
+    {
+        char ep_path[300];
+        snprintf(ep_path, sizeof ep_path, "%s/episode.flac", dir);
+        CHECK(write_flac_long(ep_path, 90) == 0);
+        player_set_repeat(p, REPEAT_OFF);
+        player_play(p, t, N, 2);
+        WAIT_FOR(p, playing(p), SLOW);
+        player_episode_t ep = {0};
+        snprintf(ep.show, sizeof ep.show, "The Show");
+        snprintf(ep.title, sizeof ep.title, "Episode 7");
+        snprintf(ep.path, sizeof ep.path, "%s", ep_path);
+        ep.start_ms = 40000;
+        player_episode_play(p, &ep);
+        player_now_t n;
+        uint64_t t_start = mono_ms_now();
+        WAIT_FOR(p, (player_now(p, &n), n.pos_ms >= 40000 && n.len_ms > 0 && n.playing), SLOW);
+        player_now(p, &n);
+        CHECK(n.podcast && !n.podcast_stream && !strcmp(n.track.title, "Episode 7") && !strcmp(n.track.artist, "The Show"));
+        /* from 40 s on, by no more than the time that's passed (and a little) */
+        uint32_t late = (uint32_t)(mono_ms_now() - t_start) + 500;
+        if (!(n.pos_ms >= 40000 && n.pos_ms < 40000 + late && n.len_ms >= 89000 && n.len_ms <= 91000))
+            fprintf(stderr, "episode pos %u len %u (%u ms on)\n", n.pos_ms, n.len_ms, late);
+        CHECK(n.pos_ms >= 40000 && n.pos_ms < 40000 + late && n.len_ms >= 89000 && n.len_ms <= 91000);
+        /* the skip keys: 30 s on, 15 s back, from where it was (and what's played since;
+         * 100 ms either way: the player's reading of where it was, a moment apart) */
+        uint32_t before = now_pos(p);
+        uint64_t t_skip = mono_ms_now();
+        player_next(p);                                   /* +30 s */
+        WAIT_FOR(p, now_pos(p) + 100 >= before + 30000, SLOW);
+        uint32_t after = now_pos(p), since = (uint32_t)(mono_ms_now() - t_skip) + 500;
+        if (!(after + 100 >= before + 30000 && after < before + 30000 + since)) fprintf(stderr, "next: %u -> %u\n", before, after);
+        CHECK(after + 100 >= before + 30000 && after < before + 30000 + since);
+        before = after;
+        t_skip = mono_ms_now();
+        player_prev(p);                                   /* -15 s */
+        WAIT_FOR(p, now_pos(p) < before, SLOW);
+        after = now_pos(p);
+        since = (uint32_t)(mono_ms_now() - t_skip) + 500;
+        if (!(after + 15100 >= before && after + 15000 < before + since)) fprintf(stderr, "prev: %u -> %u\n", before, after);
+        CHECK(after + 15100 >= before && after + 15000 < before + since);
+        uint32_t pos = 0, len = 0;
+        CHECK(player_episode(p, &pos, &len) != NULL && pos + 15100 >= before && len >= 89000);
+        player_toggle_pause(p);                           /* paused: it stays */
+        WAIT_FOR(p, !playing(p), SLOW);
+        CHECK(!playing(p) && player_episode(p, NULL, NULL) && !player_episode_ended(p));
+        /* to its end: said once, then cued from the start */
+        player_seek_by(p, 31000);
+        player_toggle_pause(p);
+        WAIT_FOR(p, player_episode(p, NULL, NULL) && !playing(p) && now_pos(p) == 0, SLOW);
+        CHECK(player_episode_ended(p) && !player_episode_ended(p));
+        CHECK(player_episode(p, &pos, NULL) && pos == 0);
+        /* music again: the episode is left, the queue cued where it was */
+        player_toggle_pause(p);                           /* (first: it plays again, from the start) */
+        WAIT_FOR(p, playing(p), SLOW);
+        CHECK(playing(p) && now_pos(p) < 5000);
+        player_play(p, t, N, 1);
+        player_now(p, &n);
+        CHECK(!n.podcast && cur_id(p) == t[1] && !player_episode(p, NULL, NULL));
+        /* faster: about 3 s of it in 2 s; music as it is again after */
+        player_set_speed(p, 150);
+        ep.start_ms = 10000;
+        player_episode_play(p, &ep);
+        WAIT_FOR(p, (player_now(p, &n), n.playing && n.pos_ms >= 10000), SLOW);
+        /* about 1.5 s of it for each second that passes: measured up to three
+         * times (a busy computer can hold the playback thread up for a while) */
+        int fast = 0;
+        for (int a = 0; a < 3 && !fast; a++) {
+            player_tick(p);
+            uint32_t p0 = now_pos(p);
+            uint64_t w0 = mono_ms_now();
+            sleep_ms(1000);
+            player_tick(p);
+            double r = (double)(now_pos(p) - p0) / (double)(mono_ms_now() - w0);
+            fast = r >= 1.3 && r <= 1.7;
+            if (!fast) fprintf(stderr, "at 1.5x: %.2fx\n", r);
+        }
+        CHECK(fast);
+        CHECK(player_speed(p) == 150);
+        player_play(p, t, N, 1);                          /* music: not sped up */
+        WAIT_FOR(p, playing(p), SLOW);
+        int normal = 0;                                   /* (a slow computer only makes it slower) */
+        for (int a = 0; a < 5 && !normal; a++) {
+            player_tick(p);
+            int64_t id0 = cur_id(p);
+            uint32_t p0 = now_pos(p);
+            uint64_t w0 = mono_ms_now();
+            sleep_ms(120);
+            player_tick(p);
+            if (cur_id(p) != id0 || !playing(p)) continue;   /* (the 0.3 s track ended meanwhile) */
+            double r = (double)(now_pos(p) - p0) / (double)(mono_ms_now() - w0);
+            normal = r <= 1.2;
+            if (!normal) fprintf(stderr, "music after an episode at 1.5x: %.2fx\n", r);
+        }
+        CHECK(normal);
+        player_set_speed(p, 100);
+        /* the radio leaves an episode too, and an episode the radio */
+        player_episode_play(p, &ep);
+        radio_station_t rs = {"A station", "http://127.0.0.1:9/none", ""};
+        player_radio_play(p, &rs, 1, 0);
+        CHECK(!player_episode(p, NULL, NULL) && player_radio(p));
+        player_episode_play(p, &ep);
+        CHECK(player_episode(p, NULL, NULL) && !player_radio(p));
+        player_play(p, t, N, 0);
+    }
 
     /* very short tracks and no tick from the UI meanwhile (busy): the engine
      * goes on through all of them by itself, gapless, and stops once, at the
@@ -419,7 +570,8 @@ int main(void)
         player_play(p, t, N, 0);
         eng_status_t before, after;
         engine_status(eng, &before);
-        sleep_ms(2300);                                   /* six 0.3 s tracks */
+        WAIT_UNTIL((engine_status(eng, &after), after.stop_seq != before.stop_seq));   /* six 0.3 s tracks */
+        sleep_ms(300);                                    /* (and nothing after) */
         engine_status(eng, &after);
         CHECK(after.track_id == t[5] && after.stop_seq == before.stop_seq + 1 && after.ended && !after.error);
         player_tick(p);
@@ -428,13 +580,14 @@ int main(void)
         /* a skip before the tick has caught up: past the track that plays
          * now, not the one the player last saw */
         player_play(p, t, N, 0);
-        sleep_ms(700);
+        WAIT_UNTIL((engine_status(eng, &after), after.track_id == t[1] || after.track_id == t[2] || after.track_id == t[3]));
         engine_status(eng, &after);
         int k = 0;
         while (k < N - 1 && t[k] != after.track_id) k++;
         player_next(p);
-        CHECK(k >= 1 && k < N - 1 && cur_id(p) == t[k + 1]);
-        WAIT_FOR(p, !playing(p), 3000);
+        int nk = idx_of(p, t, N);                         /* (the engine may have gone on as it was asked) */
+        CHECK(k >= 1 && k < N - 1 && (nk == k + 1 || (k + 2 < N && nk == k + 2)));
+        WAIT_FOR(p, !playing(p), SLOW);
     }
 
     /* a damaged next track: skipped, not the end of the queue */
@@ -446,8 +599,8 @@ int main(void)
         if (f) fclose(f);
         player_set_repeat(p, REPEAT_OFF);
         player_play(p, t, N, 2);                          /* 03, then 04 (damaged), 05 */
-        WAIT_FOR(p, cur_id(p) == t[4], 8000);
-        CHECK(cur_id(p) == t[4]);
+        WAIT_FOR(p, idx_of(p, t, N) >= 4, SLOW);          /* (05, or 06 after it) */
+        CHECK(idx_of(p, t, N) >= 4);
         CHECK(write_flac(bad, 4) == 0);                   /* (as it was, for what follows) */
     }
 

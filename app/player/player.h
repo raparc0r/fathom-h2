@@ -42,6 +42,10 @@ typedef struct {
     int         connecting;   /* connecting, or reconnecting after the stream dropped */
     int         radio_failed; /* gave up reconnecting (Play tries again) */
     char        art_url[512]; /* the song's cover (an http(s) image), "" = none */
+    /* A podcast episode: track.title is the episode, track.artist and
+     * .album the show; pos_ms/len_ms its own. */
+    int         podcast;
+    int         podcast_stream;   /* ...streamed (not downloaded): no seeking */
 } player_now_t;
 
 player_t *player_new(library_t *lib, engine_t *eng);
@@ -109,6 +113,31 @@ const radio_station_t *player_radio_at(const player_t *p, int i);  /* station i 
  * used over what the stream says until the station changes; NULL = clear.
  * art_url: its cover ("" or NULL = none). */
 void player_radio_set_info(player_t *p, const char *artist, const char *title, const char *art_url);
+
+/* Podcasts: play an episode, a file on the card or (path http(s)://) streamed
+ * from its start, at start_ms (a file only). As with the radio, the queue is
+ * kept, cued where it was left; playing anything from the library, or the
+ * radio, leaves the episode. Next and Previous skip forward 30 s and back
+ * 15 s; at its end it stops (player_episode_ended says so, once). */
+typedef struct {
+    char show[128];
+    char title[160];
+    char path[640];
+    char id[13], key[13];     /* the show's and the episode's (net/podcast.h) */
+    uint32_t start_ms;
+    uint32_t len_ms;          /* if known: shown until the file says */
+} player_episode_t;
+#define PLAYER_SKIP_FWD_MS 30000
+#define PLAYER_SKIP_BACK_MS 15000
+void player_episode_play(player_t *p, const player_episode_t *e);
+/* The episode playing or paused (NULL: none): where it is (*pos_ms, *len_ms; may be NULL). */
+const player_episode_t *player_episode(player_t *p, uint32_t *pos_ms, uint32_t *len_ms);
+/* 1 once after the episode played to its end. */
+int player_episode_ended(player_t *p);
+/* Episodes' speed, in percent (100: as recorded): faster without the pitch
+ * going up. Episodes only; music always plays as it is. */
+void player_set_speed(player_t *p, int pct);
+int  player_speed(const player_t *p);
 
 void player_tick(player_t *p);
 /* Nothing for player_tick() to follow until a command (a key) starts

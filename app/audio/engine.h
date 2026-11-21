@@ -31,6 +31,7 @@ typedef struct {
     unsigned       stop_seq;     /* +1 each time playback stops by itself (ended or error) */
     int            output_lost;  /* a write or open failed (device gone); the engine paused */
     int            starting;     /* a track is about to start (engine_play not yet taken up) */
+    uint32_t       start_ms;     /* ...from there in (engine_play_at) */
     int            start_paused; /* ...and it will start paused */
     int            eq;           /* the EQ is on for this track */
     int            stream;       /* the track is an internet stream (no length, no seeking) */
@@ -58,6 +59,10 @@ void engine_queue_next(engine_t *e, const char *path, int64_t id);  /* gapless s
 /* The same with the track's own gain (volume levelling; 1.0 = bit-perfect), which
  * takes effect at the track's first sample, so gapless joins stay seamless. */
 void engine_play_gain(engine_t *e, const char *path, int64_t id, float gain);
+/* The same from start_ms in (a podcast episode, or a long file, where it was
+ * left): nothing before it is ever heard, which a play and then a seek can't
+ * promise (an idle engine starts on the play before the seek comes). */
+void engine_play_at(engine_t *e, const char *path, int64_t id, float gain, uint32_t start_ms);
 void engine_queue_next_gain(engine_t *e, const char *path, int64_t id, float gain);
 /* Lines up what follows the current track, in order (replacing what was lined
  * up; n = 0: nothing), at most ENGINE_AHEAD: the engine goes on to each by
@@ -88,6 +93,10 @@ void engine_set_eq(engine_t *e, const eq_profile_t *p);
 void engine_set_dop(engine_t *e, int on);
 /* A fade (0..1) applied on top of the gain: the sleep timer's. 1.0 = none. */
 void engine_set_fade(engine_t *e, float fade);
+/* Faster without the pitch going up (audio/tempo.h), in percent: 100 = off
+ * (the samples untouched). Mono and stereo PCM only; from the next chunk. The
+ * position and length stay the track's own. */
+void engine_set_speed(engine_t *e, int speed_pct);
 void engine_status(engine_t *e, eng_status_t *st);
 /* What the output runs at now (its describe(); "" when it's closed). */
 void engine_describe_output(engine_t *e, char *out, int cap);

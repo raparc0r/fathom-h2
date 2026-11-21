@@ -235,6 +235,23 @@ void eq_run(eq_t *e, int32_t *s, long frames)
     }
 }
 
+void eq_curve_db(const eq_profile_t *p, unsigned rate, const double *f, int n, float *db)
+{
+    double c[EQ_MAX_BANDS][5];
+    int m = 0;
+    for (int i = 0; i < p->n && i < EQ_MAX_BANDS; i++)
+        if (usable(&p->band[i], rate) && p->band[i].gain_db != 0) design(&p->band[i], rate, c[m++]);
+    for (int k = 0; k < n; k++) {
+        double w = 2 * M_PI * f[k] / rate, c1 = cos(w), s1 = sin(w), c2 = cos(2 * w), s2 = sin(2 * w), g = 1;
+        for (int i = 0; i < m; i++) {   /* the power gains multiplied: one logarithm a point */
+            double nr = c[i][0] + c[i][1] * c1 + c[i][2] * c2, ni = -c[i][1] * s1 - c[i][2] * s2;
+            double dr = 1 + c[i][3] * c1 + c[i][4] * c2, di = -c[i][3] * s1 - c[i][4] * s2;
+            g *= (nr * nr + ni * ni) / (dr * dr + di * di);
+        }
+        db[k] = (float)(10 * log10(g));
+    }
+}
+
 double eq_response_db(const eq_profile_t *p, unsigned rate, double f)
 {
     double w = 2 * M_PI * f / rate, db = p->preamp_db;

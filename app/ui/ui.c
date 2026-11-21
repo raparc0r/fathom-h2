@@ -18,8 +18,12 @@
 #include "library/playlist.h"
 #include "core/rng.h"
 #include "net/radiodir.h"
+#include "net/podcast.h"
+#include "net/podsync.h"
+#include "net/coverfind.h"
 
 #include <math.h>
+#include <stddef.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +38,15 @@
 #define ROW_Y0     ((ROW_H - 38) / 2)   /* the playing-bars marker, centred in a row */
 #define ROW_MARGIN 6
 #define SLOTS      (ROWS + 2)   /* one spare row above and below for scrolling */
+/* The EQ editor's curve, over the top of the list as Battery's graph is: 20 Hz
+ * to 20 kHz on a log scale across the plot, +-12 dB top to bottom, worked out
+ * at EQG_PTS points */
+#define EQG_X0 10
+#define EQG_X1 (UI_W - 10)
+#define EQG_Y0 4
+#define EQG_Y1 72
+#define EQG_RANGE 12.0
+#define EQG_PTS 100
 #define ABOUT_MAX  16           /* Settings > About: the device's rows at most */
 #define STEP       4            /* stepped-corner notch and hard-shadow offset (Pixel Pastel) */
 #define SEGMENTS   24
@@ -53,14 +66,17 @@
  * one); Settings always stays. */
 static const char *const HOME[] = {"Now playing", "Shuffle all songs", "Search", "Albums", "Artists",
                                    "Album artists", "Songs", "Playlists", "Favourites", "Recently added",
-                                   "History", "Radio", "Settings", "Genres", "Composers", "Years", "Folders"};
+                                   "History", "Radio", "Settings", "Genres", "Composers", "Years", "Folders",
+                                   "Podcasts"};
 static const char *const HOME_ID[] = {"nowplaying", "shuffle", "search", "albums", "artists",
                                       "albumartists", "songs", "playlists", "favourites", "recent",
-                                      "history", "radio", "settings", "genres", "composers", "years", "folders"};
+                                      "history", "radio", "settings", "genres", "composers", "years", "folders",
+                                      "podcasts"};
 /* (Items added later come after Settings in this numbering, which pixel_icons.h
  * follows; on Home they go before Settings.) */
 enum { H_NOWPLAYING, H_SHUFFLE, H_SEARCH, H_ALBUMS, H_ARTISTS, H_ALBUM_ARTISTS, H_SONGS, H_PLAYLISTS,
-       H_FAVOURITES, H_RECENT_ADDED, H_HISTORY, H_RADIO, H_SETTINGS, H_GENRES, H_COMPOSERS, H_YEARS, H_FOLDERS, H_N };
+       H_FAVOURITES, H_RECENT_ADDED, H_HISTORY, H_RADIO, H_SETTINGS, H_GENRES, H_COMPOSERS, H_YEARS, H_FOLDERS,
+       H_PODCASTS, H_N };
 /* Hidden until shown in Settings > Home (fewer people tag them) */
 static int home_hidden_by_default(int h) { return h == H_COMPOSERS || h == H_YEARS; }
 /* Their icons: Tabler Icons code points (player-play, arrows-shuffle, search,
@@ -73,9 +89,11 @@ static int home_hidden_by_default(int h) { return h == H_COMPOSERS || h == H_YEA
  * (Tabler), and Pixel Pastel's own after the items' (pixel_icons.h). */
 #define H_UPDATE H_N
 #define UPDATE_ICON 0xf703
+#define PODCAST_ICON 0xe000   /* drawn into the icon font: tools/fonts/add_podcast_icon.py */
 static const uint32_t HOME_ICON[H_N] = {0xed46, 0xf000, 0xeb1c, 0xea90, 0xef2c, 0xebf2,
                                         0xeafc, 0xeec0, 0xeabe, 0xf7c5, 0xebea, 0xef2d, 0xeb20,
-                                        0xf1f6, 0xee8b, 0xea53, 0xeaad};   /* category, feather, calendar, folder */
+                                        0xf1f6, 0xee8b, 0xea53, 0xeaad,    /* category, feather, calendar, folder */
+                                        PODCAST_ICON};
 #include "pixel_icons.h"
 #define PIXEL_ICON_SCALE 2
 #define ICON_W 22     /* the icon's column; the text starts after it */
@@ -93,23 +111,23 @@ static const char PASS_CHARS[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRST
 static const int PASS_GROUPS[] = {0, 26, 52, 62};   /* a, A, 0, symbols */
 static const char *const HISTORY[] = {"Recently played", "Most played"};
 static const char *const SETTINGS[] = {"Interface", "Home", "Display", "Sound", "Bluetooth", "Wi-Fi",
-                                       "Network drive", "SSH", "USB connection", "Playback", "Power", "Library",
-                                       "About"};
+                                       "Network drive", "SSH", "USB connection", "Playback", "Podcasts", "Power",
+                                       "Library", "About"};
 enum { SET_INTERFACE, SET_HOME, SET_DISPLAY, SET_SOUND, SET_BLUETOOTH, SET_WIFI, SET_SHARE, SET_SSH, SET_USB, SET_PLAYBACK,
-       SET_POWER, SET_LIBRARY, SET_ABOUT };
+       SET_PODCASTS, SET_POWER, SET_LIBRARY, SET_ABOUT };
 
 /* Rows of the quick settings panel and of Settings > Display. */
 typedef enum {
     ST_BRIGHTNESS, ST_SHUFFLE, ST_REPEAT, ST_SLEEP, ST_STOP_AFTER, ST_TIMEOUT,
     ST_DIM, ST_ON_CHARGING, ST_COVERS, ST_OUTPUT, ST_EQ, ST_LEVELLING, ST_DAC_FILTER, ST_PAUSE_UNPLUG, ST_AUTO_OFF,
     ST_RESCAN, ST_USB_DRIVE, ST_USB_COMPUTER, ST_USB_DAC, ST_N_SONGS, ST_N_ALBUMS, ST_N_ARTISTS, ST_N_PLAYLISTS,
-    ST_BT, ST_BT_DEVICE, ST_WIFI, ST_WIFI_NET,
+    ST_BT, ST_WIFI,
     ST_SHUF_BY, ST_SHUF_FRESH, ST_SHUF_INTERLUDES, ST_SHUF_WORKS, ST_SHUF_SPOKEN, ST_BALANCE, ST_VOL_LIMIT, ST_PURE, ST_TRANSPORT, ST_BATTERY, ST_LANGUAGE,
-    ST_THEME, ST_ALBUM_ARTISTS,
+    ST_THEME, ST_ALBUM_ARTISTS, ST_POD_AUTO, ST_POD_KEEP, ST_POD_CLEAN, ST_POD_SPEED, ST_FIND_COVERS,
 } setting_t;
 /* Quick settings (quick_rows(): Bluetooth's and Wi-Fi's rows where they are) */
-static const setting_t QUICK[] = {ST_BRIGHTNESS, ST_SHUFFLE, ST_REPEAT, ST_EQ, ST_BT, ST_BT_DEVICE,
-                                  ST_WIFI, ST_WIFI_NET, ST_SLEEP, ST_STOP_AFTER, ST_TIMEOUT};
+static const setting_t QUICK[] = {ST_BRIGHTNESS, ST_SHUFFLE, ST_REPEAT, ST_EQ, ST_BT, ST_WIFI,
+                                  ST_SLEEP, ST_STOP_AFTER, ST_TIMEOUT};
 static const setting_t SOUND_ROWS[] = {ST_OUTPUT, ST_PURE, ST_EQ, ST_BALANCE, ST_VOL_LIMIT, ST_LEVELLING, ST_TRANSPORT,
                                        ST_USB_DAC, ST_DAC_FILTER};   /* sound_rows(): those with their hooks */
 static const setting_t PLAYBACK_ROWS[] = {ST_SHUFFLE, ST_SHUF_BY, ST_SHUF_FRESH, ST_SHUF_INTERLUDES, ST_SHUF_WORKS,
@@ -118,13 +136,22 @@ static const setting_t PLAYBACK_ROWS[] = {ST_SHUFFLE, ST_SHUF_BY, ST_SHUF_FRESH,
 /* Settings > Playback's shuffle rows, to the player (at start and when changed). */
 static void shuffle_prefs_apply(void);
 static const setting_t POWER_ROWS[] = {ST_BATTERY, ST_AUTO_OFF, ST_SLEEP};
-static const setting_t LIBRARY_ROWS[] = {ST_RESCAN, ST_N_SONGS, ST_N_ALBUMS, ST_N_ARTISTS, ST_N_PLAYLISTS};
+static const setting_t POD_ROWS[] = {ST_POD_AUTO, ST_POD_KEEP, ST_POD_CLEAN, ST_POD_SPEED};
+static const int POD_KEEPS[] = {1, 2, 3, 5};
+static const int POD_CLEANS[] = {1, 3, 7, 30, 0};            /* days; 0 = never */
+static const setting_t LIBRARY_ROWS[] = {ST_RESCAN, ST_FIND_COVERS, ST_N_SONGS, ST_N_ALBUMS, ST_N_ARTISTS, ST_N_PLAYLISTS};
 static const setting_t USB_ROWS[] = {ST_USB_COMPUTER, ST_USB_DRIVE, ST_USB_DAC};
 static const int AUTO_OFFS[] = {5, 15, 30, 0};               /* minutes; 0 = never */
 static const int SLEEPS[] = {0, 15, 30, 45, 60, 90, PLAYER_SLEEP_END_ALBUM};   /* minutes; 0 = off */
 static const setting_t DISPLAY_ROWS[] = {ST_BRIGHTNESS, ST_TIMEOUT, ST_DIM, ST_ON_CHARGING};
 static const setting_t INTERFACE_ROWS[] = {ST_THEME, ST_COVERS, ST_ALBUM_ARTISTS, ST_LANGUAGE};
 static const int TIMEOUTS[] = {15, 30, 60, 120, 300, 0};   /* seconds; 0 = never */
+
+/* The theme editor: its colours, as it names them, and its rows */
+enum { TC_BG, TC_SURFACE, TC_TEXT, TC_MUTED, TC_SELBG, TC_SELFG, TC_SIGNAL, TC_MODE, TC_INFO, TC_BATTERY,
+       TC_ARTIST, TC_ALBUM, TC_CHIPBG, TC_CHIPFG, TC_WARNING, TC_DANGER, TC_N };
+enum { TE_NAME, TE_BASE, TE_ACCENT, TE_COLOURS, TE_FONT, TE_SIZE, TE_SELECTION, TE_CORNERS, TE_RADIUS,
+       TE_PROGRESS, TE_PLAYING, TE_CURSOR, TE_SHADOW, TE_MOTION, TE_SAVE, TE_DELETE, TE_N };
 
 /* Context menu actions. */
 typedef enum {
@@ -133,6 +160,8 @@ typedef enum {
     CTX_ADD_PLAYLIST, CTX_PL_REMOVE, CTX_PL_MOVE, CTX_PL_DELETE, CTX_PL_RENAME, CTX_HOME_MOVE,
     CTX_BT_FORGET, CTX_WIFI_FORGET,
     CTX_RADIO_PLAY, CTX_RADIO_ADD, CTX_RADIO_REMOVE,
+    CTX_POD_REFRESH, CTX_POD_UNSUB, CTX_POD_DOWNLOAD, CTX_POD_CANCEL, CTX_POD_DELETE, CTX_POD_PLAYED, CTX_POD_UNPLAYED,
+    CTX_POD_CHAPTERS, CTX_POD_SPEED, CTX_FIND_COVER, CTX_REMOVE_COVER, CTX_FIND_ANOTHER,
 } ctx_action_t;
 static const char *const CTX_LABEL[] = {
     "Play", "Play next", "Add to queue", "Show queue", "Go to album", "Go to artist", "Info",
@@ -140,6 +169,8 @@ static const char *const CTX_LABEL[] = {
     "Add to playlist", "Remove from playlist", "Move", "Delete playlist", "Rename playlist", "Move",
     "Forget this device", "Forget this network",
     "Play", "Add to your stations", "Remove from your stations",
+    "Check for new episodes", "Unsubscribe", "Download", "Cancel download", "Delete download", "Mark as played",
+    "Mark as not played", "Chapters", "Speed", "Find cover", "Remove cover", "Find another cover",
 };
 
 /* Rows of the track info screen. */
@@ -152,11 +183,11 @@ typedef enum {
     L_GENRES, L_GENRE_ALBUMS, L_COMPOSERS, L_COMPOSER_ALBUMS, L_COMPOSER_TRACKS, L_YEARS, L_YEAR_ALBUMS, L_FOLDER,
     L_TRACKS, L_SONGS, L_PLAYLISTS, L_PLAYLIST_TRACKS, L_HOME_EDIT,
     L_FAVOURITES, L_RECENT_ADDED, L_RECENT_PLAYED, L_MOST_PLAYED, L_HISTORY,
-    L_SETTINGS, L_INTERFACE, L_THEMES, L_QUICK, L_DISPLAY, L_SOUND, L_EQ, L_EQ_EDIT, L_EQ_BAND, L_BLUETOOTH, L_WIFI, L_WIFI_PASS, L_SHARE, L_SSH, L_USB, L_PLAYBACK, L_POWER, L_LIBRARY, L_ABOUT, L_SIGNAL,
+    L_SETTINGS, L_INTERFACE, L_THEMES, L_QUICK, L_DISPLAY, L_SOUND, L_EQ, L_EQ_EDIT, L_EQ_BAND, L_THEME_EDIT, L_THEME_COLOURS, L_BLUETOOTH, L_WIFI, L_WIFI_PASS, L_SHARE, L_SSH, L_USB, L_PLAYBACK, L_POD_SETTINGS, L_POWER, L_LIBRARY, L_ABOUT, L_SIGNAL,
     L_CONTEXT, L_INFO, L_QUEUE, L_PICK_PLAYLIST, L_SEARCH, L_RENAME, L_USB_ASK, L_WIFI_ASK, L_RADIO,
     /* Home > Radio > Find stations: its menu, genres, countries, a list of stations, search by name */
-    L_RDIR, L_RDIR_GENRES, L_RDIR_COUNTRIES, L_RDIR_RESULTS, L_RDIR_SEARCH,
-    L_UPDATE, L_BATTERY, L_BAT_SPAN, L_BAT_HISTORY, L_UNINSTALL, L_UPD_ASK, L_PLACEHOLDER
+    L_RDIR, L_RDIR_GENRES, L_RDIR_COUNTRIES, L_RDIR_RESULTS, L_RDIR_SEARCH, L_PODCASTS, L_POD_SHOW, L_POD_SEARCH, L_POD_CHAPTERS,
+    L_UPDATE, L_BATTERY, L_BAT_SPAN, L_BAT_HISTORY, L_UNINSTALL, L_UPD_ASK, L_COVER_FIND, L_PLACEHOLDER
 } list_kind_t;
 
 typedef struct {
@@ -235,6 +266,14 @@ static struct {
     uint32_t np_seq;        /* player seq the Now Playing art belongs to */
     uint16_t art_px[LIB_ART_LARGE * LIB_ART_LARGE];
     lv_image_dsc_t art_dsc;
+    /* Find cover (net/coverfind.h): the album, the match shown, its picture */
+    lv_obj_t *cf, *cf_art, *cf_img, *cf_title, *cf_artist, *cf_meta, *cf_note, *cf_hint;
+    uint16_t cf_px[LIB_ART_LARGE * LIB_ART_LARGE];
+    lv_image_dsc_t cf_dsc;
+    int64_t cf_album;
+    int cf_k;                 /* the match shown */
+    int cf_drawn;             /* what's drawn: (find state, matches, picture state, k) */
+    unsigned cf_batch_seq;    /* Find missing covers: the last batch said */
 
     /* what the list showed last time, to decide which animation applies */
     int last_depth, last_top, last_np;
@@ -255,6 +294,7 @@ static struct {
     lv_obj_t *row[SLOTS], *row_lbl[SLOTS], *row_meta[SLOTS], *row_dot[SLOTS], *row_eq[SLOTS][3];
     lv_obj_t *row_line[SLOTS], *row_lt[SLOTS], *row_la[SLOTS];   /* album rows: title and artist, one line */
     lv_obj_t *row_icon[SLOTS], *row_picon[SLOTS];   /* Home: an icon glyph, or a pixel icon */
+    lv_obj_t *row_mark[SLOTS];                      /* a podcast episode on the card: an arrow onto a line */
     lv_obj_t *row_sw[SLOTS], *row_sw_part[SLOTS][3];  /* Theme: a little picture of each (bar, text, accent) */
     lv_obj_t *row_cov[SLOTS];       /* Albums: each album's cover, the library's 34 px thumbnail */
     lv_image_dsc_t cov_dsc[SLOTS];  /* (their pixels: g_cov, only while Albums is shown) */
@@ -262,6 +302,7 @@ static struct {
     lv_obj_t *row_wheel[SLOTS], *row_ch[SLOTS][3];   /* the typing row: letter before, the wheel's (larger), after */
     int slot_item[SLOTS], slot_playing[SLOTS];
     int slot_accent[SLOTS];   /* drawn in the theme's accent colour (Home's Update available!) */
+    int slot_mark[SLOTS];     /* the on-the-card mark before the meta (a downloaded podcast episode) */
     /* album rows (line_layout): shown so, and how wide the title and the
      * artist are in full */
     int line_on[SLOTS], line_tw[SLOTS], line_aw[SLOTS];
@@ -349,6 +390,39 @@ static struct {
     int bat_days, bat_span;   /* bat_span: -1 since full charge, else one of bat.span */
     uint32_t bat_at;
     lv_obj_t *bat_graph, *bat_lbl[9];
+    lv_obj_t *eq_graph, *eq_lbl[3], *eq_warn;   /* the EQ editor's curve (eq_place) */
+    eq_profile_t eqg_for;                     /* the profile eqg_db[] was worked out for */
+    int eqg_have;
+    float eqg_db[EQG_PTS];                    /* its bands' response, preamp left out */
+    /* the theme editor (Settings > Interface > Theme, Menu on a theme) */
+    theme_t the;                              /* the theme being made or changed */
+    char the_file[128];                       /* its file in the themes folder ("" = not saved yet) */
+    int the_dirty;                            /* changed since it was opened or saved */
+    int the_acc;                              /* the accent picked (ACCENTS), -1 = its own colours */
+    int the_pal;                              /* the colour being picked (the_pal_at), -1 = its own */
+    uint32_t the_back_armed, the_del_armed;
+    int rename_theme;                         /* the name entry names the theme, not a playlist */
+    /* Podcasts (Home > Podcasts; net/podsync.h): read from the card when the
+     * pages open, and again when the worker changed something */
+    pod_show_t *pod_shows; int pod_n;
+    char pod_cur[13]; int pod_ci;             /* the show open (its id; its index in pod_shows, -1 none) */
+    pod_episode_t *pod_eps; int pod_ne;
+    pod_state_t *pod_st; int pod_nst;
+    unsigned char pod_on_card[POD_MAX_EPISODES];
+    int64_t pod_seen;                         /* the open show: episodes newer than this are new */
+    unsigned pod_changed, pod_failed, pod_imported;
+    pod_show_t *pod_found; int pod_nf, pod_search;   /* Find podcasts: the shows found, how it went */
+    char pod_opml[300];                       /* an OPML file to import ("" none) */
+    int pod_ctx;                              /* the episode (or show) a menu is for */
+    uint32_t pod_del_armed;
+    struct { char id[13], key[13]; uint32_t pos, len, saved; } pod_play;   /* the episode playing: kept on the card */
+    uint32_t pod_auto_at;
+    pod_chapter_t pod_ch[64]; int pod_nch;    /* the episode playing's chapters */
+    char pod_ch_key[13];
+    int pod_cover;                            /* Now Playing shows the show's cover */
+    lv_obj_t *thp, *thp_in, *thp_hd, *thp_bat, *thp_mode[2], *thp_sel, *thp_notch[4], *thp_cur, *thp_sel_t,
+             *thp_sel_m, *thp_dot, *thp_eq[3], *thp_row_t, *thp_row_m, *thp_track, *thp_fill, *thp_seg[10],
+             *thp_warn;                       /* its preview over the list (the_place) */
     int list_y0;
 } S;
 
@@ -706,6 +780,7 @@ static int wifi_row(int i, int *net)
     return WR_NET;
 }
 
+static int the_rows(void);
 static int list_count(const level_t *l)
 {
     if (library_backed(l->kind)) return l->items.n;
@@ -729,7 +804,13 @@ static int list_count(const level_t *l)
     case L_RDIR_RESULTS: return S.rd_n > 0 ? 1 + S.rd_n : 0;   /* Random station, the stations */
     case L_RDIR_SEARCH:   /* typing; the stations, or a line saying how the search goes */
         return 1 + (S.rd_n > 0 ? S.rd_n : S.rd_job == RD_JOB_LIST || S.rd_state == RD_FAILED || S.rd_n == 0 ? 1 : 0);
-    case L_THEMES: return S.n_themes;
+    case L_THEMES: return S.n_themes + (S.hooks.theme_save != NULL);   /* the themes, New theme */
+    case L_PODCASTS: return 1 + (S.pod_n ? S.pod_n : !S.pod_opml[0]) + (S.pod_opml[0] != '\0');   /* Find podcasts, the shows (or how to add some), Import */
+    case L_POD_SHOW: return S.pod_ne > 0 ? S.pod_ne : 1;                /* (or a line saying why there are none) */
+    case L_POD_SEARCH: return 1 + (S.pod_nf > 0 ? S.pod_nf : S.pod_search != -1 ? 1 : 0);
+    case L_POD_CHAPTERS: return S.pod_nch;
+    case L_THEME_EDIT: return the_rows();
+    case L_THEME_COLOURS: return TC_N;
     case L_EQ: return 1 + S.eq_n + 1;              /* Off, the profiles, New EQ */
     case L_EQ_EDIT: return 1 + S.eqe.n + (S.eqe.n < EQ_MAX_BANDS) + 1;   /* preamp, bands, add, delete */
     case L_EQ_BAND: return 5;                      /* type, frequency, gain, Q, remove */
@@ -743,6 +824,7 @@ static int list_count(const level_t *l)
     }
     case L_PLAYBACK: return (int)(sizeof PLAYBACK_ROWS / sizeof PLAYBACK_ROWS[0]);
     case L_POWER: return (int)(sizeof POWER_ROWS / sizeof POWER_ROWS[0]);
+    case L_POD_SETTINGS: return (int)(sizeof POD_ROWS / sizeof POD_ROWS[0]);
     case L_LIBRARY: return (int)(sizeof LIBRARY_ROWS / sizeof LIBRARY_ROWS[0]);
     case L_SIGNAL: {
         int n = 0;
@@ -802,8 +884,8 @@ static int quick_rows(setting_t *out)
 {
     int n = 0;
     for (size_t i = 0; i < sizeof QUICK / sizeof QUICK[0]; i++) {
-        if ((QUICK[i] == ST_BT || QUICK[i] == ST_BT_DEVICE) && !S.hooks.bt_state) continue;
-        if ((QUICK[i] == ST_WIFI || QUICK[i] == ST_WIFI_NET) && !S.hooks.wifi_state) continue;
+        if (QUICK[i] == ST_BT && !S.hooks.bt_state) continue;
+        if (QUICK[i] == ST_WIFI && !S.hooks.wifi_state) continue;
         out[n++] = QUICK[i];
     }
     return n;
@@ -846,6 +928,7 @@ static setting_t setting_at(const level_t *l, int i)
     }
     case L_PLAYBACK: return PLAYBACK_ROWS[i];
     case L_POWER: return POWER_ROWS[i];
+    case L_POD_SETTINGS: return POD_ROWS[i];
     case L_LIBRARY: return LIBRARY_ROWS[i];
     case L_INTERFACE: return INTERFACE_ROWS[i];
     default: return DISPLAY_ROWS[i];
@@ -854,7 +937,7 @@ static setting_t setting_at(const level_t *l, int i)
 
 static int is_setting_level(list_kind_t k)
 {
-    return k == L_QUICK || k == L_DISPLAY || k == L_SOUND || k == L_PLAYBACK || k == L_POWER || k == L_LIBRARY ||
+    return k == L_QUICK || k == L_DISPLAY || k == L_SOUND || k == L_PLAYBACK || k == L_POWER || k == L_LIBRARY || k == L_POD_SETTINGS ||
            k == L_USB || k == L_INTERFACE;
 }
 
@@ -990,6 +1073,8 @@ static void eqe_new(void)
 
 /* A setting's row, translated here (its list isn't translated whole: a
  * network's, a device's or an EQ's name stays as it is) */
+static void pod_speed_text(int pct, char *out, size_t cap);
+
 static void setting_row(setting_t st, int editing, char *main, size_t mn, char *meta, size_t tn)
 {
     switch (st) {
@@ -1117,7 +1202,34 @@ static void setting_row(setting_t st, int editing, char *main, size_t mn, char *
         else tr_num(meta, tn, "%s min", m);
         break;
     }
+    case ST_POD_AUTO:
+        snprintf(main, mn, "%s", tr("New episodes"));
+        snprintf(meta, tn, "%s", tr(settings_get_int("podcasts.auto", 1) ? "When charging" : "Off"));
+        break;
+    case ST_POD_KEEP:
+        snprintf(main, mn, "%s", tr("Keep per show"));
+        snprintf(meta, tn, "%d", settings_get_int("podcasts.keep", 2));
+        break;
+    case ST_POD_CLEAN: {
+        int d = settings_get_int("podcasts.clean_days", 7);
+        snprintf(main, mn, "%s", tr("Delete played"));
+        if (d <= 0) snprintf(meta, tn, "%s", tr("Never"));
+        else if (d == 1) snprintf(meta, tn, "%s", tr("After a day"));
+        else tr_num(meta, tn, "After %s days", d);
+        break;
+    }
+    case ST_POD_SPEED:
+        snprintf(main, mn, "%s", tr("Speed"));
+        pod_speed_text(S.player ? player_speed(S.player) : settings_get_int("podcasts.speed", 100), meta, tn);
+        break;
     case ST_RESCAN: snprintf(main, mn, "%s", tr("Rescan the music folder")); break;
+    case ST_FIND_COVERS: {
+        cf_batch_t b;
+        cf_batch_status(&b);
+        snprintf(main, mn, "%s", tr(b.running ? "Stop finding covers" : "Find missing covers"));
+        if (b.running) snprintf(meta, tn, "%d / %d", b.done, b.total);
+        break;
+    }
     case ST_USB_DRIVE: snprintf(main, mn, "%s", tr("USB drive mode")); break;
     case ST_USB_COMPUTER: {
         static const char *const what[] = {"Ask", "USB drive", "Just charge", "USB DAC"};
@@ -1127,27 +1239,21 @@ static void setting_row(setting_t st, int editing, char *main, size_t mn, char *
         break;
     }
     case ST_USB_DAC: snprintf(main, mn, "%s", tr("USB DAC mode")); break;
-    case ST_BT:
+    case ST_BT: {               /* quick settings: what's connected, or on/off; opens the page */
         snprintf(main, mn, "%s", tr("Bluetooth"));
-        snprintf(meta, tn, "%s", S.bt_busy[0] && strcmp(S.bt_busy, "Searching") ? tr(S.bt_busy) : on_off(S.bt_on));
-        break;
-    case ST_WIFI:
-        snprintf(main, mn, "%s", tr("Wi-Fi"));
-        snprintf(meta, tn, "%s", S.wifi_busy[0] && strcmp(S.wifi_busy, "Searching") ? tr(S.wifi_busy) : on_off(S.wifi_on));
-        break;
-    case ST_WIFI_NET:
-        snprintf(main, mn, "%s", tr("Wi-Fi network"));
-        snprintf(meta, tn, "%.*s", (int)tn - 1, S.wifi_st.state == UI_WIFI_CONNECTED ? S.wifi_st.ssid
-                                                : S.wifi_on ? tr("None") : "");
-        break;
-    case ST_BT_DEVICE: {
-        snprintf(main, mn, "%s", tr("Bluetooth device"));
         const char *c = NULL;
         for (int d = 0; d < S.bt_n; d++)
             if (S.bt[d].connected) c = S.bt[d].name[0] ? S.bt[d].name : S.bt[d].addr;
-        snprintf(meta, tn, "%s", c ? c : S.bt_on ? tr("None") : "");
+        snprintf(meta, tn, "%s", S.bt_busy[0] && strcmp(S.bt_busy, "Searching") ? tr(S.bt_busy)
+                                 : c && S.bt_on ? c : on_off(S.bt_on));
         break;
     }
+    case ST_WIFI:               /* the same for Wi-Fi: the network joined, or on/off */
+        snprintf(main, mn, "%s", tr("Wi-Fi"));
+        if (S.wifi_busy[0] && strcmp(S.wifi_busy, "Searching")) snprintf(meta, tn, "%s", tr(S.wifi_busy));
+        else if (S.wifi_on && S.wifi_st.state == UI_WIFI_CONNECTED) snprintf(meta, tn, "%.*s", (int)tn - 1, S.wifi_st.ssid);
+        else snprintf(meta, tn, "%s", on_off(S.wifi_on));
+        break;
     case ST_N_SONGS: snprintf(main, mn, "%s", tr("Songs")); snprintf(meta, tn, "%d", S.lib_counts[0]); break;
     case ST_N_ALBUMS: snprintf(main, mn, "%s", tr("Albums")); snprintf(meta, tn, "%d", S.lib_counts[1]); break;
     case ST_N_ARTISTS: snprintf(main, mn, "%s", tr("Artists")); snprintf(meta, tn, "%d", S.lib_counts[2]); break;
@@ -1205,7 +1311,7 @@ static void info_row(int64_t track, int i, char *main, size_t mn, char *meta, si
 
 static const char *entry_letters(list_kind_t k)
 {
-    return k == L_SEARCH || k == L_RDIR_SEARCH ? SEARCH_CHARS : k == L_WIFI_PASS ? PASS_CHARS : NAME_CHARS;
+    return k == L_SEARCH || k == L_RDIR_SEARCH || k == L_POD_SEARCH ? SEARCH_CHARS : k == L_WIFI_PASS ? PASS_CHARS : NAME_CHARS;
 }
 
 static void entry_glyph(list_kind_t k, int i, char *out, size_t cap)
@@ -1213,7 +1319,8 @@ static void entry_glyph(list_kind_t k, int i, char *out, size_t cap)
     const char *letters = entry_letters(k);
     int n = (int)strlen(letters);
     i = ((i % (n + 1)) + n + 1) % (n + 1);
-    if (i == n) snprintf(out, cap, "%s", tr(k == L_SEARCH ? "Results" : k == L_RDIR_SEARCH ? "Search" : k == L_WIFI_PASS ? "Join" : "Done"));
+    if (i == n) snprintf(out, cap, "%s", tr(k == L_SEARCH ? "Results" : k == L_RDIR_SEARCH || k == L_POD_SEARCH ? "Search"
+                                           : k == L_WIFI_PASS ? "Join" : "Done"));
     else if (letters[i] == ' ') snprintf(out, cap, "%s", tr("space"));
     else if (k == L_WIFI_PASS) snprintf(out, cap, "%c", letters[i]);   /* exactly what's typed */
     else snprintf(out, cap, "%c", letters[i] >= 'a' && letters[i] <= 'z' ? letters[i] - 32 : letters[i]);
@@ -1224,7 +1331,7 @@ static void entry_glyph(list_kind_t k, int i, char *out, size_t cap)
  * Done, space) is shown alone, with no neighbours. */
 static void entry_row(list_kind_t k, char *main, size_t mn, char wheel[3][WHEEL_CAP])
 {
-    if ((k == L_SEARCH || k == L_RDIR_SEARCH) && !S.entry[0]) snprintf(main, mn, "%s", tr("Type with the wheel"));
+    if ((k == L_SEARCH || k == L_RDIR_SEARCH || k == L_POD_SEARCH) && !S.entry[0]) snprintf(main, mn, "%s", tr("Type with the wheel"));
     else if (k == L_WIFI_PASS && !S.entry[0]) snprintf(main, mn, "%s", tr("Password"));
     else snprintf(main, mn, "%s_", S.entry);
     entry_glyph(k, S.entry_ch - 1, wheel[0], WHEEL_CAP);
@@ -1239,7 +1346,8 @@ static void entry_row(list_kind_t k, char *main, size_t mn, char wheel[3][WHEEL_
 
 static int is_typing_row(const level_t *l, int i)
 {
-    return (l->kind == L_SEARCH || l->kind == L_RENAME || l->kind == L_WIFI_PASS || l->kind == L_RDIR_SEARCH) && i == 0;
+    return (l->kind == L_SEARCH || l->kind == L_RENAME || l->kind == L_WIFI_PASS || l->kind == L_RDIR_SEARCH ||
+            l->kind == L_POD_SEARCH) && i == 0;
 }
 
 /* Search result r: artists, then albums, then songs. */
@@ -1450,7 +1558,7 @@ static void battery_row(list_kind_t k, int i, char *main, size_t mn, char *meta,
     if (k == L_BATTERY) {
         if (i == 0) {
             snprintf(main, mn, "%s", S.bat_days == 7 ? "Last 7 days" : "Last 24 hours");
-            snprintf(meta, tn, "%s", S.bat_days == 7 ? "OK: 24 hours" : "OK: 7 days");
+            snprintf(meta, tn, "%s", S.bat_days == 7 ? "Play: 24 hours" : "Play: 7 days");
         } else if (i == 1) {
             snprintf(main, mn, "Since full charge");
             fmt_dur(d, sizeof d, S.bat.since.on_s);
@@ -1635,8 +1743,8 @@ static void bat_graph_draw(lv_event_t *e)
         for (int y = y0; y < y1; y += 4) bat_rect(layer, &d, x0 + S.bat.gap[g], y, x0 + S.bat.gap[g], y + 1);
 }
 
-/* The Battery screen's graph over the top of the list, which moves down below it */
-static void battery_place(list_kind_t k)
+/* The Battery screen's graph over the top of the list (graphs_place moves the list down) */
+static int battery_place(list_kind_t k)
 {
     int on = k == L_BATTERY && S.hooks.battery_report;
     if (on && !S.bat_graph) {
@@ -1650,8 +1758,648 @@ static void battery_place(list_kind_t k)
         lv_obj_set_style_bg_opa(S.bat_graph, LV_OPA_COVER, 0);
         if (on) { lv_obj_move_foreground(S.bat_graph); battery_labels(); }
     }
+    return on;
+}
+
+/* ---------- the EQ editor's curve (Settings > Sound > EQ > a profile, a band) ---------- */
+
+static int eqg_x(double f)
+{
+    if (f < 20) f = 20;
+    if (f > 20000) f = 20000;
+    return EQG_X0 + (int)lround((log10(f) - log10(20.0)) / 3.0 * (EQG_X1 - EQG_X0));
+}
+
+static int eqg_y(double db)
+{
+    if (db > EQG_RANGE) db = EQG_RANGE;
+    if (db < -EQG_RANGE) db = -EQG_RANGE;
+    return EQG_Y0 + (int)lround((EQG_RANGE - db) / (2 * EQG_RANGE) * (EQG_Y1 - EQG_Y0));
+}
+
+/* The curve at the plot's column x, between the points either side of it */
+static double eqg_at(int x)
+{
+    double pos = (double)x * (EQG_PTS - 1) / (EQG_X1 - EQG_X0);
+    int i = (int)pos;
+    if (i < 0) return S.eqg_db[0];
+    if (i >= EQG_PTS - 1) return S.eqg_db[EQG_PTS - 1];
+    double fr = pos - i;
+    return S.eqg_db[i] * (1 - fr) + S.eqg_db[i + 1] * fr;
+}
+
+static int same_profile(const eq_profile_t *a, const eq_profile_t *b)
+{
+    if (a->preamp_db != b->preamp_db || a->n != b->n) return 0;
+    for (int i = 0; i < a->n; i++)
+        if (a->band[i].type != b->band[i].type || a->band[i].fc != b->band[i].fc ||
+            a->band[i].gain_db != b->band[i].gain_db || a->band[i].q != b->band[i].q)
+            return 0;
+    return 1;
+}
+
+/* The curve for the profile being edited (worked out again only when it
+ * changed), and the warning when, with the preamp, it goes above 0 dB: the
+ * loudest moments can clip there. */
+static void eqg_update(void)
+{
+    if (S.eqg_have && same_profile(&S.eqg_for, &S.eqe)) return;
+    double f[EQG_PTS];
+    for (int i = 0; i < EQG_PTS; i++) f[i] = 20 * pow(1000, (double)i / (EQG_PTS - 1));
+    eq_curve_db(&S.eqe, 48000, f, EQG_PTS, S.eqg_db);
+    S.eqg_for = S.eqe;
+    S.eqg_have = 1;
+    double peak = -1e9;
+    int at = 0;
+    for (int i = 0; i < EQG_PTS; i++)
+        if (S.eqg_db[i] > peak) peak = S.eqg_db[i], at = i;
+    peak += S.eqe.preamp_db;
+    if (S.eq_warn) {
+        char num[16], t[64];
+        snprintf(num, sizeof num, "+%.1f dB", peak);
+        subst(t, sizeof t, tr("%s over 0 dB"), num, NULL);
+        set_text(S.eq_warn, t);
+        show(S.eq_warn, peak > 0.05);
+        /* on the side away from the peak, so it covers neither it nor its dot */
+        lv_obj_align(S.eq_warn, at >= EQG_PTS / 2 ? LV_ALIGN_TOP_LEFT : LV_ALIGN_TOP_RIGHT,
+                     at >= EQG_PTS / 2 ? EQG_X0 : -(UI_W - EQG_X1), EQG_Y0);
+    }
+}
+
+/* The band the page is about: the selected row's on the profile's page, the
+ * page's own on a band's; -1 for none (Preamp, Add a band...) */
+static int eqg_selected(void)
+{
+    const level_t *l = &S.stack[S.depth - 1];
+    if (l->kind == L_EQ_BAND) return l->parent >= 0 && l->parent < S.eqe.n ? (int)l->parent : -1;
+    if (l->kind == L_EQ_EDIT) return l->sel >= 1 && l->sel <= S.eqe.n ? l->sel - 1 : -1;
+    return -1;
+}
+
+/* Drawn whole: the grid (+-6 dB, 100 Hz, 1 kHz, 10 kHz; 0 dB stronger), on a
+ * band's page a faint line at its frequency, the curve a column a pixel (each
+ * joined to the one before), the bands as dots on it, the selected one bigger
+ * in the theme's signal colour */
+static void eq_graph_draw(lv_event_t *e)
+{
+    lv_layer_t *layer = lv_event_get_layer(e);
+    lv_area_t a;
+    lv_obj_get_coords(lv_event_get_target(e), &a);
+    const theme_t *t = T();
+    if (!S.eqg_have) eqg_update();
+    lv_draw_rect_dsc_t d;
+    lv_draw_rect_dsc_init(&d);
+    d.radius = 0;
+    d.bg_opa = LV_OPA_COVER;
+    int ox = a.x1, oy = a.y1, x0 = ox + EQG_X0, x1 = ox + EQG_X1;
+    d.bg_color = C(t->surface);
+    for (int g = -1; g <= 1; g += 2) {
+        int y = oy + eqg_y(6.0 * g);
+        bat_rect(layer, &d, x0, y, x1, y);
+    }
+    static const double decade[3] = {100, 1000, 10000};
+    for (int i = 0; i < 3; i++) {
+        int x = ox + eqg_x(decade[i]);
+        bat_rect(layer, &d, x, oy + EQG_Y0, x, oy + EQG_Y1);
+    }
+    d.bg_color = C(t->text_muted);
+    d.bg_opa = LV_OPA_50;
+    bat_rect(layer, &d, x0, oy + eqg_y(0), x1, oy + eqg_y(0));
+    int sel = eqg_selected();
+    if (S.stack[S.depth - 1].kind == L_EQ_BAND && sel >= 0) {
+        d.bg_color = C(t->signal);
+        d.bg_opa = LV_OPA_40;
+        int x = ox + eqg_x(S.eqe.band[sel].fc);
+        bat_rect(layer, &d, x, oy + EQG_Y0, x, oy + EQG_Y1);
+    }
+    d.bg_opa = LV_OPA_COVER;
+    d.bg_color = C(t->text);
+    int prev = -1;
+    for (int x = 0; x <= EQG_X1 - EQG_X0; x++) {
+        int y = eqg_y(eqg_at(x));
+        int lo = prev < 0 || y < prev ? y : prev, hi = prev < 0 || y > prev ? y : prev;
+        bat_rect(layer, &d, x0 + x, oy + lo, x0 + x, oy + hi + 1);
+        prev = y;
+    }
+    int round_dots = t->corner == THEME_CORNER_ROUND;
+    for (int pass = 0; pass < 2; pass++)          /* the others, then the selected one over them */
+        for (int i = 0; i < S.eqe.n; i++) {
+            if ((i == sel) != pass) continue;
+            int x = eqg_x(S.eqe.band[i].fc), y = eqg_y(eqg_at(x - EQG_X0)), r = pass ? 4 : 2;
+            d.bg_color = C(pass ? t->signal : t->text_muted);
+            d.radius = round_dots ? r + 1 : 0;
+            bat_rect(layer, &d, ox + x - r, oy + y - r, ox + x + r, oy + y + r);
+        }
+}
+
+/* The curve over the top of the EQ editor's pages (graphs_place moves the list down) */
+static int eq_place(list_kind_t k)
+{
+    int on = k == L_EQ_EDIT || k == L_EQ_BAND;
+    if (on && !S.eq_graph) {
+        S.eq_graph = box(S.list, 0, 0, UI_W, BAT_GRAPH_H);
+        lv_obj_add_event_cb(S.eq_graph, eq_graph_draw, LV_EVENT_DRAW_MAIN, NULL);
+        for (int i = 0; i < 3; i++) S.eq_lbl[i] = label(S.eq_graph);
+        S.eq_warn = label(S.eq_graph);
+    }
+    if (S.eq_graph) {
+        show(S.eq_graph, on);
+        lv_obj_set_style_bg_color(S.eq_graph, C(T()->bg), 0);
+        lv_obj_set_style_bg_opa(S.eq_graph, LV_OPA_COVER, 0);
+        if (on) {
+            static const char *const mark[3] = {"100", "1k", "10k"};
+            static const double at[3] = {100, 1000, 10000};
+            for (int i = 0; i < 3; i++) {
+                style_label(S.eq_lbl[i], S.f->meta, T()->text_muted);
+                lv_obj_set_width(S.eq_lbl[i], 40);
+                lv_obj_set_style_text_align(S.eq_lbl[i], LV_TEXT_ALIGN_CENTER, 0);
+                set_text(S.eq_lbl[i], mark[i]);
+                /* above the graph's foot, whatever the font's height (the pixel one is taller) */
+                int y = BAT_GRAPH_H - lv_font_get_line_height(S.f->meta);
+                lv_obj_set_pos(S.eq_lbl[i], eqg_x(at[i]) - 20, y > EQG_Y1 + 1 ? EQG_Y1 + 1 : y);
+            }
+            style_label(S.eq_warn, S.f->meta, T()->warning);
+            lv_obj_set_style_bg_color(S.eq_warn, C(T()->bg), 0);   /* readable over the grid */
+            lv_obj_set_style_bg_opa(S.eq_warn, LV_OPA_COVER, 0);
+            lv_obj_set_style_pad_hor(S.eq_warn, 3, 0);
+            S.eqg_have = 0;                         /* (a profile opened anew, or another theme) */
+            eqg_update();
+            lv_obj_move_foreground(S.eq_graph);
+            lv_obj_invalidate(S.eq_graph);
+        }
+    }
+    return on;
+}
+
+
+/* ---------- Podcasts: what's on the card, and the rows (Home > Podcasts) ---------- */
+
+#define POD_STATES 400
+
+static const char *pod_dir(void) { return podsync_dir(); }
+
+/* The subscriptions, and an OPML file to offer */
+static void pod_read_shows(void)
+{
+    if (!S.pod_shows) S.pod_shows = calloc(POD_MAX_SHOWS, sizeof *S.pod_shows);
+    S.pod_n = S.pod_shows && pod_dir()[0] ? pod_shows_load(pod_dir(), S.pod_shows, POD_MAX_SHOWS) : 0;
+    S.pod_ci = -1;
+    for (int i = 0; i < S.pod_n; i++)
+        if (!strcmp(S.pod_shows[i].id, S.pod_cur)) S.pod_ci = i;
+    S.pod_opml[0] = '\0';
+    if (S.hooks.podcast_opml && S.hooks.podcast_opml(S.pod_opml, sizeof S.pod_opml) != 1) S.pod_opml[0] = '\0';
+}
+
+/* The open show's episodes, where each was left, and which are on the card */
+static void pod_read_episodes(void)
+{
+    S.pod_ne = S.pod_nst = 0;
+    if (S.pod_ci < 0) return;
+    if (!S.pod_eps) S.pod_eps = calloc(POD_MAX_EPISODES, sizeof *S.pod_eps);
+    if (!S.pod_st) S.pod_st = calloc(POD_STATES, sizeof *S.pod_st);
+    if (!S.pod_eps || !S.pod_st) return;
+    const char *id = S.pod_shows[S.pod_ci].id;
+    S.pod_ne = pod_episodes_load(pod_dir(), id, S.pod_eps, POD_MAX_EPISODES);
+    S.pod_nst = pod_state_load(pod_dir(), id, S.pod_st, POD_STATES);
+    for (int i = 0; i < S.pod_ne; i++) S.pod_on_card[i] = (unsigned char)pod_downloaded(pod_dir(), id, &S.pod_eps[i]);
+}
+
+static void pod_free(void)
+{
+    free(S.pod_shows);
+    free(S.pod_eps);
+    free(S.pod_st);
+    free(S.pod_found);
+    S.pod_shows = NULL;
+    S.pod_eps = NULL;
+    S.pod_st = NULL;
+    S.pod_found = NULL;
+    S.pod_n = S.pod_ne = S.pod_nst = S.pod_nf = 0;
+    S.pod_ci = -1;
+    S.pod_cur[0] = '\0';
+}
+
+/* "1.25x" */
+static void pod_speed_text(int pct, char *out, size_t cap)
+{
+    if (pct % 100 == 0) snprintf(out, cap, "%d\xC3\x97", pct / 100);
+    else if (pct % 10 == 0) snprintf(out, cap, "%d.%d\xC3\x97", pct / 100, pct % 100 / 10);
+    else snprintf(out, cap, "%d.%02d\xC3\x97", pct / 100, pct % 100);
+}
+
+/* The chapter of the episode playing at ms (-1: none) */
+static int pod_chapter_at(uint32_t ms)
+{
+    int c = -1;
+    for (int i = 0; i < S.pod_nch; i++)
+        if (S.pod_ch[i].start_ms <= ms) c = i;
+    return c;
+}
+
+static int pod_subscribed(const char *url)
+{
+    for (int i = 0; i < S.pod_n; i++)
+        if (!strcmp(S.pod_shows[i].url, url)) return 1;
+    return 0;
+}
+
+static void pod_shows_row(int i, char *main, size_t mn, char *meta, size_t tn, int *playing)
+{
+    if (i == 0) {
+        podsync_status_t st;
+        podsync_status(&st);
+        snprintf(main, mn, "%s", tr("Find podcasts"));
+        if (st.refreshing) snprintf(meta, tn, "%s", tr("Checking"));
+        return;
+    }
+    i--;
+    if (!S.pod_n && !S.pod_opml[0]) {            /* none yet: how to add some */
+        snprintf(main, mn, "%s", tr("Or an OPML file on the card"));
+        return;
+    }
+    if (i < S.pod_n) {
+        const pod_show_t *s = &S.pod_shows[i];
+        snprintf(main, mn, "%s", s->title);
+        if (s->latest > s->seen) snprintf(meta, tn, "%s", tr("New"));
+        *playing = S.now.podcast && !strcmp(S.pod_play.id, s->id);
+        return;
+    }
+    const char *b = strrchr(S.pod_opml, '/');
+    subst(main, mn, tr("Import %s"), b ? b + 1 : S.pod_opml, NULL);
+}
+
+/* An episode: its title; how it stands (downloading, played, time left, new, its length) */
+static void pod_episode_row(int i, char *main, size_t mn, char *meta, size_t tn, int *playing)
+{
+    if (S.pod_ci < 0) return;
+    const pod_show_t *s = &S.pod_shows[S.pod_ci];
+    if (!S.pod_ne) {                      /* none: why */
+        podsync_status_t st;
+        podsync_status(&st);
+        snprintf(main, mn, "%s", tr(st.refreshing ? "Reading its episodes\xE2\x80\xA6"
+                                    : s->refreshed ? "No episodes" : "Menu: Check for new episodes"));
+        return;
+    }
+    const pod_episode_t *e = &S.pod_eps[i];
+    snprintf(main, mn, "%s", e->title);
+    pod_state_t st;
+    pod_state_find(S.pod_st, S.pod_nst, e->key, &st);
+    int dl = podsync_download_state(s->id, e->key);
+    uint32_t len = st.len_ms ? st.len_ms : (uint32_t)e->dur_s * 1000;
+    if (dl == 0) snprintf(meta, tn, "%s", tr("Waiting"));
+    else if (dl > 0) snprintf(meta, tn, "%d%%", dl);
+    else if (st.played) snprintf(meta, tn, "%s", tr("Played"));
+    else if (st.pos_ms && len > st.pos_ms) tr_num(meta, tn, "%s min left", (long)((len - st.pos_ms + 59999) / 60000));
+    else if (e->date > S.pod_seen) snprintf(meta, tn, "%s", tr("New"));
+    else if (len) tr_num(meta, tn, "%s min", (long)((len + 59999) / 60000));
+    *playing = S.now.podcast && !strcmp(S.pod_play.id, s->id) && !strcmp(S.pod_play.key, e->key);
+}
+
+/* Find podcasts: a show found, or a line saying how the search goes */
+static void pod_found_row(int i, char *main, size_t mn, char *meta, size_t tn, int *playing)
+{
+    if (S.pod_nf <= 0) {
+        snprintf(main, mn, "%s", tr(S.pod_search == 0 ? "Searching\xE2\x80\xA6"
+                                    : S.pod_search == -2 ? "Couldn't reach the directory" : "No podcasts found"));
+        return;
+    }
+    if (i >= S.pod_nf) return;
+    snprintf(main, mn, "%s", S.pod_found[i].title);
+    if (pod_subscribed(S.pod_found[i].url)) {
+        snprintf(meta, tn, "%s", tr("Added"));
+        *playing = 1;
+    }
+}
+
+/* ---------- the theme editor's choices and its preview (Settings > Interface > Theme) ---------- */
+
+/* Accents: the selection, progress, playing mark and icons in one colour */
+static const struct { const char *name; int hue, sat; } ACCENTS[] = {
+    {"Mint", 158, 72}, {"Teal", 176, 60}, {"Sky", 199, 85}, {"Blue", 217, 85}, {"Indigo", 235, 70},
+    {"Violet", 262, 70}, {"Pink", 330, 75}, {"Red", 355, 80}, {"Coral", 14, 100}, {"Orange", 28, 95},
+    {"Amber", 42, 95}, {"Lime", 84, 60}, {"Grey", 210, 8},
+};
+#define N_ACCENTS ((int)(sizeof ACCENTS / sizeof ACCENTS[0]))
+
+/* The colours as the editor names them (TC_*, at the top) */
+static const struct { const char *name; size_t off; } THE_COL[TC_N] = {
+    {"Background", offsetof(theme_t, bg)}, {"Panels", offsetof(theme_t, surface)},
+    {"Text", offsetof(theme_t, text)}, {"Secondary text", offsetof(theme_t, text_muted)},
+    {"Selection", offsetof(theme_t, select_bg)}, {"Text on selection", offsetof(theme_t, select_fg)},
+    {"Progress, playing", offsetof(theme_t, signal)}, {"Icons", offsetof(theme_t, mode)},
+    {"Format, output", offsetof(theme_t, info)}, {"Battery", offsetof(theme_t, battery)},
+    {"Artist", offsetof(theme_t, artist)}, {"Album", offsetof(theme_t, album)},
+    {"Format chip", offsetof(theme_t, chip_bg)}, {"Text on chip", offsetof(theme_t, chip_fg)},
+    {"Warnings", offsetof(theme_t, warning)}, {"Errors", offsetof(theme_t, danger)},
+};
+/* theme_validate's rules: a colour on another, and the contrast it needs */
+static const struct { int fg, bg; double min; } THE_PAIRS[] = {
+    {TC_TEXT, TC_BG, 7}, {TC_MUTED, TC_BG, 4.5}, {TC_SELFG, TC_SELBG, 7}, {TC_TEXT, TC_SURFACE, 7},
+    {TC_SIGNAL, TC_BG, 4.5}, {TC_INFO, TC_BG, 4.5}, {TC_MODE, TC_BG, 4.5}, {TC_BATTERY, TC_BG, 4.5},
+    {TC_WARNING, TC_BG, 4.5}, {TC_DANGER, TC_BG, 4.5}, {TC_ARTIST, TC_BG, 4.5}, {TC_ALBUM, TC_BG, 4.5},
+    {TC_CHIPFG, TC_CHIPBG, 4.5},
+};
+#define N_PAIRS ((int)(sizeof THE_PAIRS / sizeof THE_PAIRS[0]))
+
+static const struct { const char *family, *name; } FONT_FAMILIES[] = {
+    {"atkinson", "Atkinson"}, {"arkpixel", "Ark Pixel"}, {"vt323", "VT323"},
+};
+/* Text size Large: a step up from each family's sizes (Ark Pixel has only its own) */
+static const int SIZE_LARGE_ATKINSON[THEME_PX_N] = {16, 22, 20, 24, 17};
+static const int SIZE_LARGE_VT323[THEME_PX_N] = {22, 28, 26, 32, 24};
+
+
+static uint32_t *the_col(theme_t *t, int r) { return (uint32_t *)((char *)t + THE_COL[r].off); }
+static uint32_t the_get(int r) { return *the_col(&S.the, r); }
+
+static const int *the_large(const theme_t *t)
+{
+    if (t->font_file[0]) return NULL;
+    return !strcmp(t->font, "atkinson") ? SIZE_LARGE_ATKINSON : !strcmp(t->font, "vt323") ? SIZE_LARGE_VT323 : NULL;
+}
+
+/* 0: the family's own sizes, 1: Large, 2: the theme file's own */
+static int the_size(const theme_t *t)
+{
+    int none = 1;
+    for (int r = 0; r < THEME_PX_N; r++) none &= !t->font_px[r];
+    if (none) return 0;
+    const int *large = the_large(t);
+    return large && !memcmp(large, t->font_px, sizeof t->font_px) ? 1 : 2;
+}
+
+/* Of the rules colour r is in (r = -1: all of them), the one that reads worst
+ * for what it needs; -1 if none. Its contrast goes in *c. */
+static int the_worst(int r, double *c)
+{
+    int w = -1;
+    double worst = 1e9;
+    for (int i = 0; i < N_PAIRS; i++) {
+        if (r >= 0 && THE_PAIRS[i].fg != r && THE_PAIRS[i].bg != r) continue;
+        double x = theme_contrast(the_get(THE_PAIRS[i].fg), the_get(THE_PAIRS[i].bg));
+        if (x / THE_PAIRS[i].min < worst) { worst = x / THE_PAIRS[i].min; w = i; *c = x; }
+    }
+    return w;
+}
+
+/* "Text: 3.2:1, needs 7:1" for a rule that fails (r: as for the_worst), else "" */
+static void the_problem(int r, char *out, size_t cap)
+{
+    double c = 0;
+    int w = the_worst(r, &c);
+    out[0] = '\0';
+    if (w < 0 || c >= THE_PAIRS[w].min) return;
+    char have[16], need[16];
+    snprintf(have, sizeof have, "%.1f:1", floor(c * 10) / 10);
+    snprintf(need, sizeof need, "%g:1", THE_PAIRS[w].min);
+    char msg[96];
+    subst(msg, sizeof msg, tr("%s, needs %s"), have, need);
+    snprintf(out, cap, "%s: %s", tr(THE_COL[THE_PAIRS[w].fg].name), msg);
+}
+
+/* The editor's rows: the theme's choices, then Save (and Delete, for one on the card) */
+static int the_rows(void) { return S.the_file[0] ? TE_N : TE_N - 1; }
+
+static void the_row(int i, char *main, size_t mn, char *meta, size_t tn)
+{
+    const theme_t *t = &S.the;
+    int ed = S.editing && S.stack[S.depth - 1].sel == i;
+    char v[64] = "";
+    static const char *const corner[] = {"Round", "Stepped", "Square"};
+    switch (i) {
+    case TE_NAME: snprintf(main, mn, "Name"); snprintf(meta, tn, "%s", t->name); return;
+    case TE_BASE: snprintf(main, mn, "Dark or light"); snprintf(v, sizeof v, "%s", tr(t->dark ? "Dark" : "Light")); break;
+    case TE_ACCENT:
+        snprintf(main, mn, "Accent");
+        snprintf(v, sizeof v, "%s", tr(S.the_acc >= 0 ? ACCENTS[S.the_acc].name : "Its own"));
+        break;
+    case TE_COLOURS: {
+        char p[96];
+        snprintf(main, mn, "Colours");
+        the_problem(-1, p, sizeof p);
+        if (p[0]) snprintf(v, sizeof v, "%s", tr("too faint"));
+        break;
+    }
+    case TE_FONT:
+        snprintf(main, mn, "Font");
+        snprintf(v, sizeof v, "%s", tr("Its own"));
+        for (size_t f = 0; f < sizeof FONT_FAMILIES / sizeof FONT_FAMILIES[0]; f++)
+            if (!t->font_file[0] && !strcmp(t->font, FONT_FAMILIES[f].family)) snprintf(v, sizeof v, "%s", FONT_FAMILIES[f].name);
+        break;
+    case TE_SIZE: {
+        int z = the_size(t);
+        snprintf(main, mn, "Text size");
+        snprintf(v, sizeof v, "%s", tr(z == 0 ? "Normal" : z == 1 ? "Large" : "Its own"));
+        break;
+    }
+    case TE_SELECTION: snprintf(main, mn, "Selection"); snprintf(v, sizeof v, "%s", tr(t->selection_bar ? "Bar" : "Pill")); break;
+    case TE_CORNERS: snprintf(main, mn, "Corners"); snprintf(v, sizeof v, "%s", tr(corner[t->corner <= 2 ? t->corner : 0])); break;
+    case TE_RADIUS: snprintf(main, mn, "Corner radius"); snprintf(v, sizeof v, "%d px", t->radius); break;
+    case TE_PROGRESS: snprintf(main, mn, "Progress bar"); snprintf(v, sizeof v, "%s", tr(t->progress_segments ? "Segments" : "Bar")); break;
+    case TE_PLAYING: snprintf(main, mn, "Playing mark"); snprintf(v, sizeof v, "%s", tr(t->playing_equalizer ? "Equalizer" : "Dot")); break;
+    case TE_CURSOR: snprintf(main, mn, "Cursor"); snprintf(v, sizeof v, "%s", tr(t->cursor_arrow ? "Arrow" : "None")); break;
+    case TE_SHADOW: snprintf(main, mn, "Shadow"); snprintf(v, sizeof v, "%s", tr(t->shadow_hard ? "Hard" : "None")); break;
+    case TE_MOTION: snprintf(main, mn, "Motion"); snprintf(v, sizeof v, "%s", tr(t->motion_stepped ? "Stepped" : "Smooth")); break;
+    case TE_SAVE: snprintf(main, mn, "Save"); if (S.the_dirty) snprintf(v, sizeof v, "%s", tr("not saved")); break;
+    default: snprintf(main, mn, "Delete this theme"); return;
+    }
+    snprintf(meta, tn, ed ? "< %s >" : "%s", v);
+}
+
+/* The colours a colour can be, picked with the wheel on Colours: greys, then
+ * each accent's hue in six tones, from pale (for text on dark) to night (for
+ * dark backgrounds) */
+static const struct { const char *name; int l; } GREYS[] = {
+    {"White", 100}, {"Paper", 95}, {"Light grey", 80}, {"Grey", 60}, {"Dark grey", 36}, {"Charcoal", 18},
+    {"Ink", 8}, {"Black", 0},
+};
+static const struct { const char *fmt; int sat, l; } TONES[] = {   /* sat: of the accent's own, in % */
+    {"Pale %s", 70, 90}, {"Light %s", 90, 76}, {"%s", 100, 62}, {"Dark %s", 90, 44}, {"Deep %s", 50, 22},
+    {"Night %s", 35, 9},
+};
+#define N_GREYS ((int)(sizeof GREYS / sizeof GREYS[0]))
+#define N_TONES ((int)(sizeof TONES / sizeof TONES[0]))
+#define N_PAL (N_GREYS + (N_ACCENTS - 1) * N_TONES)   /* (the accents' Grey is the greys) */
+
+static uint32_t the_pal_at(int i, char *name, size_t cap)
+{
+    if (i < N_GREYS) {
+        if (name) snprintf(name, cap, "%s", tr(GREYS[i].name));
+        return theme_from_hsl(0, 0, GREYS[i].l);
+    }
+    i -= N_GREYS;
+    int h = i / N_TONES, t = i % N_TONES;
+    if (name) subst(name, cap, tr(TONES[t].fmt), tr(ACCENTS[h].name), NULL);
+    return theme_from_hsl(ACCENTS[h].hue, ACCENTS[h].sat * TONES[t].sat / 100, TONES[t].l);
+}
+
+/* The named colour c is (-1: none), and the nearest one */
+static int the_pal_find(uint32_t c)
+{
+    for (int i = 0; i < N_PAL; i++)
+        if (the_pal_at(i, NULL, 0) == (c & 0xFFFFFF)) return i;
+    return -1;
+}
+
+static int the_pal_nearest(uint32_t c)
+{
+    int best = 0;
+    long bd = -1;
+    for (int i = 0; i < N_PAL; i++) {
+        uint32_t p = the_pal_at(i, NULL, 0);
+        long dr = (long)((p >> 16) & 0xff) - (long)((c >> 16) & 0xff), dg = (long)((p >> 8) & 0xff) - (long)((c >> 8) & 0xff),
+             db = (long)(p & 0xff) - (long)(c & 0xff), d = 3 * dr * dr + 4 * dg * dg + 2 * db * db;
+        if (bd < 0 || d < bd) { bd = d; best = i; }
+    }
+    return best;
+}
+
+/* Colours: each one, and how its text reads ("too faint" under the rule) */
+static void the_colour_row(int i, char *main, size_t mn, char *meta, size_t tn)
+{
+    if (i < 0 || i >= TC_N) return;
+    snprintf(main, mn, "%s", THE_COL[i].name);
+    if (S.editing && S.stack[S.depth - 1].sel == i) {   /* being picked: its name */
+        char name[48];
+        if (S.the_pal >= 0) the_pal_at(S.the_pal, name, sizeof name);
+        else snprintf(name, sizeof name, "%s", tr("Its own"));
+        snprintf(meta, tn, "< %s >", name);
+        return;
+    }
+    double c = 0;
+    int w = the_worst(i, &c), fg = 0;
+    if (w < 0) return;
+    for (int p = 0; p < N_PAIRS; p++) fg |= THE_PAIRS[p].fg == i;
+    if (c < THE_PAIRS[w].min) snprintf(meta, tn, "%s", tr("too faint"));   /* (the strip says which text) */
+    else if (fg) snprintf(meta, tn, "%.1f:1", floor(c * 10) / 10);   /* (a background: its text's, on their rows) */
+}
+
+static int is_theme_page(list_kind_t k) { return k == L_THEME_EDIT || k == L_THEME_COLOURS; }
+
+/* The preview: a header, a selected row, a playing one and a progress bar, in
+ * the theme being made; the editor's own page stays in the theme in use. */
+#define THP_W (UI_W - 12)
+static void the_preview(void)
+{
+    if (!S.thp) return;
+    const theme_t *t = &S.the, *u = T();
+    int round = t->corner == THEME_CORNER_ROUND, bar = t->selection_bar;
+    fill(S.thp, u->bg);
+    fill(S.thp_in, t->bg);
+    lv_obj_set_style_border_color(S.thp_in, C(u->surface), 0);
+    /* (one small font: the theme's own can be too tall for the strip, and the colours are the point) */
+    const lv_font_t *pf = &lv_font_montserrat_14;
+    style_label(S.thp_hd, pf, t->text);
+    style_label(S.thp_bat, pf, t->battery);
+    for (int i = 0; i < 2; i++) fill(S.thp_mode[i], t->mode);
+    /* the selection: a pill (or stepped) or a full-width bar */
+    int sx = bar ? 0 : 4, sw = bar ? THP_W - 2 : THP_W - 10;
+    lv_obj_set_pos(S.thp_sel, sx, 22);
+    lv_obj_set_width(S.thp_sel, sw);
+    lv_obj_set_style_radius(S.thp_sel, round && !bar ? (t->radius < 13 ? t->radius : 13) : 0, 0);
+    fill(S.thp_sel, t->select_bg);
+    for (int k = 0; k < 4; k++) {
+        fill(S.thp_notch[k], t->bg);
+        lv_obj_set_x(S.thp_notch[k], k & 1 ? sw - STEP : 0);
+        show(S.thp_notch[k], t->corner == THEME_CORNER_STEPPED && !bar);
+    }
+    show(S.thp_cur, t->cursor_arrow);
+    style_label(S.thp_cur, &lv_font_montserrat_14, t->select_fg);
+    style_label(S.thp_sel_t, pf, t->select_fg);
+    lv_obj_align(S.thp_sel_t, LV_ALIGN_LEFT_MID, t->cursor_arrow ? 24 : 10, 0);
+    style_label(S.thp_sel_m, pf, t->select_fg);
+    /* the playing row: a dot or an equalizer */
+    lv_obj_set_style_radius(S.thp_dot, round ? LV_RADIUS_CIRCLE : 0, 0);
+    fill(S.thp_dot, t->signal);
+    show(S.thp_dot, !t->playing_equalizer);
+    for (int i = 0; i < 3; i++) { fill(S.thp_eq[i], t->signal); show(S.thp_eq[i], t->playing_equalizer); }
+    style_label(S.thp_row_t, pf, t->text);
+    style_label(S.thp_row_m, pf, t->text_muted);
+    /* progress: a bar or segments */
+    int seg = t->progress_segments;
+    show(S.thp_track, !seg);
+    fill(S.thp_track, t->surface);
+    fill(S.thp_fill, t->signal);
+    lv_obj_set_style_radius(S.thp_track, round ? 3 : 0, 0);
+    lv_obj_set_style_radius(S.thp_fill, round ? 3 : 0, 0);
+    for (int i = 0; i < 10; i++) { fill(S.thp_seg[i], i < 6 ? t->signal : t->surface); show(S.thp_seg[i], seg); }
+    /* a rule that fails: the colour's own on its page, else the first */
+    char p[96];
+    level_t *l = &S.stack[S.depth - 1];
+    the_problem(l->kind == L_THEME_COLOURS ? l->sel : -1, p, sizeof p);
+    style_label(S.thp_warn, S.f->meta, u->warning);
+    lv_obj_set_style_bg_color(S.thp_warn, C(u->bg), 0);
+    set_text(S.thp_warn, p);
+    show(S.thp_warn, p[0] != '\0');
+    lv_obj_invalidate(S.thp);
+}
+
+/* The preview over the top of the theme editor's pages (graphs_place moves the list down) */
+static int the_place(list_kind_t k)
+{
+    int on = is_theme_page(k);
+    if (on && !S.thp) {
+        S.thp = box(S.list, 0, 0, UI_W, BAT_GRAPH_H);
+        S.thp_in = box(S.thp, 6, 2, THP_W, BAT_GRAPH_H - 6);
+        lv_obj_set_style_border_width(S.thp_in, 1, 0);
+        lv_obj_set_style_radius(S.thp_in, 6, 0);
+        lv_obj_set_style_clip_corner(S.thp_in, true, 0);
+        S.thp_hd = label(S.thp_in);
+        lv_obj_set_pos(S.thp_hd, 8, 2);
+        lv_label_set_text(S.thp_hd, LV_SYMBOL_LEFT " Albums");
+        S.thp_bat = label(S.thp_in);
+        lv_obj_align(S.thp_bat, LV_ALIGN_TOP_RIGHT, -8, 2);
+        lv_label_set_text(S.thp_bat, "86%");
+        for (int i = 0; i < 2; i++) S.thp_mode[i] = box(S.thp_in, THP_W - 66 + 5 * i, 6, 3, 10);
+        S.thp_sel = box(S.thp_in, 4, 22, THP_W - 10, 26);
+        for (int q = 0; q < 4; q++) S.thp_notch[q] = box(S.thp_sel, 0, q < 2 ? 0 : 26 - STEP, STEP, STEP);
+        S.thp_cur = label(S.thp_sel);
+        lv_label_set_text(S.thp_cur, LV_SYMBOL_PLAY);
+        lv_obj_align(S.thp_cur, LV_ALIGN_LEFT_MID, 8, 0);
+        S.thp_sel_t = label(S.thp_sel);
+        lv_label_set_text(S.thp_sel_t, "Kind of Blue");
+        S.thp_sel_m = label(S.thp_sel);
+        lv_label_set_text(S.thp_sel_m, "1959");
+        lv_obj_align(S.thp_sel_m, LV_ALIGN_RIGHT_MID, -10, 0);
+        S.thp_dot = box(S.thp_in, 12, 58, 6, 6);
+        static const int eq_h[3] = {8, 12, 6};
+        for (int i = 0; i < 3; i++) S.thp_eq[i] = box(S.thp_in, 10 + 4 * i, 68 - eq_h[i], 3, eq_h[i]);
+        S.thp_row_t = label(S.thp_in);
+        lv_obj_set_pos(S.thp_row_t, 26, 53);
+        lv_label_set_text(S.thp_row_t, "Blue Train");
+        S.thp_row_m = label(S.thp_in);
+        lv_obj_align(S.thp_row_m, LV_ALIGN_TOP_RIGHT, -14, 53);
+        lv_label_set_text(S.thp_row_m, "1957");
+        S.thp_track = box(S.thp_in, 8, 75, THP_W - 18, 5);
+        S.thp_fill = box(S.thp_track, 0, 0, (THP_W - 18) * 6 / 10, 5);
+        int segw = (THP_W - 18 - 9 * 3) / 10;
+        for (int i = 0; i < 10; i++) S.thp_seg[i] = box(S.thp_in, 8 + i * (segw + 3), 75, segw, 5);
+        S.thp_warn = label(S.thp);
+        lv_obj_set_style_bg_opa(S.thp_warn, LV_OPA_COVER, 0);
+        lv_obj_set_style_pad_hor(S.thp_warn, 3, 0);
+        lv_obj_align(S.thp_warn, LV_ALIGN_TOP_RIGHT, -10, 3);
+    }
+    if (S.thp) {
+        show(S.thp, on);
+        if (on) { lv_obj_move_foreground(S.thp); the_preview(); }
+    }
+    return on;
+}
+
+/* A graph over the top of the list, if the page has one: the list moves down below it */
+static void graphs_place(list_kind_t k)
+{
+    int on = battery_place(k);
+    on |= eq_place(k);
+    on |= the_place(k);
     S.list_y0 = on ? BAT_GRAPH_H : 0;
     rows_box_place();
+}
+
+/* How many rows show below a graph, or without one */
+static int rows_shown(list_kind_t k)
+{
+    return (k == L_BATTERY && S.hooks.battery_report) || k == L_EQ_EDIT || k == L_EQ_BAND || is_theme_page(k) ? 3 : ROWS;
 }
 
 static void battery_load(void)
@@ -1861,7 +2609,7 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
         *playing = rd_on_air(&S.rd_st[r]);
         break;
     }
-    case L_QUICK: case L_DISPLAY: case L_SOUND: case L_PLAYBACK: case L_POWER: case L_LIBRARY: case L_USB:
+    case L_QUICK: case L_DISPLAY: case L_SOUND: case L_PLAYBACK: case L_POWER: case L_LIBRARY: case L_USB: case L_POD_SETTINGS:
     case L_INTERFACE:
         setting_row(setting_at(l, i), S.editing && i == l->sel, main, mn, meta, tn);
         break;
@@ -1889,7 +2637,10 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
     case L_UPDATE: update_row(i, main, mn, meta, tn); break;
     case L_UNINSTALL: uninstall_row_text(i, main, mn, meta, tn); break;
     case L_BATTERY: case L_BAT_SPAN: case L_BAT_HISTORY: battery_row(l->kind, i, main, mn, meta, tn); break;
-    case L_CONTEXT: snprintf(main, mn, "%s", CTX_LABEL[S.ctx[i]]); break;
+    case L_CONTEXT:
+        snprintf(main, mn, "%s", CTX_LABEL[S.ctx[i]]);
+        if (S.ctx[i] == CTX_POD_SPEED && S.player) pod_speed_text(player_speed(S.player), meta, tn);
+        break;
     case L_INFO: info_row(l->parent, i, main, mn, meta, tn); break;
     case L_SEARCH:
     case L_RENAME:
@@ -1920,7 +2671,24 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
         break;
     case L_EQ_EDIT: eqe_row(i, main, mn, meta, tn); break;
     case L_EQ_BAND: eqe_band_row((int)l->parent, i, main, mn, meta, tn); break;
+    case L_PODCASTS: pod_shows_row(i, main, mn, meta, tn, playing); break;
+    case L_POD_SHOW: pod_episode_row(i, main, mn, meta, tn, playing); break;
+    case L_POD_CHAPTERS:
+        if (i < S.pod_nch) {
+            if (S.pod_ch[i].title[0]) snprintf(main, mn, "%s", S.pod_ch[i].title);
+            else tr_num(main, mn, "Chapter %s", i + 1);
+            fmt_time(meta, tn, (int)(S.pod_ch[i].start_ms / 1000), 0);
+            *playing = i == pod_chapter_at(S.now.pos_ms);
+        }
+        break;
+    case L_POD_SEARCH:
+        if (i == 0) { char wheel[3][WHEEL_CAP]; entry_row(l->kind, main, mn, wheel); }
+        else pod_found_row(i - 1, main, mn, meta, tn, playing);
+        break;
+    case L_THEME_EDIT: the_row(i, main, mn, meta, tn); break;
+    case L_THEME_COLOURS: the_colour_row(i, main, mn, meta, tn); break;
     case L_THEMES:
+        if (i >= S.n_themes) { snprintf(main, mn, "%s", tr("New theme")); break; }
         snprintf(main, mn, "%s", S.themes[i].name);
         if (S.themes[i].status == THEME_ERROR) snprintf(meta, tn, "%s", tr("can't load"));
         else if (S.themes[i].status == THEME_WARN) snprintf(meta, tn, "%s", tr("warning"));
@@ -2065,6 +2833,16 @@ static void apply_theme(void)
     for (int i = 0; i < SEGMENTS; i++) show(S.np_seg[i], t->progress_segments);
     style_label(S.np_t0, S.f->meta, t->text_muted);
     style_label(S.np_t1, S.f->meta, t->text_muted);
+
+    /* Find cover */
+    fill(S.cf, t->bg);
+    lv_obj_set_style_radius(S.cf_art, radius, 0);
+    fill(S.cf_art, t->surface);
+    style_label(S.cf_title, S.f->title, t->text);
+    style_label(S.cf_artist, S.f->sub, t->artist);
+    style_label(S.cf_meta, S.f->meta, t->album);
+    style_label(S.cf_note, S.f->meta, t->info);
+    style_label(S.cf_hint, S.f->meta, t->text_muted);
 }
 
 /* Colour every row; `sel_slot` is the row the pill is over (text flips as the pill arrives). */
@@ -2082,6 +2860,8 @@ static void color_slots(int sel_slot)
         lv_color_t ic = C(sel ? t->select_fg : acc ? t->signal : t->text_muted);
         if (!lv_color_eq(lv_obj_get_style_image_recolor(S.row_picon[j], 0), ic))
             lv_obj_set_style_image_recolor(S.row_picon[j], ic, 0);
+        if (!lv_color_eq(lv_obj_get_style_image_recolor(S.row_mark[j], 0), ic))
+            lv_obj_set_style_image_recolor(S.row_mark[j], ic, 0);
         for (int w = 0; w < 3; w++) set_text_color(S.row_ch[j][w], C(sel ? t->select_fg : w == 1 ? t->text : t->text_muted));
         for (int k = 0; k < 3; k++) fill(S.row_eq[j][k], sel ? t->select_fg : t->signal);
         /* the playing dot: on the selection too, in its text colour (hidden there, Home's
@@ -2296,6 +3076,33 @@ static const lv_image_dsc_t *pixel_icon_big(int k)
     return &dsc;
 }
 
+/* A podcast episode on the card: an arrow down onto a line, 12 px, tinted
+ * like the meta beside it (drawn: the themes' fonts share no such sign) */
+#define MARK_PX 12
+#define MARK_GAP 5
+static const lv_image_dsc_t *on_card_mark(void)
+{
+    static const char *const MARK_ROWS[MARK_PX] = {
+        ".....XX.....", ".....XX.....", ".....XX.....", ".....XX.....",
+        ".XX..XX..XX.", "..XX.XX.XX..", "...XXXXXX...", "....XXXX....",
+        ".....XX.....", "............", ".XXXXXXXXXX.", ".XXXXXXXXXX.",
+    };
+    static uint8_t px[MARK_PX * MARK_PX];
+    static lv_image_dsc_t dsc;
+    if (!dsc.data) {
+        for (int y = 0; y < MARK_PX; y++)
+            for (int x = 0; x < MARK_PX; x++) px[y * MARK_PX + x] = MARK_ROWS[y][x] == 'X' ? 255 : 0;
+        dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+        dsc.header.cf = LV_COLOR_FORMAT_A8;
+        dsc.header.w = MARK_PX;
+        dsc.header.h = MARK_PX;
+        dsc.header.stride = MARK_PX;
+        dsc.data_size = sizeof px;
+        dsc.data = px;
+    }
+    return &dsc;
+}
+
 static const lv_image_dsc_t *pixel_icon(int k)
 {
     enum { PX = PIXEL_ICON_GRID * PIXEL_ICON_SCALE };
@@ -2331,7 +3138,7 @@ static int ui_text_list(list_kind_t k)
 {
     switch (k) {
     case L_HOME: case L_HOME_EDIT: case L_HISTORY: case L_SETTINGS: case L_WIFI_ASK: case L_UPD_ASK:
-    case L_EQ_EDIT: case L_EQ_BAND: case L_SHARE: case L_SSH: case L_ABOUT: case L_CONTEXT: case L_USB_ASK: case L_UPDATE:
+    case L_EQ_EDIT: case L_EQ_BAND: case L_THEME_EDIT: case L_THEME_COLOURS: case L_PODCASTS: case L_SHARE: case L_SSH: case L_ABOUT: case L_CONTEXT: case L_USB_ASK: case L_UPDATE:
     case L_UNINSTALL:
     case L_RDIR: case L_RDIR_GENRES: case L_BATTERY: case L_BAT_SPAN:
         return 1;
@@ -2499,7 +3306,9 @@ static void fill_slots(const level_t *l, int n)
         S.slot_item[j] = visible ? i : -1;
         S.slot_playing[j] = 0;
         S.slot_accent[j] = visible && l->kind == L_HOME && S.home[i] == H_UPDATE;
+        S.slot_mark[j] = visible && l->kind == L_POD_SHOW && i < S.pod_ne && S.pod_on_card[i];
         show(S.row[j], visible);
+        show(S.row_mark[j], 0);
         if (!visible) continue;
         char main[256], meta[128];
         int playing;
@@ -2567,9 +3376,17 @@ static void fill_slots(const level_t *l, int n)
         if (col) x += ICON_W + ICON_GAP;
         else if (eq) x += 18;
         else if (playing) x += 14;
-        int swatch = l->kind == L_THEMES && i < S.n_themes;   /* the theme's colours, in miniature */
+        int swatch = (l->kind == L_THEMES && i < S.n_themes) || l->kind == L_THEME_COLOURS;
         show(S.row_sw[j], swatch);
-        if (swatch) {
+        if (swatch && l->kind == L_THEME_COLOURS) {   /* a colour of the theme being made */
+            uint32_t c = the_get(i);
+            fill(S.row_sw[j], c);
+            lv_obj_set_style_border_color(S.row_sw[j], C(T()->text_muted), 0);
+            lv_obj_set_style_radius(S.row_sw[j], T()->corner == THEME_CORNER_ROUND ? 4 : 0, 0);
+            for (int q = 0; q < 3; q++) fill(S.row_sw_part[j][q], c);
+            if (lv_obj_get_style_x(S.row_sw[j], 0) != x) lv_obj_set_x(S.row_sw[j], x);
+            x += SWATCH_W + ICON_GAP;
+        } else if (swatch) {   /* the theme's colours, in miniature */
             const theme_t *th = &S.themes[i];
             fill(S.row_sw[j], th->bg);
             lv_obj_set_style_border_color(S.row_sw[j], C(T()->text_muted), 0);
@@ -2603,6 +3420,14 @@ static void fill_slots(const level_t *l, int n)
         if (meta[0] && !typing) {
             lv_text_get_size(&sz, meta, S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
             if (sz.x + 18 > meta_w) meta_w = sz.x + 18;
+        }
+        if (S.slot_mark[j] && !typing) {          /* on the card: the mark, just before the meta */
+            int mx = UI_W - 2 * ROW_MARGIN - 10 - (meta[0] ? sz.x + MARK_GAP : 0) - MARK_PX;
+            if (lv_image_get_src(S.row_mark[j]) != on_card_mark()) lv_image_set_src(S.row_mark[j], on_card_mark());
+            if (lv_obj_get_style_x(S.row_mark[j], 0) != mx) lv_obj_set_x(S.row_mark[j], mx);
+            show(S.row_mark[j], 1);
+            if (meta[0]) { if (sz.x + 18 + MARK_PX + MARK_GAP > meta_w) meta_w = sz.x + 18 + MARK_PX + MARK_GAP; }
+            else meta_w = MARK_PX + 18;
         }
         int line = !typing && library_backed(l->kind) && library_row_shows_artist(view_of(l->kind)) &&
                    album_artists_on();
@@ -2640,7 +3465,13 @@ static void render_list(render_mode_t mode)
     level_t *l = &S.stack[S.depth - 1];
     int n = list_count(l);
     if (l->sel < l->top) l->top = l->sel;
-    if (l->sel >= l->top + ROWS) l->top = l->sel - ROWS + 1;
+    int rows = rows_shown(l->kind);
+    if (l->sel >= l->top + rows) l->top = l->sel - rows + 1;
+    if (S.eq_graph && (l->kind == L_EQ_EDIT || l->kind == L_EQ_BAND)) {   /* the curve and the selected band */
+        eqg_update();
+        lv_obj_invalidate(S.eq_graph);
+    }
+    if (is_theme_page(l->kind)) the_preview();     /* the theme as it is now */
 
     char head[136];   /* "‹ " and a title of up to 127 bytes */
     const char *title = l->title_ui ? tr(l->title) : l->title;
@@ -2696,7 +3527,7 @@ static void render_list(render_mode_t mode)
         stop_list_anims();
         S.pill_y = S.pill_target = target;
         S.rows_off = 0;
-        battery_place(l->kind);
+        graphs_place(l->kind);
         if (!covers_in(l->kind)) covers_free();     /* (a list without covers: their memory back) */
         lv_obj_set_y(S.pill, S.list_y0 + target);
         rows_box_place();
@@ -2746,6 +3577,23 @@ static void load_art(void)
     S.np_seq = S.player ? player_seq(S.player) : 0;
     if (S.now.radio) return;           /* the radio's cover comes by ui_set_radio_art */
     S.radio_art = 0;
+    if (S.now.podcast) {               /* the show's, kept small on the card */
+        const player_episode_t *e = S.player ? player_episode(S.player, NULL, NULL) : NULL;
+        char p[800];
+        FILE *f = NULL;
+        if (e && pod_dir()[0]) {
+            pod_cover_path(pod_dir(), e->id, p, sizeof p);
+            f = fopen(p, "rbe");
+        }
+        S.pod_cover = f && fread(S.art_px, 1, sizeof S.art_px, f) == sizeof S.art_px;
+        if (f) fclose(f);
+        if (S.pod_cover) {
+            lv_image_cache_drop(&S.art_dsc);
+            lv_image_set_src(S.np_img, &S.art_dsc);
+            lv_obj_invalidate(S.np_img);
+        }
+        return;
+    }
     int ok = S.lib && S.now.active &&
              library_art(S.lib, S.now.track.album_id, LIB_ART_LARGE, S.art_px) == 0;
     if (ok) {
@@ -2756,26 +3604,38 @@ static void load_art(void)
     show(S.np_img, ok);
 }
 
+/* A Home item's icon, big, in the cover's place (the radio's, a podcast's) */
+static void np_icon(int h)
+{
+    int pix = T()->icons_pixel;
+    show(S.np_img, 0);
+    show(S.np_radio_px, pix);
+    show(S.np_radio, !pix && S.f->icon);
+    if (pix && lv_image_get_src(S.np_radio_px) != pixel_icon_big(h)) {
+        lv_image_set_src(S.np_radio_px, pixel_icon_big(h));
+        lv_obj_center(S.np_radio_px);
+    }
+    if (!pix && S.f->icon) {
+        char g[5];
+        utf8_of(HOME_ICON[h], g);
+        set_text(S.np_radio, g);
+        if (lv_obj_get_style_align(S.np_radio, 0) != LV_ALIGN_CENTER) lv_obj_center(S.np_radio);   /* (once: it redraws) */
+    }
+}
+
 /* Now Playing for a radio station: what it says is playing, the station, the
  * stream's format; time listened and "Live" under the bar, which stays empty. */
 static void render_np_radio(void)
 {
     const lib_track_t *t = &S.now.track;
     int art = S.radio_art;
-    int pix = !art && T()->icons_pixel;
-    if (art && lv_image_get_src(S.np_img) != &S.art_dsc) lv_image_set_src(S.np_img, &S.art_dsc);
-    show(S.np_img, art);
-    show(S.np_radio_px, pix);
-    show(S.np_radio, !art && !pix && S.f->icon);
-    if (pix && lv_image_get_src(S.np_radio_px) != pixel_icon_big(H_RADIO)) {
-        lv_image_set_src(S.np_radio_px, pixel_icon_big(H_RADIO));
-        lv_obj_center(S.np_radio_px);
-    }
-    if (!art && !pix && S.f->icon) {
-        char g[5];
-        utf8_of(HOME_ICON[H_RADIO], g);
-        set_text(S.np_radio, g);
-        if (lv_obj_get_style_align(S.np_radio, 0) != LV_ALIGN_CENTER) lv_obj_center(S.np_radio);   /* (once: it redraws) */
+    if (art) {
+        if (lv_image_get_src(S.np_img) != &S.art_dsc) lv_image_set_src(S.np_img, &S.art_dsc);
+        show(S.np_img, 1);
+        show(S.np_radio_px, 0);
+        show(S.np_radio, 0);
+    } else {
+        np_icon(H_RADIO);
     }
     set_text(S.h_left, tr("Radio"));
     /* The station in the big title (what's on is the question when listening to
@@ -2820,7 +3680,7 @@ static void render_np(void)
     /* (the header's title is set once per render: setting it to one text and
      * then another redraws it, every second) */
     if (!S.now.active || S.now.radio || !(S.now.count > 1 && S.now.index >= 0 && S.now.index < S.now.count))
-        set_text(S.h_left, tr(S.now.active && S.now.radio ? "Radio" : "Now playing"));
+        set_text(S.h_left, tr(S.now.active && S.now.radio ? "Radio" : S.now.active && S.now.podcast ? "Podcast" : "Now playing"));
     if (!S.now.active) {
         set_text(S.np_title, tr("Nothing playing"));
         set_text(S.np_artist, tr("Choose an album, or Shuffle all songs"));
@@ -2848,12 +3708,28 @@ static void render_np(void)
         if (sz.x > UI_W / 2 + 30) snprintf(h, sizeof h, "%d/%d", S.now.index + 1, S.now.count);
         set_text(S.h_left, h);
     }
-    show(S.np_radio, 0);
-    show(S.np_radio_px, 0);
     const lib_track_t *t = &S.now.track;
-    set_text(S.np_title, t->title);
-    set_text(S.np_artist, t->artist);
-    set_text(S.np_album, t->album);
+    if (S.now.podcast) {               /* an episode: the show's cover (or the podcast icon), the show under the title */
+        if (S.pod_cover) {
+            if (lv_image_get_src(S.np_img) != &S.art_dsc) lv_image_set_src(S.np_img, &S.art_dsc);
+            show(S.np_img, 1);
+            show(S.np_radio, 0);
+            show(S.np_radio_px, 0);
+        } else {
+            np_icon(H_PODCASTS);
+        }
+        set_text(S.np_title, t->title);
+        set_text(S.np_artist, t->artist);
+        int c = S.player && player_episode(S.player, NULL, NULL) &&
+                !strcmp(player_episode(S.player, NULL, NULL)->key, S.pod_ch_key) ? pod_chapter_at(S.now.pos_ms) : -1;
+        set_text(S.np_album, c >= 0 ? S.pod_ch[c].title : S.now.podcast_stream ? tr("Streaming") : "");
+    } else {
+        show(S.np_radio, 0);
+        show(S.np_radio_px, 0);
+        set_text(S.np_title, t->title);
+        set_text(S.np_artist, t->artist);
+        set_text(S.np_album, t->album);
+    }
 
     char b[32], r[16];
     fmt_rate(r, sizeof r, t->sample_rate);
@@ -2862,7 +3738,7 @@ static void render_np(void)
     else snprintf(b, sizeof b, "%s %s", t->codec, r);
     if (S.eq_name[0] && !S.pure) snprintf(b + strlen(b), sizeof b - strlen(b), " \xC2\xB7 EQ");   /* not bit-perfect */
     set_text(S.np_chip, b);
-    show(S.np_chip, 1);
+    show(S.np_chip, !S.now.podcast || t->sample_rate);   /* (an episode not started yet: no format) */
 
     int pos = (int)(S.now.pos_ms / 1000), len = (int)(S.now.len_ms / 1000);
     if (pos > len) pos = len;
@@ -2890,7 +3766,8 @@ static void render_np(void)
     }
     set_text_color(S.np_out, C(S.bitperfect ? T()->signal : T()->info));
     char nx[300] = "";
-    if (S.now.stop_after) snprintf(nx, sizeof nx, "%s", tr("Stops after this track"));
+    if (S.now.podcast) ;               /* (no queue: Next and Previous skip) */
+    else if (S.now.stop_after) snprintf(nx, sizeof nx, "%s", tr("Stops after this track"));
     else if (S.player && player_queue_len(S.player) > 0 && S.lib) {
         char meta[32];
         int64_t id = player_queue_at(S.player, 0);   /* read once per track, not every second */
@@ -3279,7 +4156,7 @@ static void uninstall_overlay(void)
     lv_obj_set_width(hint, UI_W - 32);
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(hint, tr(pending ? "OK restarts, Back cancels" : "OK looks again"));
+    lv_label_set_text(hint, tr(pending ? "Play restarts, Back cancels" : "Play looks again"));
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -12);
     /* the text centred in the room above the hint (two lines of it in a wide font) */
     lv_obj_update_layout(hint);
@@ -3425,15 +4302,15 @@ static const char *setting_help(setting_t st)
     case ST_THEME: return "Pick how Fathom looks. More themes can go in fathom/themes.";
     case ST_COVERS: return "Show album covers when browsing Albums/Songs.";
     case ST_ALBUM_ARTISTS: return "Display artist name when browsing albums.";
-    case ST_BRIGHTNESS: return "How bright the screen is. <OK>, then turn the wheel.";
+    case ST_BRIGHTNESS: return "How bright the screen is. Press Play, then turn the wheel.";
     case ST_TIMEOUT: return "How long the screen stays on. Saves battery.";
     case ST_DIM: return "Dims the screen 5 seconds before it turns off.";
     case ST_ON_CHARGING: return "Keeps the screen on while the H2 is plugged in.";
     case ST_LANGUAGE: return "Interface language. More in fathom/lang.";
-    case ST_OUTPUT: return "Where the sound goes. <OK> shows each step in the path.";
+    case ST_OUTPUT: return "Where the sound goes. Play shows each step in the path.";
     case ST_PURE: return "Skips EQ, balance and levelling, for bit-perfect sound.";
     case ST_EQ: return "Shape the sound with an equaliser. Each output keeps its own.";
-    case ST_BALANCE: return "Left/right balance. <OK>, then turn the wheel.";
+    case ST_BALANCE: return "Left/right balance. Press Play, then turn the wheel.";
     case ST_VOL_LIMIT: return "Caps the volume, to protect your ears. Per output.";
     case ST_LEVELLING: return "Plays songs at the same loudness, or albums as mastered.";
     case ST_TRANSPORT: return "With a USB DAC: Bluetooth and screen off for the cleanest sound.";
@@ -3447,10 +4324,15 @@ static const char *setting_help(setting_t st)
     case ST_SHUF_SPOKEN: return "Leaves out tracks whose genre is audiobook, podcast or spoken.";
     case ST_REPEAT: return "Repeat all, or one song.";
     case ST_PAUSE_UNPLUG: return "Pauses when wired headphones are unplugged.";
-    case ST_BATTERY: return "Charge and time left. <OK> shows the battery history.";
+    case ST_BATTERY: return "Charge and time left. Play shows the battery history.";
     case ST_AUTO_OFF: return "Turns the H2 off when it's not in use.";
+    case ST_POD_AUTO: return "Your shows' new episodes download by themselves, while charging on Wi-Fi.";
+    case ST_POD_KEEP: return "How many of each show's newest unplayed episodes are downloaded.";
+    case ST_POD_CLEAN: return "A played episode's download is deleted after this long.";
+    case ST_POD_SPEED: return "Episodes faster, without the voices going up. Music always plays as it is.";
     case ST_SLEEP: return "Stops the music after a set time or at the end of the album.";
     case ST_RESCAN: return "Force a library rescan.";
+    case ST_FIND_COVERS: return "Finds covers online for albums without one. Keeps only sure matches.";
     case ST_N_SONGS: case ST_N_ALBUMS: case ST_N_ARTISTS: case ST_N_PLAYLISTS: return "Library counts.";
     case ST_USB_COMPUTER: return "What to do when plugged into a computer.";
     case ST_USB_DRIVE: return "Use the H2 as a USB drive, to copy music.";
@@ -3471,6 +4353,7 @@ static const char *page_help(int set)
         [SET_SSH] = "Connect to the H2 through SSH.",
         [SET_USB] = "What the H2 does when you plug it into a computer.",
         [SET_PLAYBACK] = "Shuffle options, repeat and pause on unplug.",
+        [SET_PODCASTS] = "Downloading new episodes, keeping and deleting them, speed.",
         [SET_POWER] = "Battery, sleep timer and auto power off.",
         [SET_LIBRARY] = "Rescan library and library stats.",
         [SET_ABOUT] = "Device info and firmware updates.",
@@ -3491,7 +4374,7 @@ static const char *row_help(const level_t *l)
     case L_WIFI:
         switch (wifi_row(i, &w)) {
         case WR_TOGGLE: return "Turns Wi-Fi on or off. Off saves battery.";
-        case WR_LINK: return "The network you're on. <OK> shows its address and signal.";
+        case WR_LINK: return "The network you're on. Play shows its address and signal.";
         case WR_SEARCH: return "Refresh the list of networks.";
         default: return NULL;
         }
@@ -3514,7 +4397,7 @@ static const char *row_help(const level_t *l)
     case L_ABOUT:
         if (i >= n) return NULL;
         switch (about_row(i)) {
-        case AB_RESET: return "Reset all settings to defaults. Press <OK> twice.";
+        case AB_RESET: return "Reset all settings to defaults. Press Play twice.";
         case AB_UNINSTALL: return "Put the H2 back on HiBy's own firmware.";
         case AB_AUTO: return "Check for updates once a day over Wi-Fi.";
         case AB_CHECK: return "Check for a newer version of Fathom.";
@@ -3531,7 +4414,7 @@ static const char *row_help(const level_t *l)
         switch (uninstall_row(i)) {
         case UR_LOOK: return "Put HiBy's update file for the H2 at the top of the card or in Music.";
         case UR_VERSION: return "Use your H2's version of HiBy's firmware, or a newer one.";
-        case UR_GO: return "Press <OK> twice. Your music stays on the card.";
+        case UR_GO: return "Press Play twice. Your music stays on the card.";
         default: return NULL;
         }
     default:
@@ -3623,6 +4506,45 @@ void ui_set_battery(int percent, int charging)
     if (S.h_right) render_header_status();
 }
 
+/* Find cover: the match shown, its picture (or why there's none), and what OK does */
+static void render_cf(void)
+{
+    int n = 0, st = cf_find_state(&n);
+    cf_match_t m;
+    memset(&m, 0, sizeof m);
+    if (S.cf_k >= n) S.cf_k = n ? n - 1 : 0;
+    int pic = st == 1 && n ? cf_find_show(S.cf_k, &m, S.cf_px) : -1;
+    S.cf_drawn = (st + 2) | (n << 3) | ((pic + 2) << 8) | (S.cf_k << 11);
+    char meta[32] = "", hint[96], head[136];
+    snprintf(head, sizeof head, "\xe2\x80\xb9 %s", S.stack[S.depth - 1].title);   /* "‹ Album" */
+    set_text(S.h_left, head);
+    if (pic == 1) {
+        lv_image_cache_drop(&S.cf_dsc);            /* same descriptor, new pixels */
+        lv_image_set_src(S.cf_img, &S.cf_dsc);
+        lv_obj_invalidate(S.cf_img);
+    }
+    show(S.cf_img, pic == 1);
+    if (st == 1 && n) {
+        set_text(S.cf_title, m.title);
+        set_text(S.cf_artist, m.artist);
+        if (m.year) snprintf(meta, sizeof meta, "%d", m.year);
+        set_text(S.cf_meta, meta);
+        char src[64];
+        subst(src, sizeof src, tr("Source: %s"), m.source == CF_APPLE ? "Apple" : "MusicBrainz", NULL);
+        set_text(S.cf_note, pic == -2 ? tr("Couldn't fetch it") : src);
+        snprintf(hint, sizeof hint, "%d / %d  %s", S.cf_k + 1, n,
+                 tr(pic == 1 ? "Play: use this cover" : pic == 0 ? "Fetching its picture\xE2\x80\xA6"
+                    : pic == -2 ? "Play: try again" : "No picture"));
+        set_text(S.cf_hint, hint);
+    } else {
+        set_text(S.cf_title, st == 0 ? tr("Looking\xE2\x80\xA6") : st == -2 ? tr("Couldn't look it up") : tr("Nothing found"));
+        set_text(S.cf_artist, "");
+        set_text(S.cf_meta, "");
+        set_text(S.cf_note, st == -2 ? tr("No network, or no answer") : "");
+        set_text(S.cf_hint, st == 0 ? "" : tr("Back: done"));
+    }
+}
+
 static void render(render_mode_t mode)
 {
     int np_changed = S.now_playing_view != S.last_np;
@@ -3632,10 +4554,14 @@ static void render(render_mode_t mode)
         pending_free();
         return;
     }
-    show(S.list, !S.now_playing_view);
+    int cfv = !S.now_playing_view && S.stack[S.depth - 1].kind == L_COVER_FIND;
+    show(S.list, !S.now_playing_view && !cfv);
     show(S.np, S.now_playing_view);
+    show(S.cf, cfv);
     render_header_status();
-    if (S.now_playing_view) {
+    if (cfv) {
+        render_cf();
+    } else if (S.now_playing_view) {
         render_np();
         if (np_changed && mode == R_ANIMATE) start_transition(TR_NP_IN);
     } else if (np_changed && mode == R_ANIMATE) {
@@ -3752,7 +4678,7 @@ static int rd_ready(char *why, size_t cap)
     return 0;
 }
 
-#define RD_UNREACHABLE "Couldn't reach the station directory. OK tries again"
+#define RD_UNREACHABLE "Couldn't reach the station directory. Play tries again"
 
 /* Ask for the list on top: stations for q, or (NULL) the countries. */
 static void rd_ask(const rdir_query_t *q)
@@ -3911,6 +4837,8 @@ static void pop_level(int stay)
     if (l->kind == L_EQ_BAND) qsort(S.eqe.band, (size_t)S.eqe.n, sizeof S.eqe.band[0], band_by_freq);
     if (l->kind == L_EQ_EDIT && S.hooks.eq_preview) S.hooks.eq_preview(NULL);         /* the output's own choice */
     if (l->kind == L_UNINSTALL) uninstall_overlay_close();
+    if (l->kind == L_POD_SHOW) { S.pod_ci = -1; S.pod_cur[0] = '\0'; S.pod_ne = 0; }
+    if (l->kind == L_PODCASTS) pod_free();
     library_list_free(&l->items);
     S.depth--;
     S.editing = 0;
@@ -4015,7 +4943,447 @@ static int subject_tracks(lib_list_t *out)
 
 #define CTX_ADD(a) (S.ctx[S.ctx_n++] = (a))
 
+/* An album's covers found online: Find cover where it has none; where it has
+ * one (its own, or found), Find another cover; and a found one can go */
+static void ctx_add_cover(int64_t album)
+{
+    int cov = library_album_cover(S.lib, album);
+    if (cov == LIB_COVER_NONE) CTX_ADD(CTX_FIND_COVER);
+    else if (cov != LIB_COVER_UNKNOWN) CTX_ADD(CTX_FIND_ANOTHER);
+    if (cov == LIB_COVER_FOUND || cov == LIB_COVER_PICKED) CTX_ADD(CTX_REMOVE_COVER);
+}
+
 /* Context menu for the playing track (Now Playing), a queue row, or the selected row. */
+/* ---------- the theme editor: opening, saving, the choices ---------- */
+
+static int wheel_step(int n);
+
+/* Another theme already has this name (themes are kept, and picked, by name) */
+static int the_taken(const char *name)
+{
+    for (int i = 0; i < S.n_themes; i++)
+        if (!strcasecmp(S.themes[i].name, name) && (!S.the_file[0] || strcmp(S.themes[i].file, S.the_file))) return 1;
+    return 0;
+}
+
+static void the_unique(const char *base, char *out, size_t cap)
+{
+    snprintf(out, cap, "%s", base);
+    for (int k = 2; k < 100 && the_taken(out); k++) snprintf(out, cap, "%.40s %d", base, k);
+}
+
+/* The accent nearest a colour (Grey for one with little colour) */
+static int the_nearest_accent(uint32_t c)
+{
+    int h, s, l, best = 0, bd = 999;
+    theme_to_hsl(c, &h, &s, &l);
+    if (s < 15) return N_ACCENTS - 1;
+    for (int i = 0; i < N_ACCENTS - 1; i++) {
+        int d = abs(ACCENTS[i].hue - h);
+        if (d > 180) d = 360 - d;
+        if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+}
+
+/* Open the editor: on theme i (a built-in one as a copy), or (i < 0) on a new
+ * one with the current theme's shapes and font and colours from an accent */
+static void the_open(int i)
+{
+    if (!S.hooks.theme_save) return;
+    const theme_t *src = i >= 0 && i < S.n_themes ? &S.themes[i] : T();
+    if (src->status == THEME_ERROR) { ui_toast(src->note, 4000); return; }
+    S.the = *src;
+    S.the_acc = -1;
+    S.the_dirty = 0;
+    S.the_back_armed = S.the_del_armed = 0;
+    snprintf(S.the_file, sizeof S.the_file, "%s", i >= 0 ? src->file : "");
+    if (!S.the_file[0]) {                     /* new, or a copy: a theme of the owner's own */
+        char name[48];
+        if (i < 0) {
+            S.the_acc = the_nearest_accent(src->select_bg);
+            theme_make(&S.the, src->dark, ACCENTS[S.the_acc].hue, ACCENTS[S.the_acc].sat);
+            the_unique(tr("My theme"), name, sizeof name);
+        } else {
+            char base[48];
+            subst(base, sizeof base, tr("%s copy"), src->name, NULL);
+            the_unique(base, name, sizeof name);
+            ui_toast("A copy: the built-in themes stay as they are", 2500);
+        }
+        snprintf(S.the.name, sizeof S.the.name, "%s", name);
+        S.the.author[0] = S.the.licence[0] = S.the.file[0] = '\0';
+        S.the_dirty = 1;
+    }
+    push(L_THEME_EDIT, S.the.name, 0);
+}
+
+/* The catalogue read again (a theme saved or deleted): use_file is used, or
+ * ("") the theme in use stays, by name (the default if it's gone) */
+static void the_reload(const char *use_file)
+{
+    char cur[48];
+    snprintf(cur, sizeof cur, "%s", T()->name);
+    int n = S.hooks.themes_reload ? S.hooks.themes_reload() : S.n_themes;
+    if (n > 0) S.n_themes = n;
+    int idx = -1;
+    for (int i = 0; i < S.n_themes && use_file[0]; i++)
+        if (!strcmp(S.themes[i].file, use_file)) idx = i;
+    for (int i = 0; i < S.n_themes && idx < 0; i++)
+        if (!strcmp(S.themes[i].name, cur)) idx = i;
+    if (idx < 0) idx = 0;
+    S.cur_theme = idx;
+    for (int d = 0; d < S.depth; d++)
+        if (S.stack[d].kind == L_THEMES) S.stack[d].sel = idx;
+    ui_set_theme(idx);
+}
+
+static void the_save(void)
+{
+    char p[96], err[512], saved[128];
+    if (!S.the.name[0]) { ui_toast("Give it a name first", 2000); return; }
+    if (the_taken(S.the.name)) { ui_toast("Another theme has this name", 2500); return; }
+    the_problem(-1, p, sizeof p);
+    if (!p[0] && theme_validate(&S.the, err, sizeof err)) {   /* (a rule the editor doesn't name) */
+        char *nl = strchr(err, '\n');
+        if (nl) *nl = '\0';
+        snprintf(p, sizeof p, "%s", err);
+    }
+    if (p[0]) { ui_toast(p, 3500); return; }
+    if (S.hooks.theme_save(&S.the, S.the_file, saved, sizeof saved)) { ui_toast("Couldn't save the theme", 2500); return; }
+    snprintf(S.the_file, sizeof S.the_file, "%s", saved);
+    S.the_dirty = 0;
+    the_reload(saved);
+    ui_toast("Saved, and in use", 1500);
+}
+
+static void the_delete(void)
+{
+    uint32_t now = lv_tick_get();
+    if (!S.hooks.theme_remove || !S.the_file[0]) return;
+    if (!(S.the_del_armed && now - S.the_del_armed < 3000)) {
+        S.the_del_armed = now;
+        ui_toast("Press again to delete this theme", 3000);
+        return;
+    }
+    S.the_del_armed = 0;
+    if (S.hooks.theme_remove(S.the_file)) {
+        ui_toast(strchr(S.the_file, '/') ? "It has its own folder: delete it on a computer" : "Couldn't delete it", 3000);
+        return;
+    }
+    S.the_dirty = 0;
+    pop();
+    the_reload("");
+    ui_toast("Theme deleted", 1500);
+}
+
+/* The wheel on a value: the accent, the radius, a colour */
+static void the_adjust(const level_t *l, int d)
+{
+    if (l->kind == L_THEME_EDIT && l->sel == TE_ACCENT) {
+        S.the_acc = ((S.the_acc < 0 ? 0 : S.the_acc) + d + N_ACCENTS) % N_ACCENTS;
+        theme_accent(&S.the, ACCENTS[S.the_acc].hue, ACCENTS[S.the_acc].sat);
+    } else if (l->kind == L_THEME_EDIT && l->sel == TE_RADIUS) {
+        int r = S.the.radius + d;
+        S.the.radius = r < 0 ? 0 : r > 20 ? 20 : r;
+    } else if (l->kind == L_THEME_COLOURS && l->sel >= 0 && l->sel < TC_N) {
+        int r = l->sel, step = wheel_step(1000);   /* faster as it turns faster */
+        if (S.the_pal < 0) S.the_pal = the_pal_nearest(the_get(r));   /* its own colour: the nearest first */
+        else S.the_pal = ((S.the_pal + d * step) % N_PAL + N_PAL) % N_PAL;
+        *the_col(&S.the, r) = the_pal_at(S.the_pal, NULL, 0);
+        if (r == TC_SELBG || r == TC_SELFG || r == TC_SIGNAL || r == TC_MODE) S.the_acc = -1;
+    } else {
+        return;
+    }
+    S.the_dirty = 1;
+}
+
+/* Play on a row of the editor's pages */
+static void the_ok(level_t *l)
+{
+    theme_t *t = &S.the;
+    if (l->kind == L_THEME_COLOURS) {             /* pick another with the wheel */
+        if (l->sel < 0 || l->sel >= TC_N) return;
+        S.the_pal = the_pal_find(the_get(l->sel));
+        S.editing = 1;
+        return;
+    }
+    switch (l->sel) {
+    case TE_NAME:
+        S.rename_theme = 1;
+        snprintf(S.entry, sizeof S.entry, "%s", t->name);
+        S.entry_ch = 0;
+        push_ui(L_RENAME, "Theme name", 0);
+        return;
+    case TE_BASE: {                               /* every colour made again for it */
+        int h, s, lg;
+        if (S.the_acc >= 0) { h = ACCENTS[S.the_acc].hue; s = ACCENTS[S.the_acc].sat; }
+        else theme_to_hsl(t->select_bg, &h, &s, &lg);
+        theme_make(t, !t->dark, h, s);
+        break;
+    }
+    case TE_ACCENT:
+        if (S.the_acc < 0) {                      /* from its own colours: the nearest accent */
+            S.the_acc = the_nearest_accent(t->select_bg);
+            theme_accent(t, ACCENTS[S.the_acc].hue, ACCENTS[S.the_acc].sat);
+            S.the_dirty = 1;
+        }
+        S.editing = 1;
+        return;
+    case TE_COLOURS: push_ui(L_THEME_COLOURS, "Colours", 0); return;
+    case TE_FONT: {
+        if (t->font_file[0]) { ui_toast("Its own font: change it on a computer", 2500); return; }
+        int n = (int)(sizeof FONT_FAMILIES / sizeof FONT_FAMILIES[0]), f = 0;
+        while (f < n && strcmp(t->font, FONT_FAMILIES[f].family)) f++;
+        snprintf(t->font, sizeof t->font, "%s", FONT_FAMILIES[(f + 1) % n].family);
+        memset(t->font_px, 0, sizeof t->font_px);
+        t->icons_pixel = !strcmp(t->font, "arkpixel");
+        break;
+    }
+    case TE_SIZE: {
+        const int *large = the_large(t);
+        if (!large) {
+            ui_toast(t->font_file[0] ? "Its own font: change it on a computer" : "Ark Pixel comes in one size", 2500);
+            return;
+        }
+        if (the_size(t) == 0) memcpy(t->font_px, large, sizeof t->font_px);
+        else memset(t->font_px, 0, sizeof t->font_px);
+        ui_toast("The new size shows once it's saved", 2000);
+        break;
+    }
+    case TE_SELECTION: t->selection_bar = !t->selection_bar; break;
+    case TE_CORNERS: t->corner = (theme_corner_t)((t->corner + 1) % 3); break;
+    case TE_RADIUS: S.editing = 1; return;
+    case TE_PROGRESS: t->progress_segments = !t->progress_segments; break;
+    case TE_PLAYING: t->playing_equalizer = !t->playing_equalizer; break;
+    case TE_CURSOR: t->cursor_arrow = !t->cursor_arrow; break;
+    case TE_SHADOW: t->shadow_hard = !t->shadow_hard; break;
+    case TE_MOTION: t->motion_stepped = !t->motion_stepped; break;
+    case TE_SAVE: the_save(); return;
+    case TE_DELETE: the_delete(); return;
+    default: return;
+    }
+    S.the_dirty = 1;
+}
+
+/* ---------- Podcasts: what Play and Menu do ---------- */
+
+/* The network can be used now; else say why (or offer to turn on Wi-Fi): 0 */
+static int pod_net(void)
+{
+    char why[96] = "";
+    if (!S.hooks.radio_ready || S.hooks.radio_ready(why, sizeof why) == 0) return 1;
+    if (!wifi_ask_if_off(WT_OK)) ui_toast(why[0] ? why : "Podcasts need Wi-Fi for this", 2500);
+    return 0;
+}
+
+/* The episode playing: where it is, kept on the card now and then (every 15 s
+ * of playing, on a pause, when another one starts or it's left), and played
+ * when it ends (or is left within its last 30 s). */
+static void pod_save_play(int played)
+{
+    if (!S.pod_play.key[0] || !pod_dir()[0]) return;
+    pod_state_t st = {0};
+    snprintf(st.key, sizeof st.key, "%s", S.pod_play.key);
+    st.len_ms = S.pod_play.len;
+    if (played || (S.pod_play.len > 60000 && S.pod_play.pos + 30000 > S.pod_play.len)) {
+        st.played = 1;
+        st.played_at = (int64_t)time(NULL);
+        st.pos_ms = 0;
+    } else {
+        st.pos_ms = S.pod_play.pos;
+    }
+    pod_state_put(pod_dir(), S.pod_play.id, &st);
+    S.pod_play.saved = st.pos_ms;
+    if (S.pod_ci >= 0 && !strcmp(S.pod_shows[S.pod_ci].id, S.pod_play.id)) pod_read_episodes();
+}
+
+static void pod_track(void)
+{
+    if (!S.player) return;
+    uint32_t pos = 0, len = 0;
+    const player_episode_t *e = player_episode(S.player, &pos, &len);
+    if (player_episode_ended(S.player)) {       /* played to its end */
+        S.pod_play.pos = 0;
+        pod_save_play(1);
+        return;
+    }
+    if (S.pod_play.key[0] && (!e || strcmp(e->key, S.pod_play.key) || strcmp(e->id, S.pod_play.id))) {
+        pod_save_play(0);                         /* left (or another one started) */
+        S.pod_play.key[0] = '\0';
+    }
+    if (!e) return;
+    if (!S.pod_play.key[0]) {
+        snprintf(S.pod_play.id, sizeof S.pod_play.id, "%s", e->id);
+        snprintf(S.pod_play.key, sizeof S.pod_play.key, "%s", e->key);
+        S.pod_play.saved = pos;
+    }
+    S.pod_play.pos = pos;
+    if (len) S.pod_play.len = len;
+    uint32_t d = pos > S.pod_play.saved ? pos - S.pod_play.saved : S.pod_play.saved - pos;
+    if (d >= 15000 || (!S.now.playing && d >= 1000)) pod_save_play(0);
+}
+
+static void pod_play_episode(int i)
+{
+    if (!S.player || S.pod_ci < 0 || i < 0 || i >= S.pod_ne) return;
+    const pod_show_t *s = &S.pod_shows[S.pod_ci];
+    const pod_episode_t *e = &S.pod_eps[i];
+    if (S.now.podcast && !strcmp(S.pod_play.id, s->id) && !strcmp(S.pod_play.key, e->key)) {
+        if (!S.now.playing) player_pause(S.player, 0);   /* this one: go on with it */
+        S.now_playing_view = 1;
+        return;
+    }
+    pod_state_t st;
+    pod_state_find(S.pod_st, S.pod_nst, e->key, &st);
+    player_episode_t pe;
+    memset(&pe, 0, sizeof pe);
+    snprintf(pe.show, sizeof pe.show, "%s", s->title);
+    snprintf(pe.title, sizeof pe.title, "%s", e->title);
+    snprintf(pe.id, sizeof pe.id, "%s", s->id);
+    snprintf(pe.key, sizeof pe.key, "%s", e->key);
+    pe.len_ms = st.len_ms ? st.len_ms : (uint32_t)e->dur_s * 1000;
+    if (S.pod_on_card[i]) {
+        pod_episode_path(pod_dir(), s->id, e, pe.path, sizeof pe.path);
+        pe.start_ms = st.played ? 0 : st.pos_ms;
+    } else {
+        if (!pod_net()) return;
+        snprintf(pe.path, sizeof pe.path, "%s", e->url);
+        if (st.pos_ms >= 60000) {
+            char at[16], msg[96];
+            fmt_time(at, sizeof at, (int)(st.pos_ms / 1000), 0);
+            subst(msg, sizeof msg, tr("From the start: download it to go on from %s"), at, NULL);
+            ui_toast(msg, 3000);
+        }
+    }
+    pod_track();                                  /* (the one playing: kept) */
+    S.pod_nch = S.pod_on_card[i] ? pod_chapters(pod_dir(), s->id, e, S.pod_ch, 64) : 0;
+    snprintf(S.pod_ch_key, sizeof S.pod_ch_key, "%s", e->key);
+    player_episode_play(S.player, &pe);
+    snprintf(S.pod_play.id, sizeof S.pod_play.id, "%s", pe.id);
+    snprintf(S.pod_play.key, sizeof S.pod_play.key, "%s", pe.key);
+    S.pod_play.pos = S.pod_play.saved = pe.start_ms;
+    S.pod_play.len = pe.len_ms;
+    S.now_playing_view = 1;
+}
+
+static void pod_open(void)
+{
+    pod_read_shows();
+    push_ui(L_PODCASTS, "Podcasts", 0);
+    S.stack[S.depth - 1].sel = S.pod_n ? 1 : 0;
+    for (int i = 0; i < S.pod_n; i++)            /* the show playing selected */
+        if (S.now.podcast && !strcmp(S.pod_shows[i].id, S.pod_play.id)) S.stack[S.depth - 1].sel = i + 1;
+    /* feeds over an hour old: read again, with the network already up */
+    int64_t now = (int64_t)time(NULL), oldest = now;
+    for (int i = 0; i < S.pod_n; i++)
+        if (S.pod_shows[i].refreshed < oldest) oldest = S.pod_shows[i].refreshed;
+    char why[96];
+    if (S.pod_n && now - oldest > 3600 && S.hooks.radio_ready && S.hooks.radio_ready(why, sizeof why) == 0)
+        podsync_refresh("");
+}
+
+static void pod_open_show(int i)
+{
+    if (i < 0 || i >= S.pod_n) return;
+    pod_show_t *s = &S.pod_shows[i];
+    snprintf(S.pod_cur, sizeof S.pod_cur, "%s", s->id);
+    S.pod_ci = i;
+    pod_read_episodes();
+    S.pod_seen = s->seen;                         /* new while it's open; seen from now on */
+    if (s->latest > s->seen) {
+        s->seen = s->latest;
+        pod_show_seen(pod_dir(), s->id, s->seen);
+    }
+    push(L_POD_SHOW, s->title, i);
+    level_t *l = &S.stack[S.depth - 1];
+    for (int e = 0; e < S.pod_ne; e++)            /* the episode playing selected */
+        if (S.now.podcast && !strcmp(S.pod_play.id, s->id) && !strcmp(S.pod_play.key, S.pod_eps[e].key)) l->sel = e;
+}
+
+static void pod_search_run(void)
+{
+    if (!S.entry[0]) { ui_toast("Type a name first", 1500); return; }
+    if (!pod_net()) return;
+    if (podsync_search(S.entry)) { S.pod_search = -2; return; }
+    S.pod_search = 0;
+    S.pod_nf = 0;
+}
+
+/* Something on the card changed (a feed read, a download): the lists again */
+static void pod_reload(void)
+{
+    level_t *l = &S.stack[S.depth - 1];
+    pod_read_shows();
+    if (S.pod_ci >= 0) pod_read_episodes();
+    else if (l->kind == L_POD_SHOW) { S.pod_ne = 0; }   /* (unsubscribed meanwhile) */
+    for (int d = 0; d < S.depth; d++) {
+        level_t *k = &S.stack[d];
+        if (k->kind != L_PODCASTS && k->kind != L_POD_SHOW) continue;
+        int n = list_count(k);
+        if (k->sel >= n) k->sel = n - 1;
+        if (k->sel < 0) k->sel = 0;
+    }
+}
+
+/* ui_tick: the search's answer. 1 while waiting for one */
+static int pod_poll(void)
+{
+    if (S.pod_search != 0) return 0;
+    if (!S.pod_found) S.pod_found = calloc(POD_SEARCH_MAX, sizeof *S.pod_found);
+    if (!S.pod_found) return 0;
+    int n = 0, r = podsync_search_result(S.pod_found, POD_SEARCH_MAX, &n);
+    if (r == 0) return 1;
+    S.pod_search = r;
+    S.pod_nf = r == 1 ? n : 0;
+    level_t *l = &S.stack[S.depth - 1];
+    if (l->kind == L_POD_SEARCH && l->sel == 0 && S.pod_nf > 0) l->sel = 1;
+    if (l->kind == L_POD_SEARCH) render(R_ANIMATE);
+    return 0;
+}
+
+/* Once a second: the episode playing kept; the card's changes shown; now and
+ * then, the automatic part (feeds read, new episodes downloaded while charging) */
+static void pod_second(void)
+{
+    if (!pod_dir()[0]) return;
+    pod_track();
+    podsync_status_t st;
+    podsync_status(&st);
+    if (st.failed_seq != S.pod_failed) {         /* a feed or a download that failed: said once */
+        if (S.pod_failed || st.failed_seq > 1) {
+            char msg[128];
+            subst(msg, sizeof msg, tr("Couldn't get %s"), st.failed_what, NULL);
+            ui_toast(msg, 3000);
+        }
+        S.pod_failed = st.failed_seq;
+    }
+    if (st.import_seq != S.pod_imported) {       /* an import finished: how it went */
+        if (st.import_seq > 0 && S.pod_imported != st.import_seq) {
+            char msg[96];
+            if (st.imported < 0) snprintf(msg, sizeof msg, "%s", tr("Couldn't read the OPML file"));
+            else if (st.imported == 0) snprintf(msg, sizeof msg, "%s", tr("No new shows in it"));
+            else tr_num(msg, sizeof msg, st.imported == 1 ? "%s show added" : "%s shows added", st.imported);
+            ui_toast(msg, 2500);
+        }
+        S.pod_imported = st.import_seq;
+    }
+    if (st.changed != S.pod_changed) {
+        S.pod_changed = st.changed;
+        list_kind_t k = S.stack[S.depth - 1].kind;
+        if (S.pod_shows && (k == L_PODCASTS || k == L_POD_SHOW || k == L_POD_SEARCH || S.pod_ci >= 0)) pod_reload();
+    }
+    uint32_t now = lv_tick_get();
+    if (!S.pod_auto_at) S.pod_auto_at = now - 7 * 60 * 1000 + 1;   /* first 3 minutes in (the network up by then) */
+    if (now - S.pod_auto_at >= 10 * 60 * 1000) {                    /* then every 10 minutes */
+        S.pod_auto_at = now;
+        char why[96];
+        int net = S.hooks.radio_ready && S.hooks.radio_ready(why, sizeof why) == 0;
+        if (settings_get_int("podcasts.auto", 1))
+            podsync_auto((int64_t)time(NULL), net, S.charging, 6 * 3600, settings_get_int("podcasts.keep", 2),
+                         settings_get_int("podcasts.clean_days", 7));
+    }
+}
+
 static int open_context(void)
 {
     level_t *l = &S.stack[S.depth - 1];
@@ -4046,6 +5414,43 @@ static int open_context(void)
         snprintf(S.ctx_wifi, sizeof S.ctx_wifi, "%s", S.wifi[w].ssid);
         CTX_ADD(CTX_WIFI_FORGET);
         push_from_here(L_CONTEXT, S.wifi[w].ssid, 0, 0);
+        return 0;
+    }
+    if (on_np && S.now.podcast) {             /* an episode playing: its chapters, its speed */
+        const player_episode_t *pe = S.player ? player_episode(S.player, NULL, NULL) : NULL;
+        if (!pe) return -1;
+        if (S.pod_nch && !strcmp(pe->key, S.pod_ch_key)) CTX_ADD(CTX_POD_CHAPTERS);
+        CTX_ADD(CTX_POD_SPEED);
+        push_from_here(L_CONTEXT, pe->title, 0, 0);
+        return 0;
+    }
+    if (l->kind == L_PODCASTS && !on_np) {    /* Podcasts: check for new episodes (all, or a show's); unsubscribe */
+        if (l->sel > S.pod_n) return -1;
+        S.pod_ctx = l->sel - 1;
+        S.pod_del_armed = 0;
+        CTX_ADD(CTX_POD_REFRESH);
+        if (S.pod_ctx >= 0) CTX_ADD(CTX_POD_UNSUB);
+        push_from_here(L_CONTEXT, S.pod_ctx >= 0 ? S.pod_shows[S.pod_ctx].title : tr("Podcasts"), 0, 0);
+        return 0;
+    }
+    if (l->kind == L_POD_SHOW && !on_np && S.pod_ci >= 0) {   /* an episode: download it or not, played or not */
+        S.pod_ctx = S.pod_ne ? l->sel : -1;
+        if (S.pod_ctx >= 0) {
+            const pod_episode_t *e = &S.pod_eps[S.pod_ctx];
+            pod_state_t st;
+            pod_state_find(S.pod_st, S.pod_nst, e->key, &st);
+            if (S.pod_on_card[S.pod_ctx]) CTX_ADD(CTX_POD_DELETE);
+            else if (podsync_download_state(S.pod_shows[S.pod_ci].id, e->key) >= 0) CTX_ADD(CTX_POD_CANCEL);
+            else CTX_ADD(CTX_POD_DOWNLOAD);
+            CTX_ADD(st.played ? CTX_POD_UNPLAYED : CTX_POD_PLAYED);
+        }
+        CTX_ADD(CTX_POD_REFRESH);
+        push_from_here(L_CONTEXT, S.pod_ctx >= 0 ? S.pod_eps[S.pod_ctx].title : S.pod_shows[S.pod_ci].title, 0, 0);
+        return 0;
+    }
+    if (l->kind == L_THEMES && !on_np) {      /* Settings > Interface > Theme: edit one (a copy, of a built-in one) */
+        if (!S.hooks.theme_save || l->sel >= S.n_themes) return -1;
+        the_open(l->sel);
         return 0;
     }
     if (l->kind == L_EQ && !on_np) {          /* Settings > Sound > EQ: edit one */
@@ -4125,14 +5530,140 @@ static int open_context(void)
         if (S.ctx_artist) CTX_ADD(CTX_GO_ARTIST);
         CTX_ADD(library_favourite(S.lib, S.ctx_track) ? CTX_FAV_REMOVE : CTX_FAV_ADD);
         CTX_ADD(CTX_INFO);
+        if (S.ctx_album) ctx_add_cover(S.ctx_album);
     } else {
         S.ctx_artist = library_album_artist(S.lib, S.ctx_album);
         library_album_name(S.lib, S.ctx_album, title, sizeof title);
         CTX_ADD(CTX_PLAY); CTX_ADD(CTX_PLAY_NEXT); CTX_ADD(CTX_ADD_QUEUE); CTX_ADD(CTX_ADD_PLAYLIST);
         if (S.ctx_artist && !(l->kind == L_ARTIST_ALBUMS && l->parent == S.ctx_artist)) CTX_ADD(CTX_GO_ARTIST);
+        ctx_add_cover(S.ctx_album);
     }
     push_from_here(L_CONTEXT, title, 0, 0);
     return 0;
+}
+
+/* ---------- covers found online (net/coverfind.h) ---------- */
+
+/* Wi-Fi up (1); else asked to turn it on, or why not said (0) */
+static int cover_net(int then)
+{
+    char why[96] = "";
+    if (!S.hooks.radio_ready || S.hooks.radio_ready(why, sizeof why) == 0) return 1;
+    if (!wifi_ask_if_off(then)) ui_toast(why[0] ? why : "Finding covers needs Wi-Fi", 2500);
+    return 0;
+}
+
+/* An album's cover changed: its rows and Now Playing drawn again */
+static void cover_changed(int64_t album)
+{
+    covers_reset(1);
+    if (S.now.active && !S.now.radio && !S.now.podcast && S.now.track.album_id == album) load_art();
+}
+
+/* Context menu > Find cover: its matches, shown one at a time */
+static void cover_find_open(int64_t album, int from_np)
+{
+    lib_album_t a;
+    if (!S.lib || library_album_info(S.lib, album, &a)) return;
+    if (!a.title[0]) { ui_toast("It has no album name to look for", 2500); return; }
+    if (!cover_net(WT_NONE)) return;
+    if (cf_find(&a)) { ui_toast("Can't look covers up here", 2000); return; }
+    S.cf_album = album;
+    S.cf_k = 0;
+    S.cf_drawn = -1;
+    push(L_COVER_FIND, a.title, 0);                 /* (titled with the album: what's looked for) */
+    S.stack[S.depth - 1].back_to_np = from_np;
+}
+
+static void cover_find_key(ui_key_t k)
+{
+    int n = 0, st = cf_find_state(&n);
+    switch (k) {
+    case UI_KEY_UP: if (S.cf_k > 0) S.cf_k--; break;
+    case UI_KEY_DOWN: if (S.cf_k + 1 < n) S.cf_k++; break;
+    case UI_KEY_OK: {
+        static uint16_t small[LIB_ART_SMALL * LIB_ART_SMALL];
+        if (st != 1 || !n) break;
+        int pic = cf_find_show(S.cf_k, NULL, NULL);
+        if (pic == -2) { cf_find_retry(S.cf_k); break; }   /* (couldn't be fetched: again) */
+        if (pic != 1) break;
+        if (cf_find_keep(S.cf_k, S.cf_px, small) || library_store_found_cover(S.lib, S.cf_album, S.cf_px, small)) {
+            ui_toast("Couldn't save the cover", 2500);
+            break;
+        }
+        int64_t album = S.cf_album;
+        cf_find_close();
+        pop();
+        cover_changed(album);
+        ui_toast("Cover saved", 1500);
+        break;
+    }
+    default: break;
+    }
+}
+
+/* Settings > Library > Find missing covers (or, under way, stop) */
+static void covers_find_all(void)
+{
+    cf_batch_t b;
+    cf_batch_status(&b);
+    if (b.running) { cf_batch_stop(); ui_toast("Stopped", 1500); return; }
+    if (!S.lib) return;
+    lib_album_t *list = NULL;
+    int n = library_albums_without_cover(S.lib, &list);
+    if (n == 0) ui_toast("Every album has a cover", 2000);
+    else if (n > 0 && cover_net(WT_OK)) {
+        if (cf_batch(list, n)) ui_toast("Can't look covers up here", 2000);
+        else {
+            char msg[96];
+            tr_num(msg, sizeof msg, n == 1 ? "Looking for %s cover" : "Looking for %s covers", n);
+            ui_toast(msg, 2000);
+        }
+    }
+    free(list);
+}
+
+/* Every 100 ms: a find's answers and pictures as they come; the batch's
+ * covers stored, and how it went said when it's done. 1 while waiting. */
+static int cf_poll(void)
+{
+    static uint16_t large[LIB_ART_LARGE * LIB_ART_LARGE], small[LIB_ART_SMALL * LIB_ART_SMALL];
+    int64_t album;
+    int stored = 0;
+    while (S.lib && cf_batch_take(&album, large, small)) {
+        if (library_store_found_cover(S.lib, album, large, small) == 0) {
+            stored = 1;
+            if (S.now.active && S.now.track.album_id == album) cover_changed(album);
+        }
+    }
+    if (stored) covers_reset(1);
+    cf_batch_t b;
+    cf_batch_status(&b);
+    if (b.seq != S.cf_batch_seq) {
+        if (S.cf_batch_seq || b.seq > 1 || !b.running) {
+            char msg[160];
+            if (b.failed && !b.done) snprintf(msg, sizeof msg, "%s", tr("Couldn't reach MusicBrainz or Apple"));
+            else if (b.total == 0) snprintf(msg, sizeof msg, "%s", tr("No covers to look for"));
+            else {
+                char f[48], u[48], z[48];
+                tr_num(f, sizeof f, b.found == 1 ? "%s cover found" : "%s covers found", b.found);
+                tr_num(u, sizeof u, "%s unsure", b.unsure);
+                tr_num(z, sizeof z, "%s not found", b.none);
+                snprintf(msg, sizeof msg, "%s, %s, %s", f, u, z);
+            }
+            ui_toast(msg, 4000);
+        }
+        S.cf_batch_seq = b.seq;
+    }
+    level_t *l = &S.stack[S.depth - 1];
+    if (l->kind == L_LIBRARY && !S.now_playing_view && b.running) render(R_CONTENT);   /* (its count) */
+    if (l->kind != L_COVER_FIND || S.now_playing_view) return b.running;
+    int n = 0, st = cf_find_state(&n);
+    int pic = st == 1 && n ? cf_find_show(S.cf_k, NULL, NULL) : -1;
+    int k = S.cf_k >= n ? (n ? n - 1 : 0) : S.cf_k;
+    int now = (st + 2) | (n << 3) | ((pic + 2) << 8) | (k << 11);
+    if (now != S.cf_drawn) render(R_CONTENT);
+    return st == 0 || pic == 0 || b.running;
 }
 
 static void run_context(ctx_action_t a)
@@ -4188,6 +5719,20 @@ static void run_context(ctx_action_t a)
         pop_level(1);
         push_ui(L_INFO, "Info", track);
         S.stack[S.depth - 1].back_to_np = from_np;
+        break;
+    case CTX_FIND_COVER:
+    case CTX_FIND_ANOTHER:
+        pop_level(1);
+        cover_find_open(album, from_np);
+        break;
+    case CTX_REMOVE_COVER:
+        pop_level(0);
+        if (library_remove_found_cover(S.lib, album) == 0) {
+            cover_changed(album);
+            ui_toast(library_album_cover(S.lib, album) == LIB_COVER_OWN ? "Back to its own cover" : "Cover removed", 1500);
+        } else {
+            ui_toast("Couldn't remove it", 2000);
+        }
         break;
     case CTX_Q_PLAY:
         pop_level(1);
@@ -4277,7 +5822,83 @@ static void run_context(ctx_action_t a)
         }
         break;
     }
+    case CTX_POD_SPEED: {                     /* the next speed; the menu stays (Play again: the next) */
+        static const int SPEEDS[] = {100, 125, 150, 175, 200};
+        int cur = S.player ? player_speed(S.player) : 100, k = 0;
+        for (int i = 0; i < 5; i++)
+            if (SPEEDS[i] == cur) k = i;
+        int to = SPEEDS[(k + 1) % 5];
+        if (S.player) player_set_speed(S.player, to);
+        settings_set_int("podcasts.speed", to);
+        break;
+    }
+    case CTX_POD_CHAPTERS: {
+        int back = S.stack[S.depth - 1].back_to_np;
+        pop_level(1);
+        push_ui(L_POD_CHAPTERS, "Chapters", 0);
+        level_t *c = &S.stack[S.depth - 1];
+        c->back_to_np = back;
+        int at = pod_chapter_at(S.now.pos_ms);
+        c->sel = at >= 0 ? at : 0;
+        break;
+    }
+    case CTX_POD_REFRESH: {
+        level_t *under = &S.stack[S.depth - 2];
+        const char *url = under->kind == L_POD_SHOW && S.pod_ci >= 0 ? S.pod_shows[S.pod_ci].url
+                        : under->kind == L_PODCASTS && S.pod_ctx >= 0 && S.pod_ctx < S.pod_n ? S.pod_shows[S.pod_ctx].url : "";
+        char u[512];
+        snprintf(u, sizeof u, "%s", url);
+        pop_level(1);
+        if (!pod_net()) break;
+        podsync_refresh(u);
+        ui_toast("Checking for new episodes", 1500);
+        break;
+    }
+    case CTX_POD_UNSUB: {
+        uint32_t now = lv_tick_get();
+        if (!(S.pod_del_armed && now - S.pod_del_armed < 3000)) {
+            S.pod_del_armed = now;
+            ui_toast("Press again to unsubscribe (its downloads go too)", 3000);
+            break;
+        }
+        S.pod_del_armed = 0;
+        pop_level(1);
+        if (S.pod_ctx < 0 || S.pod_ctx >= S.pod_n) break;
+        if (podsync_unsubscribe(S.pod_shows[S.pod_ctx].url) == 0) {
+            memmove(&S.pod_shows[S.pod_ctx], &S.pod_shows[S.pod_ctx + 1], (size_t)(S.pod_n - S.pod_ctx - 1) * sizeof S.pod_shows[0]);
+            S.pod_n--;
+            level_t *l = &S.stack[S.depth - 1];
+            if (l->kind == L_PODCASTS && l->sel >= list_count(l)) l->sel = list_count(l) - 1;
+            ui_toast("Unsubscribed", 1500);
+        }
+        break;
+    }
+    case CTX_POD_DOWNLOAD: case CTX_POD_CANCEL: case CTX_POD_DELETE: case CTX_POD_PLAYED: case CTX_POD_UNPLAYED: {
+        pop_level(1);
+        if (S.pod_ci < 0 || S.pod_ctx < 0 || S.pod_ctx >= S.pod_ne) break;
+        const char *id = S.pod_shows[S.pod_ci].id;
+        const pod_episode_t *e = &S.pod_eps[S.pod_ctx];
+        if (a == CTX_POD_DOWNLOAD) {
+            if (!pod_net()) break;
+            if (podsync_download(id, e) == 0) ui_toast("Downloading", 1500);
+        } else if (a == CTX_POD_CANCEL) {
+            podsync_cancel_download(id, e->key);
+        } else if (a == CTX_POD_DELETE) {
+            if (pod_delete_download(pod_dir(), id, e) == 0) ui_toast("Download deleted", 1500);
+            S.pod_on_card[S.pod_ctx] = 0;
+        } else {
+            pod_state_t st;
+            pod_state_find(S.pod_st, S.pod_nst, e->key, &st);
+            st.played = a == CTX_POD_PLAYED;
+            st.played_at = st.played ? (int64_t)time(NULL) : 0;
+            st.pos_ms = 0;
+            pod_state_put(pod_dir(), id, &st);
+            pod_read_episodes();
+        }
+        break;
+    }
     case CTX_PL_RENAME:
+        S.rename_theme = 0;
         S.rename_id = S.ctx_playlist;
         pop_level(1);
         library_playlist_name(S.lib, S.rename_id, S.entry, sizeof S.entry);
@@ -4427,7 +6048,26 @@ static void setting_ok(setting_t st)
         settings_set_int("power.auto_off", AUTO_OFFS[i < n ? (i + 1) % n : 1]);
         break;
     }
+    case ST_POD_AUTO: settings_set_int("podcasts.auto", !settings_get_int("podcasts.auto", 1)); break;
+    case ST_POD_KEEP: case ST_POD_CLEAN: {
+        const int *v = st == ST_POD_KEEP ? POD_KEEPS : POD_CLEANS;
+        int n = st == ST_POD_KEEP ? 4 : 5, cur = settings_get_int(st == ST_POD_KEEP ? "podcasts.keep" : "podcasts.clean_days",
+                                                                  st == ST_POD_KEEP ? 2 : 7), i = 0;
+        while (i < n && v[i] != cur) i++;
+        settings_set_int(st == ST_POD_KEEP ? "podcasts.keep" : "podcasts.clean_days", v[i < n ? (i + 1) % n : 0]);
+        break;
+    }
+    case ST_POD_SPEED: {
+        static const int SPEEDS[] = {100, 125, 150, 175, 200};
+        int cur = S.player ? player_speed(S.player) : 100, k = 0;
+        for (int i = 0; i < 5; i++)
+            if (SPEEDS[i] == cur) k = i;
+        if (S.player) player_set_speed(S.player, SPEEDS[(k + 1) % 5]);
+        settings_set_int("podcasts.speed", SPEEDS[(k + 1) % 5]);
+        break;
+    }
     case ST_RESCAN: if (S.hooks.rescan) S.hooks.rescan(); break;
+    case ST_FIND_COVERS: covers_find_all(); break;
     case ST_USB_DRIVE: if (S.hooks.usb_drive) S.hooks.usb_drive(); break;
     case ST_USB_COMPUTER: {      /* Ask, USB drive, USB DAC, Just charge */
         static const int order[] = {UI_USB_ASK, UI_USB_DRIVE, UI_USB_DAC, UI_USB_CHARGE};
@@ -4437,15 +6077,8 @@ static void setting_ok(setting_t st)
         break;
     }
     case ST_USB_DAC: if (S.hooks.usb_dac) S.hooks.usb_dac(); break;
-    case ST_BT: if (S.hooks.bt_do) S.hooks.bt_do(UI_BT_TOGGLE, NULL); break;
-    case ST_BT_DEVICE: push_ui(L_BLUETOOTH, "Bluetooth", 0); break;   /* the devices, and on/off */
-    case ST_WIFI:
-        if (S.hooks.wifi_do) {
-            S.hooks.wifi_do(UI_WIFI_TOGGLE, NULL, NULL);
-            settings_set_int("wifi.on", !S.wifi_on);
-        }
-        break;
-    case ST_WIFI_NET:
+    case ST_BT: push_ui(L_BLUETOOTH, "Bluetooth", 0); break;   /* the devices, and on/off */
+    case ST_WIFI:                                              /* the networks, and on/off */
         push_ui(L_WIFI, "Wi-Fi", 0);
         if (S.hooks.wifi_do) S.hooks.wifi_do(UI_WIFI_SCAN, NULL, NULL);
         break;
@@ -4493,6 +6126,7 @@ static void open_selected(void)
                 if (rd_on_air(&S.radio[i])) { S.stack[S.depth - 1].sel = i + 1; break; }
             break;
         case H_SETTINGS: push_ui(L_SETTINGS, "Settings", 0); break;
+        case H_PODCASTS: pod_open(); break;
         }
         break;
     case L_ALBUMS:
@@ -4752,9 +6386,9 @@ static void open_selected(void)
         break;
     case L_SETTINGS: {
         static const list_kind_t sub[] = {L_INTERFACE, L_HOME_EDIT, L_DISPLAY, L_SOUND, L_BLUETOOTH, L_WIFI, L_SHARE, L_SSH,
-                                          L_USB, L_PLAYBACK, L_POWER, L_LIBRARY, L_ABOUT};
+                                          L_USB, L_PLAYBACK, L_POD_SETTINGS, L_POWER, L_LIBRARY, L_ABOUT};
         push_ui(sub[l->sel], SETTINGS[l->sel], 0);
-        if (sub[l->sel] == L_HOME_EDIT) ui_toast("OK shows or hides. Menu: Move", 2500);
+        if (sub[l->sel] == L_HOME_EDIT) ui_toast("Play shows or hides. Menu: Move", 2500);
         if (sub[l->sel] == L_WIFI && S.hooks.wifi_do) S.hooks.wifi_do(UI_WIFI_SCAN, NULL, NULL);   /* fresh networks */
         break;
     }
@@ -4882,14 +6516,48 @@ static void open_selected(void)
         }
         break;
     }
+    case L_THEME_EDIT: case L_THEME_COLOURS: the_ok(l); break;
+    case L_PODCASTS:
+        if (l->sel == 0) {                        /* Find podcasts */
+            S.entry[0] = '\0';
+            S.entry_ch = 0;
+            S.ok_added = 0;
+            if (S.pod_search != 0) { S.pod_search = -1; S.pod_nf = 0; }
+            push_ui(L_POD_SEARCH, "Find podcasts", 0);
+        } else if (l->sel - 1 < S.pod_n) {
+            pod_open_show(l->sel - 1);
+        } else if (S.pod_opml[0] && podsync_import_opml(S.pod_opml) == 0) {
+            ui_toast("Adding its shows\xE2\x80\xA6", 2000);
+        }
+        break;
+    case L_POD_SHOW: pod_play_episode(l->sel); break;
+    case L_POD_CHAPTERS:
+        if (S.player && l->sel < S.pod_nch && S.now.podcast) {
+            player_seek_by(S.player, (int)S.pod_ch[l->sel].start_ms - (int)S.now.pos_ms);
+            if (!S.now.playing) player_pause(S.player, 0);
+            pop();
+            S.now_playing_view = 1;
+        }
+        break;
+    case L_POD_SEARCH:                            /* a show found: add it */
+        if (l->sel >= 1 && l->sel - 1 < S.pod_nf) {
+            const pod_show_t *f = &S.pod_found[l->sel - 1];
+            if (pod_subscribed(f->url)) ui_toast("Already in your podcasts", 1500);
+            else if (podsync_subscribe(f) == 0) {
+                if (S.pod_n < POD_MAX_SHOWS) S.pod_shows[S.pod_n++] = *f;   /* (marked Added now; read again later) */
+                ui_toast("Added: reading its episodes", 2000);
+            }
+        }
+        break;
     case L_THEMES: {
+        if (l->sel >= S.n_themes) { the_open(-1); break; }   /* New theme */
         const theme_t *th = &S.themes[l->sel];
         if (th->status == THEME_ERROR) { ui_toast(th->note, 4000); break; }
         ui_set_theme(l->sel);
         if (th->status == THEME_WARN) ui_toast(th->note, 4000);
         break;
     }
-    case L_QUICK: case L_DISPLAY: case L_SOUND: case L_PLAYBACK: case L_POWER: case L_LIBRARY: case L_USB:
+    case L_QUICK: case L_DISPLAY: case L_SOUND: case L_PLAYBACK: case L_POWER: case L_LIBRARY: case L_USB: case L_POD_SETTINGS:
     case L_INTERFACE:
         setting_ok(setting_at(l, l->sel));
         break;
@@ -5228,6 +6896,20 @@ void ui_key(ui_key_t k)
     case UI_KEY_DIMMER: set_brightness(brightness() - 1); render(R_CONTENT); return;
     default: break;
     }
+    if (!S.now_playing_view && l->kind == L_COVER_FIND) {   /* Find cover: turn through the matches */
+        if (k == UI_KEY_UP || k == UI_KEY_DOWN || k == UI_KEY_OK) {
+            cover_find_key(k);
+            render(R_ANIMATE);
+            return;
+        }
+        if (k == UI_KEY_BACK || k == UI_KEY_BACK_LONG) {
+            cf_find_close();
+            pop_level(k == UI_KEY_BACK_LONG);
+            if (k == UI_KEY_BACK_LONG) S.now_playing_view = 1;
+            render(R_ANIMATE);
+            return;
+        }
+    }
     if (S.now_playing_view) {
         int len = (int)(S.now.len_ms / 1000);
         switch (k) {
@@ -5261,8 +6943,8 @@ void ui_key(ui_key_t k)
         return;
     }
     int n = list_count(l);
-    if ((l->kind == L_SEARCH || l->kind == L_RENAME || l->kind == L_WIFI_PASS || l->kind == L_RDIR_SEARCH) &&
-        l->sel == 0) {   /* typing with the wheel */
+    if ((l->kind == L_SEARCH || l->kind == L_RENAME || l->kind == L_WIFI_PASS || l->kind == L_RDIR_SEARCH ||
+         l->kind == L_POD_SEARCH) && l->sel == 0) {   /* typing with the wheel */
         const char *letters = entry_letters(l->kind);
         int nl = (int)strlen(letters);
         size_t len = strlen(S.entry);
@@ -5288,12 +6970,21 @@ void ui_key(ui_key_t k)
                     rd_ask(&S.rd_q);
                     if (S.rd_state == RD_FAILED) l->sel = 1;   /* (why, on the line below) */
                 }
+                else if (l->kind == L_POD_SEARCH) pod_search_run();
                 else if (l->kind == L_WIFI_PASS) {
                     if (strlen(S.entry) < 8) { ui_toast("At least 8 characters", 1500); break; }
                     if (S.hooks.wifi_do) S.hooks.wifi_do(UI_WIFI_CONNECT, S.wifi_pass_ssid, S.entry);
                     memset(S.entry, 0, sizeof S.entry);
                     pop();
                     ui_toast("Joining...", 1500);
+                }
+                else if (S.rename_theme) {                /* the theme editor's name */
+                    if (!S.entry[0]) { ui_toast("Type a name first", 1500); break; }
+                    snprintf(S.the.name, sizeof S.the.name, "%s", S.entry);
+                    S.the_dirty = 1;
+                    pop();
+                    level_t *up = &S.stack[S.depth - 1];
+                    if (up->kind == L_THEME_EDIT) snprintf(up->title, sizeof up->title, "%s", S.the.name);
                 }
                 else if (S.entry[0] && library_playlist_rename(S.lib, S.rename_id, S.entry) == 0) {
                     pop();
@@ -5334,7 +7025,7 @@ void ui_key(ui_key_t k)
         render(R_ANIMATE);
         return;
     }
-    if ((l->kind == L_SEARCH || l->kind == L_RDIR_SEARCH) && k == UI_KEY_BACK) {   /* in the results: back to the letters */
+    if ((l->kind == L_SEARCH || l->kind == L_RDIR_SEARCH || l->kind == L_POD_SEARCH) && k == UI_KEY_BACK) {   /* in the results: back to the letters */
         l->sel = 0;
         render(R_ANIMATE);
         return;
@@ -5375,6 +7066,26 @@ void ui_key(ui_key_t k)
         }
         render(R_CONTENT);
         return;
+    }
+    if (S.editing && (l->kind == L_THEME_EDIT || l->kind == L_THEME_COLOURS)) {   /* a theme's value, with the wheel */
+        switch (k) {
+        case UI_KEY_UP: the_adjust(l, -1); break;
+        case UI_KEY_DOWN: the_adjust(l, +1); break;
+        case UI_KEY_OK: case UI_KEY_BACK: S.editing = 0; break;
+        default: break;
+        }
+        render(R_CONTENT);
+        return;
+    }
+    if (l->kind == L_THEME_EDIT && k == UI_KEY_BACK && S.the_dirty) {   /* leaving it unsaved: press twice */
+        uint32_t now = lv_tick_get();
+        if (!(S.the_back_armed && now - S.the_back_armed < 3000)) {
+            S.the_back_armed = now;
+            ui_toast("Not saved: press Back again to leave it", 3000);
+            render(R_CONTENT);
+            return;
+        }
+        S.the_back_armed = 0;
     }
     if (S.editing && (l->kind == L_EQ_EDIT || l->kind == L_EQ_BAND)) {   /* an EQ value, with the wheel */
         switch (k) {
@@ -5424,6 +7135,8 @@ void ui_key(ui_key_t k)
 int ui_tick(void)
 {
     int asking = rd_poll();      /* the station directory's answer */
+    asking |= pod_poll();        /* ...and the podcast directory's */
+    asking |= cf_poll();         /* ...and covers' */
     if (!S.player) return asking;
     uint32_t seq = player_seq(S.player);
     player_tick(S.player);
@@ -5441,10 +7154,18 @@ void ui_tick_1s(void)
     if (S.wifi_then.armed && lv_tick_elaps(S.wifi_then.at) >= 45000) wifi_then_run(0);   /* (no network joined, say) */
     list_kind_t k = S.stack[S.depth - 1].kind;
     if ((k == L_BATTERY || k == L_BAT_SPAN || k == L_BAT_HISTORY) && lv_tick_elaps(S.bat_at) >= 60000) battery_load();
+    pod_second();
     S.ticking = 1;
     render(R_CONTENT);
     S.ticking = 0;
     settings_autosave(lv_tick_get(), 1500);
+}
+
+void ui_save_state(void)
+{
+    if (!pod_dir()[0]) return;
+    pod_track();
+    if (S.pod_play.key[0]) pod_save_play(0);
 }
 
 void ui_set_hooks(const ui_hooks_t *h)
@@ -5530,6 +7251,136 @@ void ui_show(const char *what)
         l->sel = S.about_n;                         /* Check for updates (or what follows) */
         if (!strcmp(what, "update")) push_ui(L_UPDATE, "Updates", 0);
         ui_update_changed();
+    } else if (!strcmp(what, "eqedit") || !strcmp(what, "eqband")) {
+        /* the EQ editor on a profile, its curve over it: the 8.9 kHz band selected,
+         * or its own page with the gain being turned up */
+        eqe_open("AirPods Pro");
+        level_t *e = &S.stack[S.depth - 1];
+        int b = 0;
+        for (int i = 0; i < S.eqe.n; i++)
+            if (S.eqe.band[i].fc > 8000 && S.eqe.band[i].fc < 9000) b = i;
+        e->sel = b + 1;
+        if (!strcmp(what, "eqband")) {
+            S.eqe.band[b].gain_db = 8;
+            push(L_EQ_BAND, "Peak 8.9 kHz", b);
+            S.stack[S.depth - 1].sel = 2;
+            S.editing = 1;
+        }
+    } else if (!strcmp(what, "podsettings")) {      /* Settings > Podcasts */
+        S.stack[0].sel = home_index(H_SETTINGS);
+        push_ui(L_SETTINGS, "Settings", 0);
+        S.stack[S.depth - 1].sel = SET_PODCASTS;
+        push_ui(L_POD_SETTINGS, "Podcasts", 0);
+    } else if (!strcmp(what, "libsettings")) {      /* Settings > Library, on Find missing covers */
+        S.stack[0].sel = home_index(H_SETTINGS);
+        push_ui(L_SETTINGS, "Settings", 0);
+        S.stack[S.depth - 1].sel = SET_LIBRARY;
+        push_ui(L_LIBRARY, "Library", 0);
+        S.stack[S.depth - 1].sel = 1;
+    } else if (!strcmp(what, "covermenu") || !strcmp(what, "coverfind") || !strcmp(what, "covermenuown")) {
+        /* an album without a cover: Menu on it ("covermenu"), Find cover's first match ("coverfind");
+         * one with its own: Menu on it ("covermenuown") */
+        int want = !strcmp(what, "covermenuown") ? LIB_COVER_OWN : LIB_COVER_NONE;
+        S.stack[0].sel = home_index(H_ALBUMS);
+        push_ui(L_ALBUMS, "Albums", 0);
+        level_t *l = &S.stack[S.depth - 1];
+        for (int i = 0; S.lib && i < l->items.n; i++)
+            if (library_album_cover(S.lib, l->items.ids[i]) == want) { l->sel = i; break; }
+        if (strcmp(what, "coverfind")) {
+            open_context();
+            for (int i = 0; i < S.ctx_n; i++)
+                if (S.ctx[i] == CTX_FIND_COVER || S.ctx[i] == CTX_FIND_ANOTHER) S.stack[S.depth - 1].sel = i;
+        } else if (l->items.n) {
+            cover_find_open(l->items.ids[l->sel], 0);
+            for (int i = 0; i < 300; i++) {          /* (the simulator's saved answers, and the picture) */
+                int n = 0;
+                cf_poll();
+                if (cf_find_state(&n) == 1 && n && cf_find_show(0, NULL, NULL) != 0) break;
+                struct timespec ts = {0, 10 * 1000 * 1000L};
+                nanosleep(&ts, NULL);
+            }
+        }
+    } else if (!strncmp(what, "pod", 3)) {
+        /* Podcasts (the simulator's sample shows): "podcasts" the list, "podshow" a
+         * show's episodes, "podsearch" Find podcasts' answer, "podnp" an episode playing */
+        S.stack[0].sel = home_index(H_PODCASTS);
+        pod_open();
+        if (!strcmp(what, "podshow") || !strcmp(what, "podnp") || !strcmp(what, "podchapters") || !strcmp(what, "podmenu")) {
+            S.stack[S.depth - 1].sel = 1;
+            pod_open_show(0);
+            S.stack[S.depth - 1].sel = S.pod_ne > 1 ? 1 : 0;
+        }
+        if ((!strcmp(what, "podnp") || !strcmp(what, "podchapters") || !strcmp(what, "podmenu")) && S.pod_ne > 1 && S.lib) {   /* (a song of the library stands in for its file) */
+            lib_list_t songs;
+            lib_track_t t;
+            if (library_list(S.lib, LIB_SONGS, 0, &songs) > 0 && library_track(S.lib, songs.ids[0], &t) == 0) {
+                player_episode_t pe = {0};
+                snprintf(pe.show, sizeof pe.show, "%s", S.pod_shows[0].title);
+                snprintf(pe.title, sizeof pe.title, "%s", S.pod_eps[1].title);
+                snprintf(pe.path, sizeof pe.path, "%s", t.path);
+                snprintf(pe.id, sizeof pe.id, "%s", S.pod_shows[0].id);
+                snprintf(pe.key, sizeof pe.key, "%s", S.pod_eps[1].key);
+                pe.len_ms = (uint32_t)S.pod_eps[1].dur_s * 1000;
+                pe.start_ms = 23 * 60 * 1000;
+                S.pod_nch = pod_chapters(pod_dir(), pe.id, &S.pod_eps[1], S.pod_ch, 64);
+                snprintf(S.pod_ch_key, sizeof S.pod_ch_key, "%s", pe.key);
+                player_episode_play(S.player, &pe);
+                player_pause(S.player, 1);
+                snprintf(S.pod_play.id, sizeof S.pod_play.id, "%s", pe.id);
+                snprintf(S.pod_play.key, sizeof S.pod_play.key, "%s", pe.key);
+                S.now_playing_view = 1;
+            }
+            if (songs.ids) library_list_free(&songs);
+            if (!strcmp(what, "podmenu")) {             /* Menu on it: Chapters, Speed (at 1.25x) */
+                player_set_speed(S.player, 125);
+                player_now(S.player, &S.now);
+                open_context();
+                S.stack[S.depth - 1].sel = 1;
+            }
+            if (!strcmp(what, "podchapters") && S.pod_nch) {
+                S.now_playing_view = 0;
+                push_ui(L_POD_CHAPTERS, "Chapters", 0);
+                S.stack[S.depth - 1].sel = 1;
+            }
+        }
+        if (!strcmp(what, "podsearch")) {
+            S.stack[S.depth - 1].sel = 0;
+            snprintf(S.entry, sizeof S.entry, "radiolab");
+            S.entry_ch = 0;
+            push_ui(L_POD_SEARCH, "Find podcasts", 0);
+            pod_search_run();
+            for (int i = 0; i < 300 && S.pod_search == 0; i++) {
+                pod_poll();
+                struct timespec ts = {0, 10 * 1000 * 1000L};
+                nanosleep(&ts, NULL);
+            }
+        }
+    } else if (!strncmp(what, "theme", 5) && strcmp(what, "themes")) {
+        /* the theme editor, as in its mockups: a new dark theme with a coral accent, "Harbour";
+         * "themesnew": the list's New theme row; "themecolours": its colours, Text selected;
+         * "themecolour": Text being picked, at Dark grey (too faint); "themesave": Save */
+        if (!strcmp(what, "themesnew")) {
+            push_ui(L_THEMES, "Theme", 0);
+            S.stack[S.depth - 1].sel = S.n_themes;
+        } else {
+            the_open(-1);
+            S.the_acc = 8;                                   /* Coral */
+            theme_make(&S.the, 1, 215, 30);
+            theme_accent(&S.the, ACCENTS[8].hue, ACCENTS[8].sat);
+            snprintf(S.the.name, sizeof S.the.name, "Harbour");
+            level_t *e = &S.stack[S.depth - 1];
+            snprintf(e->title, sizeof e->title, "%s", S.the.name);
+            e->sel = !strcmp(what, "themesave") ? TE_SAVE : TE_ACCENT;
+            if (!strcmp(what, "themecolours") || !strcmp(what, "themecolour")) {
+                push_ui(L_THEME_COLOURS, "Colours", 0);
+                S.stack[S.depth - 1].sel = TC_TEXT;
+            }
+            if (!strcmp(what, "themecolour")) {
+                S.the_pal = 4;                               /* Dark grey */
+                S.the.text = the_pal_at(S.the_pal, NULL, 0);
+                S.editing = 1;
+            }
+        }
     } else if (!strcmp(what, "uninstall")) {
         S.stack[0].sel = home_index(H_SETTINGS);
         push_ui(L_SETTINGS, "Settings", 0);
@@ -5719,9 +7570,15 @@ void ui_init(lv_obj_t *screen, const theme_t *themes, int n_themes,
     S.art_dsc.header.stride = LIB_ART_LARGE * 2;
     S.art_dsc.data = (const uint8_t *)S.art_px;
     S.art_dsc.data_size = sizeof S.art_px;
+    S.cf_dsc = S.art_dsc;
+    S.cf_dsc.data = (const uint8_t *)S.cf_px;
+    S.cf_dsc.data_size = sizeof S.cf_px;
     S.themes = themes; S.n_themes = n_themes;
     S.fonts = fonts; S.n_fonts = n_fonts;
     S.battery_pct = -1;
+    S.pod_ci = -1;
+    S.pod_search = -1;
+    if (player) player_set_speed(player, settings_get_int("podcasts.speed", 100));
     S.scr = screen;
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -5797,6 +7654,11 @@ void ui_init(lv_obj_t *screen, const theme_t *themes, int n_themes,
         lv_obj_align(S.row_picon[j], LV_ALIGN_LEFT_MID, 10, 0);
         lv_obj_set_style_image_recolor_opa(S.row_picon[j], LV_OPA_COVER, 0);
         show(S.row_picon[j], 0);
+        S.row_mark[j] = lv_image_create(row);
+        lv_obj_remove_flag(S.row_mark[j], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_pos(S.row_mark[j], 0, (ROW_H - MARK_PX) / 2);
+        lv_obj_set_style_image_recolor_opa(S.row_mark[j], LV_OPA_COVER, 0);
+        show(S.row_mark[j], 0);
         S.row_lbl[j] = label(row);
         lv_obj_align(S.row_lbl[j], LV_ALIGN_LEFT_MID, 10, 0);
         S.row_meta[j] = label(row);
@@ -5822,6 +7684,35 @@ void ui_init(lv_obj_t *screen, const theme_t *themes, int n_themes,
     S.ghost = lv_image_create(screen);
     lv_obj_remove_flag(S.ghost, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
     show(S.ghost, 0);
+
+    /* Find cover: a match's picture, as Now Playing's, and what it is */
+    S.cf = box(screen, 0, HEADER_H, UI_W, UI_H - HEADER_H);
+    S.cf_art = box(S.cf, 12, 6, LIB_ART_LARGE, LIB_ART_LARGE);
+    lv_obj_set_style_clip_corner(S.cf_art, true, 0);
+    S.cf_img = lv_image_create(S.cf_art);
+    lv_obj_set_pos(S.cf_img, 0, 0);
+    show(S.cf_img, 0);
+    S.cf_title = label(S.cf);
+    lv_obj_set_pos(S.cf_title, 160, 8);
+    lv_obj_set_size(S.cf_title, 150, 64);
+    lv_label_set_long_mode(S.cf_title, LV_LABEL_LONG_DOT);
+    S.cf_artist = label(S.cf);
+    lv_obj_set_pos(S.cf_artist, 160, 74);
+    lv_obj_set_width(S.cf_artist, 150);
+    lv_label_set_long_mode(S.cf_artist, LV_LABEL_LONG_DOT);
+    S.cf_meta = label(S.cf);
+    lv_obj_set_pos(S.cf_meta, 160, NP_ALBUM_Y);
+    lv_obj_set_width(S.cf_meta, 150);
+    lv_label_set_long_mode(S.cf_meta, LV_LABEL_LONG_DOT);
+    S.cf_note = label(S.cf);                /* "Source: MusicBrainz": two lines where the font is wide */
+    lv_obj_set_pos(S.cf_note, 160, 122);
+    lv_obj_set_width(S.cf_note, 150);
+    lv_label_set_long_mode(S.cf_note, LV_LABEL_LONG_WRAP);
+    S.cf_hint = label(S.cf);
+    lv_obj_set_pos(S.cf_hint, 12, UI_H - HEADER_H - 30);
+    lv_obj_set_width(S.cf_hint, UI_W - 24);
+    lv_label_set_long_mode(S.cf_hint, LV_LABEL_LONG_DOT);
+    show(S.cf, 0);
 
     S.np = box(screen, 0, HEADER_H, UI_W, UI_H - HEADER_H);
     const int art_x = 12, tx = 160, tw = 150, ty = 8;

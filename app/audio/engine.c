@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "engine.h"
 #include "gain.h"
+#include "tempo.h"
 
 #include <errno.h>
 #include <math.h>
@@ -34,6 +35,7 @@ typedef struct {
     int64_t id;
     float   gain;      /* the track's own (volume levelling); 1.0 = none */
     uint32_t tag;      /* the caller's, for eng_status_t.tag */
+    uint32_t start_ms; /* engine_play_at: from here in */
     int     valid;
 } pending_t;
 
@@ -69,7 +71,9 @@ struct engine {
     float fade;                /* the sleep timer's fade-out; applied on top of gain */
     float track_gain;          /* the playing track's levelling; changes exactly at its first sample */
     float bal[2];              /* the balance: left, right (1 = untouched) */
-    int writing;               /* the thread is in out.write/drain without mu */
+    int writing;               /* the thread is in out.write/drain (or a seek) without mu */
+    int seeking;               /* a seek under way: where to (seek_to), for the status meanwhile */
+    uint32_t seek_to;
     int hold;                  /* engine_switch_output() in progress: no new writes */
     int out_lost;              /* a write failed (device gone): paused */
     unsigned cut;              /* +1 when another thread drops the output's queue: a write
@@ -90,8 +94,26 @@ struct engine {
     unsigned meta_seq, dec_meta;  /* ours (for eng_status_t), and the decoder's last seen */
     char meta[256], meta_url[512];
 
+    /* faster (engine_set_speed): the stretch, made for the track's format */
+    int speed;                 /* percent; 100 = off */
+    int tempo_dirty;           /* (under mu) start it afresh: a new track, a seek, a new speed */
+    tempo_t *tempo;
+    unsigned tempo_rate;
+    int tempo_ch;
+    int32_t *tbuf;
+
     int32_t buf[CHUNK_FRAMES * MAX_CH];
 };
+
+#define TBUF_FRAMES (CHUNK_FRAMES * 2 + 4 * TEMPO_MAX_SEQ)
+
+/* What the output still has to play, in the track's frames (sped up: more of
+ * the track than of the output), and what the stretch holds */
+static int64_t ahead_frames(const engine_t *e, long out_delay)
+{
+    if (e->speed == 100 || !e->tempo) return out_delay;
+    return (int64_t)out_delay * e->speed / 100 + tempo_latency(e->tempo);
+}
 
 /* How deep a sample format the output was opened for: 0 = up to 16 bits
  * (S16_LE first), 1 = up to 24 (lossy sources too), 2 = more. */
@@ -215,6 +237,7 @@ static int start_track(engine_t *e, const pending_t *p, int gapless, decoder_t *
     e->track_gain = p->gain;
     e->pos_frames = 0;
     e->rewind = 0;
+    e->tempo_dirty = 1;
     e->seq++;
     e->error = 0;
     e->ended = 0;
@@ -280,6 +303,32 @@ static void unblock(engine_t *e)
     e->out.pause(e->out.ctx, 0);
 }
 
+/* Called with mu held, on the engine thread: the decoder to `frame`, without
+ * mu and at an ordinary priority. An MP3 with no index is read from the
+ * start up to there (seconds, an hour in): holding mu meanwhile held up
+ * everyone asking the engine's status (the UI), and at the playback
+ * thread's priority it took the CPU from them too. `writing` keeps
+ * engine_switch_output() from changing things meanwhile, as during a write. */
+static int seek_unlocked(engine_t *e, uint64_t frame, uint32_t ms)
+{
+    decoder_t *dec = e->dec;
+    e->writing = 1;
+    e->seeking = 1;
+    e->seek_to = ms;
+    pthread_mutex_unlock(&e->mu);
+    audio_thread_priority(0);
+    uint32_t t0 = mono_ms();
+    int rc = decoder_seek(dec, frame);
+    uint32_t took = mono_ms() - t0;
+    if (took > 300) fprintf(stderr, "engine: a seek to %u:%02u took %u ms\n", ms / 60000, ms / 1000 % 60, took);
+    audio_thread_priority(1);
+    pthread_mutex_lock(&e->mu);
+    e->writing = 0;
+    e->seeking = 0;
+    if (e->hold) pthread_cond_broadcast(&e->cv);
+    return rc;
+}
+
 static void *run(void *arg)
 {
     engine_t *e = arg;
@@ -328,6 +377,19 @@ static void *run(void *arg)
             if (start_track(e, &p, 0, nd, &nf) == 0) {
                 e->state = e->start_paused ? ENG_PAUSED : ENG_PLAYING;
                 if (e->out_open) e->out.pause(e->out.ctx, e->start_paused);
+                e->start_paused = 0;
+                /* From where it was left, before a sample is written (this thread
+                 * writes nothing until it's done). A pause or a stop meanwhile
+                 * acts on the state just set, as for any track. */
+                if (p.start_ms && !e->dec_net && e->fmt.rate) {
+                    decoder_t *dec = e->dec;
+                    uint64_t frame = (uint64_t)p.start_ms * e->fmt.rate / 1000;
+                    int rc = seek_unlocked(e, frame, p.start_ms);
+                    if (dec != e->dec || e->cmd_play.valid || e->quit) continue;   /* (replaced meanwhile) */
+                    if (e->cmd_seek) rc = -1;                 /* (a seek asked meanwhile: that one next) */
+                    if (rc == 0) e->pos_frames = frame;
+                    e->tempo_dirty = 1;
+                }
             } else {
                 if (e->out_open) e->out.flush(e->out.ctx);   /* (what played before stops too) */
                 track_failed(e, &p);
@@ -337,12 +399,17 @@ static void *run(void *arg)
         }
         if (e->cmd_seek && e->dec) {
             e->cmd_seek = 0;
+            decoder_t *dec = e->dec;
             uint64_t frame = (uint64_t)e->seek_ms * e->fmt.rate / 1000;
-            if (decoder_seek(e->dec, frame) == 0) {
+            int rc = seek_unlocked(e, frame, e->seek_ms);
+            if (dec != e->dec || e->cmd_play.valid || e->quit) continue;   /* (replaced meanwhile) */
+            if (e->cmd_seek) rc = -1;                    /* (another seek asked meanwhile: that one next) */
+            if (rc == 0) {
                 e->out.flush(e->out.ctx);
                 eq_reset(e->eq);
                 e->pos_frames = frame;
                 e->rewind = 0;
+                e->tempo_dirty = 1;
             }
             if (e->state == ENG_PAUSED && e->out_open) e->out.pause(e->out.ctx, 1);   /* (unblock() unpaused it) */
             continue;
@@ -355,6 +422,7 @@ static void *run(void *arg)
                 e->out.flush(e->out.ctx);
                 eq_reset(e->eq);
                 e->pos_frames = e->rewind_to;
+                e->tempo_dirty = 1;
             }
             continue;
         }
@@ -400,6 +468,32 @@ static void *run(void *arg)
         float bl = ch == 2 && !e->fmt.dop ? e->bal[0] : 1.0f, br = ch == 2 && !e->fmt.dop ? e->bal[1] : 1.0f;
         long w = 0;
         unsigned cut = e->cut;
+        /* faster: through the stretch (made for this format, afresh when asked) */
+        tempo_t *tp = NULL;
+        if (e->speed != 100 && ch <= 2 && !e->fmt.dop && e->fmt.rate) {
+            if (!e->tbuf) e->tbuf = malloc((size_t)TBUF_FRAMES * 2 * sizeof *e->tbuf);
+            if (e->tempo && (e->tempo_rate != e->fmt.rate || e->tempo_ch != ch)) {
+                tempo_free(e->tempo);
+                e->tempo = NULL;
+            }
+            if (!e->tempo && e->tbuf) {
+                e->tempo = tempo_new(e->fmt.rate, ch, e->speed);
+                e->tempo_rate = e->fmt.rate;
+                e->tempo_ch = ch;
+            }
+            if (e->tempo && e->tempo_dirty) {
+                tempo_set_speed(e->tempo, e->speed);
+                tempo_reset(e->tempo);
+            }
+            tp = e->tempo;
+        }
+        else if (e->speed == 100 && e->tempo) {          /* back to normal: its memory back */
+            tempo_free(e->tempo);
+            e->tempo = NULL;
+            free(e->tbuf);
+            e->tbuf = NULL;
+        }
+        e->tempo_dirty = 0;
         e->writing = 1;
         int net = e->dec_net;
         decoder_set_next(dec, e->n_next && !decoder_is_stream(e->next[0].path) ? e->next[0].path : NULL);
@@ -415,7 +509,12 @@ static void *run(void *arg)
             pthread_mutex_lock(&e->mu);
             int old = e->cut != cut;
             pthread_mutex_unlock(&e->mu);
-            if (!old) w = e->out.write(e->out.ctx, e->buf, n);
+            if (!old && tp) {
+                long tn = tempo_run(tp, e->buf, n, e->tbuf, TBUF_FRAMES);
+                w = tn > 0 ? e->out.write(e->out.ctx, e->tbuf, tn) : 0;
+            } else if (!old) {
+                w = e->out.write(e->out.ctx, e->buf, n);
+            }
         }
         pthread_mutex_lock(&e->mu);
         e->writing = 0;
@@ -445,8 +544,9 @@ static void *run(void *arg)
              * at the resume, from what was heard, as after a pause. */
             long lost = e->out_open ? e->out.delay(e->out.ctx) : 0;
             if (lost > (long)e->fmt.rate / 20 && !e->dec_net && !e->rewind) {
+                int64_t back = ahead_frames(e, lost);
                 e->rewind = 1;
-                e->rewind_to = e->pos_frames > (uint64_t)lost ? e->pos_frames - (uint64_t)lost : 0;
+                e->rewind_to = (int64_t)e->pos_frames > back ? e->pos_frames - (uint64_t)back : 0;
             }
             continue;
         }
@@ -499,6 +599,7 @@ engine_t *engine_new(const audio_output_t *out)
     e->fade = 1.0f;
     e->track_gain = 1.0f;
     e->bal[0] = e->bal[1] = 1.0f;
+    e->speed = 100;
     /* Priority inheritance: the UI thread holding the lock (engine_status)
      * runs at the playback thread's priority until it lets go, so a busy H2
      * can't hold playback up behind it. */
@@ -532,6 +633,8 @@ void engine_free(engine_t *e)
     if (e->dec) decoder_close(e->dec);
     if (e->out_open) e->out.close(e->out.ctx);
     eq_destroy(e->eq);
+    tempo_free(e->tempo);
+    free(e->tbuf);
     pthread_mutex_destroy(&e->mu);
     pthread_cond_destroy(&e->cv);
     free(e);
@@ -543,6 +646,7 @@ static void set_pending(pending_t *p, const char *path, int64_t id, float gain, 
     p->id = id;
     p->gain = gain;
     p->tag = tag;
+    p->start_ms = 0;
     p->valid = 1;
 }
 
@@ -551,8 +655,14 @@ void engine_queue_next(engine_t *e, const char *path, int64_t id) { engine_queue
 
 void engine_play_gain(engine_t *e, const char *path, int64_t id, float gain)
 {
+    engine_play_at(e, path, id, gain, 0);
+}
+
+void engine_play_at(engine_t *e, const char *path, int64_t id, float gain, uint32_t start_ms)
+{
     pthread_mutex_lock(&e->mu);
     set_pending(&e->cmd_play, path, id, gain, 0);
+    e->cmd_play.start_ms = start_ms;
     unblock(e);        /* (paused: the thread may be waiting in a write) */
     e->ended = e->error = 0;   /* (they were the last track's) */
     e->start_paused = 0;
@@ -594,8 +704,9 @@ void engine_pause(engine_t *e, int on)
          * stream: up to a second) would resume past what was heard: go back
          * to it at the resume. (Less than 50 ms isn't worth a seek.) */
         if (before - after > (long)e->fmt.rate / 20 && e->dec && !e->dec_net && !e->rewind) {
+            int64_t back = ahead_frames(e, before);
             e->rewind = 1;
-            e->rewind_to = e->pos_frames > (uint64_t)before ? e->pos_frames - (uint64_t)before : 0;
+            e->rewind_to = (int64_t)e->pos_frames > back ? e->pos_frames - (uint64_t)back : 0;
         }
     } else if (!on && e->state == ENG_PAUSED) {
         e->state = ENG_PLAYING;
@@ -696,6 +807,17 @@ static void dop_to_pcm(engine_t *e)
     e->error = 1;
 }
 
+void engine_set_speed(engine_t *e, int speed_pct)
+{
+    pthread_mutex_lock(&e->mu);
+    int s = speed_pct < 50 ? 50 : speed_pct > 300 ? 300 : speed_pct;
+    if (s != e->speed) {
+        e->speed = s;
+        e->tempo_dirty = 1;
+    }
+    pthread_mutex_unlock(&e->mu);
+}
+
 void engine_set_fade(engine_t *e, float fade)
 {
     pthread_mutex_lock(&e->mu);
@@ -765,10 +887,14 @@ void engine_status(engine_t *e, eng_status_t *st)
                                    st->balance[0] == 1.0f && st->balance[1] == 1.0f);
     if (e->fmt.rate) {
         long delay = e->out_open ? e->out.delay(e->out.ctx) : 0;
-        int64_t heard = e->rewind ? (int64_t)e->rewind_to : (int64_t)e->pos_frames - delay;
+        int64_t heard = e->rewind ? (int64_t)e->rewind_to : (int64_t)e->pos_frames - ahead_frames(e, delay);
         if (heard < 0) heard = 0;
         st->pos_ms = (uint32_t)(heard * 1000 / e->fmt.rate);
         st->len_ms = (uint32_t)(e->fmt.total_frames * 1000 / e->fmt.rate);
     }
+    /* a jump under way (or asked): where it's going, at once (not where it was) */
+    if (e->cmd_seek && e->dec) st->pos_ms = e->seek_ms;
+    else if (e->seeking) st->pos_ms = e->seek_to;
+    if (e->cmd_play.valid) st->start_ms = e->cmd_play.start_ms;
     pthread_mutex_unlock(&e->mu);
 }

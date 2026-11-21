@@ -23,6 +23,7 @@ set -eu
 cd "$(dirname "$0")/.."
 H2SSH=${H2SSH:-ssh root@10.42.0.1}
 DIR=/mnt/sd/fathom/test/unit
+VERBOSE=${H2_TESTS_VERBOSE:-0}   # 1: every test's output, not only a failure's
 want=$(for t in "$@"; do printf ' test_%s' "${t#test_}"; done)
 
 echo "== building for the H2, and copying to it ($DIR)"
@@ -49,6 +50,7 @@ docker/run.sh sh -c '
     mkdir -p $stage/lib $stage/assets $stage/tests
     for t in $tests; do cp $OUT/$t $stage/; done
     cp assets/radio.txt $stage/assets/
+    cp -R assets/themes $stage/assets/
     cp -R tests/fixtures tests/tls tests/data $stage/tests/
     # their shared libraries, and those libraries own
     needed() { $H/bin/mipsel-buildroot-linux-musl-readelf -d "$@" | sed -n "s/.*NEEDED.*\[\(.*\)\]/\1/p" | sort -u; }
@@ -72,5 +74,6 @@ $H2SSH "cd $DIR && fails=0 && for t in \$(cat run-list.txt); do
         s=\$(date +%s); FATHOM_NO_RT=1 SQLITE_TMPDIR=$DIR/t LD_LIBRARY_PATH=$DIR/lib TMPDIR=$DIR/t nice -n 19 ./\$t > \$t.log 2>&1; rc=\$?
         printf '%-18s %s  %ss\n' \$t \$([ \$rc = 0 ] && echo ok || echo FAILED) \$((\$(date +%s) - s))
         [ \$rc = 0 ] || { fails=\$((fails + 1)); sed 's/^/    /' \$t.log | tail -40; }
+        [ \$rc != 0 ] || [ $VERBOSE = 0 ] || sed 's/^/    /' \$t.log | tail -40
         rm -rf $DIR/t/*
     done; cd / && rm -rf $DIR; echo; [ \$fails = 0 ] && echo 'all passed on the H2' || { echo \"\$fails failed on the H2\"; exit 1; }"

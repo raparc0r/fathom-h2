@@ -8,6 +8,16 @@
 #include <string.h>
 #include <unistd.h>
 
+/* Who's asking: Fathom, its version and where it's from (MusicBrainz asks
+ * apps to say so, and is stricter with those that don't) */
+static char g_ua[160] = "Fathom (HiFi Walker H2; https://github.com/raparc0r/fathom-h2)";
+
+void http_set_version(const char *version)
+{
+    snprintf(g_ua, sizeof g_ua, "Fathom/%s (HiFi Walker H2; https://github.com/raparc0r/fathom-h2)",
+             version && *version ? version : "dev");
+}
+
 #ifdef FATHOM_HAVE_FFMPEG
 #include <libavformat/avio.h>
 #include <libavutil/dict.h>
@@ -15,7 +25,6 @@
 #include "audio/ff_util.h"
 
 #define HTTP_TIMEOUT_US "15000000"
-#define HTTP_UA "Fathom (HiFi Walker H2)"
 
 static int interrupted(void *ctx)
 {
@@ -23,17 +32,21 @@ static int interrupted(void *ctx)
     return abort && *abort;
 }
 
-static AVIOContext *open_url(const char *url, const volatile int *abort)
+/* *gone: the server said it isn't there (HTTP 4xx: not found, forbidden...),
+ * as opposed to not reaching it (a name that didn't resolve, a timeout) */
+static AVIOContext *open_url(const char *url, const volatile int *abort, int *gone)
 {
     AVIOContext *pb = NULL;
     AVIOInterruptCB icb = {interrupted, (void *)abort};
     AVDictionary *opt = NULL;
     av_dict_set(&opt, "rw_timeout", HTTP_TIMEOUT_US, 0);
-    av_dict_set(&opt, "user_agent", HTTP_UA, 0);
+    av_dict_set(&opt, "user_agent", g_ua, 0);
     av_dict_set(&opt, "follow", "1", 0);          /* (FFmpeg follows redirects by default) */
     ff_tls_options(&opt);
     int r = avio_open2(&pb, url, AVIO_FLAG_READ, &icb, &opt);
     av_dict_free(&opt);
+    if (gone) *gone = r == AVERROR_HTTP_BAD_REQUEST || r == AVERROR_HTTP_UNAUTHORIZED || r == AVERROR_HTTP_FORBIDDEN ||
+                      r == AVERROR_HTTP_NOT_FOUND || r == AVERROR_HTTP_OTHER_4XX;
     return r < 0 ? NULL : pb;
 }
 
@@ -41,8 +54,9 @@ long http_get(const char *url, char *buf, size_t cap, const volatile int *abort)
 {
     if (!buf || cap < 1) return -1;
     buf[0] = '\0';
-    AVIOContext *pb = open_url(url, abort);
-    if (!pb) return -1;
+    int gone = 0;
+    AVIOContext *pb = open_url(url, abort, &gone);
+    if (!pb) return gone ? -3 : -1;
     size_t n = 0;
     int cut = 0;
     for (;;) {
@@ -66,8 +80,9 @@ long http_get(const char *url, char *buf, size_t cap, const volatile int *abort)
 int64_t http_download(const char *url, const char *path, http_progress_fn progress, void *ctx,
                       const volatile int *abort)
 {
-    AVIOContext *pb = open_url(url, abort);
-    if (!pb) return -1;
+    int gone = 0;
+    AVIOContext *pb = open_url(url, abort, &gone);
+    if (!pb) return gone ? -3 : -1;
     char part[1024];
     snprintf(part, sizeof part, "%s.part", path);
     FILE *f = fopen(part, "wbe");

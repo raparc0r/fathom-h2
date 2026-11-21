@@ -66,6 +66,8 @@
 #include "library/library.h"
 #include "library/tags.h"
 #include "net/update.h"
+#include "net/podsync.h"
+#include "net/coverfind.h"
 #include "audio/decoder.h"
 #include "audio/ff_util.h"
 #include "audio/eq.h"
@@ -103,6 +105,23 @@ static void keep_logo_for_exit(const lv_image_dsc_t *logo)
     DISP(set_last_frame)(g_logo565);
     static const int fatal[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT};
     for (size_t i = 0; i < sizeof fatal / sizeof fatal[0]; i++) signal(fatal[i], on_fatal);
+}
+
+/* The themes (the card's fathom/themes after the built-in ones), and the theme editor's hooks */
+static theme_t g_themes[UI_MAX_THEMES];
+static char g_user_themes[600], g_assets_dir[600];
+static int hook_theme_save(const theme_t *t, const char *file, char *saved, size_t cap)
+{
+    int r = ui_theme_write(g_user_themes, t, file, saved, cap);
+    sync();
+    return r;
+}
+static int hook_themes_reload(void) { return ui_load_themes(g_assets_dir, g_user_themes, g_themes, UI_MAX_THEMES); }
+static int hook_theme_remove(const char *file)
+{
+    int r = ui_theme_delete(g_user_themes, file);
+    sync();
+    return r;
 }
 
 /* kill -USR1 $(pidof fathom-player): the screen as it is now, to /tmp/fathom-screen.bmp */
@@ -1382,6 +1401,31 @@ static int hook_radio_remove(const char *url)
     return radio_remove(path, example, url);
 }
 
+/* Home > Podcasts: an OPML file (subscriptions exported from another app) to
+ * offer, the first by name at the top of the card, in Music or in
+ * fathom/podcasts. */
+static const char *g_music;       /* the music folder (--music) */
+static int hook_podcast_opml(char *path, size_t cap)
+{
+    char dirs[3][600];
+    snprintf(dirs[0], sizeof dirs[0], "%s", CARD_DIR);
+    snprintf(dirs[1], sizeof dirs[1], "%s", g_music ? g_music : CARD_DIR "/Music");
+    snprintf(dirs[2], sizeof dirs[2], "%s", podsync_dir());
+    for (int d = 0; d < 3; d++) {
+        DIR *dir = opendir(dirs[d]);
+        struct dirent *e;
+        char best[256] = "";
+        while (dir && (e = readdir(dir))) {
+            size_t n = strlen(e->d_name);
+            if (e->d_name[0] == '.' || n < 6 || strcasecmp(e->d_name + n - 5, ".opml")) continue;
+            if (!best[0] || strcmp(e->d_name, best) < 0) snprintf(best, sizeof best, "%s", e->d_name);
+        }
+        if (dir) closedir(dir);
+        if (best[0]) { snprintf(path, cap, "%s/%s", dirs[d], best); return 1; }
+    }
+    return 0;
+}
+
 /* A station can play once Wi-Fi has an address (or, for testing over USB, a
  * proxy is set: http_proxy=http://10.42.0.2:PORT). */
 static int hook_radio_ready(char *why, size_t cap)
@@ -1654,7 +1698,6 @@ static void dac_filter_next(void)
     if (mixer_enum_set(HW_CTL, DAC_FILTER, next) == 0) settings_set_int("sound.dac_filter", next);
 }
 
-static const char *g_music;
 static int scan_with_progress(library_t *lib, const char *music, const theme_t *t, const ui_fonts_t *f);
 
 /* ---------- USB drive mode ----------
@@ -2395,10 +2438,10 @@ int main(int argc, char **argv)
 
     lv_init();
     lv_tick_set_cb(ms_now);
-    static theme_t themes[UI_MAX_THEMES];
-    char user_themes[600];
-    snprintf(user_themes, sizeof user_themes, "%s/themes", data);   /* contributed themes on the card */
-    int n_themes = ui_load_themes(assets, user_themes, themes, UI_MAX_THEMES);
+    theme_t *themes = g_themes;
+    snprintf(g_user_themes, sizeof g_user_themes, "%s/themes", data);   /* contributed themes on the card */
+    snprintf(g_assets_dir, sizeof g_assets_dir, "%s", assets);
+    int n_themes = ui_load_themes(assets, g_user_themes, themes, UI_MAX_THEMES);
     const ui_fonts_t *base_fonts = n_themes > 0 ? ui_theme_fonts(&themes[0]) : NULL;
     if (!base_fonts) { fprintf(stderr, "no usable theme or font in %s\n", assets); return 1; }
     if (!theme_given) {                 /* the last theme picked, by name */
@@ -2450,6 +2493,9 @@ int main(int argc, char **argv)
     char pl_dir[600];
     snprintf(pl_dir, sizeof pl_dir, "%s/playlists", data);   /* your own playlists: never in the music folder */
     library_set_playlist_dir(lib, pl_dir);
+    char found[600];
+    snprintf(found, sizeof found, "%s/covers", data);   /* (every library handle: scans use them too) */
+    library_set_found_covers(found);
     fast_walk_setup(lib, music);
     lib_list_t songs = {0};
     int have = library_list(lib, LIB_SONGS, 0, &songs);
@@ -2505,6 +2551,7 @@ int main(int argc, char **argv)
         .rescan = rescan, .restart = restart_player, .usb_drive = usb_drive, .usb_dac = usb_dac_mode, .about = about,
         .eq_list = hook_eq_list, .eq_set = hook_eq_set, .eq_get = hook_eq_get, .eq_put = hook_eq_put,
         .eq_preview = hook_eq_preview, .eq_remove = hook_eq_remove,
+        .theme_save = hook_theme_save, .themes_reload = hook_themes_reload, .theme_remove = hook_theme_remove,
     };
     if (bt_available() && out_is_alsa) {
         hooks.bt_state = bt_ui_state;
@@ -2517,6 +2564,7 @@ int main(int argc, char **argv)
         hooks.wifi_networks = wifi_ui_networks;
         hooks.wifi_do = wifi_ui_do;
         wifi_init(settings_get_int("wifi.on", 0));
+        http_set_version(FATHOM_VERSION);
         updater_init(CARD_DIR, FATHOM_VERSION, settings_get("update.api", ""));   /* (a test server's) */
         if (!update_is_newer(settings_get("update.found", ""), FATHOM_VERSION) && settings_get("update.found", "")[0])
             settings_set("update.found", "");    /* installed since */
@@ -2542,6 +2590,12 @@ int main(int argc, char **argv)
         hooks.radio_ready = hook_radio_ready;
         hooks.radio_add = hook_radio_add;
         hooks.radio_remove = hook_radio_remove;
+        char pods[600];
+        snprintf(pods, sizeof pods, "%s/podcasts", data);
+        if (podsync_start(pods) == 0) hooks.podcast_opml = hook_podcast_opml;
+        char covers[600];                /* covers found online (Find cover): on the card, never beside the music */
+        snprintf(covers, sizeof covers, "%s/covers", data);
+        cf_start(covers);
     }
     g_lib = lib;
     g_music = music;
@@ -2664,6 +2718,9 @@ int main(int argc, char **argv)
     if (g_batlog_on) batlog_flush(&g_batlog);   /* (a restart or USB drive mode: the H2 stays on) */
     clock_save();
     settings_save();
+    ui_save_state();       /* (where a podcast episode was left) */
+    podsync_stop();        /* (a download under way: dropped, its .part removed) */
+    cf_stop();
     queue_save();
     if (player) player_free(player);
     if (eng) engine_free(eng);

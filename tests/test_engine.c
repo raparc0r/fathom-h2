@@ -84,6 +84,9 @@ typedef struct {
     unsigned only_rate;           /* opens only this rate (0: any) */
     int gone;                     /* unplugged: open() says so */
     int opens;
+    int watch;                    /* from al_watch(): the earliest track frame written, and how many */
+    long first_frame;
+    unsigned long long watched;
 } alsa_like_t;
 
 static int al_open(void *ctx, const audio_format_t *f)
@@ -109,6 +112,11 @@ static long al_write(void *ctx, const int32_t *x, long n)
     if (r > 0) {
         a->frames += (unsigned long long)n;
         a->queued += n;
+        if (a->watch && x) {
+            for (long i = 0; i < n; i++)
+                if (frame_of(x + 2 * i) < a->first_frame) a->first_frame = frame_of(x + 2 * i);
+            a->watched += (unsigned long long)n;
+        }
     }
     pthread_mutex_unlock(&a->mu);
     return r;
@@ -170,6 +178,65 @@ static int al_wait_in_write(alsa_like_t *a)
         if (!in) sleep_ms(5);
     }
     return in;
+}
+
+static void al_watch(alsa_like_t *a)
+{
+    pthread_mutex_lock(&a->mu);
+    a->watch = 1;
+    a->first_frame = 0x7fffffff;
+    a->watched = 0;
+    pthread_mutex_unlock(&a->mu);
+}
+
+static unsigned long long al_watched(alsa_like_t *a, long *first)
+{
+    pthread_mutex_lock(&a->mu);
+    unsigned long long n = a->watched;
+    if (first) *first = a->first_frame;
+    pthread_mutex_unlock(&a->mu);
+    return n;
+}
+
+/* A track started part-way in (an episode where it was left), on an engine
+ * that sat paused, so idle: nothing before that point is ever written. A
+ * play and then a seek let the idle thread start on the play first (the
+ * beginning heard for a moment). And the status says where it's going at
+ * once, for a start part-way in and for a seek. */
+static void test_play_at(const char *dir)
+{
+    char a[300];
+    snprintf(a, sizeof a, "%s/at.flac", dir);
+    CHECK(write_ramp(a, 44100, 44100 * 5) == 0);
+    audio_output_t out;
+    static alsa_like_t al;
+    al_create(&out, &al);
+    engine_t *e = engine_new(&out);
+    for (int round = 0; round < 20; round++) {      /* (the race it closes was there only now and then) */
+        engine_play(e, a, 1);
+        WAIT(status(e).state == ENG_PLAYING && !status(e).starting, 2000);
+        engine_pause(e, 1);
+        WAIT(status(e).state == ENG_PAUSED, 1000);
+        sleep_ms(20);                                 /* (paused: the thread waits, idle) */
+        al_watch(&al);
+        engine_play_at(e, a, 2, 1.0f, 3000);
+        eng_status_t s = status(e);
+        CHECK(!s.starting || s.start_ms == 3000);
+        long first = 0;
+        WAIT(al_watched(&al, NULL) > 4410, 3000);
+        al_watched(&al, &first);
+        if (first < 3 * 44100) fprintf(stderr, "round %d: frame %ld written, before 3 s\n", round, first);
+        CHECK(first >= 3 * 44100);
+        s = status(e);
+        CHECK(s.track_id == 2 && s.pos_ms >= 3000);
+    }
+    /* a seek: where it's going, before the thread has got there */
+    engine_pause(e, 1);
+    engine_seek_ms(e, 1234);
+    eng_status_t s = status(e);
+    CHECK(s.pos_ms == 1234 || (s.pos_ms >= 1234 && s.pos_ms < 1400));
+    engine_free(e);
+    unlink(a);
 }
 
 /* Pause, seek, play and stop while the thread waits in a write on the paused
@@ -474,6 +541,7 @@ int main(void)
     test_open_fails(dir);
     test_pause_drops(dir);
     test_stall_drops(dir);
+    test_play_at(dir);
     rmdir(dir);
     if (failures) fprintf(stderr, "%d failure(s)\n", failures);
     else printf("engine: all checks passed\n");

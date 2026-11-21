@@ -20,6 +20,14 @@
  * count, or -1 if not even a built-in theme loads. */
 int ui_load_themes(const char *assets_dir, const char *user_dir, theme_t *themes, int max);
 
+/* The theme editor's files in user_dir: t written over `file` (relative to
+ * user_dir, as theme_t.file) or, with file "", to a new NAME.theme after its
+ * name; the file written goes in saved. Written beside, then moved over, so a
+ * power cut leaves the old file or the new one. 0 = written. ui_theme_delete
+ * removes a NAME.theme (not a theme with its own folder): 0 = removed. */
+int ui_theme_write(const char *user_dir, const theme_t *t, const char *file, char *saved, size_t cap);
+int ui_theme_delete(const char *user_dir, const char *file);
+
 /* The fonts for a theme (its own files, or a built-in family). NULL if they
  * can't be loaded. Suitable as ui_hooks_t.fonts. */
 const ui_fonts_t *ui_theme_fonts(const theme_t *t);
