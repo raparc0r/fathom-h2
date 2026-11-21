@@ -46,6 +46,7 @@ I recommend you check it out: [rockbox.org](https://www.rockbox.org).
 - **A better shuffle.** It spreads songs across artists and albums, and plays what you
   haven't heard in a while first.
 - **Themes**: use one of the four built-in themes, or make your own on the H2 itself.
+- **Customizable home screen.** Show/hide and reorder entries such as Composers, Genres...
 - **Missing album covers**, found online and saved on the card, never in your music
   folder.
 - **Lots of ways to browse**: artists, albums, genres, composers, years, folders,
@@ -54,7 +55,6 @@ I recommend you check it out: [rockbox.org](https://www.rockbox.org).
 - **Battery history**, a sleep timer and automatic power-off.
 - **Updates over Wi-Fi.** It tells you when a new version is out.
 - **SSH and SFTP**, if you like to poke around (off by default).
-- 
 
 | | | |
 |---|---|---|
