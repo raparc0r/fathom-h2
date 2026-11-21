@@ -88,6 +88,7 @@ add_executable(fathom-player
   ${ROOT}/app/audio/out_null.c
   ${ROOT}/app/audio/out_clock.c
   ${ROOT}/app/audio/out_alsa.c
+  ${ROOT}/app/audio/pcmring.c
   ${ROOT}/app/audio/mixer_alsa.c
   ${ROOT}/app/player/player.c
   ${ROOT}/app/player/radio.c
@@ -171,6 +172,7 @@ add_executable(fathom-bitperfect
   ${ROOT}/app/audio/tempo.c
   ${ROOT}/app/audio/crossfeed.c
   ${ROOT}/app/audio/out_alsa.c
+  ${ROOT}/app/audio/pcmring.c
   ${ROOT}/app/audio/mixer_alsa.c)
 target_include_directories(fathom-bitperfect PRIVATE ${ROOT}/app ${DEPS_STATIC_INCLUDE_DIRS})
 target_compile_options(fathom-bitperfect PRIVATE -Wall -Wextra -Wno-unused-parameter)

@@ -20,6 +20,7 @@
 #include <sound/asound.h>
 
 #include "audio/output.h"
+#include "audio/pcmring.h"
 #include "core/lat.h"
 
 typedef struct {
@@ -36,7 +37,11 @@ typedef struct {
     char     desc[96];
     FILE *tap;                  /* out_alsa_set_tap(): a copy of every byte written */
     unsigned long lat_thr, lat_queued;   /* (LAT: the start threshold, frames written since the prepare) */
+    pcmring_t hist;             /* what was last written, for a_flush_soft (up to the buffer, 256 KB at most) */
+    int soft_tail;              /* a soft flush left a tail playing: an underrun after it is its end */
 } alsa_out_t;
+
+#define HIST_MAX_BYTES (256 * 1024)
 
 /* ---- hw_params helpers (what alsa-lib's snd_pcm_hw_params_any/set_* do) ---- */
 
@@ -116,6 +121,7 @@ static void a_close(void *ctx)
         close(a->fd);
     }
     a->fd = -1;
+    pcmring_free(&a->hist);
 }
 
 static int a_open(void *ctx, const audio_format_t *fmt)
@@ -169,6 +175,13 @@ static int a_open(void *ctx, const audio_format_t *fmt)
     a->sample_bytes = format_bytes(a->format);
     a->period = hp_int(&hp, SNDRV_PCM_HW_PARAM_PERIOD_SIZE)->min;
     a->buffer = hp_int(&hp, SNDRV_PCM_HW_PARAM_BUFFER_SIZE)->min;
+    {   /* a copy of what's queued, for a flush that fades instead of clicking */
+        unsigned fb = (unsigned)fmt->channels * (unsigned)format_bytes(a->format);
+        unsigned cap = a->buffer < HIST_MAX_BYTES / fb ? a->buffer : HIST_MAX_BYTES / fb;
+        pcmring_free(&a->hist);
+        if (!fmt->dop) pcmring_init(&a->hist, cap, fb);   /* (DoP: never faded, its markers would go) */
+        a->soft_tail = 0;
+    }
 
     struct snd_pcm_sw_params sp;
     memset(&sp, 0, sizeof sp);
@@ -251,6 +264,8 @@ static long a_write(void *ctx, const int32_t *frames, long n)
     while (left > 0) {
         struct snd_xferi x = {.buf = (void *)buf, .frames = (snd_pcm_uframes_t)left};
         if (ioctl(a->fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &x) == 0) {
+            pcmring_put(&a->hist, buf, (unsigned)x.result);
+            a->soft_tail = 0;
             buf += (size_t)x.result * frame_bytes;
             left -= x.result;
             if (lat_on() && a->lat_queued < a->lat_thr && (a->lat_queued += x.result) >= a->lat_thr)
@@ -260,7 +275,9 @@ static long a_write(void *ctx, const int32_t *frames, long n)
         if (errno == EINTR) continue;
         if (errno == EPIPE || errno == ESTRPIPE) {      /* underrun: start again */
             static unsigned underruns;               /* (a gap you hear: logged, to find them) */
-            fprintf(stderr, "alsa: underrun %u\n", ++underruns);
+            if (!a->soft_tail) fprintf(stderr, "alsa: underrun %u\n", ++underruns);
+            a->soft_tail = 0;                        /* (a soft flush's tail ran out first: not a gap) */
+            pcmring_reset(&a->hist);
             a->lat_queued = 0;
             if (ioctl(a->fd, SNDRV_PCM_IOCTL_PREPARE) == 0) continue;
         }
@@ -309,6 +326,61 @@ static void a_flush(void *ctx)
     ioctl(a->fd, SNDRV_PCM_IOCTL_PREPARE);
     a->paused = 0;
     a->lat_queued = 0;
+    a->soft_tail = 0;
+    pcmring_reset(&a->hist);
+}
+
+static int ring_format(int format)
+{
+    return format == SNDRV_PCM_FORMAT_S16_LE ? PCMRING_S16 : format == SNDRV_PCM_FORMAT_S24_LE ? PCMRING_S24_4
+         : format == SNDRV_PCM_FORMAT_S32_LE ? PCMRING_S32 : PCMRING_S24_3;
+}
+
+/* As a_flush, without the click of sound stopped mid-waveform: all but a
+ * period of what's queued is taken back (the DMA may read up to that far
+ * ahead), and the 8 ms after it written again from the copy, faded to
+ * silence. The PCM keeps running; what comes next follows the fade. Only
+ * from the writing thread, between writes (output.h: flush_soft). Paused,
+ * not started, DoP, or a rewind the driver refuses: a_flush. */
+static void a_flush_soft(void *ctx)
+{
+    alsa_out_t *a = ctx;
+    if (a->fd < 0) return;
+    snd_pcm_sframes_t d = 0;
+    if (a->paused || !a->hist.buf || ioctl(a->fd, SNDRV_PCM_IOCTL_DELAY, &d) || d <= 0) { a_flush(a); return; }
+    unsigned fade = a->fmt.rate / 125 > 16 ? a->fmt.rate / 125 : 16;
+    if ((unsigned long)d <= a->period + fade) return;     /* (as little as that left: it plays out) */
+    unsigned long want = (unsigned long)d - a->period;
+    if (want > a->hist.cap) want = a->hist.cap;           /* (no further back than the copy goes) */
+    size_t fb = a->hist.frame_bytes;
+    uint8_t *tail = malloc((size_t)fade * fb);
+    if (!tail || pcmring_get(&a->hist, (unsigned)want, fade, tail)) { free(tail); a_flush(a); return; }
+    snd_pcm_uframes_t rw = want;
+    if (ioctl(a->fd, SNDRV_PCM_IOCTL_REWIND, &rw) || rw != want) {   /* (refused, or only part: the copy's out of step) */
+        free(tail);
+        a_flush(a);
+        return;
+    }
+    pcmring_unput(&a->hist, (unsigned)want);
+    pcm_fade_out(tail, fade, a->fmt.channels, ring_format(a->format));
+    const uint8_t *p = tail;
+    unsigned left = fade;
+    while (left) {
+        struct snd_xferi x = {.buf = (void *)p, .frames = left};
+        if (ioctl(a->fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &x)) {
+            if (errno == EINTR) continue;
+            free(tail);
+            a_flush(a);
+            return;
+        }
+        pcmring_put(&a->hist, p, (unsigned)x.result);
+        p += (size_t)x.result * fb;
+        left -= (unsigned)x.result;
+    }
+    free(tail);
+    a->flushes++;
+    a->soft_tail = 1;
+    LAT("alsa: soft flush: %lu frames taken back, %u faded", (unsigned long)want, fade);
 }
 
 static void a_pause(void *ctx, int on)
@@ -346,7 +418,8 @@ int out_alsa_create(audio_output_t *out, const char *device)
     snprintf(a->dev, sizeof a->dev, "%s", device ? device : "/dev/snd/pcmC0D0p");
     a->fd = -1;
     if (access(a->dev, W_OK)) { free(a); return -1; }
-    *out = (audio_output_t){a_open, a_write, a_delay, a_drain, a_flush, a_pause, a_close, a_describe, a, NULL, a_can_cut};
+    *out = (audio_output_t){a_open, a_write, a_delay, a_drain, a_flush, a_pause, a_close, a_describe, a, NULL, a_can_cut,
+                            a_flush_soft};
     return 0;
 }
 

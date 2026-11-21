@@ -170,11 +170,9 @@ static int64_t sim_cf_download(const char *url, const char *path, http_progress_
     return out && total ? (int64_t)total : -1;
 }
 /* What's new, as a release's whatsnew.txt gives it (the screenshots; About's row) */
-#define SIM_WHATS_NEW_VERSION "v0.14.0"
-#define SIM_WHATS_NEW "Smart playlists that keep themselves up to date\n" \
-                      "Shuffle any playlist, album or artist from its menu\n" \
-                      "A dimmer logo while the H2 starts\n" \
-                      "Fixes for radio after starting, podcasts and moving items\n"
+#define SIM_WHATS_NEW_VERSION "v0.14.1"
+#define SIM_WHATS_NEW "Hotfix: Eliminates clicking sound when you skip, go back or seek\n" \
+                      "Easier to read update and What's new screens\n"
 static int sim_pod_opml(char *path, size_t cap)
 {
     snprintf(path, cap, "build/sim-data/podcasts/subscriptions.opml");

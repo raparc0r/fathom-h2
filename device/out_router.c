@@ -21,6 +21,13 @@ static void r_pause(void *c, int on) { (void)c; cur()->pause(cur()->ctx, on); }
 static void r_close(void *c) { (void)c; cur()->close(cur()->ctx); }
 static void r_describe(void *c, char *o, int cap) { (void)c; cur()->describe(cur()->ctx, o, cap); }
 static int r_can_cut(void *c) { (void)c; return cur()->can_cut ? cur()->can_cut(cur()->ctx) : 0; }
+/* (Bluetooth has none: its flush) */
+static void r_flush_soft(void *c)
+{
+    (void)c;
+    if (cur()->flush_soft) cur()->flush_soft(cur()->ctx);
+    else cur()->flush(cur()->ctx);
+}
 static int r_set_eq(void *c, const eq_profile_t *p)
 {
     (void)c;
@@ -31,7 +38,8 @@ void out_router_create(audio_output_t *out, const audio_output_t *alsa, const au
 {
     R.alsa = *alsa;
     if (bt) R.bt = *bt;
-    *out = (audio_output_t){r_open, r_write, r_delay, r_drain, r_flush, r_pause, r_close, r_describe, &R, r_set_eq, r_can_cut};
+    *out = (audio_output_t){r_open, r_write, r_delay, r_drain, r_flush, r_pause, r_close, r_describe, &R, r_set_eq, r_can_cut,
+                            r_flush_soft};
 }
 
 void out_router_alsa(void *ctx, void *device)

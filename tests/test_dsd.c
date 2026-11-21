@@ -445,7 +445,7 @@ int main(int argc, char **argv)
         /* the same through the engine: one open, the whole file's samples */
         keep_t k = {.cap = 176400 + 4096};
         k.buf = calloc((size_t)k.cap * 2, sizeof *k.buf);
-        audio_output_t out = {k_open, k_write, k_delay, k_nop, k_nop, k_pause, k_nop, k_describe, &k, NULL, NULL};
+        audio_output_t out = {k_open, k_write, k_delay, k_nop, k_nop, k_pause, k_nop, k_describe, &k, NULL, NULL, NULL};
         engine_t *e = engine_new(&out);
         engine_play(e, a, 1);
         engine_pause(e, 1);                           /* b must be queued before a ends */
@@ -554,7 +554,7 @@ int main(int argc, char **argv)
          * back to PCM at once when the output changes */
         keep_t k = {.cap = 176400 + 4096};
         k.buf = calloc((size_t)k.cap * 2, sizeof *k.buf);
-        audio_output_t out = {k_open, k_write, k_delay, k_nop, k_nop, k_pause, k_nop, k_describe, &k, NULL, NULL};
+        audio_output_t out = {k_open, k_write, k_delay, k_nop, k_nop, k_pause, k_nop, k_describe, &k, NULL, NULL, NULL};
         engine_t *e = engine_new(&out);
         engine_set_dop(e, 1);
         engine_set_balance(e, 1.0f, 0.5f);

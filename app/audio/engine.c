@@ -162,6 +162,15 @@ static void out_open_for(engine_t *e, const audio_format_t *of)
     if (e->out_open && e->state == ENG_PAUSED) e->out.pause(e->out.ctx, 1);
 }
 
+/* Called with mu held, on the engine thread, between writes: what's queued
+ * dropped, faded out where the output can (output.h: flush_soft), else as
+ * flush() drops it. */
+static void out_flush_soft(engine_t *e)
+{
+    if (e->out.flush_soft) e->out.flush_soft(e->out.ctx);
+    else e->out.flush(e->out.ctx);
+}
+
 /* Called with mu held, on the engine thread: the EQ or crossfeed was turned on
  * during a track the output was opened for at 16 bits, so it opens again at
  * 24. What it had queued goes with the old one: with keep_place (mid-track),
@@ -280,11 +289,16 @@ static int start_track(engine_t *e, const pending_t *p, int gapless, decoder_t *
     if (!e->out_open || !same_out_format(&e->out_fmt, &of)) {
         if (e->out_open) {
             if (gapless) e->out.drain(e->out.ctx);   /* let the previous track finish */
-            else e->out.flush(e->out.ctx);
+            else if (e->out.flush_soft) {            /* another rate: faded, and that played out, */
+                e->out.flush_soft(e->out.ctx);       /* before the close (dropped mid-waveform, it */
+                e->out.drain(e->out.ctx);            /* clicked: about 30 ms, the fade's tail) */
+            } else {
+                e->out.flush(e->out.ctx);
+            }
         }
         out_open_for(e, &of);
     } else if (!gapless) {
-        e->out.flush(e->out.ctx);                    /* same format: just drop queued audio */
+        out_flush_soft(e);                           /* same format: drop queued audio (fading it) */
     }
     if (!gapless) { eq_reset(e->eq); crossfeed_reset(e->xf); }   /* (gapless: the filters carry on) */
     eq_sync(e, 0);
@@ -348,6 +362,7 @@ static void cut_write(engine_t *e)
 {
     if (!e->writing || e->state != ENG_PLAYING || !e->out_open || e->hold || e->seeking || e->draining) return;
     if (!e->out.can_cut || !e->out.can_cut(e->out.ctx)) return;   /* (Bluetooth: as before) */
+    if (e->out.flush_soft) return;   /* (the write ends within a chunk; then a fade, not a click) */
     e->cut++;
     e->out.flush(e->out.ctx);
 }
@@ -456,7 +471,7 @@ static void *run(void *arg)
             if (dec != e->dec || e->cmd_play.valid || e->quit) continue;   /* (replaced meanwhile) */
             if (e->cmd_seek) rc = -1;                    /* (another seek asked meanwhile: that one next) */
             if (rc == 0) {
-                e->out.flush(e->out.ctx);
+                out_flush_soft(e);
                 eq_reset(e->eq);
                 crossfeed_reset(e->xf);
                 e->pos_frames = frame;

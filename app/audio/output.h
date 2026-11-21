@@ -31,6 +31,13 @@ typedef struct {
      * 0 (Bluetooth: its flush is a round trip to bluez-alsa and resets the
      * resampler the write is using): it waits for the write, as before. */
     int  (*can_cut)(void *ctx);
+    /* Optional: as flush(), but without the click of sound stopped
+     * mid-waveform: what's playing fades out over a few ms (a little may stay
+     * queued, about 30 ms). Only from the thread that writes, with no write
+     * under way. The engine uses it for a new track and a seek; given it, a
+     * skip waits for the write under way (at most a chunk) rather than cut it
+     * with flush() from another thread. NULL: flush(). */
+    void (*flush_soft)(void *ctx);
 } audio_output_t;
 
 int  out_sdl_create(audio_output_t *out);

@@ -4076,7 +4076,7 @@ static void update_overlay(void)
         lv_obj_set_style_text_align(S.upd_detail, LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_long_mode(S.upd_detail, LV_LABEL_LONG_WRAP);
         S.upd_hint = lv_label_create(S.upd_ov);
-        style_label(S.upd_hint, S.f->meta, t->text_muted);
+        style_label(S.upd_hint, S.f->body, t->text_muted);   /* (the lists' size: what to press, read at a glance) */
         lv_obj_set_width(S.upd_hint, UI_W - 32);
         lv_obj_set_style_text_align(S.upd_hint, LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_long_mode(S.upd_hint, LV_LABEL_LONG_WRAP);
@@ -4171,8 +4171,8 @@ static void whats_new_open(void)
     lv_obj_set_style_pad_top(col, 14, 0);
     lv_obj_set_style_pad_bottom(col, 10, 0);
     lv_obj_set_style_pad_row(col, 10, 0);
-    lv_obj_t *title = lv_label_create(col);       /* (the header's font: on one line in every theme) */
-    style_label(title, S.f->head, t->text);
+    lv_obj_t *title = lv_label_create(col);       /* (the lists' size, as the points) */
+    style_label(title, S.f->body, t->text);
     lv_obj_set_width(title, LV_PCT(100));
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
     char tt[96];

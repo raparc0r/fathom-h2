@@ -90,6 +90,8 @@ typedef struct {
     int watch;                    /* from al_watch(): the earliest track frame written, and how many */
     long first_frame;
     unsigned long long watched;
+    unsigned soft;                /* flush_soft()s (al_flush_soft) */
+    unsigned drains;
 } alsa_like_t;
 
 static int al_open(void *ctx, const audio_format_t *f)
@@ -130,7 +132,7 @@ static void al_nop(void *ctx) { (void)ctx; }
 /* ALSA's drain waits for what's queued to be played: a while, in which the
  * player queues the next track (an instant drain let a short track end
  * before the next was queued, on the H2's one core) */
-static void al_drain(void *ctx) { (void)ctx; sleep_ms(50); }
+static void al_drain(void *ctx) { ((alsa_like_t *)ctx)->drains++; sleep_ms(50); }
 
 static void al_flush(void *ctx)
 {
@@ -154,6 +156,16 @@ static void al_pause(void *ctx, int on)
 
 static int al_can_cut(void *ctx) { return ((alsa_like_t *)ctx)->can_cut; }
 
+/* As ALSA's: queued audio goes (faded), the write isn't woken: called between writes */
+static void al_flush_soft(void *ctx)
+{
+    alsa_like_t *a = ctx;
+    pthread_mutex_lock(&a->mu);
+    a->soft++;
+    a->queued = 0;
+    pthread_mutex_unlock(&a->mu);
+}
+
 static void al_describe(void *ctx, char *o, int cap) { (void)ctx; snprintf(o, (size_t)cap, "alsa-like"); }
 
 static void al_create(audio_output_t *out, alsa_like_t *a)
@@ -161,7 +173,7 @@ static void al_create(audio_output_t *out, alsa_like_t *a)
     memset(a, 0, sizeof *a);
     pthread_mutex_init(&a->mu, NULL);
     pthread_cond_init(&a->cv, NULL);
-    *out = (audio_output_t){al_open, al_write, al_delay, al_drain, al_flush, al_pause, al_nop, al_describe, a, NULL, al_can_cut};
+    *out = (audio_output_t){al_open, al_write, al_delay, al_drain, al_flush, al_pause, al_nop, al_describe, a, NULL, al_can_cut, NULL};
 }
 
 static void al_gate(alsa_like_t *a, int on)
@@ -510,7 +522,7 @@ static void test_pause_drops(const char *dir)
     bt_like_t bl;
     memset(&bl, 0, sizeof bl);
     pthread_mutex_init(&bl.mu, NULL);
-    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL};
+    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL, NULL};
     engine_t *e = engine_new(&out);
     engine_play(e, a, 1);
     sleep_ms(1000);
@@ -542,7 +554,7 @@ static void test_stall_drops(const char *dir)
     memset(&bl, 0, sizeof bl);
     pthread_mutex_init(&bl.mu, NULL);
     bl.first_after = 0;
-    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL};
+    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL, NULL};
     engine_t *e = engine_new(&out);
     engine_play(e, a, 1);
     sleep_ms(1000);
@@ -626,7 +638,7 @@ static void test_crossfeed_keeps_place(const char *dir)
     bt_like_t bl;
     memset(&bl, 0, sizeof bl);
     pthread_mutex_init(&bl.mu, NULL);
-    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL};
+    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL, NULL};
     engine_t *e = engine_new(&out);
     engine_play(e, a, 1);
     sleep_ms(1000);
@@ -672,6 +684,58 @@ static void test_crossfeed_16bit_output(const char *dir)
     unlink(a);
 }
 
+/* An output with a soft flush (ALSA's: a fade, not a click): a new track
+ * doesn't cut the write under way (it ends within its chunk), and then what's
+ * queued goes by the soft flush, on the engine's thread, not the hard one. */
+static void test_flush_soft(const char *dir)
+{
+    char a[300], b[300];
+    snprintf(a, sizeof a, "%s/soft-a.flac", dir);
+    snprintf(b, sizeof b, "%s/soft-b.flac", dir);
+    CHECK(write_ramp(a, 44100, 44100 * 2) == 0 && write_ramp(b, 44100, 44100) == 0);
+    audio_output_t out;
+    alsa_like_t al;
+    al_create(&out, &al);
+    al.can_cut = 1;
+    out.flush_soft = al_flush_soft;
+    engine_t *e = engine_new(&out);
+    al_gate(&al, 1);                              /* writes held: the new track comes mid-write */
+    engine_play(e, a, 1);
+    CHECK(al_wait_in_write(&al));
+    engine_play(e, b, 2);
+    sleep_ms(50);
+    CHECK(al.flushes == 0);                       /* the write wasn't cut */
+    al_gate(&al, 0);
+    WAIT(status(e).track_id == 2 && al.soft >= 1, 2000);
+    CHECK(status(e).track_id == 2 && al.soft >= 1 && al.flushes == 0);
+    engine_seek_ms(e, 500);                       /* a seek: the same */
+    WAIT(al.soft >= 2, 2000);
+    CHECK(al.soft >= 2 && al.flushes == 0);
+    /* another rate: the output opens again; first the fade, played out (a
+     * drain), not a drop mid-waveform */
+    char c[300];
+    snprintf(c, sizeof c, "%s/soft-c.flac", dir);
+    CHECK(write_ramp(c, 48000, 48000) == 0);
+    al_gate(&al, 1);                              /* b again, held in a write: playing, not ended */
+    engine_play(e, b, 4);
+    CHECK(al_wait_in_write(&al));
+    unsigned soft0 = al.soft, drains0 = al.drains;
+    int opens0 = al.opens;
+    engine_play(e, c, 3);
+    al_gate(&al, 0);
+    WAIT(status(e).track_id == 3 && al.opens > opens0, 2000);
+    /* (c is a second, written at once here: it may have ended, with a drain of its own, by now) */
+    CHECK(status(e).track_id == 3 && al.opens == opens0 + 1 && al.soft == soft0 + 1 && al.drains >= drains0 + 1 &&
+          al.flushes == 0);
+    if (!(status(e).track_id == 3 && al.opens == opens0 + 1 && al.soft == soft0 + 1 && al.drains >= drains0 + 1 && al.flushes == 0))
+        fprintf(stderr, "track %lld, opens +%d, soft +%u, drains +%u, flushes %u\n", (long long)status(e).track_id,
+                al.opens - opens0, al.soft - soft0, al.drains - drains0, al.flushes);
+    engine_free(e);
+    unlink(a);
+    unlink(b);
+    unlink(c);
+}
+
 int main(void)
 {
     char dir[200];
@@ -687,6 +751,7 @@ int main(void)
     test_crossfeed(dir);
     test_crossfeed_keeps_place(dir);
     test_crossfeed_16bit_output(dir);
+    test_flush_soft(dir);
     rmdir(dir);
     if (failures) fprintf(stderr, "%d failure(s)\n", failures);
     else printf("engine: all checks passed\n");
