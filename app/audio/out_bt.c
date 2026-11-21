@@ -449,7 +449,7 @@ int out_bt_create(audio_output_t *out, const char *bt_dir)
     pthread_mutexattr_destroy(&ma);
     signal(SIGPIPE, SIG_IGN);                  /* a dropped link is a write error, not a kill */
     *out = (audio_output_t){bt_open, bt_write, bt_delay, bt_drain, bt_flush, bt_pause,
-                            bt_close, bt_describe, o, bt_set_eq};
+                            bt_close, bt_describe, o, bt_set_eq, NULL};
     return 0;
 }
 

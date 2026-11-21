@@ -5,7 +5,7 @@
  * pieces taken further apart than they're put back together; each piece is
  * moved (within 15 ms) to where it best matches the end of the last one, and
  * the two are cross-faded over 8 ms. Speech, where it's used, comes through
- * clean; music less so. Whole numbers only (the H2 has no FPU): the match is
+ * clean; music less so. Whole numbers only (Fathom is built soft-float): the match is
  * found on a mono copy at a quarter of the rate.
  *
  * Samples are the engine's: interleaved, left-justified int32.

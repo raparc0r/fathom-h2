@@ -1,0 +1,40 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] backlight: pwm_bl: a period from the kernel command line
+
+pwm_bl.period_ns=N overrides the period the firmware (device tree) gives the
+backlight's PWM. The H2's backlight driver IC turns on only above ~15-18 %
+duty at 33 kHz (the stock firmware's lowest level is 47/255), and flickers
+faintly near that edge on USB power: another frequency may do better there,
+and this lets one be tried and kept without a new kernel. 0 (the default)
+keeps the firmware's period.
+---
+--- a/drivers/video/backlight/pwm_bl.c
++++ b/drivers/video/backlight/pwm_bl.c
+@@ -17,6 +17,16 @@
+ #include <linux/pwm_backlight.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/slab.h>
++
++/*
++ * A period for the backlight's PWM other than the firmware's (device tree's),
++ * from the kernel command line (pwm_bl.period_ns=...): a backlight driver IC
++ * near the low end of its dimming range may behave better at another
++ * frequency, and this lets that be tried without a new kernel. 0: as given.
++ */
++static unsigned int period_ns;
++module_param(period_ns, uint, 0444);
++MODULE_PARM_DESC(period_ns, "PWM period in ns, overriding the firmware's (0: keep it)");
+ 
+ struct pwm_bl_data {
+ 	struct pwm_device	*pwm;
+@@ -517,6 +527,10 @@
+ 	 */
+ 	if (!state.period && (data->pwm_period_ns > 0))
+ 		state.period = data->pwm_period_ns;
++	if (period_ns) {
++		dev_info(&pdev->dev, "PWM period %u ns (firmware's %llu)\n", period_ns, state.period);
++		state.period = period_ns;
++	}
+ 
+ 	ret = pwm_apply_might_sleep(pb->pwm, &state);
+ 	if (ret) {

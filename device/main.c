@@ -42,6 +42,9 @@
 #include "core/lang.h"
 #include "core/batlog.h"
 #include "core/settings.h"
+#include "core/lat.h"
+#include "net/dnscache.h"
+#include "net/tls_wrap.h"
 #include "audio/mixer_alsa.h"
 #include "audio_route.h"
 #include "uac_relay.h"
@@ -68,6 +71,7 @@
 #include "net/update.h"
 #include "net/podsync.h"
 #include "net/coverfind.h"
+#include "audio/crossfeed.h"
 #include "audio/decoder.h"
 #include "audio/ff_util.h"
 #include "audio/eq.h"
@@ -749,6 +753,7 @@ static void eq_path(const char *name, char *out, size_t cap)
 
 /* Sets the engine's EQ for the output playing now, from its saved choice. */
 static void balance_apply(void);
+static void crossfeed_apply(void);
 static void limit_apply(void);
 static int pure_on(void);
 static void levelling_apply(void);
@@ -775,7 +780,8 @@ static void eq_apply(void)
     if (g_eng) engine_set_eq(g_eng, on && !pure ? &p : NULL);
     ui_set_eq(on ? name : "", label);
     fprintf(stderr, "eq: %s: %s%s\n", key, on ? name : "off", pure ? " (Pure mode: bypassed)" : "");
-    balance_apply();                     /* (a new output: its balance, limit and Pure mode too) */
+    balance_apply();                     /* (a new output: its balance, crossfeed, limit and Pure mode too) */
+    crossfeed_apply();
     limit_apply();
     levelling_apply();
     dop_apply();
@@ -808,6 +814,21 @@ static int balance_db(void)
     out_setting_key("balance", key, sizeof key);
     int b = settings_get_int(key, 0);
     return b < -BALANCE_MAX ? -BALANCE_MAX : b > BALANCE_MAX ? BALANCE_MAX : b;
+}
+
+/* Crossfeed, per output like the balance ("crossfeed.<output>": XF_OFF..),
+ * off by default; Pure mode bypasses it */
+static int crossfeed_now(void)
+{
+    char key[80];
+    out_setting_key("crossfeed", key, sizeof key);
+    int l = settings_get_int(key, XF_OFF);
+    return l > XF_OFF && l < XF_LEVELS ? l : XF_OFF;
+}
+
+static void crossfeed_apply(void)
+{
+    if (g_eng) engine_set_crossfeed(g_eng, pure_on() ? XF_OFF : crossfeed_now());
 }
 
 static void balance_apply(void)
@@ -856,6 +877,10 @@ static void limit_apply(void)
 /* UI: Sound > Balance and Volume limit, for the output playing now. */
 static void hook_sound_value(int what, char *out, size_t cap)
 {
+    if (what == UI_SOUND_CROSSFEED) {
+        snprintf(out, cap, "%s", tr(crossfeed_name(crossfeed_now())));
+        return;
+    }
     if (what == UI_SOUND_BALANCE) {
         int b = balance_db();
         char n[16];
@@ -880,6 +905,12 @@ static int hook_sound_adjust(int what, int dir)
     char key[80];
     if (!dir) {
         if (what == UI_SOUND_LIMIT && on_line_out_now()) { ui_toast("Line out: fixed at 0 dB", 1500); return -1; }
+        return 0;
+    }
+    if (what == UI_SOUND_CROSSFEED) {        /* Off, Light, Medium, Strong, Off... */
+        out_setting_key("crossfeed", key, sizeof key);
+        settings_set_int(key, (crossfeed_now() + (dir < 0 ? XF_LEVELS - 1 : 1)) % XF_LEVELS);
+        crossfeed_apply();
         return 0;
     }
     if (what == UI_SOUND_BALANCE) {
@@ -972,7 +1003,14 @@ static void db_text(char *out, size_t cap, double db)
 static int hook_signal_path(int i, char *label, size_t lc, char *value, size_t vc)
 {
     static const char *const L[] = {"File", "Levelling", "EQ", "Balance", "Volume", "Output", "Sent as", "Result", "Because"};
-    if (i < 0 || i >= (int)(sizeof L / sizeof L[0]) || !g_eng) return -1;
+    if (i < 0 || i > (int)(sizeof L / sizeof L[0]) || !g_eng) return -1;
+    if (i == 4) {                                    /* Crossfeed, between Balance and Volume */
+        snprintf(label, lc, "%s", tr("Crossfeed"));
+        if (pure_on()) snprintf(value, vc, "%s", tr("Bypassed"));
+        else hook_sound_value(UI_SOUND_CROSSFEED, value, vc);
+        return 0;
+    }
+    if (i > 4) i--;
     eng_status_t st;
     engine_status(g_eng, &st);
     int pure = pure_on(), playing = st.fmt.rate && st.state != ENG_STOPPED;
@@ -987,6 +1025,7 @@ static int hook_signal_path(int i, char *label, size_t lc, char *value, size_t v
         WHY(st.eq, tr("EQ"));
         WHY(st.track_gain != 1.0f, tr("levelling"));
         WHY(st.balance[0] != 1.0f || st.balance[1] != 1.0f, tr("balance"));
+        WHY(st.crossfeed != XF_OFF, tr("crossfeed"));
         WHY(st.gain != 1.0f, tr("software volume"));
         WHY(st.out_fmt.rate && st.out_fmt.rate != st.fmt.rate, tr("resampled"));
         WHY(!st.fmt.bits && strncmp(st.fmt.codec, "DSD", 3), tr("lossy file"));
@@ -1379,9 +1418,19 @@ static int hook_radio_stations(radio_station_t *out, int max)
     char path[600];
     snprintf(path, sizeof path, "%s/radio.txt", g_data_dir);
     int n = radio_load(path, out, max);
-    if (n >= 0) return n;
-    snprintf(path, sizeof path, "%s/assets/radio.txt", g_data_dir);
-    return radio_load(path, out, max);
+    if (n < 0) {
+        snprintf(path, sizeof path, "%s/assets/radio.txt", g_data_dir);
+        n = radio_load(path, out, max);
+    }
+    /* Your stations shown: their names looked up meanwhile, so the one chosen
+     * doesn't wait for DNS (a few hundred ms on the H2, sometimes seconds) */
+    if (wifi_connected()) {
+        for (int i = 0; i < n && i < 8; i++) dnscache_prefetch_url(out[i].url);
+#ifdef FATHOM_TLS_WRAP
+        tls_wrap_warm();             /* and the certificates parsed */
+#endif
+    }
+    return n;
 }
 
 /* Find stations: your list changed from the H2 (made from the example the first time). */
@@ -1451,6 +1500,17 @@ static void radio_poll(lv_timer_t *t)
         n.playing = 0;
     }
     radiometa_want(s && n.playing ? s->info : NULL);
+    /* a station playing: the ones Next and Previous go to, looked up ahead */
+    static const radio_station_t *ahead_of;
+    if (s != ahead_of && wifi_connected()) {   /* (not connected yet: once it is) */
+        ahead_of = s;
+        const radio_station_t *first = player_radio_at(g_player, 0);
+        int i = s && first ? (int)(s - first) : -1;
+        const radio_station_t *nx = i >= 0 ? player_radio_at(g_player, i + 1) : NULL;
+        const radio_station_t *pv = i > 0 ? player_radio_at(g_player, i - 1) : NULL;
+        if (nx) dnscache_prefetch_url(nx->url);
+        if (pv) dnscache_prefetch_url(pv->url);
+    }
     char a[256], ti[256], v[512];
     if (s && radiometa_take(a, sizeof a, ti, sizeof ti, v, sizeof v)) player_radio_set_info(g_player, a, ti, v);
     /* the song's cover, when the station names one */
@@ -2398,6 +2458,32 @@ static int scan_with_progress(library_t *lib, const char *music, const theme_t *
     return n;
 }
 
+/* What's new (fathom/assets/whatsnew.txt, from the release notes' summary by
+ * make-release.sh: the version, then one point per line): shown once, at the
+ * first start of a new version over a library that was already there (an
+ * update, not a fresh install), and kept for Settings > About. A file left by
+ * another version (an update by hand that missed it) is ignored. */
+static void whats_new_setup(int had_music)
+{
+    char p[700], ver[32] = "", text[1024];
+    snprintf(p, sizeof p, "%s/whatsnew.txt", g_assets_dir);
+    FILE *f = fopen(p, "re");
+    if (!f) return;
+    if (fgets(ver, sizeof ver, f)) ver[strcspn(ver, "\r\n")] = '\0';
+    size_t n = fread(text, 1, sizeof text - 1, f);
+    text[n] = '\0';
+    fclose(f);
+    if (strcmp(ver, FATHOM_VERSION) || !text[0]) return;
+    char seen[32];
+    snprintf(seen, sizeof seen, "%s", settings_get("whatsnew.seen", ""));
+    ui_set_whats_new(ver, text, had_music && strcmp(seen, ver) != 0);
+    if (strcmp(seen, ver)) {
+        settings_set("whatsnew.seen", ver);
+        settings_save();
+    }
+    fprintf(stderr, "whats new: %s%s\n", ver, had_music && strcmp(seen, ver) ? " (shown)" : "");
+}
+
 int main(int argc, char **argv)
 {
     const char *music = "/mnt/sd/Music", *data = "/mnt/sd/fathom", *assets = "/mnt/sd/fathom/assets";
@@ -2412,6 +2498,7 @@ int main(int argc, char **argv)
     }
     /* SQLite's temporary files (a scan's groups are made aside in temp
      * tables) on the card, not in /tmp: that's RAM. (Before SQLite starts.) */
+    LAT("main: start");
     setenv("SQLITE_TMPDIR", data, 0);
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
@@ -2478,6 +2565,7 @@ int main(int argc, char **argv)
         }
         lv_screen_load(scr);
         lv_refr_now(NULL);
+        LAT("main: splash");
     }
 
     /* Library: database and cover cache live next to the music, on the card. */
@@ -2489,6 +2577,7 @@ int main(int argc, char **argv)
     tags_set_exact_mp3_length(0);   /* SD card: don't read whole MP3s for their length */
     tags_set_max_picture(FATHOM_ART_MAX_FILE);   /* embedded covers held in RAM */
     library_t *lib = library_open(db, art);
+    LAT("main: library open");
     if (!lib) { fprintf(stderr, "cannot open %s\n", db); return 1; }
     char pl_dir[600];
     snprintf(pl_dir, sizeof pl_dir, "%s/playlists", data);   /* your own playlists: never in the music folder */
@@ -2535,7 +2624,9 @@ int main(int argc, char **argv)
     lv_screen_load(main_scr);
     lv_obj_delete(splash);
     ui_logo_release();
+    LAT("main: player ready");
     ui_init(main_scr, themes, n_themes, base_fonts, 1, lib, player);
+    LAT("main: ui_init");
     g_level = settings_get_int("display.brightness", UI_BRIGHTNESS_DEFAULT);
     if (g_level < 1 || g_level > UI_BRIGHTNESS_LEVELS) g_level = UI_BRIGHTNESS_DEFAULT;
     g_timeout = settings_get_int("display.timeout", UI_TIMEOUT_DEFAULT);
@@ -2582,6 +2673,7 @@ int main(int argc, char **argv)
         hooks.ssh_do = hook_ssh_do;
         ssh_init(settings_get_int("ssh.on", 0), made_up_password("ssh.password", 0));
     }
+    LAT("main: net, ssh");
     uninstaller_init(CARD_DIR);
     hooks.uninstall_state = uninstaller_ui_state;
     hooks.uninstall_do = hook_uninstall_do;
@@ -2597,13 +2689,17 @@ int main(int argc, char **argv)
         snprintf(covers, sizeof covers, "%s/covers", data);
         cf_start(covers);
     }
+    LAT("main: podcasts, covers");
     g_lib = lib;
     g_music = music;
     int filter = settings_get_int("sound.dac_filter", -1);   /* the DAC filter chosen last time */
     if (filter >= 0) mixer_enum_set(HW_CTL, DAC_FILTER, filter);
     ui_set_hooks(&hooks);
     route_apply(0);                    /* the output's name: the first route_apply() came before the UI */
+    LAT("main: hooks");
     ui_set_theme(theme);
+    LAT("main: theme");
+    whats_new_setup(have > 0);
     screen_set(1);
     g_fast = lv_timer_create(every_100ms, 100, NULL);
     free_space_warm();
@@ -2612,8 +2708,11 @@ int main(int argc, char **argv)
     poll_battery(NULL);
     usb_dac_poll(NULL);
     g_usb_was = usb_on_computer();   /* already plugged in at start: don't ask */
+    LAT("main: screen, battery");
     eq_apply();
+    LAT("main: eq");
     if (resumed) ui_show("nowplaying");
+    LAT("main: shown");
     {
         char why[32];
         power_on_reason(why, sizeof why);
@@ -2644,6 +2743,7 @@ int main(int argc, char **argv)
         scan_start();
     }
 
+    LAT("main: loop");
     struct pollfd pfd[INPUT_MAX_POLL];
     while (!g_quit) {
         input_event_t ev;
@@ -2664,7 +2764,9 @@ int main(int argc, char **argv)
                 media_key(ev.ui_key);                /* the headphones' buttons; the screen stays as it is */
             } else if (ev.kind == IN_POWER) {
                 int was_on = g_screen_on;
+                LAT("ui: power, screen %s", was_on ? "off" : "on");
                 screen_set(!g_screen_on);
+                LAT("ui: power handled");
                 if (!was_on && wifi_available()) update_announce();
             } else if (g_relay && ev.kind == IN_UI) {
                 /* USB DAC mode: Back ends it; Play, Prev and Next are the
@@ -2676,7 +2778,9 @@ int main(int argc, char **argv)
                 else if (ev.ui_key == UI_KEY_PREV) usb_dac_key(HID_PREV);
             } else if (ev.kind == IN_UI && g_screen_on) {
                 screen_activity();
+                LAT("ui: key %d", ev.ui_key);
                 ui_key((ui_key_t)ev.ui_key);
+                LAT("ui: key %d handled", ev.ui_key);
             } else if (ev.kind == IN_UI) {
                 /* screen off: only the media keys act; Power wakes the screen */
                 if (ev.ui_key == UI_KEY_OK) ui_key(UI_KEY_PLAY);

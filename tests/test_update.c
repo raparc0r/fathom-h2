@@ -339,6 +339,25 @@ static void test_release(void)
                          "\"browser_download_url\":\"http://10.42.0.2:8000/r.zip\"}]}";
     CHECK(update_parse_release(http_d, strlen(http_d), &r) == 0 &&
           !strcmp(r.sha256, "014fa7f8f8e2323c7873f23dd825cbd907d3a31893d1e57c2c95d6006c451236"));
+    /* OTA_fathom-h2-VERSION (the same zip, for this updater) wins over the zip,
+     * listed before or after it; one being uploaded still, or another
+     * version's, is passed over for the zip */
+    const char *ota = "{\"tag_name\":\"v0.13.0\",\"assets\":["
+                      "{\"name\":\"fathom-h2-0.13.0.zip\",\"size\":9,\"browser_download_url\":\"https://x/r.zip\"},"
+                      "{\"name\":\"OTA_fathom-h2-0.13.0\",\"size\":9,\"state\":\"uploaded\",\"browser_download_url\":\"https://x/OTA_r\"}]}";
+    CHECK(update_parse_release(ota, strlen(ota), &r) == 0 && !strcmp(r.asset, "OTA_fathom-h2-0.13.0") && !strcmp(r.url, "https://x/OTA_r"));
+    const char *ota_first = "{\"tag_name\":\"v0.13.0\",\"assets\":["
+                            "{\"name\":\"OTA_fathom-h2-0.13.0\",\"size\":9,\"browser_download_url\":\"https://x/OTA_r\"},"
+                            "{\"name\":\"fathom-h2-0.13.0.zip\",\"size\":9,\"browser_download_url\":\"https://x/r.zip\"}]}";
+    CHECK(update_parse_release(ota_first, strlen(ota_first), &r) == 0 && !strcmp(r.asset, "OTA_fathom-h2-0.13.0"));
+    const char *ota_up = "{\"tag_name\":\"v0.13.0\",\"assets\":["
+                         "{\"name\":\"OTA_fathom-h2-0.13.0\",\"size\":9,\"state\":\"starter\",\"browser_download_url\":\"https://x/OTA_r\"},"
+                         "{\"name\":\"fathom-h2-0.13.0.zip\",\"size\":9,\"browser_download_url\":\"https://x/r.zip\"}]}";
+    CHECK(update_parse_release(ota_up, strlen(ota_up), &r) == 0 && !strcmp(r.asset, "fathom-h2-0.13.0.zip"));
+    const char *ota_old = "{\"tag_name\":\"v0.13.0\",\"assets\":["
+                          "{\"name\":\"OTA_fathom-h2-0.12.0\",\"size\":9,\"browser_download_url\":\"https://x/OTA_o\"},"
+                          "{\"name\":\"fathom-h2-0.13.0.zip\",\"size\":9,\"browser_download_url\":\"https://x/r.zip\"}]}";
+    CHECK(update_parse_release(ota_old, strlen(ota_old), &r) == 0 && !strcmp(r.asset, "fathom-h2-0.13.0.zip"));
     CHECK(update_parse_release("[]", 2, &r) == -1);
     CHECK(update_parse_release("{\"tag_name\":", 12, &r) == -1);
 }

@@ -399,7 +399,7 @@ int main(void)
     /* gapless through the engine: track 1 then 2, one output opening, every
      * frame in order, the position the track's own */
     cap_t cap = {0};
-    audio_output_t out = {c_open, c_write, c_delay, c_nop, c_nop, c_pause, c_nop, c_describe, &cap, NULL};
+    audio_output_t out = {c_open, c_write, c_delay, c_nop, c_nop, c_pause, c_nop, c_describe, &cap, NULL, NULL};
     engine_t *eng = engine_new(&out);
     engine_play(eng, t1.path, t1.id);
     engine_queue_next(eng, t2.path, t2.id);

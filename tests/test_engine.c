@@ -13,6 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "audio/crossfeed.h"
 #include "audio/engine.h"
 #include "audio/output.h"
 #include "tmpdir.h"
@@ -76,12 +77,14 @@ typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     int paused, gate, in_write;   /* gate: the test holds writes up */
+    int can_cut;                  /* its flush may cut a write short (as ALSA's) */
     int late;                     /* a write waiting wakes only after the flush's PREPARE:
                                      its chunk goes into the fresh buffer (ALSA can) */
     unsigned flushes;
     long queued;                  /* frames written since the last flush (what would play) */
     unsigned long long frames;
     unsigned only_rate;           /* opens only this rate (0: any) */
+    unsigned max_bits;            /* opens only up to this depth (0: any) */
     int gone;                     /* unplugged: open() says so */
     int opens;
     int watch;                    /* from al_watch(): the earliest track frame written, and how many */
@@ -93,7 +96,7 @@ static int al_open(void *ctx, const audio_format_t *f)
 {
     alsa_like_t *a = ctx;
     a->opens++;
-    return a->gone ? -2 : a->only_rate && f->rate != a->only_rate ? -1 : 0;
+    return a->gone ? -2 : (a->only_rate && f->rate != a->only_rate) || (a->max_bits && f->bits > a->max_bits) ? -1 : 0;
 }
 
 static long al_write(void *ctx, const int32_t *x, long n)
@@ -149,6 +152,8 @@ static void al_pause(void *ctx, int on)
     pthread_mutex_unlock(&a->mu);
 }
 
+static int al_can_cut(void *ctx) { return ((alsa_like_t *)ctx)->can_cut; }
+
 static void al_describe(void *ctx, char *o, int cap) { (void)ctx; snprintf(o, (size_t)cap, "alsa-like"); }
 
 static void al_create(audio_output_t *out, alsa_like_t *a)
@@ -156,7 +161,7 @@ static void al_create(audio_output_t *out, alsa_like_t *a)
     memset(a, 0, sizeof *a);
     pthread_mutex_init(&a->mu, NULL);
     pthread_cond_init(&a->cv, NULL);
-    *out = (audio_output_t){al_open, al_write, al_delay, al_drain, al_flush, al_pause, al_nop, al_describe, a, NULL};
+    *out = (audio_output_t){al_open, al_write, al_delay, al_drain, al_flush, al_pause, al_nop, al_describe, a, NULL, al_can_cut};
 }
 
 static void al_gate(alsa_like_t *a, int on)
@@ -235,6 +240,36 @@ static void test_play_at(const char *dir)
     engine_seek_ms(e, 1234);
     eng_status_t s = status(e);
     CHECK(s.pos_ms == 1234 || (s.pos_ms >= 1234 && s.pos_ms < 1400));
+    engine_free(e);
+    unlink(a);
+}
+
+/* Crossfeed on a 16-bit stereo track: the output goes 24-bit (its low bits
+ * kept) and the track no longer counts as untouched; off again, it does (the
+ * open 24-bit output kept, as for the EQ). Pure mode is the device's: it
+ * just asks for XF_OFF. */
+static void test_crossfeed(const char *dir)
+{
+    char a[300];
+    snprintf(a, sizeof a, "%s/xf.flac", dir);
+    CHECK(write_ramp(a, 44100, 44100 * 3) == 0);
+    audio_output_t out;
+    out_null_stats_t st = {0};
+    out_null_create(&out, &st);
+    engine_t *e = engine_new(&out);
+    engine_play(e, a, 1);
+    engine_pause(e, 1);
+    WAIT(st.opens >= 1, 2000);
+    CHECK(st.fmt.bits == 16 && status(e).untouched && status(e).crossfeed == XF_OFF);
+    engine_set_crossfeed(e, XF_MEDIUM);
+    engine_pause(e, 0);
+    WAIT(st.fmt.bits == 24, 2000);
+    eng_status_t s = status(e);
+    CHECK(st.fmt.bits == 24 && s.crossfeed == XF_MEDIUM && !s.untouched);
+    engine_set_crossfeed(e, XF_OFF);
+    WAIT(status(e).crossfeed == XF_OFF, 2000);
+    s = status(e);
+    CHECK(s.crossfeed == XF_OFF && s.untouched);
     engine_free(e);
     unlink(a);
 }
@@ -380,6 +415,7 @@ typedef struct {
     int stall;                    /* the link takes nothing: the next write fails and the stream goes */
     long lost;                    /* ...what was queued then, reported as the delay (as out_bt) */
     long heard_at_stall;
+    unsigned flushes;
 } bt_like_t;
 
 static long bl_played(bt_like_t *b)
@@ -443,6 +479,7 @@ static void bl_flush(void *ctx)
     pthread_mutex_lock(&b->mu);
     b->written = 0;
     b->lost = 0;
+    b->flushes++;
     pthread_mutex_unlock(&b->mu);
 }
 
@@ -473,7 +510,7 @@ static void test_pause_drops(const char *dir)
     bt_like_t bl;
     memset(&bl, 0, sizeof bl);
     pthread_mutex_init(&bl.mu, NULL);
-    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL};
+    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL};
     engine_t *e = engine_new(&out);
     engine_play(e, a, 1);
     sleep_ms(1000);
@@ -505,7 +542,7 @@ static void test_stall_drops(const char *dir)
     memset(&bl, 0, sizeof bl);
     pthread_mutex_init(&bl.mu, NULL);
     bl.first_after = 0;
-    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL};
+    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL};
     engine_t *e = engine_new(&out);
     engine_play(e, a, 1);
     sleep_ms(1000);
@@ -531,6 +568,110 @@ static void test_stall_drops(const char *dir)
     unlink(a);
 }
 
+/* A skip or a seek while the thread waits in a write as it plays (for room
+ * in the output's buffer): on an output that allows it, the write is cut
+ * short and the new track or position starts at once; on one that doesn't
+ * (Bluetooth), it waits for the write, as before. Neither is a lost device. */
+static void test_cut_write(const char *dir)
+{
+    char a[300], b[300];
+    snprintf(a, sizeof a, "%s/cut_a.flac", dir);
+    snprintf(b, sizeof b, "%s/cut_b.flac", dir);
+    CHECK(write_ramp(a, 44100, 44100 * 5) == 0 && write_ramp(b, 44100, 44100 * 5) == 0);
+    audio_output_t out;
+    static alsa_like_t al;
+    al_create(&out, &al);
+    engine_t *e = engine_new(&out);
+    for (int cut = 1; cut >= 0; cut--) {
+        al.can_cut = cut;
+        al_gate(&al, 1);
+        engine_play(e, a, 1);
+        CHECK(al_wait_in_write(&al));
+        pthread_mutex_lock(&al.mu);
+        unsigned f0 = al.flushes;
+        pthread_mutex_unlock(&al.mu);
+        engine_play(e, b, 2);                     /* the write still held up */
+        sleep_ms(150);
+        eng_status_t s = status(e);
+        pthread_mutex_lock(&al.mu);
+        unsigned f1 = al.flushes;
+        pthread_mutex_unlock(&al.mu);
+        if (cut) CHECK(s.track_id == 2 && s.state == ENG_PLAYING && !s.output_lost && f1 > f0);
+        else CHECK(f1 == f0);                     /* (no flush from here: it waits for the write) */
+        CHECK(al_wait_in_write(&al));
+        engine_seek_ms(e, 3000);
+        sleep_ms(150);
+        s = status(e);
+        if (cut) CHECK(s.track_id == 2 && s.pos_ms >= 2900);
+        al_gate(&al, 0);
+        WAIT(status(e).track_id == 2 && status(e).pos_ms >= 2900, 2000);
+        s = status(e);
+        CHECK(s.track_id == 2 && s.pos_ms >= 2900 && !s.output_lost);
+        engine_stop(e);
+        sleep_ms(50);
+    }
+    engine_free(e);
+    unlink(a);
+    unlink(b);
+}
+
+/* Crossfeed turned on mid-track (a 16-bit track: the output opens again at
+ * 24 bits, and what it had queued goes): it carries on from what was heard,
+ * not half a second further along. */
+static void test_crossfeed_keeps_place(const char *dir)
+{
+    char a[300];
+    snprintf(a, sizeof a, "%s/xfplace.flac", dir);
+    CHECK(write_ramp(a, 44100, 44100 * 4) == 0);
+    bt_like_t bl;
+    memset(&bl, 0, sizeof bl);
+    pthread_mutex_init(&bl.mu, NULL);
+    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL};
+    engine_t *e = engine_new(&out);
+    engine_play(e, a, 1);
+    sleep_ms(1000);
+    pthread_mutex_lock(&bl.mu);
+    long heard = bl.base + bl_played(&bl);
+    unsigned f0 = bl.flushes;
+    pthread_mutex_unlock(&bl.mu);
+    double t0 = now_s();
+    engine_set_crossfeed(e, XF_MEDIUM);
+    WAIT(bl.flushes != f0 && status(e).crossfeed == XF_MEDIUM, 2000);
+    sleep_ms(300);
+    eng_status_t s = status(e);
+    long want_ms = heard * 1000 / 44100 + (long)((now_s() - t0) * 1000);
+    CHECK(s.state == ENG_PLAYING && !s.error && s.crossfeed == XF_MEDIUM);
+    CHECK(labs((long)s.pos_ms - want_ms) < 150);
+    if (labs((long)s.pos_ms - want_ms) >= 150) fprintf(stderr, "at %u ms after crossfeed on, want about %ld\n", s.pos_ms, want_ms);
+    engine_free(e);
+    unlink(a);
+}
+
+/* Crossfeed turned on during a 16-bit track on an output that takes only
+ * 16 bits: it keeps playing (as it was), not silent or failed. */
+static void test_crossfeed_16bit_output(const char *dir)
+{
+    char a[300];
+    snprintf(a, sizeof a, "%s/xf16.flac", dir);
+    CHECK(write_ramp(a, 44100, 44100) == 0);
+    audio_output_t out;
+    alsa_like_t al;
+    al_create(&out, &al);
+    al.max_bits = 16;
+    al_gate(&al, 1);                              /* writes held: the change lands mid-track */
+    engine_t *e = engine_new(&out);
+    engine_play(e, a, 1);
+    CHECK(al_wait_in_write(&al));
+    engine_set_crossfeed(e, XF_MEDIUM);
+    al_gate(&al, 0);
+    WAIT(status(e).ended, 3000);
+    eng_status_t s = status(e);
+    CHECK(s.ended && !s.error && s.crossfeed == XF_MEDIUM);
+    CHECK(al.opens >= 3);                         /* 16 bits, 24 refused, 16 again */
+    engine_free(e);
+    unlink(a);
+}
+
 int main(void)
 {
     char dir[200];
@@ -542,6 +683,10 @@ int main(void)
     test_pause_drops(dir);
     test_stall_drops(dir);
     test_play_at(dir);
+    test_cut_write(dir);
+    test_crossfeed(dir);
+    test_crossfeed_keeps_place(dir);
+    test_crossfeed_16bit_output(dir);
     rmdir(dir);
     if (failures) fprintf(stderr, "%d failure(s)\n", failures);
     else printf("engine: all checks passed\n");

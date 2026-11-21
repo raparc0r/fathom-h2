@@ -45,7 +45,7 @@ struct ui_fonts {
 
 /* Screen brightness levels (perceptual steps; the platform maps them to PWM). */
 #define UI_BRIGHTNESS_LEVELS  16
-#define UI_BRIGHTNESS_DEFAULT 9
+#define UI_BRIGHTNESS_DEFAULT 3   /* (with the 50 kHz backlight; was 9) */
 #define UI_TIMEOUT_DEFAULT    30   /* seconds; 0 = never */
 /* Defaults of settings read in more than one place (settings.ini keeps
  * only what was changed: someone who never changed one gets a new default) */
@@ -82,7 +82,7 @@ enum { UI_SHARE_TOGGLE, UI_SHARE_NEW_PASSWORD };
 enum { UI_SSH_OFF, UI_SSH_STARTING, UI_SSH_ON, UI_SSH_FAILED };
 typedef struct { int state; char usb_ip[16]; char wifi_ip[16]; char password[32]; } ui_ssh_t;
 enum { UI_SSH_TOGGLE, UI_SSH_NEW_PASSWORD };
-enum { UI_SOUND_BALANCE, UI_SOUND_LIMIT };
+enum { UI_SOUND_BALANCE, UI_SOUND_LIMIT, UI_SOUND_CROSSFEED };
 /* Updates (Settings > About > Check for updates): only ever when asked.
  * The state, the versions, the release's size and the work's progress
  * (bytes done of total, while downloading, checking and unpacking). */
@@ -240,7 +240,11 @@ void ui_init(lv_obj_t *screen, const theme_t *themes, int n_themes,
              const ui_fonts_t *fonts, int n_fonts, library_t *lib, player_t *player);
 void ui_key(ui_key_t k);
 int ui_tick(void);              /* ~10x per second: follows the player; 0 when it needn't until a key */
-void ui_tick_1s(void);          /* refreshes position and progress */
+void ui_tick_1s(void);
+/* What's new in this version: the release notes' summary, one point per line
+ * (fathom/assets/whatsnew.txt). Shown at once if `show` (the first start of a
+ * new version), and from then on in Settings > About > What's new. */
+void ui_set_whats_new(const char *version, const char *text, int show);          /* refreshes position and progress */
 void ui_set_theme(int index);
 /* Before the player exits: what the UI keeps on the card now and then (where
  * a podcast episode was left), kept now. */

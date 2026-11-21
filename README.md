@@ -2,19 +2,22 @@
 
 # Fathom
 
-Latest version: [0.12.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.12.0) released November 20th 2026
+Latest version: [0.13.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.13.0) released November 21st 2026
 
-[Features](#features) · [Compatibility](#compatibility) · [Installing](#installing) · [Internet access](#internet-access) · [Licence](#licence) · [How it was made](#how-it-was-made)
+[Features](#features) · [Compatibility](#compatibility) · [Installing](#installing) · [Navigation](#navigation) · [Licence](#licence) · [How it was made](#how-it-was-made)
 
 Fathom is a new firmware for the HiFi Walker H2. I started it as a side project with
-Claude, just for myself, but it grew into a full-featured firmware, so I'm sharing it. It
-has its own kernel, system and player, built from source; the bootloader is built on
-Rockbox's, with Fathom's patches on top. The stock firmware stays on the H2, so you can go
-back to it any time. The most interesting discovery along the way: the H2 has a Wi-Fi
-chip, which Fathom uses for internet radio, copying music and updates.
+Claude, just for myself, but it grew into a pretty full-featured firmware, so I'm sharing
+it in case anyone is interested. It has working Bluetooth, though the most interesting
+discovery was that the H2 actually has a Wi-Fi chip (2.4 GHz only). It's wired, the stock
+firmware and Rockbox just don't use it. Fathom uses it for copying music, internet radio,
+podcasts and updates, and offers SSH over Wi-Fi and USB.
 
-The Rockbox port for the H2 was a huge help in sorting out the hardware. Rockbox is a great
-project, and if you haven't tried it, check it out: [rockbox.org](https://www.rockbox.org).
+Fathom is not a Rockbox port. Its bootloader is built on Rockbox's, with Fathom's patches
+on top, but the kernel, system and player are Fathom's own. The stock firmware stays on
+the H2, so you can go back to it any time. The Rockbox port for the H2 was instrumental in
+sorting out the hardware, though. Rockbox is a great project, and if you haven't tried it,
+I recommend you check it out: [rockbox.org](https://www.rockbox.org).
 
 | | | | |
 |---|---|---|---|
@@ -80,21 +83,20 @@ More: [INSTALL.md](INSTALL.md) (the full steps, and a recommended backup),
 [GUIDE.md](GUIDE.md) (using Fathom, and uninstalling it), [ADVANCED.md](ADVANCED.md)
 (recovery, SSH, building it yourself).
 
-## Internet access
+## Navigation
 
-Fathom goes online only over Wi-Fi, and by itself only for these:
+| Key | Press | Hold |
+|---|---|---|
+| Wheel | move through a list | |
+| Play | choose; on Now Playing, play or pause | |
+| Back | go back | jump to Now Playing, and back |
+| Menu | options for what's selected (shuffle an album or an artist, play next, add to a playlist, go to the album...) | quick settings: brightness, shuffle, repeat, EQ, Bluetooth, Wi-Fi, sleep timer |
+| Menu + wheel | | brightness: hold Menu and turn the wheel |
+| Prev / Next | previous or next track | seek |
+| Power | screen off or on | switch off (2 seconds) |
 
-- **the time**, from a time server when Wi-Fi connects, because the H2 has no clock that
-  keeps running while it's off;
-- **updates**, by asking GitHub once a day whether a new version is out. It never
-  downloads or installs anything unless you choose to. Settings → About → Check
-  automatically turns this off;
-- **your podcasts**, if you've added any: their feeds every few hours, and new episodes
-  while the H2 charges. Settings → Podcasts turns the downloads off.
-
-Everything else, such as radio, finding stations, finding podcasts (which asks Apple's
-podcast directory for the words you type) and finding covers (which sends an album's artist
-and title to MusicBrainz and Apple), connects only when you use it.
+With the screen off, Play, Prev, Next and the volume keys still work. In Settings, **Menu**
+on any setting says in a line or two what it does. More in [GUIDE.md](GUIDE.md).
 
 ## Licence
 

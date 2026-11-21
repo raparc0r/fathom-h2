@@ -32,10 +32,13 @@ tempo_t *tempo_new(unsigned rate, int channels, int speed_pct)
     tempo_t *t = calloc(1, sizeof *t);
     if (!t) return NULL;
     t->ch = channels;
-    t->seq = (long)rate * SEQ_MS / 1000;
-    if (t->seq > TEMPO_MAX_SEQ) t->seq = TEMPO_MAX_SEQ;
-    t->seek = (long)rate * SEEK_MS / 1000;
-    t->ov = (long)rate * OVERLAP_MS / 1000 / DECIM * DECIM;
+    /* above ~100 kHz a piece is capped at TEMPO_MAX_SEQ frames: its search and
+     * fade shrink with it (a fade longer than half a piece left nothing to copy) */
+    long r = (long)rate;
+    if (r > (long)TEMPO_MAX_SEQ * 1000 / SEQ_MS) r = (long)TEMPO_MAX_SEQ * 1000 / SEQ_MS;
+    t->seq = r * SEQ_MS / 1000;
+    t->seek = r * SEEK_MS / 1000;
+    t->ov = r * OVERLAP_MS / 1000 / DECIM * DECIM;
     t->in_cap = t->seq + t->seek + IN_SPARE;
     t->in = malloc((size_t)t->in_cap * (size_t)channels * sizeof *t->in);
     t->mid = malloc((size_t)t->ov * (size_t)channels * sizeof *t->mid);
@@ -96,13 +99,14 @@ static uint32_t isqrt32(uint32_t v)
 static int32_t match(const tempo_t *t, long k)
 {
     const int16_t *c = t->cand + k;
-    int32_t corr = 0, norm = 0;
+    int64_t corr = 0, norm = 0;           /* 64 bits: at 352.8 kHz and up the sums pass 2^31 */
     for (long i = 0, n = t->ov / DECIM; i < n; i++) {
         int32_t v = c[i * DECIM];
         corr += v * t->mid_mono[i];
         norm += v * v;
     }
-    return (int32_t)(((int64_t)corr << 8) / ((int32_t)isqrt32((uint32_t)norm) + 1));
+    uint32_t r = isqrt32(norm > UINT32_MAX ? UINT32_MAX : (uint32_t)norm);
+    return (int32_t)(corr * 256 / ((int64_t)r + 1));
 }
 
 /* Where (0..seek-1) the piece starting at p best continues the last one's end:

@@ -85,14 +85,16 @@ int64_t http_download(const char *url, const char *path, http_progress_fn progre
     if (!pb) return gone ? -3 : -1;
     char part[1024];
     snprintf(part, sizeof part, "%s.part", path);
-    FILE *f = fopen(part, "wbe");
-    if (!f) { avio_closep(&pb); return -1; }
+    /* (each call its own: the podcasts' and the covers' workers download at once) */
+    enum { CHUNK = 32768 };
+    unsigned char *chunk = malloc(CHUNK);
+    FILE *f = chunk ? fopen(part, "wbe") : NULL;
+    if (!f) { free(chunk); avio_closep(&pb); return -1; }
     int64_t total = avio_size(pb);
     uint64_t done = 0;
-    static unsigned char chunk[32768];
     int ok = 1;
     for (;;) {
-        int k = avio_read(pb, chunk, sizeof chunk);
+        int k = avio_read(pb, chunk, CHUNK);
         if (k == AVERROR_EOF || k == 0) break;
         if (k < 0 || fwrite(chunk, 1, (size_t)k, f) != (size_t)k || (abort && *abort)) { ok = 0; break; }
         done += (uint64_t)k;
@@ -106,6 +108,7 @@ int64_t http_download(const char *url, const char *path, http_progress_fn progre
         if (progress) progress(done, total > 0 ? (uint64_t)total : 0, ctx);
     }
     avio_closep(&pb);
+    free(chunk);
     if (fclose(f)) ok = 0;
     if (ok && total > 0 && done != (uint64_t)total) ok = 0;   /* cut short */
     if (!ok || rename(part, path)) { remove(part); return -1; }

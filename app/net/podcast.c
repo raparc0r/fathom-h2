@@ -232,8 +232,8 @@ int64_t pod_parse_date(const char *s)
     if (e == s || d < 1 || d > 31) {
         /* ISO 8601 (some feeds): 2026-11-19T05:00:00Z */
         int y, mo, dd, hh = 0, mi = 0, ss = 0;
-        if (sscanf(s, "%d-%d-%dT%d:%d:%d", &y, &mo, &dd, &hh, &mi, &ss) >= 3 && mo >= 1 && mo <= 12)
-            return days_from_civil(y, mo, dd) * 86400 + hh * 3600 + mi * 60 + ss;
+        if (sscanf(s, "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &dd, &hh, &mi, &ss) >= 3 && mo >= 1 && mo <= 12)
+            return days_from_civil(y, mo, dd) * 86400 + (int64_t)hh * 3600 + mi * 60 + ss;
         return 0;
     }
     s = e;
@@ -247,15 +247,17 @@ int64_t pod_parse_date(const char *s)
     long y = strtol(s, &e, 10);
     if (e == s) return 0;
     if (y < 100) y += y < 70 ? 2000 : 1900;
+    if (y > 9999) return 0;
     s = e;
     int hh = 0, mi = 0, ss = 0;
     while (*s == ' ') s++;
-    sscanf(s, "%d:%d:%d", &hh, &mi, &ss);
+    sscanf(s, "%2d:%2d:%2d", &hh, &mi, &ss);
     while (*s && !isspace((unsigned char)*s)) s++;
     while (*s == ' ') s++;
     long off = 0;                                    /* the zone, in minutes east */
     if (*s == '+' || *s == '-') {
         long z = strtol(s + 1, NULL, 10);
+        if (z < 0 || z > 2400) z = 0;
         off = (z / 100) * 60 + z % 100;
         if (*s == '-') off = -off;
     } else {
@@ -264,8 +266,10 @@ int64_t pod_parse_date(const char *s)
         for (size_t i = 0; i < sizeof Z / sizeof Z[0]; i++)
             if (!strncasecmp(s, Z[i].z, 3)) off = Z[i].h * 60;
     }
-    return days_from_civil((int)y, m + 1, (int)d) * 86400 + hh * 3600 + mi * 60 + ss - off * 60;
+    return days_from_civil((int)y, m + 1, (int)d) * 86400 + (int64_t)hh * 3600 + mi * 60 + ss - (int64_t)off * 60;
 }
+
+#define POD_MAX_DURATION (INT32_MAX / 1000)   /* seconds: ~24.8 days */
 
 int pod_parse_duration(const char *s)
 {
@@ -282,10 +286,13 @@ int pod_parse_duration(const char *s)
         if (*s != ':') break;
         s++;
     }
-    if (n == 1) return part[0] > 0 ? (int)part[0] : 0;
-    if (n == 2) return (int)(part[0] * 60 + part[1]);
-    if (n == 3) return (int)(part[0] * 3600 + part[1] * 60 + part[2]);
-    return 0;
+    /* nonsense ("-5:00", 20 digits) isn't a length: 0, and never past what
+     * the UI's milliseconds (32 bits) hold */
+    for (int i = 0; i < n; i++)
+        if (part[i] < 0 || part[i] > POD_MAX_DURATION) return 0;
+    int64_t v = n == 1 ? part[0] : n == 2 ? (int64_t)part[0] * 60 + part[1]
+              : n == 3 ? (int64_t)part[0] * 3600 + (int64_t)part[1] * 60 + part[2] : 0;
+    return v > POD_MAX_DURATION ? 0 : (int)v;
 }
 
 void pod_hash(const char *s, char out[13])
@@ -352,10 +359,15 @@ int pod_parse_feed(const char *xml, size_t len, pod_show_t *show, pod_episode_t 
                 guid[0] = '\0';
             } else if (closing && in_item) {
                 in_item = 0;
-                if (cur.url[0] && total < cap) {
+                if (cur.url[0] && cap > 0) {
                     pod_hash(guid[0] ? guid : cur.url, cur.key);
                     if (!cur.title[0]) snprintf(cur.title, sizeof cur.title, "%s", "Episode");
-                    all[total++] = cur;
+                    if (total < cap) all[total++] = cur;
+                    else {                           /* full (an oldest-first feed): over the oldest, if newer */
+                        int old = 0;
+                        for (int i = 1; i < cap; i++) if (all[i].date < all[old].date) old = i;
+                        if (cur.date > all[old].date) all[old] = cur;
+                    }
                 }
             }
             continue;
@@ -476,7 +488,9 @@ int pod_parse_chapters(const char *json, size_t len, pod_chapter_t *out, int max
         memcpy(num, v.s, k);
         num[k] = '\0';
         if (json_member(c, "toc", &v) && !json_bool(v, 1)) continue;   /* not for the table of contents */
-        out[n].start_ms = (uint32_t)(strtod(num[0] == '"' ? num + 1 : num, NULL) * 1000);
+        double sec = strtod(num[0] == '"' ? num + 1 : num, NULL);
+        if (!(sec >= 0 && sec < 4294967.0)) continue;             /* (negative, NaN, past 49 days: not a time) */
+        out[n].start_ms = (uint32_t)(sec * 1000);
         out[n].title[0] = '\0';
         if (json_member(c, "title", &v)) json_string(v, out[n].title, sizeof out[n].title);
         n++;
@@ -576,6 +590,8 @@ static void show_details(const char *dir, pod_show_t *s)
     free(t);
 }
 
+static int is_http(const char *s) { return !strncmp(s, "http://", 7) || !strncmp(s, "https://", 8); }
+
 int pod_shows_load(const char *dir, pod_show_t *out, int max)
 {
     char path[700];
@@ -586,9 +602,23 @@ int pod_shows_load(const char *dir, pod_show_t *out, int max)
     for (char *save = NULL, *l = strtok_r(t, "\n", &save); l && n < max; l = strtok_r(NULL, "\n", &save)) {
         while (*l == ' ' || *l == '\t') l++;
         if (*l == '#' || !*l) continue;
-        /* "Title = URL": the last " = " before the address (titles can have one) */
-        char *u = strstr(l, "http://") ? strstr(l, "http://") : strstr(l, "https://");
-        if (!u) continue;
+        /* "Title = URL": the last " = " before an address (titles can have
+         * one, or be the address itself: an OPML outline without a name); a
+         * hand-written "Title=URL" at an '=' before the line's first address;
+         * else a bare address from its start (an address has no spaces, but
+         * can have "=http" in its query) */
+        char *h1 = strstr(l, "http://"), *h2 = strstr(l, "https://");
+        char *first = !h1 ? h2 : !h2 ? h1 : h1 < h2 ? h1 : h2;
+        if (!first) continue;
+        char *u = NULL;
+        for (char *q = strstr(l, " = "); q; q = strstr(q + 1, " = "))
+            if (is_http(q + 3)) u = q + 3;
+        for (char *q = strchr(l, '='); !u && q && q < first; q = strchr(q + 1, '=')) {
+            char *v = q + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            if (is_http(v)) u = v;
+        }
+        if (!u) u = first;
         pod_show_t s;
         memset(&s, 0, sizeof s);
         char *e = u + strlen(u);
@@ -601,6 +631,18 @@ int pod_shows_load(const char *dir, pod_show_t *out, int max)
         for (int i = 0; i < n; i++) dup |= !strcmp(out[i].url, s.url);
         if (dup) continue;
         pod_hash(s.url, s.id);
+        /* Before 0.13 the line's first http:// was taken for the address (an
+         * address with another inside it: the inner one) and the show's
+         * folder named after that: kept if it's the one there */
+        const char *old = h1 ? h1 : h2;
+        if (strcmp(old, s.url)) {
+            char oid[13], od[700], nd[700];
+            struct stat sb;
+            pod_hash(old, oid);
+            show_dir(dir, oid, od, sizeof od);
+            show_dir(dir, s.id, nd, sizeof nd);
+            if (stat(nd, &sb) != 0 && stat(od, &sb) == 0) memcpy(s.id, oid, sizeof oid);
+        }
         show_details(dir, &s);
         if (!s.title[0]) snprintf(s.title, sizeof s.title, "%s", s.url);
         out[n++] = s;
@@ -662,6 +704,13 @@ static void remove_folder(const char *path)
 
 int pod_shows_remove(const char *dir, const char *url)
 {
+    char id[13];                                     /* its folder: as loaded (an older show's may be named otherwise) */
+    pod_hash(url, id);
+    pod_show_t *have = calloc(POD_MAX_SHOWS, sizeof *have);
+    int nh = have ? pod_shows_load(dir, have, POD_MAX_SHOWS) : 0;
+    for (int i = 0; i < nh; i++)
+        if (!strcmp(have[i].url, url)) memcpy(id, have[i].id, sizeof id);
+    free(have);
     char path[700];
     snprintf(path, sizeof path, "%s/shows.txt", dir);
     size_t len;
@@ -690,8 +739,7 @@ int pod_shows_remove(const char *dir, const char *url)
     free(out);
     free(t);
     if (r) return -1;
-    char id[13], sd[700];
-    pod_hash(url, id);
+    char sd[700];
     show_dir(dir, id, sd, sizeof sd);
     remove_folder(sd);
     return 0;
@@ -819,16 +867,19 @@ int pod_state_put(const char *dir, const char *id, const pod_state_t *s)
     else { memmove(st, st + 1, (size_t)(n - 1) * sizeof *st); st[n - 1] = *s; }   /* the oldest goes */
     char sd[700], path[760];
     show_dir(dir, id, sd, sizeof sd);
-    mkdir(dir, 0755);
-    mkdir(sd, 0755);
+    struct stat sb;
+    if (stat(sd, &sb)) { free(st); return -1; }   /* unsubscribed (its folder gone): not made again for this */
     snprintf(path, sizeof path, "%s/state.txt", sd);
-    size_t cap = (size_t)n * 64 + 1, w = 0;
+    enum { LINE = 12 + 1 + 10 + 1 + 10 + 1 + 11 + 1 + 20 + 1 };   /* the longest (numbers read back from a damaged file) */
+    size_t cap = (size_t)n * LINE + 1, w = 0;
     char *t = malloc(cap);
     if (!t) { free(st); return -1; }
     for (int k = 0; k < n; k++) {
         if (!st[k].pos_ms && !st[k].played) continue;          /* nothing to keep */
-        w += (size_t)snprintf(t + w, cap - w, "%s\t%u\t%u\t%d\t%lld\n", st[k].key, st[k].pos_ms, st[k].len_ms,
-                              st[k].played, (long long)st[k].played_at);
+        int l = snprintf(t + w, cap - w, "%s\t%u\t%u\t%d\t%lld\n", st[k].key, st[k].pos_ms, st[k].len_ms,
+                         st[k].played, (long long)st[k].played_at);
+        if (l < 0 || (size_t)l >= cap - w) break;
+        w += (size_t)l;
     }
     int r = write_file(path, t, w);
     free(t);

@@ -64,6 +64,9 @@ static unsigned n_parses;
 static unsigned grace_ms = 30000;
 static struct timespec deadline; /* cur, unused, is freed then */
 static int reaping;              /* a thread is waiting for the deadline */
+static int warming;              /* tls_wrap_warm()'s thread is on its way */
+static int warm_parsing;         /* ... and parsing now */
+static pthread_cond_t warm_cv = PTHREAD_COND_INITIALIZER;   /* (it's done) */
 
 static long ms_to(const struct timespec *a, const struct timespec *b)
 {
@@ -148,6 +151,7 @@ int __wrap_mbedtls_x509_crt_parse_file(mbedtls_x509_crt *chain, const char *path
         pthread_mutex_unlock(&mu);
         return __real_mbedtls_x509_crt_parse_file(chain, path);
     }
+    while (warm_parsing && !cur) pthread_cond_wait(&warm_cv, &mu);   /* parsed ahead right now: that one */
     if (cur && !same_file(cur, &st)) {   /* changed: new connections get it anew */
         chain_t *old = cur;
         cur = NULL;
@@ -219,5 +223,89 @@ void tls_wrap_set_grace_ms(unsigned ms)
 {
     pthread_mutex_lock(&mu);
     grace_ms = ms;
+    pthread_mutex_unlock(&mu);
+}
+
+/* A connection likely soon (Home > Radio opened): the bundle parsed now, in the
+ * background, and kept for the grace period as after a connection, so the
+ * station chosen doesn't wait for it (130-170 ms on the H2). It starts a
+ * quarter of a second later, so the list is drawn first (sharing the CPU, the
+ * first frame took 105 ms instead of 40); a connection meanwhile parses as
+ * before, and this one then has nothing to do. Parsed without the lock, so
+ * nothing waits on it but a connection that wants it during the parse (which
+ * waits for the rest of it rather than starting its own), and the caller
+ * (the UI) never waits at all. */
+#define WARM_DELAY_MS 250
+static void *warm(void *arg)
+{
+    (void)arg;
+    struct timespec d = {0, WARM_DELAY_MS * 1000000L};
+    nanosleep(&d, NULL);
+    pthread_mutex_lock(&mu);
+    int needed = !cur;
+    warm_parsing = needed;
+    if (!needed) {
+        warming = 0;
+        pthread_mutex_unlock(&mu);
+        return NULL;
+    }
+    pthread_mutex_unlock(&mu);
+    const char *bundle = ff_ca_file();
+    struct stat st;
+    chain_t *c = NULL;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (bundle && stat(bundle, &st) == 0 && (c = calloc(1, sizeof *c))) {
+        mbedtls_x509_crt_init(&c->crt);
+        if (__real_mbedtls_x509_crt_parse_file(&c->crt, bundle)) {
+            __real_mbedtls_x509_crt_free(&c->crt);   /* (a connection gets the error itself) */
+            free(c);
+            c = NULL;
+        } else {
+            c->dev = st.st_dev;
+            c->ino = st.st_ino;
+            c->size = st.st_size;
+            c->mtime = st.st_mtim;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    pthread_mutex_lock(&mu);
+    if (c) n_parses++;
+    if (c && !cur) {
+        c->next = chains;
+        chains = cur = c;
+        c = NULL;
+        idle();                          /* unused: kept for the grace period */
+        int n = 0;
+        for (const mbedtls_x509_crt *x = &cur->crt; x; x = x->next) n++;
+        fprintf(stderr, "tls: %d certificates parsed ahead in %ld ms\n", n, ms_to(&t0, &t1));
+    }
+    warming = warm_parsing = 0;
+    pthread_cond_broadcast(&warm_cv);
+    pthread_mutex_unlock(&mu);
+    if (c) {                             /* (one parsed meanwhile: not needed) */
+        __real_mbedtls_x509_crt_free(&c->crt);
+        free(c);
+    }
+    return NULL;
+}
+
+void tls_wrap_warm(void)
+{
+    if (pthread_mutex_trylock(&mu)) return;   /* a connection is parsing or lending: not now */
+    int start = !warming && ff_ca_file() != NULL;
+    if (start && cur) {                  /* parsed already: only its time extended, if unused */
+        if (!cur->refs) idle();
+        start = 0;
+    }
+    if (start) {
+        pthread_attr_t a;
+        pthread_t t;
+        pthread_attr_init(&a);
+        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        pthread_attr_setstacksize(&a, 128 * 1024);
+        warming = pthread_create(&t, &a, warm, NULL) == 0;
+        pthread_attr_destroy(&a);
+    }
     pthread_mutex_unlock(&mu);
 }

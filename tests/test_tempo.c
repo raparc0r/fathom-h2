@@ -60,8 +60,31 @@ static void tone(int ch, int speed)
     free(out);
 }
 
+/* An episode at 352.8 or 384 kHz (a DXD file): the piece is capped at
+ * TEMPO_MAX_SEQ, so its fade and search must shrink with it */
+static void high_rate(unsigned rate)
+{
+    enum { CHUNK = 1152 };
+    static int32_t in[CHUNK * 2], out[(CHUNK * 2 + 4 * TEMPO_MAX_SEQ) * 2];
+    tempo_t *t = tempo_new(rate, 2, 150);
+    CHECK(t != NULL, "%u Hz: no tempo", rate);
+    if (!t) return;
+    long w = 0, frames = 2L * rate;
+    for (long at = 0; at < frames; at += CHUNK) {
+        for (long i = 0; i < CHUNK; i++)            /* a full-scale square: the match's sums at their biggest */
+            in[2 * i] = in[2 * i + 1] = ((at + i) % 800) < 400 ? INT32_MAX : INT32_MIN;
+        w += tempo_run(t, in, CHUNK, out, CHUNK * 2 + 4 * TEMPO_MAX_SEQ);
+    }
+    tempo_free(t);
+    CHECK(labs(w - frames * 100 / 150) < 3 * TEMPO_MAX_SEQ, "%u Hz: %ld frames out, ~%ld wanted", rate, w, frames * 100 / 150);
+    printf("%u Hz at 150%%: %ld frames\n", rate, w);
+}
+
 int main(void)
 {
+    high_rate(192000);
+    high_rate(352800);
+    high_rate(384000);
     for (int ch = 1; ch <= 2; ch++) {
         tone(ch, 125);
         tone(ch, 150);

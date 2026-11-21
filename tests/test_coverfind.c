@@ -141,9 +141,12 @@ static void test_parse(void)
 
 static int net_down;
 
+static volatile int gate, gated;   /* gate: the next question waits (gated: one is waiting) */
+
 static long fake_fetch(const char *url, char *buf, size_t cap, const volatile int *abort)
 {
     (void)abort;
+    while (gate) { gated = 1; usleep(1000); }
     if (net_down) return -2;                           /* (-2: no retries, so the test doesn't wait) */
     const char *file = NULL;
     if (strstr(url, "musicbrainz.org")) {
@@ -244,6 +247,8 @@ static void test_worker(void)
     library_found_cover_path(list[3].key, "none", p, sizeof p);
     f = fopen(p, "w");
     if (f) fclose(f);
+    library_found_cover_path(list[0].key, "jpg", p, sizeof p);
+    remove(p);                                         /* (the one kept above: as if it had none) */
     CHECK(cf_batch(list, 4) == 0, "batch");
     cf_batch_t b;
     int taken = 0;
@@ -261,7 +266,53 @@ static void test_worker(void)
     library_found_cover_path(list[1].key, "jpg", p, sizeof p);
     CHECK(!exists(p), "Weezer's: not taken");
 
+    /* an album given a cover by Menu > Find cover while the batch is on its
+     * way to it: the batch leaves it (before: its own renamed over the kept one) */
+    cf_find(&list[0]);
+    for (int i = 0; i < 500 && (st = cf_find_state(&n)) == 0; i++) usleep(10000);
+    for (int i = 0; i < 500 && (r = cf_find_show(0, &m, large)) == 0; i++) usleep(10000);
+    CHECK(r == 1, "a find for the batch's album (%d)", r);
+    gate = 1;                                           /* (the batch waits in its first question) */
+    taken = 0;
+    CHECK(cf_batch(list, 1) == 0, "batch again");
+    for (int i = 0; i < 200 && !gated; i++) usleep(10000);
+    CHECK(cf_find_keep(0, large, small) == 0, "kept from the find meanwhile");
+    library_found_cover_path(list[0].key, "jpg", p, sizeof p);
+    f = fopen(p, "w");
+    if (f) { fputs("MINE", f); fclose(f); }             /* (to tell it from the batch's) */
+    gate = 0;
+    for (int i = 0; i < 1000; i++) {
+        cf_batch_status(&b);
+        while (cf_batch_take(&id, large, small)) taken++;
+        if (!b.running) break;
+        usleep(10000);
+    }
+    while (cf_batch_take(&id, large, small)) taken++;
+    cf_find_close();
+    char mine[8] = "";
+    f = fopen(p, "r");
+    if (f) { if (!fgets(mine, sizeof mine, f)) mine[0] = '\0'; fclose(f); }
+    CHECK(taken == 0 && !strcmp(mine, "MINE"), "a cover kept meanwhile left as it is (%d taken, [%s])", taken, mine);
+    CHECK(b.total == 0 && b.done == 0 && b.found + b.unsure + b.none == b.done, "not counted as looked at (%d of %d)",
+          b.done, b.total);
+
+    /* the batch's picture renamed in, then the player stopped before storing
+     * it (the album still has none): the next batch looks again and stores it */
+    f = fopen(p, "w");
+    if (f) { fputs("STALE", f); fclose(f); }
+    taken = 0;
+    CHECK(cf_batch(list, 1) == 0, "batch after a stop");
+    for (int i = 0; i < 1000; i++) {
+        cf_batch_status(&b);
+        while (cf_batch_take(&id, large, small)) taken++;
+        if (!b.running) break;
+        usleep(10000);
+    }
+    while (cf_batch_take(&id, large, small)) taken++;
+    CHECK(taken == 1 && id == 1 && b.done == 1 && b.found == 1, "looked at again and taken (%d, %d done)", taken, b.done);
+
     /* no network: it stops, and says so */
+    remove(p);
     net_down = 1;
     unsigned seq = b.seq;
     cf_batch(list, 3);
@@ -282,6 +333,20 @@ static void test_worker(void)
         usleep(10000);
     }
     CHECK(!b.running && !b.failed && b.done <= 1, "stopped (%d done)", b.done);
+    cf_stop();
+    /* pictures whose download was cut short (the player killed, the power gone): gone at the next start */
+    const char *left[] = {".find-0.jpg.part", ".find-3.jpg.part", ".batch.jpg.part"};
+    for (int i = 0; i < 3; i++) {
+        snprintf(p, sizeof p, "%s/%s", dir, left[i]);
+        f = fopen(p, "wb");
+        if (f) { fputs("x", f); fclose(f); }
+    }
+    CHECK(cf_start(dir) == 0, "started again");
+    for (int i = 0; i < 3; i++) {
+        struct stat sb;
+        snprintf(p, sizeof p, "%s/%s", dir, left[i]);
+        CHECK(stat(p, &sb) != 0, "%s removed", left[i]);
+    }
     cf_stop();
     char cmd[700];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);

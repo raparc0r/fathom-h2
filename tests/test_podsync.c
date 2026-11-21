@@ -180,6 +180,49 @@ int main(void)
     podsync_unsubscribe(b.url);
     settle();
     CHECK(pod_shows_load(dir, shows, 4) == 3, "three left");
+
+    /* a download (or a place kept) for a show unsubscribed meanwhile: its folder isn't made again */
+    if (n && ne) {
+        char slow_id[13], sd[700];
+        snprintf(slow_id, sizeof slow_id, "%s", shows[0].id);
+        podsync_unsubscribe(shows[0].url);
+        podsync_download(slow_id, &e[2]);
+        settle();
+        snprintf(sd, sizeof sd, "%s/%s", dir, slow_id);
+        struct stat sb;
+        CHECK(stat(sd, &sb) != 0, "unsubscribed: its folder not made again by a download");
+        pod_state_t ps = {0};
+        snprintf(ps.key, sizeof ps.key, "%s", e[2].key);
+        ps.pos_ms = 90000;
+        pod_state_put(dir, slow_id, &ps);
+        CHECK(stat(sd, &sb) != 0, "...nor by its place kept");
+    }
+
+    /* what a download cut short left: gone when the worker starts again */
+    n = pod_shows_load(dir, shows, 4);
+    if (n) {
+        char left[4][800], ui_tmp[800];
+        snprintf(left[0], sizeof left[0], "%s/%s/0123456789ab.mp3.part", dir, shows[0].id);
+        snprintf(left[1], sizeof left[1], "%s/%s/cover.565.tmp", dir, shows[0].id);
+        snprintf(left[2], sizeof left[2], "%s/%s/cover.565.img", dir, shows[0].id);
+        snprintf(left[3], sizeof left[3], "%s/%s/cover.565.img.part", dir, shows[0].id);
+        snprintf(ui_tmp, sizeof ui_tmp, "%s/%s/state.txt.tmp", dir, shows[0].id);   /* (the UI's, maybe being written) */
+        for (int i = 0; i < 4; i++) { FILE *f = fopen(left[i], "wb"); if (f) { fputs("x", f); fclose(f); } }
+        FILE *uf = fopen(ui_tmp, "wb");
+        if (uf) { fputs("x", uf); fclose(uf); }
+        podsync_stop();
+        podsync_start(dir);
+        struct stat sb;
+        int gone = 0;
+        for (int i = 0; i < 200 && !gone; i++) {
+            gone = 1;
+            for (int q = 0; q < 4; q++) gone &= stat(left[q], &sb) != 0;
+            if (!gone) usleep(10000);
+        }
+        CHECK(gone, "a cut-short download's .part and a cover's leftovers removed at the start");
+        CHECK(stat(ui_tmp, &sb) == 0, "the UI's state.txt.tmp left alone");
+        remove(ui_tmp);
+    }
     podsync_stop();
     if (fails) { printf("%d failed\n", fails); return 1; }
     printf("podsync: ok\n");

@@ -12,6 +12,7 @@
  * with Wi-Fi on too, that kept pushing the player's own code out of memory
  * (radio stuttered). */
 #define _GNU_SOURCE   /* pipe2 */
+#include "core/lat.h"
 #include "bt.h"
 #include "shell.h"
 
@@ -179,7 +180,9 @@ static void do_cmd(int cmd, const char *addr)
         break;
     case CMD_START: {
         set_busy("Starting");
+        LAT("bt: starting");
         int ok = sh_run(FATHOM_BT " start 2>/dev/null", out, sizeof out) == 0;
+        LAT("bt: started (%d)", ok);
         pthread_mutex_lock(&B.mu);
         B.on = ok;
         pthread_cond_broadcast(&B.cv);          /* (the monitor waits for it) */
@@ -193,7 +196,8 @@ static void do_cmd(int cmd, const char *addr)
             set_busy("Connecting");
             snprintf(c, sizeof c, FATHOM_BT " connect %s 2>/dev/null", last);
             /* right after a start the first try can fail where the next works */
-            for (int i = 0; i < 3 && sh_run(c, NULL, 0) != 0; i++) sleep(3);
+            for (int i = 0; i < 3 && sh_run(c, NULL, 0) != 0; i++) { LAT("bt: connect %d failed", i); sleep(3); }
+            LAT("bt: connect done");
         }
         break;
     }

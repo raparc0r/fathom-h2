@@ -168,8 +168,36 @@ int main(void)
     CHECK(mbedtls_x509_crt_parse_file(&a, bundle) != 0 && stats().chains == 0);
     mbedtls_x509_crt_free(&a);
 
-    /* threads: parse, verify, free at once from several; one parse in all */
+    /* parsed ahead (tls_wrap_warm): in the background, kept for the grace
+     * period like a connection's, so the next connection doesn't parse */
     copy("tests/tls/bundle.pem", bundle);
+    unsigned warm0 = stats().parses;
+    tls_wrap_warm();
+    for (int i = 0; i < 200 && stats().parses == warm0; i++) ms_sleep(10);
+    ms_sleep(20);
+    s = stats();
+    CHECK(s.parses == warm0 + 1 && s.chains == 1 && s.lent == 0);
+    tls_wrap_warm();                     /* parsed already: only kept on */
+    ms_sleep(50);
+    mbedtls_x509_crt_init(&a);
+    CHECK(mbedtls_x509_crt_parse_file(&a, bundle) == 0 && stats().parses == warm0 + 1);
+    CHECK(verify(&ok, &a, "localhost") == 0);
+    mbedtls_x509_crt_free(&a);
+    ms_sleep(600);
+    CHECK(stats().chains == 0);
+    /* a connection right after: one parse in all (its own, or the one under way) */
+    warm0 = stats().parses;
+    tls_wrap_warm();
+    mbedtls_x509_crt_init(&a);
+    CHECK(mbedtls_x509_crt_parse_file(&a, bundle) == 0);
+    s = stats();
+    CHECK(s.parses == warm0 + 1 && s.chains == 1 && s.lent == 1);
+    CHECK(verify(&ok, &a, "localhost") == 0);
+    mbedtls_x509_crt_free(&a);
+    ms_sleep(600);
+    CHECK(stats().chains == 0);
+
+    /* threads: parse, verify, free at once from several; one parse in all */
     tls_wrap_set_grace_ms(30000);
     unsigned before = stats().parses;
     ok_crt = ok;

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "disp_drm.h"
 #include "hw_paths.h"
+#include "core/lat.h"
 
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
@@ -38,6 +39,7 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *a, uint8_t *px)
     struct drm_clip_rect clip = {(uint16_t)a->x1, (uint16_t)a->y1, (uint16_t)(a->x2 + 1), (uint16_t)(a->y2 + 1)};
     struct drm_mode_fb_dirty_cmd dirty = {.fb_id = D.fb_id, .num_clips = 1, .clips_ptr = (uintptr_t)&clip};
     io(DRM_IOCTL_MODE_DIRTYFB, &dirty);   /* synchronous: the panel has the pixels when it returns */
+    LAT("drm: flushed %d,%d %dx%d", a->x1, a->y1, a->x2 - a->x1 + 1, a->y2 - a->y1 + 1);
     lv_display_flush_ready(disp);
 }
 

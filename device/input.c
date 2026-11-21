@@ -11,6 +11,8 @@
 #include <unistd.h>
 
 #include "ui/ui.h"
+#include "core/lat.h"
+#include <sys/time.h>
 
 #define LONG_PRESS_MS 600
 #define POWER_OFF_MS 2000         /* hold Power this long to power off */
@@ -242,6 +244,14 @@ int input_next(input_event_t *ev, uint32_t now)
                 if (ie.type == EV_KEY) on_remote_key(ie.code, ie.value);
                 continue;
             }
+#ifdef input_event_sec
+            if (ie.type == EV_KEY && lat_on()) {
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+                LAT("input: key %d %d, %ld ms after the kernel had it", ie.code, ie.value,
+                    (long)((tv.tv_sec - ie.input_event_sec) * 1000 + (tv.tv_usec - ie.input_event_usec) / 1000));
+            }
+#endif
             if (ie.type == EV_KEY) on_key(ie.code, ie.value, now);
             else if (ie.type == EV_SW && (ie.code == SW_HEADPHONE_INSERT || ie.code == SW_LINEOUT_INSERT)) {
                 if (ie.code == SW_HEADPHONE_INSERT) jack_hp = !!ie.value;

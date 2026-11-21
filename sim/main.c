@@ -36,6 +36,7 @@
 #include "net/podcast.h"
 #include "net/podsync.h"
 #include "net/coverfind.h"
+#include "audio/crossfeed.h"
 #include "lvgl.h"
 #include "player/player.h"
 #include "ui/theme.h"
@@ -168,6 +169,13 @@ static int64_t sim_cf_download(const char *url, const char *path, http_progress_
     if (out) fclose(out);
     return out && total ? (int64_t)total : -1;
 }
+/* What's new, as a release's whatsnew.txt gives it (the screenshots; About's row) */
+#define SIM_WHATS_NEW_VERSION "v0.13.0"
+#define SIM_WHATS_NEW "Crossfeed, for listening on headphones\n" \
+                      "Shuffle an album or an artist from its menu\n" \
+                      "Radio, skipping and Wi-Fi respond faster\n" \
+                      "No backlight flicker at low brightness\n" \
+                      "Fixes for podcasts and covers\n"
 static int sim_pod_opml(char *path, size_t cap)
 {
     snprintf(path, cap, "build/sim-data/podcasts/subscriptions.opml");
@@ -259,10 +267,11 @@ static int sim_ssh_state(ui_ssh_t *st)
 }
 static void sim_ssh_do(int what) { (void)what; }
 /* Sound > Balance and Volume limit, as on the headphone jack (balance on the engine) */
-static int g_sim_bal, g_sim_limit;
+static int g_sim_bal, g_sim_limit, g_sim_xf;
 static void sim_sound_value(int what, char *out, size_t cap)
 {
     char n[16];   /* (translated, as the H2's) */
+    if (what == UI_SOUND_CROSSFEED) { snprintf(out, cap, "%s", tr(crossfeed_name(g_sim_xf))); return; }
     snprintf(n, sizeof n, "%d", abs(g_sim_bal));
     if (what == UI_SOUND_BALANCE && !g_sim_bal) snprintf(out, cap, "%s", tr("Centre"));
     else if (what == UI_SOUND_BALANCE) tr_fill(out, cap, g_sim_bal < 0 ? "%s dB left" : "%s dB right", n, NULL);
@@ -271,6 +280,11 @@ static void sim_sound_value(int what, char *out, size_t cap)
 }
 static int sim_sound_adjust(int what, int dir)
 {
+    if (what == UI_SOUND_CROSSFEED) {
+        g_sim_xf = (g_sim_xf + (dir < 0 ? XF_LEVELS - 1 : 1)) % XF_LEVELS;
+        if (g_eng) engine_set_crossfeed(g_eng, g_sim_xf);
+        return 0;
+    }
     if (what == UI_SOUND_BALANCE) {
         g_sim_bal = g_sim_bal + dir < -12 ? -12 : g_sim_bal + dir > 12 ? 12 : g_sim_bal + dir;
         float g = (float)pow(10.0, -abs(g_sim_bal) / 20.0);
@@ -479,7 +493,8 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                                           "uninstallnone", "uninstallpending", "homeupdate", "askupdate", "askignore", "askinstall", "eqedit", "eqband",
                                           "themesnew", "themeedit", "themecolours", "themecolour", "themesave",
                                           "podcasts", "podshow", "podsearch", "podnp", "podchapters", "podmenu", "podsettings",
-                                          "libsettings", "libhelp", "covermenu", "covermenuown", "coverfind"};
+                                          "libsettings", "libhelp", "xfhelp", "whatsnew", "whatsnewend", "aboutwn", "covermenu", "covermenuown", "coverfind",
+                                          "albummenu", "artistmenu", "aartistmenu"};
     static const char *const slug[] = {"studio-mint", "studio-ember", "studio-pastel", "pixel-pastel"};
     for (int t = 0; t < 4 && t < g_n_themes; t++) {   /* the built-in themes */
         ui_set_theme(t);
@@ -574,6 +589,17 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 if (!strcmp(screens[s], "askinstall")) ui_key(UI_KEY_OK);   /* Install: About > Updates */
                 ui_set_theme(t);                            /* (the slide finished) */
                 settings_set("update.found", "");
+            } else if (!strncmp(screens[s], "whatsnew", 8)) {   /* after an update: the release's points (and turned to the end) */
+                ui_show("home");
+                ui_set_whats_new(SIM_WHATS_NEW_VERSION, SIM_WHATS_NEW, 1);
+                if (!strcmp(screens[s], "whatsnewend")) for (int k = 0; k < 8; k++) ui_key(UI_KEY_DOWN);
+            } else if (!strcmp(screens[s], "aboutwn")) {  /* Settings > About, its What's new row */
+                ui_set_whats_new(SIM_WHATS_NEW_VERSION, SIM_WHATS_NEW, 0);
+                ui_show("about");
+            } else if (!strcmp(screens[s], "xfhelp")) {   /* Menu on Sound > Crossfeed: its help */
+                ui_show("sound");
+                ui_key(UI_KEY_DOWN);
+                ui_key(UI_KEY_MENU);
             } else if (!strcmp(screens[s], "libhelp")) {  /* Menu on Find missing covers: its help */
                 ui_show("libsettings");
                 ui_key(UI_KEY_MENU);
@@ -583,7 +609,8 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
             } else {
                 ui_show(screens[s]);
             }
-            int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp") ||
+            int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp") ||
+                         !strncmp(screens[s], "whatsnew", 8) ||
                          (g_sim_upd.state >= UI_UPD_DOWNLOADING && g_sim_upd.state <= UI_UPD_RESTARTING) ||
                          !strcmp(screens[s], "uninstallpending") || !strcmp(screens[s], "uninstallnone");   /* (the update's progress screen) */
             lv_obj_t *what = on_top ? lv_layer_top() : lv_screen_active();
@@ -604,7 +631,9 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 g_sim_upd.state = UI_UPD_IDLE;
                 ui_update_changed();
             }
-            if (!strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp"))   /* (gone before the next screens) */
+            if (!strncmp(screens[s], "whatsnew", 8)) ui_key(UI_KEY_BACK);   /* (put away: Back) */
+            if (!strncmp(screens[s], "whatsnew", 8) || !strcmp(screens[s], "aboutwn")) ui_set_whats_new("", "", 0);
+            if (!strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp"))   /* (gone before the next screens) */
                 for (uint32_t c = 0; c < lv_obj_get_child_count(lv_layer_top()); c++)
                     lv_obj_add_flag(lv_obj_get_child(lv_layer_top(), (int32_t)c), LV_OBJ_FLAG_HIDDEN);
             printf("%s\n", path);

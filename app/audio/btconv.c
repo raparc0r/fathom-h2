@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Integer arithmetic throughout the signal path: the X1000 has no FPU (Fathom
- * builds soft-float), and a float MAC there costs a library call. Samples are
+/* Integer arithmetic throughout the signal path: Fathom is built soft-float
+ * (the X1000's FPU unused), and a float MAC there costs a library call. Samples are
  * Q31, coefficients Q30, sums 64-bit (MIPS madd). The filters are designed in
  * floating point once; the 48 <-> 44.1 kHz table is designed once per process. */
 #include "audio/btconv.h"
@@ -171,7 +171,7 @@ static inline int64_t dot_sym(const int32_t *lo_p, const int32_t *hi_p, const in
 static unsigned gcd(unsigned a, unsigned b) { while (b) { unsigned t = a % b; a = b; b = t; } return a; }
 
 /* The polyphase table for fam -> link, designed once (it takes a while
- * without an FPU) and shared. */
+ * with floats emulated) and shared. */
 static const int32_t *rational_table(unsigned fam, unsigned link, int *L, int *M, int *K)
 {
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;

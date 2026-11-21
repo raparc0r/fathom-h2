@@ -12,6 +12,7 @@
 #include <mpg123.h>
 
 #include "audio/dsd.h"
+#include "core/lat.h"
 #include "audio/vorbis.h"
 
 #ifdef FATHOM_HAVE_FFMPEG
@@ -320,10 +321,13 @@ static int open_ff(decoder_t *d, const char *path, int hls)
         av_dict_set(&opt, "user_agent", NET_UA, 0);
         ff_tls_options(&opt);              /* https (and a redirect to it): certificates checked */
     }
+    LAT("decoder: opening %s", path);
     int r = avformat_open_input(&d->fc, path, ifmt, &opt);
     av_dict_free(&opt);
+    LAT("decoder: open_input %d (%s)", r, d->fc && d->fc->iformat ? d->fc->iformat->name : "-");
     if (r < 0) return -1;
     if (avformat_find_stream_info(d->fc, NULL) < 0) return -1;
+    LAT("decoder: stream info (%lld bytes read)", d->fc->pb ? (long long)avio_tell(d->fc->pb) : -1LL);
     const AVCodec *codec = NULL;
     d->stream = av_find_best_stream(d->fc, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
     if (d->stream < 0 || !codec) {
@@ -336,7 +340,7 @@ static int open_ff(decoder_t *d, const char *path, int hls)
             if ((int)i != d->stream) d->fc->streams[i]->discard = AVDISCARD_ALL;
     d->cc = avcodec_alloc_context3(codec);
     if (!d->cc || avcodec_parameters_to_context(d->cc, st->codecpar) < 0) return -1;
-    d->cc->request_sample_fmt = AV_SAMPLE_FMT_S16;   /* libopus: its integer path (no FPU) */
+    d->cc->request_sample_fmt = AV_SAMPLE_FMT_S16;   /* libopus: its integer path (soft-float build) */
     if (avcodec_open2(d->cc, codec, NULL) < 0) return -1;
     d->pkt = av_packet_alloc();
     d->frm = av_frame_alloc();
@@ -505,8 +509,10 @@ static long fetch_text(decoder_t *d, const char *url, char *buf, size_t cap)
     av_dict_set(&opt, "rw_timeout", NET_TIMEOUT, 0);
     av_dict_set(&opt, "user_agent", NET_UA, 0);
     ff_tls_options(&opt);
+    LAT("decoder: fetching %s", url);
     int r = avio_open2(&pb, url, AVIO_FLAG_READ, &icb, &opt);
     av_dict_free(&opt);
+    LAT("decoder: fetch open %d", r);
     if (r < 0) return -1;
     size_t n = 0;
     while (n + 1 < cap) {
@@ -516,6 +522,7 @@ static long fetch_text(decoder_t *d, const char *url, char *buf, size_t cap)
     }
     avio_closep(&pb);
     buf[n] = '\0';
+    LAT("decoder: fetched %zu bytes", n);
     return (long)n;
 }
 

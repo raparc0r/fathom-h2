@@ -49,6 +49,10 @@ struct player {
     int64_t  sleep_album;  /* end of album: the album playing when it was set */
     uint64_t sleep_at;     /* monotonic ms when it pauses */
     player_shuffle_prefs_t sprefs;   /* Settings > Playback */
+    int      ctx_chosen;      /* the context was chosen to shuffle (an album, an artist):
+                                 spoken tracks stay in; ctx_songs: songs, never whole albums;
+                                 ctx_all: short ones too (they were all it had) */
+    int      ctx_songs, ctx_all;
 
     /* internet radio */
     int      radio;        /* on: the engine plays rst[ri] */
@@ -124,6 +128,7 @@ static void set_ctx(player_t *p, const int64_t *ids, int n)
     if (grow((void **)&p->ctx, &p->cap_ctx, n ? n : 1, sizeof *p->ctx)) return;
     memcpy(p->ctx, ids, (size_t)n * sizeof *p->ctx);
     p->n = n;
+    p->ctx_chosen = p->ctx_songs = p->ctx_all = 0;
 }
 
 static int cmp_shuf_id(const void *a, const void *b)
@@ -161,10 +166,10 @@ static void build_order(player_t *p, int first, const uint32_t *tail, size_t tai
     shuf_opts_t o;
     shuf_default_opts(&o, now_s());
     o.first = first;
-    o.mode = p->sprefs.albums ? SHUF_MODE_ALBUMS : SHUF_MODE_SONGS;
+    o.mode = p->sprefs.albums && !p->ctx_songs ? SHUF_MODE_ALBUMS : SHUF_MODE_SONGS;
     o.freshness = p->sprefs.freshness;
-    o.skip_interludes = p->sprefs.skip_interludes;
-    o.exclude_spoken = p->sprefs.exclude_spoken;
+    o.skip_interludes = p->sprefs.skip_interludes && !p->ctx_all;
+    o.exclude_spoken = p->sprefs.exclude_spoken && !p->ctx_chosen;
     o.keep_units = p->sprefs.keep_works;
     long c = shuf_build(t, (size_t)p->n, &o, rng_os_seed(), tail, tail_n, out);
     for (long i = 0; i < c; i++) p->order[p->n_order++] = (int)out[i];
@@ -299,6 +304,24 @@ void player_shuffle_all(player_t *p)
     start_at(p, 0);
 }
 
+int player_shuffle_these(player_t *p, const int64_t *ids, int n, int songs)
+{
+    if (n <= 0) return 0;
+    p->shuffle = 1;
+    set_ctx(p, ids, n);
+    p->ctx_chosen = 1;
+    p->ctx_songs = songs;
+    build_order(p, -1, NULL, 0);
+    if (p->n_order == 0) {                      /* only interludes: those, then */
+        p->ctx_all = 1;
+        build_order(p, -1, NULL, 0);
+    }
+    if (p->n_order == 0) return 0;
+    p->user_end = 0;
+    start_at(p, 0);
+    return p->n_order;
+}
+
 /* Start the cued track (from where a restored queue left off). */
 static void start_cued(player_t *p)
 {
@@ -353,14 +376,33 @@ void player_pause(player_t *p, int on)
     else if (!on && st.state == ENG_STOPPED && p->have_cur) start_cued(p);
 }
 
-/* The current track is being left: record it as played or as an early skip. */
-static void record(player_t *p, int skipped_by_user)
+/* The current track is being left: record it as played or as an early skip.
+ * In two halves for a skip: what it was taken before the next track starts,
+ * and written (the database, on the card) once the engine has it, so the
+ * next track doesn't wait for the write. */
+typedef struct { int64_t id; int early, valid; } played_t;
+
+static played_t record_take(player_t *p, int skipped_by_user)
 {
-    if (!p->have_cur || p->radio || p->pod) return;
+    played_t r = {0};
+    if (!p->have_cur || p->radio || p->pod) return r;
     eng_status_t st;
     engine_status(p->eng, &st);
-    int early = skipped_by_user && st.pos_ms < EARLY_SKIP_MS;
-    library_played(p->lib, p->cur.id, early, now_s());
+    r.id = p->cur.id;
+    r.early = skipped_by_user && st.pos_ms < EARLY_SKIP_MS;
+    r.valid = 1;
+    return r;
+}
+
+static void record_put(player_t *p, const played_t *r)
+{
+    if (r->valid) library_played(p->lib, r->id, r->early, now_s());
+}
+
+static void record(player_t *p, int skipped_by_user)
+{
+    played_t r = record_take(p, skipped_by_user);
+    record_put(p, &r);
 }
 
 /* Start a new shuffle cycle after the last one ran out (repeat all). */
@@ -384,10 +426,11 @@ void player_next(player_t *p)
     if (p->pod) { player_seek_by(p, PLAYER_SKIP_FWD_MS); return; }
     if (!p->have_cur) return;
     catch_up(p);
-    record(p, 1);
+    played_t was = record_take(p, 1);
     if (p->pos + 1 < p->n_order) start_at(p, p->pos + 1);
     else if (p->repeat == REPEAT_ALL && new_cycle(p) == 0) start_at(p, 0);
     else if (p->repeat == REPEAT_ALL) start_at(p, 0);
+    record_put(p, &was);
 }
 
 void player_prev(player_t *p)
@@ -563,8 +606,9 @@ void player_queue_jump(player_t *p, int i)
 {
     int a = p->pos + 1 + i;
     if (a <= p->pos || a >= p->n_order) return;
-    record(p, 1);
+    played_t was = record_take(p, 1);
     start_at(p, a);
+    record_put(p, &was);
 }
 
 /* ---------- saved queue ---------- */

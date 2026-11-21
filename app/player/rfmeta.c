@@ -53,6 +53,19 @@ static const char *skip_value(const char *p)
     return p;
 }
 
+/* Four hex digits' value, or -1 (stops at the first that isn't one: a NUL too) */
+static int hex4(const char *p)
+{
+    int v = 0;
+    for (int i = 0; i < 4; i++) {
+        char h = p[i];
+        int d = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+        if (d < 0) return -1;
+        v = v * 16 + d;
+    }
+    return v;
+}
+
 /* Reads a string value into out (\uXXXX as UTF-8, other escapes as themselves). */
 static int read_string(const char *p, char *out, size_t cap)
 {
@@ -68,16 +81,11 @@ static int read_string(const char *p, char *out, size_t cap)
             case 'n': case 'r': case 't': c = ' '; break;
             case 'b': case 'f': continue;
             case 'u': {
-                unsigned v = 0;
-                for (int i = 1; i <= 4; i++) {
-                    char h = p[i];
-                    v = v * 16 + (unsigned)(h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10
-                                          : h >= 'A' && h <= 'F' ? h - 'A' + 10 : 0);
-                    if (!h) return -1;
-                }
+                int v = hex4(p + 1);
+                if (v < 0) return -1;                  /* (not 4 hex digits: never past the text's end) */
                 p += 4;
                 if (v >= 0xd800 && v < 0xdc00 && p[1] == '\\' && p[2] == 'u') {   /* surrogate pair */
-                    unsigned lo = (unsigned)strtoul((char[5]){p[3], p[4], p[5], p[6], 0}, NULL, 16);
+                    int lo = hex4(p + 3);
                     if (lo >= 0xdc00 && lo < 0xe000) { v = 0x10000 + ((v - 0xd800) << 10) + (lo - 0xdc00); p += 6; }
                 }
                 char u[4];

@@ -122,6 +122,13 @@ static int playing(player_t *p)
 }
 
 /* Where the playing track is in t[0..n-1]: -1 if it isn't */
+static int idx_of_id(const int64_t *ids, int n, int64_t id)
+{
+    for (int i = 0; i < n; i++)
+        if (ids[i] == id) return i;
+    return -1;
+}
+
 static int idx_of(player_t *p, const int64_t *t, int n)
 {
     int64_t id = cur_id(p);
@@ -657,6 +664,46 @@ int main(void)
         CHECK(library_playlist_delete(lib, pl) == 0 && access(renamed, F_OK) != 0);
     }
     library_list_free(&pls);
+
+    /* Menu > Shuffle on an album or an artist (player_shuffle_these): every
+     * song once, shuffle on; one album's songs mixed even when shuffle plays
+     * whole albums (an artist's albums stay whole then); these 0.3 s tracks are
+     * all "interludes", so they play rather than nothing */
+    player_set_shuffle(p, 0);
+    player_shuffle_prefs_t sp = {.albums = 1, .freshness = 1, .skip_interludes = 1, .exclude_spoken = 1};
+    player_set_shuffle_prefs(p, &sp);
+    int in_order = 0;
+    for (int k = 0; k < 8; k++) {
+        CHECK(player_shuffle_these(p, t, N, 1) == N && player_shuffle(p) && player_queue_len(p) == N - 1);
+        int64_t seq[N];
+        seq[0] = cur_id(p);
+        for (int i = 1; i < N; i++) seq[i] = player_queue_at(p, i - 1);
+        int each = 1;
+        for (int i = 0; i < N; i++) each &= idx_of_id(seq, N, t[i]) >= 0;
+        CHECK(each);
+        in_order += !memcmp(seq, t, sizeof seq);
+    }
+    CHECK(in_order < 8);                                  /* (all 8 in order: 1 in 720^8) */
+    CHECK(player_shuffle_these(p, t, N, 0) == N && cur_id(p) == t[0] && player_queue_at(p, 0) == t[1]);
+    CHECK(player_shuffle_these(p, t, 0, 1) == 0);
+    sp.albums = 0;
+    player_set_shuffle_prefs(p, &sp);
+    CHECK(player_shuffle_these(p, t, N, 1) == N);           /* songs: all interludes, all played */
+    player_pause(p, 1);
+    /* an artist's songs: an album artist's albums whole; a guest's, only theirs */
+    lib_list_t at, arts;
+    CHECK(library_list(lib, LIB_ALBUM_ARTISTS, 0, &aa) == 1);
+    CHECK(aa.n == 1 && library_artist_tracks(lib, aa.ids[0], 0, &at) == N && at.ids[0] == t[0] && at.ids[N - 1] == t[N - 1]);
+    library_list_free(&at);
+    library_list_free(&aa);
+    CHECK(library_list(lib, LIB_ARTISTS, 0, &arts) == 3);   /* Guest One, Guest Two, Test Artist */
+    if (arts.n == 3) {
+        CHECK(library_artist_tracks(lib, arts.ids[0], 1, &at) == 1 && at.ids[0] == t[5]);
+        library_list_free(&at);
+        CHECK(library_artist_tracks(lib, arts.ids[2], 1, &at) == N);
+        library_list_free(&at);
+    }
+    library_list_free(&arts);
 
     player_free(p);
     engine_free(eng);

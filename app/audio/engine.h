@@ -34,6 +34,7 @@ typedef struct {
     uint32_t       start_ms;     /* ...from there in (engine_play_at) */
     int            start_paused; /* ...and it will start paused */
     int            eq;           /* the EQ is on for this track */
+    int            crossfeed;    /* ...and the crossfeed (XF_LIGHT..; XF_OFF: off, or a mono track) */
     int            stream;       /* the track is an internet stream (no length, no seeking) */
     int            connecting;   /* ...and it is still connecting */
     unsigned       meta_seq;     /* changes with meta */
@@ -91,6 +92,9 @@ void engine_set_eq(engine_t *e, const eq_profile_t *p);
  * balance, levelling and fade are bypassed for it. engine_switch_output()
  * turns it off: say so again for the new output if it takes DoP too. */
 void engine_set_dop(engine_t *e, int on);
+/* Crossfeed for headphones (audio/crossfeed.h: XF_OFF, XF_LIGHT...), on stereo
+ * PCM from the next chunk; on, the output is at least 24-bit, as with the EQ. */
+void engine_set_crossfeed(engine_t *e, int level);
 /* A fade (0..1) applied on top of the gain: the sleep timer's. 1.0 = none. */
 void engine_set_fade(engine_t *e, float fade);
 /* Faster without the pitch going up (audio/tempo.h), in percent: 100 = off

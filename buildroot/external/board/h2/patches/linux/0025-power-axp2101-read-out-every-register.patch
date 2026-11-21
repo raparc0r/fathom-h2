@@ -1,0 +1,47 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] power: axp2101: read out every register
+
+A read-only "registers" attribute on the AXP2101 (RR: VV per line): how the
+charger and the power path are set up and what they are doing, for problems
+that show only on USB power (a faint backlight flicker at full charge). The
+H2 has no i2c-dev; reads have no side effects on the chip.
+---
+--- a/drivers/power/supply/axp2101_battery.c
++++ b/drivers/power/supply/axp2101_battery.c
+@@ -201,6 +201,27 @@
+ }
+ static DEVICE_ATTR_RO(power_on_reason);
+ 
++/*
++ * Every register, read (only), as "RR: VV" lines: to see how the charger and
++ * the power path are set up and what they are doing (the H2 has no i2c-dev).
++ * Reads have no side effects on the AXP2101 (its interrupt flags clear only
++ * when written).
++ */
++static ssize_t registers_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct axp2101_batt *b = dev_get_drvdata(dev);
++	unsigned int reg, val;
++	int len = 0;
++
++	for (reg = 0; reg <= 0xff; reg++) {
++		if (regmap_read(b->regmap, reg, &val))
++			continue;
++		len += sysfs_emit_at(buf, len, "%02x: %02x\n", reg, val);
++	}
++	return len;
++}
++static DEVICE_ATTR_RO(registers);
++
+ static int axp2101_probe(struct i2c_client *client)
+ {
+ 	struct device *dev = &client->dev;
+@@ -238,6 +259,8 @@
+ 			 axp2101_on_reason, on, off);
+ 		if (device_create_file(dev, &dev_attr_power_on_reason))
+ 			dev_warn(dev, "no power_on_reason attribute\n");
++		if (device_create_file(dev, &dev_attr_registers))
++			dev_warn(dev, "no registers attribute\n");
+ 	}
+ 
+ 	cfg.drv_data = b;

@@ -102,7 +102,7 @@ int out_sdl_create(audio_output_t *out)
     }
     sdl_out_t *o = calloc(1, sizeof *o);
     if (!o) return -1;
-    *out = (audio_output_t){s_open, s_write, s_delay, s_drain, s_flush, s_pause, s_close, s_describe, o, NULL};
+    *out = (audio_output_t){s_open, s_write, s_delay, s_drain, s_flush, s_pause, s_close, s_describe, o, NULL, NULL};
     return 0;
 }
 

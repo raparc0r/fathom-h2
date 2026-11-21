@@ -2,6 +2,7 @@
 /* Podcasts over the network: one worker, one job at a time (podsync.h). */
 #include "net/podsync.h"
 
+#include <dirent.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -206,9 +207,21 @@ static void progress(uint64_t done, uint64_t total, void *ctx)
     pthread_mutex_unlock(&P.mu);
 }
 
+/* The show is still subscribed to (a download queued before an unsubscribe
+ * would make its folder again, and fill it with what nothing lists) */
+static int subscribed(const char *id)
+{
+    pod_show_t *shows = calloc(POD_MAX_SHOWS, sizeof *shows);
+    if (!shows) return 1;
+    int n = pod_shows_load(P.dir, shows, POD_MAX_SHOWS), yes = 0;
+    for (int i = 0; i < n; i++) yes |= !strcmp(shows[i].id, id);
+    free(shows);
+    return yes;
+}
+
 static void download(job_t *j)
 {
-    if (pod_downloaded(P.dir, j->id, &j->ep)) return;
+    if (pod_downloaded(P.dir, j->id, &j->ep) || !subscribed(j->id)) return;
     char path[800], sd[700];
     snprintf(sd, sizeof sd, "%s/%s", P.dir, j->id);
     mkdir(P.dir, 0755);
@@ -257,7 +270,7 @@ static void search(job_t *j, unsigned gen)
         P.found = n >= 0 ? found : NULL;
         P.n_found = n >= 0 ? n : 0;
         P.search_state = n >= 0 ? 1 : -2;
-        found = NULL;
+        if (n >= 0) found = NULL;                   /* (kept; a failed one's freed below) */
     }
     pthread_mutex_unlock(&P.mu);
     free(found);
@@ -365,9 +378,37 @@ static void run(job_t *j, unsigned search_gen)
     }
 }
 
+/* What a download or a cover cut short left (the player killed, the card
+ * pulled, the power gone): KEY.mp3.part, cover.565.img(.part), cover.565.tmp.
+ * Only this worker writes those, so at its start none is under way. */
+static void sweep(void)
+{
+    DIR *d = opendir(P.dir);
+    struct dirent *e;
+    char sd[1200], f[1500];
+    while (d && (e = readdir(d))) {
+        if (e->d_name[0] == '.' || strlen(e->d_name) != 12) continue;   /* the shows' folders: 12 hex */
+        snprintf(sd, sizeof sd, "%s/%s", P.dir, e->d_name);
+        DIR *s = opendir(sd);
+        struct dirent *g;
+        while (s && (g = readdir(s))) {
+            size_t n = strlen(g->d_name);
+            /* (only the worker's own: the UI may be writing a state.txt.tmp now) */
+            if ((n > 5 && !strcmp(g->d_name + n - 5, ".part")) || !strcmp(g->d_name, "cover.565.tmp") ||
+                !strcmp(g->d_name, "cover.565.img")) {
+                snprintf(f, sizeof f, "%s/%s", sd, g->d_name);
+                remove(f);
+            }
+        }
+        if (s) closedir(s);
+    }
+    if (d) closedir(d);
+}
+
 static void *worker(void *arg)
 {
     (void)arg;
+    sweep();
     pthread_mutex_lock(&P.mu);
     while (!P.stop) {
         if (!P.head) { pthread_cond_wait(&P.cv, &P.mu); continue; }

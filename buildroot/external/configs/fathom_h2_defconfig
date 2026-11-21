@@ -2,7 +2,10 @@
 # Fathom for the HiFi Walker H2 (X1000, hw4).:
 # kernel + small initramfs, booted from the SD card by the Rockbox bootloader.
 
-# CPU: Ingenic X1000 (XBurst, MIPS32r2 with FPU; Buildroot adds the FPU erratum flags)
+# CPU: Ingenic X1000 (XBurst, MIPS32r2 with an FPU). The build is soft-float
+# (BR2_MIPS_SOFT_FLOAT, Buildroot's default): the FPU is unused. Checked
+# 2026-11-20: no code that runs per sample or per frame uses floats, only filter
+# design and formatting.
 BR2_mipsel=y
 BR2_mips_xburst=y
 
@@ -61,7 +64,8 @@ BR2_PACKAGE_JPEG_TURBO=y
 BR2_PACKAGE_TINYALSA=y
 BR2_PACKAGE_TINYALSA_TOOLS=y
 # Formats beyond FLAC and MP3, for the player (app/audio/ff_util.c): FFmpeg with
-# only integer decoders (the X1000 has no FPU) and the demuxers they need; Opus
+# only integer decoders (the build is soft-float, Buildroot's default for MIPS:
+# the X1000's FPU is unused) and the demuxers they need; Opus
 # through libopus built fixed-point. No programs, encoders or filters. (Vorbis:
 # Tremor, below.)
 BR2_PACKAGE_FFMPEG=y

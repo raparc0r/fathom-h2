@@ -3,6 +3,7 @@
 #include "player/rfmeta.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int fails;
@@ -34,6 +35,16 @@ int main(void)
     CHECK(rf_parse("{\"levels\":[{\"items\":[],\"position\":0}]}", a, sizeof a, t, sizeof t, NULL, 0) != 0);
     CHECK(rf_parse("not json", a, sizeof a, t, sizeof t, NULL, 0) != 0);
     CHECK(rf_parse("{\"steps\":{\"a\":{\"title\":\"unterminated", a, sizeof a, t, sizeof t, NULL, 0) != 0);
+    /* escapes cut short at the very end (in a buffer of their own size, for ASan): refused, nothing past the end read */
+    static const char *const cut[] = {"{\"levels\":[{\"position\":0,\"items\":[\"\\ud83c\\ua", "{\"levels\":[{\"items\":[\"\\u12",
+                                      "{\"levels\":[{\"items\":[\"\\ud8\"]}]}"};
+    for (int i = 0; i < 3; i++) {
+        size_t n = strlen(cut[i]) + 1;
+        char *c = malloc(n);
+        memcpy(c, cut[i], n);
+        CHECK(rf_parse(c, a, sizeof a, t, sizeof t, NULL, 0) != 0);
+        free(c);
+    }
 
     CHECK(rf_station("radiofrance:7") == 7);
     CHECK(rf_station("radiofrance:") == -1);

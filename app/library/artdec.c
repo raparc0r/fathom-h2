@@ -135,7 +135,7 @@ static int png_stream(FILE *f, long off, int min_side, const art_limits_t *lim, 
             if (b[12]) { r = 1; goto out; }           /* interlaced */
             static const int chans[7] = {1, 0, 3, 1, 2, 0, 4};
             if (p.ctype > 6 || !(p.channels = chans[p.ctype]) || !p.w || !p.h || p.w > 65535 || p.h > 65535) goto out;
-            if (p.depth != 8 && p.depth != 16 && !((p.ctype == 0 || p.ctype == 3) && p.depth < 8 && (8 % p.depth) == 0))
+            if (p.depth != 8 && p.depth != 16 && !((p.ctype == 0 || p.ctype == 3) && (p.depth == 1 || p.depth == 2 || p.depth == 4)))
                 goto out;
             size_t bits = (size_t)p.channels * (size_t)p.depth;
             p.rowbytes = ((size_t)p.w * bits + 7) / 8;

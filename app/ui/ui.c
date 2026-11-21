@@ -123,12 +123,12 @@ typedef enum {
     ST_RESCAN, ST_USB_DRIVE, ST_USB_COMPUTER, ST_USB_DAC, ST_N_SONGS, ST_N_ALBUMS, ST_N_ARTISTS, ST_N_PLAYLISTS,
     ST_BT, ST_WIFI,
     ST_SHUF_BY, ST_SHUF_FRESH, ST_SHUF_INTERLUDES, ST_SHUF_WORKS, ST_SHUF_SPOKEN, ST_BALANCE, ST_VOL_LIMIT, ST_PURE, ST_TRANSPORT, ST_BATTERY, ST_LANGUAGE,
-    ST_THEME, ST_ALBUM_ARTISTS, ST_POD_AUTO, ST_POD_KEEP, ST_POD_CLEAN, ST_POD_SPEED, ST_FIND_COVERS,
+    ST_THEME, ST_ALBUM_ARTISTS, ST_POD_AUTO, ST_POD_KEEP, ST_POD_CLEAN, ST_POD_SPEED, ST_FIND_COVERS, ST_CROSSFEED,
 } setting_t;
 /* Quick settings (quick_rows(): Bluetooth's and Wi-Fi's rows where they are) */
 static const setting_t QUICK[] = {ST_BRIGHTNESS, ST_SHUFFLE, ST_REPEAT, ST_EQ, ST_BT, ST_WIFI,
                                   ST_SLEEP, ST_STOP_AFTER, ST_TIMEOUT};
-static const setting_t SOUND_ROWS[] = {ST_OUTPUT, ST_PURE, ST_EQ, ST_BALANCE, ST_VOL_LIMIT, ST_LEVELLING, ST_TRANSPORT,
+static const setting_t SOUND_ROWS[] = {ST_OUTPUT, ST_PURE, ST_EQ, ST_CROSSFEED, ST_BALANCE, ST_VOL_LIMIT, ST_LEVELLING, ST_TRANSPORT,
                                        ST_USB_DAC, ST_DAC_FILTER};   /* sound_rows(): those with their hooks */
 static const setting_t PLAYBACK_ROWS[] = {ST_SHUFFLE, ST_SHUF_BY, ST_SHUF_FRESH, ST_SHUF_INTERLUDES, ST_SHUF_WORKS,
                                          ST_SHUF_SPOKEN, ST_REPEAT, ST_PAUSE_UNPLUG};
@@ -162,6 +162,7 @@ typedef enum {
     CTX_RADIO_PLAY, CTX_RADIO_ADD, CTX_RADIO_REMOVE,
     CTX_POD_REFRESH, CTX_POD_UNSUB, CTX_POD_DOWNLOAD, CTX_POD_CANCEL, CTX_POD_DELETE, CTX_POD_PLAYED, CTX_POD_UNPLAYED,
     CTX_POD_CHAPTERS, CTX_POD_SPEED, CTX_FIND_COVER, CTX_REMOVE_COVER, CTX_FIND_ANOTHER,
+    CTX_SHUFFLE,
 } ctx_action_t;
 static const char *const CTX_LABEL[] = {
     "Play", "Play next", "Add to queue", "Show queue", "Go to album", "Go to artist", "Info",
@@ -171,6 +172,7 @@ static const char *const CTX_LABEL[] = {
     "Play", "Add to your stations", "Remove from your stations",
     "Check for new episodes", "Unsubscribe", "Download", "Cancel download", "Delete download", "Mark as played",
     "Mark as not played", "Chapters", "Speed", "Find cover", "Remove cover", "Find another cover",
+    "Shuffle",
 };
 
 /* Rows of the track info screen. */
@@ -254,6 +256,7 @@ static struct {
     /* the context menu's subject and actions */
     ctx_action_t ctx[12]; int ctx_n;
     int64_t ctx_track, ctx_album, ctx_artist, ctx_playlist;
+    int ctx_credited;                         /* ctx_artist from Artists (credited), not Album artists */
     int ctx_qidx;           /* queue row the menu is for, -1 if none */
     int ctx_plpos;          /* row in your own playlist the menu is for, -1 if none */
     lib_list_t pick_ids;    /* "Add to playlist": the tracks to add */
@@ -384,6 +387,10 @@ static struct {
      * one downloads, unpacks or installs (NULL: not shown) */
     ui_update_t upd;
     lv_obj_t *upd_ov, *upd_title, *upd_bar, *upd_detail, *upd_hint;
+    lv_obj_t *wn_ov, *wn_body, *wn_hint;   /* What's new: the panel, its points, the hint */
+    lv_obj_t *wn_row[16];     /* ...each point (the wheel moves through them a whole point at a time) */
+    int wn_h[16], wn_n, wn_first, wn_last;
+    char wn_ver[24], wn_text[1024];
     /* Settings > Power > Battery: the history as of bat_at (ms), its graph
      * (over the list, which moves down below it: list_y0), the span shown */
     batrep_t bat;
@@ -414,6 +421,7 @@ static struct {
     pod_show_t *pod_found; int pod_nf, pod_search;   /* Find podcasts: the shows found, how it went */
     char pod_opml[300];                       /* an OPML file to import ("" none) */
     int pod_ctx;                              /* the episode (or show) a menu is for */
+    char pod_ctx_key[13], pod_ctx_url[512];   /* ...which (found again when the lists are read again) */
     uint32_t pod_del_armed;
     struct { char id[13], key[13]; uint32_t pos, len, saved; } pod_play;   /* the episode playing: kept on the card */
     uint32_t pod_auto_at;
@@ -737,11 +745,12 @@ static void uninstall_look(void)
 
 /* About's rows: the device's, then Check for updates and Check automatically
  * (with updates), Uninstall Fathom (when it can), Reset all settings. */
-enum { AB_INFO, AB_CHECK, AB_AUTO, AB_UNINSTALL, AB_RESET };
+enum { AB_INFO, AB_WHATSNEW, AB_CHECK, AB_AUTO, AB_UNINSTALL, AB_RESET };
 static int about_row(int i)
 {
     if (i < S.about_n) return AB_INFO;
     i -= S.about_n;
+    if (S.wn_text[0] && i-- == 0) return AB_WHATSNEW;   /* (a release's: not in builds of my own) */
     if (S.hooks.update_do) {
         if (i < 2) return i == 0 ? AB_CHECK : AB_AUTO;
         i -= 2;
@@ -834,7 +843,7 @@ static int list_count(const level_t *l)
     }
     case L_ABOUT:
         about_look();
-        return S.about_n + 2 * (S.hooks.update_do != NULL) + (S.hooks.uninstall_do != NULL) + 1;   /* about_row */
+        return S.about_n + (S.wn_text[0] != 0) + 2 * (S.hooks.update_do != NULL) + (S.hooks.uninstall_do != NULL) + 1;   /* about_row */
     case L_UNINSTALL: uninstall_look(); return uninstall_rows();
     case L_UPDATE: update_look(); return S.upd.state == UI_UPD_AVAILABLE || S.upd.state == UI_UPD_FAILED ? 2 : 1;
     case L_BATTERY: return 3;                      /* the graph's range, since full charge, history */
@@ -904,7 +913,7 @@ static int sound_rows(setting_t *r)
     for (size_t i = 0; i < sizeof SOUND_ROWS / sizeof SOUND_ROWS[0]; i++) {
         setting_t st = SOUND_ROWS[i];
         if (st == ST_DAC_FILTER && !S.hooks.dac_filter_name) continue;
-        if ((st == ST_BALANCE || st == ST_VOL_LIMIT) && !S.hooks.sound_value) continue;
+        if ((st == ST_BALANCE || st == ST_VOL_LIMIT || st == ST_CROSSFEED) && !S.hooks.sound_value) continue;
         if (st == ST_PURE && !S.hooks.pure_toggle) continue;
         if (st == ST_TRANSPORT && !S.hooks.transport_toggle) continue;
         r[n++] = st;
@@ -1158,6 +1167,14 @@ static void setting_row(setting_t st, int editing, char *main, size_t mn, char *
         snprintf(main, mn, "%s", tr("Transport mode"));
         snprintf(meta, tn, "%s", on_off(settings_get_int("sound.transport", UI_TRANSPORT_DEFAULT)));
         break;
+    case ST_CROSSFEED: {
+        char v[48] = "";
+        snprintf(main, mn, "%s", tr("Crossfeed"));
+        if (S.pure) { snprintf(meta, tn, "%s", tr("Bypassed")); break; }
+        if (S.hooks.sound_value) S.hooks.sound_value(UI_SOUND_CROSSFEED, v, sizeof v);
+        snprintf(meta, tn, "%s", v);
+        break;
+    }
     case ST_BALANCE:
     case ST_VOL_LIMIT: {
         char v[48] = "";
@@ -1953,15 +1970,35 @@ static void pod_read_shows(void)
 /* The open show's episodes, where each was left, and which are on the card */
 static void pod_read_episodes(void)
 {
+    /* the episode selected (and a menu's), by key: a refresh puts a new one
+     * first, so the places move; found again whoever reads the list again
+     * (a refresh, the place kept every 15 s, Mark played) */
+    char sel_key[sizeof S.stack / sizeof S.stack[0]][13] = {{0}};
+    for (int d = 0; d < S.depth && S.pod_eps; d++) {
+        level_t *k = &S.stack[d];
+        if (k->kind == L_POD_SHOW && k->sel >= 0 && k->sel < S.pod_ne)
+            snprintf(sel_key[d], sizeof sel_key[d], "%s", S.pod_eps[k->sel].key);
+    }
     S.pod_ne = S.pod_nst = 0;
-    if (S.pod_ci < 0) return;
-    if (!S.pod_eps) S.pod_eps = calloc(POD_MAX_EPISODES, sizeof *S.pod_eps);
-    if (!S.pod_st) S.pod_st = calloc(POD_STATES, sizeof *S.pod_st);
-    if (!S.pod_eps || !S.pod_st) return;
-    const char *id = S.pod_shows[S.pod_ci].id;
-    S.pod_ne = pod_episodes_load(pod_dir(), id, S.pod_eps, POD_MAX_EPISODES);
-    S.pod_nst = pod_state_load(pod_dir(), id, S.pod_st, POD_STATES);
-    for (int i = 0; i < S.pod_ne; i++) S.pod_on_card[i] = (unsigned char)pod_downloaded(pod_dir(), id, &S.pod_eps[i]);
+    if (S.pod_ci >= 0) {
+        if (!S.pod_eps) S.pod_eps = calloc(POD_MAX_EPISODES, sizeof *S.pod_eps);
+        if (!S.pod_st) S.pod_st = calloc(POD_STATES, sizeof *S.pod_st);
+    }
+    if (S.pod_ci >= 0 && S.pod_eps && S.pod_st) {
+        const char *id = S.pod_shows[S.pod_ci].id;
+        S.pod_ne = pod_episodes_load(pod_dir(), id, S.pod_eps, POD_MAX_EPISODES);
+        S.pod_nst = pod_state_load(pod_dir(), id, S.pod_st, POD_STATES);
+        for (int i = 0; i < S.pod_ne; i++) S.pod_on_card[i] = (unsigned char)pod_downloaded(pod_dir(), id, &S.pod_eps[i]);
+    }
+    for (int d = 0; d < S.depth; d++)
+        for (int i = 0; sel_key[d][0] && i < S.pod_ne; i++)
+            if (!strcmp(S.pod_eps[i].key, sel_key[d])) S.stack[d].sel = i;
+    if (S.pod_ctx_key[0]) {                       /* an episode's menu: where it is now, or gone (-1) */
+        int at = -1;
+        for (int i = 0; i < S.pod_ne; i++)
+            if (!strcmp(S.pod_eps[i].key, S.pod_ctx_key)) at = i;
+        S.pod_ctx = at;
+    }
 }
 
 static void pod_free(void)
@@ -2075,9 +2112,11 @@ static void pod_found_row(int i, char *main, size_t mn, char *meta, size_t tn, i
 
 /* Accents: the selection, progress, playing mark and icons in one colour */
 static const struct { const char *name; int hue, sat; } ACCENTS[] = {
-    {"Mint", 158, 72}, {"Teal", 176, 60}, {"Sky", 199, 85}, {"Blue", 217, 85}, {"Indigo", 235, 70},
-    {"Violet", 262, 70}, {"Pink", 330, 75}, {"Red", 355, 80}, {"Coral", 14, 100}, {"Orange", 28, 95},
-    {"Amber", 42, 95}, {"Lime", 84, 60}, {"Grey", 210, 8},
+    {"Mint", 158, 72}, {"Teal", 176, 60}, {"Sky", 199, 85}, {"Steel blue", 214, 41}, {"Blue", 217, 85},
+    {"Indigo", 235, 70}, {"Violet", 262, 70}, {"Lavender", 270, 55}, {"Purple", 290, 65}, {"Plum", 305, 45},
+    {"Pink", 330, 75}, {"Hot pink", 330, 100}, {"Red", 355, 80}, {"Tomato", 4, 100}, {"Coral", 14, 100},
+    {"Orange", 28, 95}, {"Wheat", 39, 55}, {"Amber", 42, 95}, {"Lime", 84, 60}, {"Sea green", 120, 25},
+    {"Emerald", 140, 60}, {"Grey", 210, 8},   /* (Grey last: the greys) */
 };
 #define N_ACCENTS ((int)(sizeof ACCENTS / sizeof ACCENTS[0]))
 
@@ -2142,19 +2181,14 @@ static int the_worst(int r, double *c)
     return w;
 }
 
-/* "Text: 3.2:1, needs 7:1" for a rule that fails (r: as for the_worst), else "" */
+/* "Text: bad contrast" for a rule that fails (r: as for the_worst), else "" */
 static void the_problem(int r, char *out, size_t cap)
 {
     double c = 0;
     int w = the_worst(r, &c);
     out[0] = '\0';
     if (w < 0 || c >= THE_PAIRS[w].min) return;
-    char have[16], need[16];
-    snprintf(have, sizeof have, "%.1f:1", floor(c * 10) / 10);
-    snprintf(need, sizeof need, "%g:1", THE_PAIRS[w].min);
-    char msg[96];
-    subst(msg, sizeof msg, tr("%s, needs %s"), have, need);
-    snprintf(out, cap, "%s: %s", tr(THE_COL[THE_PAIRS[w].fg].name), msg);
+    snprintf(out, cap, "%s: %s", tr(THE_COL[THE_PAIRS[w].fg].name), tr("bad contrast"));
 }
 
 /* The editor's rows: the theme's choices, then Save (and Delete, for one on the card) */
@@ -2177,7 +2211,7 @@ static void the_row(int i, char *main, size_t mn, char *meta, size_t tn)
         char p[96];
         snprintf(main, mn, "Colours");
         the_problem(-1, p, sizeof p);
-        if (p[0]) snprintf(v, sizeof v, "%s", tr("too faint"));
+        if (p[0]) snprintf(v, sizeof v, "%s", tr("bad contrast"));
         break;
     }
     case TE_FONT:
@@ -2254,7 +2288,7 @@ static int the_pal_nearest(uint32_t c)
     return best;
 }
 
-/* Colours: each one, and how its text reads ("too faint" under the rule) */
+/* Colours: each one, and how its text reads ("bad contrast" under the rule) */
 static void the_colour_row(int i, char *main, size_t mn, char *meta, size_t tn)
 {
     if (i < 0 || i >= TC_N) return;
@@ -2270,7 +2304,7 @@ static void the_colour_row(int i, char *main, size_t mn, char *meta, size_t tn)
     int w = the_worst(i, &c), fg = 0;
     if (w < 0) return;
     for (int p = 0; p < N_PAIRS; p++) fg |= THE_PAIRS[p].fg == i;
-    if (c < THE_PAIRS[w].min) snprintf(meta, tn, "%s", tr("too faint"));   /* (the strip says which text) */
+    if (c < THE_PAIRS[w].min) snprintf(meta, tn, "%s", tr("bad contrast"));   /* (the strip says which text) */
     else if (fg) snprintf(meta, tn, "%.1f:1", floor(c * 10) / 10);   /* (a background: its text's, on their rows) */
 }
 
@@ -2617,6 +2651,10 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
     case L_ABOUT:
         switch (about_row(i)) {
         case AB_RESET: snprintf(main, mn, "Reset all settings"); break;
+        case AB_WHATSNEW:
+            snprintf(main, mn, "%s", tr("What's new"));
+            snprintf(meta, tn, "%s", S.wn_ver);
+            break;
         case AB_UNINSTALL: snprintf(main, mn, "Uninstall Fathom"); break;
         case AB_AUTO:
             snprintf(main, mn, "Check automatically");
@@ -4065,6 +4103,122 @@ static void update_overlay(void)
     lv_bar_set_value(S.upd_bar, permille, LV_ANIM_OFF);
 }
 
+/* ---------- What's new ----------
+ * After an update, once: the release's points (ui_set_whats_new), each with
+ * a dot in the theme's accent (drawn: the theme fonts share almost no
+ * symbols), under a title. When they don't all fit, the wheel moves through
+ * them a whole point at a time, and only points that fit entirely are drawn
+ * (no line cut at an edge); Play or Back puts it away. Settings > About >
+ * What's new shows it again. */
+
+static void whats_new_close(void)
+{
+    if (S.wn_ov) lv_obj_delete(S.wn_ov);
+    S.wn_ov = S.wn_body = S.wn_hint = NULL;
+    S.wn_n = 0;
+}
+
+/* The points from wn_first on that fit whole (at least one), and the hint:
+ * "Turn for more" while some are left below, then how to put it away */
+static void whats_new_show(void)
+{
+    if (!S.wn_body || !S.wn_n) return;
+    int room = lv_obj_get_content_height(S.wn_body), gap = lv_obj_get_style_pad_row(S.wn_body, 0), used = 0;
+    S.wn_last = S.wn_first;
+    for (int i = 0; i < S.wn_n; i++) {
+        int on = i >= S.wn_first && (i == S.wn_first || used + gap + S.wn_h[i] <= room);
+        if (on) { used += (i > S.wn_first ? gap : 0) + S.wn_h[i]; S.wn_last = i; }
+        else if (i > S.wn_first) used = room + 1;    /* (none after one that doesn't fit) */
+        show(S.wn_row[i], on);
+    }
+    if (S.wn_hint)
+        lv_label_set_text(S.wn_hint, tr(S.wn_last < S.wn_n - 1 ? "Turn for more, Play: done" : "Play or Back: done"));
+}
+
+static void whats_new_open(void)
+{
+    if (!S.wn_text[0]) return;
+    whats_new_close();
+    const theme_t *t = T();
+    S.wn_ov = box(lv_layer_top(), 0, 0, UI_W, UI_H);
+    fill(S.wn_ov, t->bg);
+    lv_obj_t *col = box(S.wn_ov, 0, 0, UI_W, UI_H);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_hor(col, 16, 0);
+    lv_obj_set_style_pad_top(col, 14, 0);
+    lv_obj_set_style_pad_bottom(col, 10, 0);
+    lv_obj_set_style_pad_row(col, 10, 0);
+    lv_obj_t *title = lv_label_create(col);       /* (the header's font: on one line in every theme) */
+    style_label(title, S.f->head, t->text);
+    lv_obj_set_width(title, LV_PCT(100));
+    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+    char tt[96];
+    subst(tt, sizeof tt, tr("What's new in %s"), S.wn_ver, NULL);
+    lv_label_set_text(title, tt);
+    S.wn_body = box(col, 0, 0, LV_PCT(100), 10);
+    lv_obj_set_flex_grow(S.wn_body, 1);
+    lv_obj_set_flex_flow(S.wn_body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(S.wn_body, 8, 0);
+    S.wn_n = S.wn_first = 0;
+    const lv_font_t *pf = S.f->body;              /* (the lists' 20 px: easy to read; the wheel scrolls the rest) */
+    int lh = lv_font_get_line_height(pf), dot = 7;
+    for (const char *p = S.wn_text; *p;) {
+        const char *e = strchr(p, '\n');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        char line[300];
+        snprintf(line, sizeof line, "%.*s", (int)(n < sizeof line ? n : sizeof line - 1), p);
+        p += n + (e != NULL);
+        if (!line[0] || S.wn_n == (int)(sizeof S.wn_row / sizeof S.wn_row[0])) continue;
+        lv_obj_t *row = box(S.wn_body, 0, 0, LV_PCT(100), LV_SIZE_CONTENT);
+        S.wn_row[S.wn_n++] = row;
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        lv_obj_set_style_pad_column(row, 10, 0);
+        lv_obj_t *d = box(row, 0, 0, dot, dot);
+        fill(d, t->signal);
+        lv_obj_set_style_radius(d, t->corner == THEME_CORNER_ROUND ? LV_RADIUS_CIRCLE : 0, 0);
+        lv_obj_set_style_margin_top(d, (lh - dot) / 2, 0);
+        lv_obj_t *l = lv_label_create(row);
+        style_label(l, pf, t->text);
+        lv_obj_set_flex_grow(l, 1);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(l, tr(line));
+    }
+    S.wn_hint = lv_label_create(col);
+    style_label(S.wn_hint, S.f->meta, t->text_muted);
+    lv_obj_set_width(S.wn_hint, LV_PCT(100));
+    lv_obj_set_style_text_align(S.wn_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_move_background(S.wn_ov);            /* (toasts and the volume bar stay over it) */
+    lv_obj_update_layout(S.wn_ov);               /* each point's height, all of them shown */
+    for (int i = 0; i < S.wn_n; i++) S.wn_h[i] = lv_obj_get_height(S.wn_row[i]);
+    whats_new_show();
+}
+
+/* A key while it's up: 1 if it was its (the wheel scrolls; Play, Back, Menu
+ * put it away; the media keys and the volume are the player's as ever) */
+static int whats_new_key(ui_key_t k)
+{
+    switch (k) {
+    case UI_KEY_UP: case UI_KEY_DOWN:
+        if (k == UI_KEY_DOWN && S.wn_last < S.wn_n - 1) S.wn_first++;
+        if (k == UI_KEY_UP && S.wn_first > 0) S.wn_first--;
+        whats_new_show();
+        return 1;
+    case UI_KEY_OK: case UI_KEY_BACK: case UI_KEY_BACK_LONG: case UI_KEY_MENU:
+        whats_new_close();
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+void ui_set_whats_new(const char *version, const char *text, int show)
+{
+    snprintf(S.wn_ver, sizeof S.wn_ver, "%s", version ? version : "");
+    snprintf(S.wn_text, sizeof S.wn_text, "%s", text ? text : "");
+    if (show) whats_new_open();
+}
+
 /* A key while the progress screen is up: 1 if it was the screen's. */
 static int update_overlay_key(ui_key_t k)
 {
@@ -4311,6 +4465,7 @@ static const char *setting_help(setting_t st)
     case ST_PURE: return "Skips EQ, balance and levelling, for bit-perfect sound.";
     case ST_EQ: return "Shape the sound with an equaliser. Each output keeps its own.";
     case ST_BALANCE: return "Left/right balance. Press Play, then turn the wheel.";
+    case ST_CROSSFEED: return "Each ear hears a little of the other side, as with speakers.";
     case ST_VOL_LIMIT: return "Caps the volume, to protect your ears. Per output.";
     case ST_LEVELLING: return "Plays songs at the same loudness, or albums as mastered.";
     case ST_TRANSPORT: return "With a USB DAC: Bluetooth and screen off for the cleanest sound.";
@@ -4978,9 +5133,10 @@ static int the_nearest_accent(uint32_t c)
     int h, s, l, best = 0, bd = 999;
     theme_to_hsl(c, &h, &s, &l);
     if (s < 15) return N_ACCENTS - 1;
-    for (int i = 0; i < N_ACCENTS - 1; i++) {
+    for (int i = 0; i < N_ACCENTS - 1; i++) {   /* by hue, then how strong (Pink or Hot pink) */
         int d = abs(ACCENTS[i].hue - h);
         if (d > 180) d = 360 - d;
+        d = 4 * d + abs(ACCENTS[i].sat - s);
         if (d < bd) { bd = d; best = i; }
     }
     return best;
@@ -5193,25 +5349,26 @@ static void pod_save_play(int played)
         st.pos_ms = S.pod_play.pos;
     }
     pod_state_put(pod_dir(), S.pod_play.id, &st);
-    S.pod_play.saved = st.pos_ms;
+    S.pod_play.saved = S.pod_play.pos;   /* (where it was kept from: a played one's 0 isn't, or its last 30 s saved every second) */
     if (S.pod_ci >= 0 && !strcmp(S.pod_shows[S.pod_ci].id, S.pod_play.id)) pod_read_episodes();
 }
 
-static void pod_track(void)
+/* 1 if it has just played to its end (kept as played) */
+static int pod_track(void)
 {
-    if (!S.player) return;
+    if (!S.player) return 0;
     uint32_t pos = 0, len = 0;
     const player_episode_t *e = player_episode(S.player, &pos, &len);
-    if (player_episode_ended(S.player)) {       /* played to its end */
+    if (player_episode_ended(S.player)) {       /* played to its end (said once) */
         S.pod_play.pos = 0;
         pod_save_play(1);
-        return;
+        return 1;
     }
     if (S.pod_play.key[0] && (!e || strcmp(e->key, S.pod_play.key) || strcmp(e->id, S.pod_play.id))) {
         pod_save_play(0);                         /* left (or another one started) */
         S.pod_play.key[0] = '\0';
     }
-    if (!e) return;
+    if (!e) return 0;
     if (!S.pod_play.key[0]) {
         snprintf(S.pod_play.id, sizeof S.pod_play.id, "%s", e->id);
         snprintf(S.pod_play.key, sizeof S.pod_play.key, "%s", e->key);
@@ -5221,6 +5378,7 @@ static void pod_track(void)
     if (len) S.pod_play.len = len;
     uint32_t d = pos > S.pod_play.saved ? pos - S.pod_play.saved : S.pod_play.saved - pos;
     if (d >= 15000 || (!S.now.playing && d >= 1000)) pod_save_play(0);
+    return 0;
 }
 
 static void pod_play_episode(int i)
@@ -5255,7 +5413,8 @@ static void pod_play_episode(int i)
             ui_toast(msg, 3000);
         }
     }
-    pod_track();                                  /* (the one playing: kept) */
+    if (!pod_track() && S.pod_play.key[0])
+        pod_save_play(0);                         /* the one playing: where it is now, not 15 s ago */
     S.pod_nch = S.pod_on_card[i] ? pod_chapters(pod_dir(), s->id, e, S.pod_ch, 64) : 0;
     snprintf(S.pod_ch_key, sizeof S.pod_ch_key, "%s", e->key);
     player_episode_play(S.player, &pe);
@@ -5313,15 +5472,34 @@ static void pod_search_run(void)
 static void pod_reload(void)
 {
     level_t *l = &S.stack[S.depth - 1];
+    /* the shows selected (and a menu's), by feed: an unsubscribe takes a show
+     * out, so the places move (the episodes': pod_read_episodes) */
+    char sel_url[sizeof S.stack / sizeof S.stack[0]][512] = {{0}};
+    for (int d = 0; d < S.depth; d++) {
+        level_t *k = &S.stack[d];
+        if (k->kind == L_PODCASTS && k->sel >= 1 && k->sel <= S.pod_n)
+            snprintf(sel_url[d], sizeof sel_url[d], "%s", S.pod_shows[k->sel - 1].url);
+    }
     pod_read_shows();
     if (S.pod_ci >= 0) pod_read_episodes();
-    else if (l->kind == L_POD_SHOW) { S.pod_ne = 0; }   /* (unsubscribed meanwhile) */
+    else if (l->kind == L_POD_SHOW) {             /* (unsubscribed meanwhile) */
+        S.pod_ne = 0;
+        if (S.pod_ctx_key[0]) S.pod_ctx = -1;
+    }
     for (int d = 0; d < S.depth; d++) {
         level_t *k = &S.stack[d];
         if (k->kind != L_PODCASTS && k->kind != L_POD_SHOW) continue;
+        for (int i = 0; sel_url[d][0] && i < S.pod_n; i++)
+            if (!strcmp(S.pod_shows[i].url, sel_url[d])) k->sel = i + 1;
         int n = list_count(k);
         if (k->sel >= n) k->sel = n - 1;
         if (k->sel < 0) k->sel = 0;
+    }
+    if (S.pod_ctx_url[0]) {                       /* a show's menu: where it is now, or gone (-1) */
+        int at = -1;
+        for (int i = 0; i < S.pod_n; i++)
+            if (!strcmp(S.pod_shows[i].url, S.pod_ctx_url)) at = i;
+        S.pod_ctx = at;
     }
 }
 
@@ -5389,6 +5567,7 @@ static int open_context(void)
     level_t *l = &S.stack[S.depth - 1];
     S.ctx_n = 0;
     S.ctx_track = S.ctx_album = S.ctx_artist = S.ctx_playlist = 0;
+    S.ctx_credited = 0;
     S.ctx_qidx = -1;
     S.ctx_plpos = -1;
     char title[128] = "";
@@ -5427,6 +5606,8 @@ static int open_context(void)
     if (l->kind == L_PODCASTS && !on_np) {    /* Podcasts: check for new episodes (all, or a show's); unsubscribe */
         if (l->sel > S.pod_n) return -1;
         S.pod_ctx = l->sel - 1;
+        snprintf(S.pod_ctx_url, sizeof S.pod_ctx_url, "%s", S.pod_ctx >= 0 ? S.pod_shows[S.pod_ctx].url : "");
+        S.pod_ctx_key[0] = '\0';
         S.pod_del_armed = 0;
         CTX_ADD(CTX_POD_REFRESH);
         if (S.pod_ctx >= 0) CTX_ADD(CTX_POD_UNSUB);
@@ -5435,6 +5616,8 @@ static int open_context(void)
     }
     if (l->kind == L_POD_SHOW && !on_np && S.pod_ci >= 0) {   /* an episode: download it or not, played or not */
         S.pod_ctx = S.pod_ne ? l->sel : -1;
+        snprintf(S.pod_ctx_key, sizeof S.pod_ctx_key, "%s", S.pod_ctx >= 0 ? S.pod_eps[S.pod_ctx].key : "");
+        S.pod_ctx_url[0] = '\0';
         if (S.pod_ctx >= 0) {
             const pod_episode_t *e = &S.pod_eps[S.pod_ctx];
             pod_state_t st;
@@ -5502,6 +5685,9 @@ static int open_context(void)
         S.ctx_album = l->items.ids[l->sel];
     } else if (l->kind == L_PLAYLISTS && l->sel < l->items.n) {
         S.ctx_playlist = l->items.ids[l->sel];
+    } else if ((l->kind == L_ARTISTS || l->kind == L_ALBUM_ARTISTS) && l->sel < l->items.n) {
+        S.ctx_artist = l->items.ids[l->sel];
+        S.ctx_credited = l->kind == L_ARTISTS;
     } else {
         return -1;
     }
@@ -5531,10 +5717,13 @@ static int open_context(void)
         CTX_ADD(library_favourite(S.lib, S.ctx_track) ? CTX_FAV_REMOVE : CTX_FAV_ADD);
         CTX_ADD(CTX_INFO);
         if (S.ctx_album) ctx_add_cover(S.ctx_album);
+    } else if (!S.ctx_album) {                      /* an artist: their songs */
+        if (library_artist_name(S.lib, S.ctx_artist, title, sizeof title)) return -1;
+        CTX_ADD(CTX_SHUFFLE);
     } else {
         S.ctx_artist = library_album_artist(S.lib, S.ctx_album);
         library_album_name(S.lib, S.ctx_album, title, sizeof title);
-        CTX_ADD(CTX_PLAY); CTX_ADD(CTX_PLAY_NEXT); CTX_ADD(CTX_ADD_QUEUE); CTX_ADD(CTX_ADD_PLAYLIST);
+        CTX_ADD(CTX_PLAY); CTX_ADD(CTX_SHUFFLE); CTX_ADD(CTX_PLAY_NEXT); CTX_ADD(CTX_ADD_QUEUE); CTX_ADD(CTX_ADD_PLAYLIST);
         if (S.ctx_artist && !(l->kind == L_ARTIST_ALBUMS && l->parent == S.ctx_artist)) CTX_ADD(CTX_GO_ARTIST);
         ctx_add_cover(S.ctx_album);
     }
@@ -5631,7 +5820,9 @@ static int cf_poll(void)
     int64_t album;
     int stored = 0;
     while (S.lib && cf_batch_take(&album, large, small)) {
-        if (library_store_found_cover(S.lib, album, large, small) == 0) {
+        /* (only over no cover: one of its own may have come with a rescan
+         * while the batch ran, and a found one would then go ahead of it) */
+        if (library_album_cover(S.lib, album) == LIB_COVER_NONE && library_store_found_cover(S.lib, album, large, small) == 0) {
             stored = 1;
             if (S.now.active && S.now.track.album_id == album) cover_changed(album);
         }
@@ -5689,6 +5880,15 @@ static void run_context(ctx_action_t a)
                 ui_toast(msg, 1500);
             }
         }
+        library_list_free(&tr);
+        break;
+    }
+    case CTX_SHUFFLE: {                           /* an album's songs, or an artist's */
+        int n = album ? library_list(S.lib, LIB_ALBUM_TRACKS, album, &tr)
+                      : library_artist_tracks(S.lib, artist, S.ctx_credited, &tr);
+        pop_level(1);
+        if (n > 0 && S.player && player_shuffle_these(S.player, tr.ids, tr.n, album != 0)) S.now_playing_view = 1;
+        else ui_toast("Nothing to shuffle", 1500);
         library_list_free(&tr);
         break;
     }
@@ -5980,6 +6180,10 @@ static void setting_ok(setting_t st)
     }
     case ST_TRANSPORT: if (S.hooks.transport_toggle) S.hooks.transport_toggle(); break;
     case ST_OUTPUT: if (S.hooks.signal_path) push_ui(L_SIGNAL, "Signal path", 0); break;
+    case ST_CROSSFEED:                     /* Off, Light, Medium, Strong */
+        if (S.pure) { ui_toast("Bypassed in Pure mode", 1500); break; }
+        if (S.hooks.sound_adjust) S.hooks.sound_adjust(UI_SOUND_CROSSFEED, 1);
+        break;
     case ST_BALANCE: case ST_VOL_LIMIT:
         if (st == ST_BALANCE && S.pure) { ui_toast("Bypassed in Pure mode", 1500); break; }
         if (S.hooks.sound_adjust && S.hooks.sound_adjust(st == ST_BALANCE ? UI_SOUND_BALANCE : UI_SOUND_LIMIT, 0) == 0)
@@ -6393,7 +6597,9 @@ static void open_selected(void)
         break;
     }
     case L_ABOUT:
-        if (about_row(l->sel) == AB_CHECK) {           /* Check for updates: from here, or */
+        if (about_row(l->sel) == AB_WHATSNEW) {
+            whats_new_open();
+        } else if (about_row(l->sel) == AB_CHECK) {    /* Check for updates: from here, or */
             if (wifi_ask_if_off(WT_OK)) break;
             S.hooks.update_do(UI_UPD_CHECK);
             push_ui(L_UPDATE, "Updates", 0);
@@ -6850,6 +7056,7 @@ void ui_key(ui_key_t k)
     level_t *l = &S.stack[S.depth - 1];
     player_t *pl = S.player;
     if (S.upd_ov && update_overlay_key(k)) return;
+    if (S.wn_ov && whats_new_key(k)) return;
     if (S.uni_ov && uninstall_overlay_key(k)) return;
     /* keys that do the same thing everywhere */
     switch (k) {
@@ -7164,8 +7371,7 @@ void ui_tick_1s(void)
 void ui_save_state(void)
 {
     if (!pod_dir()[0]) return;
-    pod_track();
-    if (S.pod_play.key[0]) pod_save_play(0);
+    if (!pod_track() && S.pod_play.key[0]) pod_save_play(0);   /* (one that just ended stays played) */
 }
 
 void ui_set_hooks(const ui_hooks_t *h)
@@ -7300,6 +7506,13 @@ void ui_show(const char *what)
                 nanosleep(&ts, NULL);
             }
         }
+    } else if (!strcmp(what, "albummenu") || !strcmp(what, "artistmenu") || !strcmp(what, "aartistmenu")) {
+        /* Menu on an album (Play, Shuffle, ...), an artist in Artists, one in Album artists */
+        int art = !strcmp(what, "artistmenu"), aart = !strcmp(what, "aartistmenu");
+        S.stack[0].sel = home_index(art ? H_ARTISTS : aart ? H_ALBUM_ARTISTS : H_ALBUMS);
+        push_ui(art ? L_ARTISTS : aart ? L_ALBUM_ARTISTS : L_ALBUMS, art ? "Artists" : aart ? "Album artists" : "Albums", 0);
+        S.stack[S.depth - 1].sel = S.stack[S.depth - 1].items.n > 2 ? 2 : 0;
+        open_context();
     } else if (!strncmp(what, "pod", 3)) {
         /* Podcasts (the simulator's sample shows): "podcasts" the list, "podshow" a
          * show's episodes, "podsearch" Find podcasts' answer, "podnp" an episode playing */
@@ -7358,15 +7571,15 @@ void ui_show(const char *what)
     } else if (!strncmp(what, "theme", 5) && strcmp(what, "themes")) {
         /* the theme editor, as in its mockups: a new dark theme with a coral accent, "Harbour";
          * "themesnew": the list's New theme row; "themecolours": its colours, Text selected;
-         * "themecolour": Text being picked, at Dark grey (too faint); "themesave": Save */
+         * "themecolour": Text being picked, at Dark grey (bad contrast); "themesave": Save */
         if (!strcmp(what, "themesnew")) {
             push_ui(L_THEMES, "Theme", 0);
             S.stack[S.depth - 1].sel = S.n_themes;
         } else {
             the_open(-1);
-            S.the_acc = 8;                                   /* Coral */
+            for (S.the_acc = 0; strcmp(ACCENTS[S.the_acc].name, "Coral"); S.the_acc++) {}
             theme_make(&S.the, 1, 215, 30);
-            theme_accent(&S.the, ACCENTS[8].hue, ACCENTS[8].sat);
+            theme_accent(&S.the, ACCENTS[S.the_acc].hue, ACCENTS[S.the_acc].sat);
             snprintf(S.the.name, sizeof S.the.name, "Harbour");
             level_t *e = &S.stack[S.depth - 1];
             snprintf(e->title, sizeof e->title, "%s", S.the.name);

@@ -11,7 +11,7 @@ does.
 | Wheel | move through a list | |
 | Play | choose; on Now Playing, play or pause | |
 | Back | go back | jump to Now Playing, and back |
-| Menu | options for what's selected (play next, add to a playlist, go to the album...) | quick settings: brightness, shuffle, repeat, EQ, Bluetooth, Wi-Fi, sleep timer |
+| Menu | options for what's selected (shuffle an album or an artist, play next, add to a playlist, go to the album...) | quick settings: brightness, shuffle, repeat, EQ, Bluetooth, Wi-Fi, sleep timer |
 | Menu + wheel | | brightness: hold Menu and turn the wheel |
 | Prev / Next | previous or next track | seek |
 | Power | screen off or on | switch off (2 seconds) |
@@ -47,10 +47,10 @@ in Albums, and the language. Your own themes go in the card's `fathom/themes/` f
 ([THEMES.md](THEMES.md) explains every option); restart the H2 to see a new one.
 To make your own theme on the H2: Settings → Interface → Theme → **New theme**, or
 **Menu** on a theme to change it (a built-in one opens as a copy). Choose dark or light and
-an accent colour, then, if you like, each colour (Play, then turn the wheel through 80
+an accent colour, then, if you like, each colour (Play, then turn the wheel through 134
 named colours: greys, and each accent from pale to night), the shapes, the font and the
 text size. The strip at the top
-shows the theme as you make it, and says when some text would be too faint to read.
+shows the theme as you make it, and says when some text and its background have bad contrast.
 **Save** switches to it; a new text size shows once it's saved. Back without saving asks
 you to press it twice.
 
@@ -90,8 +90,14 @@ selected one highlighted. If the curve with the preamp goes above 0 dB, it says 
 much: lower the preamp by that, or loud passages may clip. A band's Type switches between
 peak, low shelf and high shelf.
 
-**Pure mode** (Settings → Sound) turns off the EQ, balance and volume levelling in one go,
-and Now Playing shows "Bit+" while the music reaches the DAC exactly as in the file.
+**Crossfeed** (Settings → Sound → Crossfeed, press Play to change it) lets each ear hear a
+little of the other side, low in the mix and mostly the bass, as it would from speakers.
+Recordings with instruments panned hard to one side are less tiring on headphones.
+**Light**, **Medium** and **Strong** set how much; like the EQ, each output keeps its own
+(off by default), so it can be on for your headphones and off for the line out.
+
+**Pure mode** (Settings → Sound) turns off the EQ, crossfeed, balance and volume levelling in
+one go, and Now Playing shows "Bit+" while the music reaches the DAC exactly as in the file.
 
 ## Bluetooth headphones
 
@@ -205,7 +211,9 @@ To update: Settings → About → **Check for updates**, then **Update to vX.Y.Z
 downloads (about 14 MB) while the music plays on, checks every file, then asks: **Play**
 installs it and restarts the H2, **Back** cancels. It needs about 65 MB free on the card
 while it works. Your music, settings, library, playlists, EQs, themes and Wi-Fi networks
-stay as they are.
+stay as they are. The first time the new version starts, it shows **What's new**; turn the
+wheel to read it all, and press Play or Back to carry on. Settings → About → **What's new**
+shows it again.
 
 Don't turn the H2 off while it says "Installing" (a few seconds); if it loses power anyway,
 it finishes at the next start. If a new version ever fails to start, the H2 goes back to

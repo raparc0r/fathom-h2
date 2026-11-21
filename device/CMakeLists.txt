@@ -84,7 +84,7 @@ add_executable(fathom-player
   ${ROOT}/app/sys/uninstall.c
   ${ROOT}/app/audio/engine.c
   ${ROOT}/app/audio/loudness.c
-  ${ROOT}/app/audio/btconv.c ${ROOT}/app/audio/eq.c ${ROOT}/app/audio/tempo.c
+  ${ROOT}/app/audio/btconv.c ${ROOT}/app/audio/eq.c ${ROOT}/app/audio/tempo.c ${ROOT}/app/audio/crossfeed.c
   ${ROOT}/app/audio/out_null.c
   ${ROOT}/app/audio/out_clock.c
   ${ROOT}/app/audio/out_alsa.c
@@ -141,9 +141,15 @@ target_link_options(fathom-player PRIVATE -static -Wl,--gc-sections -flto=auto)
 # (app/net/tls_wrap.c: FFmpeg's calls to mbedTLS are redirected to it)
 if(MBEDTLS_FOUND)
   target_sources(fathom-player PRIVATE ${ROOT}/app/net/tls_wrap.c)
+  target_compile_definitions(fathom-player PRIVATE FATHOM_TLS_WRAP)
   target_link_options(fathom-player PRIVATE
     -Wl,--wrap=mbedtls_x509_crt_parse_file -Wl,--wrap=mbedtls_x509_crt_free)
 endif()
+# DNS answers kept a while (app/net/dnscache.c): every lookup in the player,
+# FFmpeg's included, goes through it
+target_sources(fathom-player PRIVATE ${ROOT}/app/net/dnscache.c)
+set_property(SOURCE ${ROOT}/app/net/dnscache.c APPEND PROPERTY COMPILE_DEFINITIONS DNSCACHE_WRAP)
+target_link_options(fathom-player PRIVATE -Wl,--wrap=getaddrinfo -Wl,--wrap=freeaddrinfo)
 # z: the updater's unzip (app/net/unzip.c), the zlib FFmpeg already links
 target_link_libraries(fathom-player PRIVATE lvgl ${DEPS_STATIC_LDFLAGS} z pthread m)
 install(TARGETS fathom-player RUNTIME DESTINATION bin)
@@ -163,6 +169,7 @@ add_executable(fathom-bitperfect
   ${ROOT}/app/audio/engine.c
   ${ROOT}/app/audio/eq.c
   ${ROOT}/app/audio/tempo.c
+  ${ROOT}/app/audio/crossfeed.c
   ${ROOT}/app/audio/out_alsa.c
   ${ROOT}/app/audio/mixer_alsa.c)
 target_include_directories(fathom-bitperfect PRIVATE ${ROOT}/app ${DEPS_STATIC_INCLUDE_DIRS})

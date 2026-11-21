@@ -8,6 +8,7 @@
 #include "wifi.h"
 #include "shell.h"
 #include "core/lang.h"
+#include "core/lat.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -27,6 +28,19 @@
 #define POLL_MS 2000
 #define POLL_IDLE_MAX_MS 30000
 #define POLL_CONNECTED_MS 10000
+/* Just after Wi-Fi starts, a saved network in range is being joined within a
+ * second (status "connecting"), and its address comes once status sees the
+ * join (fathom-wifi status wakes DHCP then): every 0.5 s while it's joining,
+ * for up to 15 s. The first look for networks (for Settings > Wi-Fi) waits
+ * until it's connected, and 5 s more (a station resumed is filling its buffer
+ * then): a scan takes the radio off the network's channel for seconds, so a
+ * join or an address under way would wait for it. Nothing being joined 2.5 s
+ * after the start (nothing saved in range: the list is wanted), it looks at
+ * once. */
+#define POLL_JOIN_MS 500
+#define JOIN_WINDOW_MS 15000
+#define JOIN_SEEN_MS 2500
+#define SCAN_AFTER_JOIN_MS 5000
 
 enum { CMD_NONE, CMD_START, CMD_STOP, CMD_SCAN, CMD_CONNECT, CMD_FORGET };
 
@@ -47,6 +61,18 @@ static struct {
 } W = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
 
 static void changed_locked(void) { W.seq++; }
+
+/* (the worker's own) a start's joining window: since and until (monotonic ms,
+ * join_until 0 = none); the first scan still to do, and when (0: not yet) */
+static uint32_t join_since, join_until, scan_at;
+static int scan_due;
+
+static uint32_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000);
+}
 
 static void set_busy(const char *b)
 {
@@ -102,6 +128,7 @@ static int poll_status(void)
     st.dbm = *f[2] ? atoi(f[2]) : 0;
     pthread_mutex_lock(&W.mu);
     int changed = memcmp(&st, &W.st, sizeof st) != 0;
+    if (st.state != W.st.state) LAT("wifi: status %s", state);
     if (changed) {
         if (st.state == UI_WIFI_CONNECTED && W.st.state != UI_WIFI_CONNECTED) {
             snprintf(W.msg, sizeof W.msg, "%s", "Wi-Fi: %s");
@@ -118,6 +145,7 @@ static int poll_status(void)
 
 static void scan(void)
 {
+    LAT("wifi: scan");
     set_busy("Searching");
     char out[4096] = "", *save = NULL;
     sh_run(FATHOM_WIFI " scan 4 2>/dev/null", out, sizeof out);   /* (out stays empty if it can't start) */
@@ -150,7 +178,9 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
     case CMD_START: {
         set_busy("Starting");
         char err[200] = "";
+        LAT("wifi: starting");
         int ok = sh_run(FATHOM_WIFI " on 2>&1 >/dev/null", err, sizeof err) == 0;
+        LAT("wifi: started (%d)", ok);
         pthread_mutex_lock(&W.mu);
         W.on = ok;
         changed_locked();
@@ -164,10 +194,16 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
         }
         fprintf(stderr, "wifi: on\n");
         poll_status();
-        scan();
+        join_since = now_ms();                    /* (see POLL_JOIN_MS) */
+        join_until = join_since + JOIN_WINDOW_MS;
+        if (!join_until) join_until = 1;
+        scan_due = 1;
+        scan_at = 0;
         break;
     }
     case CMD_STOP:
+        join_until = scan_at = 0;
+        scan_due = 0;
         set_busy("Stopping");
         sh_run(FATHOM_WIFI " off >/dev/null 2>&1", NULL, 0);
         pthread_mutex_lock(&W.mu);
@@ -181,8 +217,11 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
         break;
     case CMD_SCAN:
         scan();
+        scan_due = 0;
         break;
     case CMD_CONNECT: {
+        join_until = scan_at = 0;                /* (it scans when done) */
+        scan_due = 0;
         set_busy("Connecting");
         sh_quote(ssid, q, sizeof q);
         sh_quote(pass, qp, sizeof qp);
@@ -210,6 +249,8 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
         break;
     }
     case CMD_FORGET:
+        join_until = scan_at = 0;
+        scan_due = 0;
         set_busy("Forgetting");
         sh_quote(ssid, q, sizeof q);
         snprintf(c, sizeof c, FATHOM_WIFI " forget %s >/dev/null 2>&1", q);
@@ -229,11 +270,18 @@ static void *worker(void *arg)
         if (!W.cmd && !W.on) {
             pthread_cond_wait(&W.cv, &W.mu);     /* off: nothing to poll until a command */
         } else if (!W.cmd) {
-            int ms = W.st.state == UI_WIFI_CONNECTED ? POLL_CONNECTED_MS
+            int ms = join_until ? POLL_JOIN_MS
+                   : W.st.state == UI_WIFI_CONNECTED ? POLL_CONNECTED_MS
                    : W.st.state == UI_WIFI_CONNECTING ? POLL_MS : idle_ms;
+            if (scan_due && scan_at) {           /* the first scan, when it's due */
+                int32_t left = (int32_t)(scan_at - now_ms());
+                if (left < ms) ms = left < 0 ? 0 : left;
+            }
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_sec += ms / 1000;
+            ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
             pthread_cond_timedwait(&W.cv, &W.mu, &ts);
         }
         int cmd = W.cmd, on = W.on;
@@ -249,6 +297,28 @@ static void *worker(void *arg)
         } else if (on) {
             int changed = poll_status();
             idle_ms = changed ? POLL_MS : idle_ms * 2 > POLL_IDLE_MAX_MS ? POLL_IDLE_MAX_MS : idle_ms * 2;
+            if (join_until) {
+                /* connected: the first scan a little later; nothing being joined
+                 * (or the window over): now. Then the usual pace. */
+                pthread_mutex_lock(&W.mu);
+                int state = W.st.state;
+                pthread_mutex_unlock(&W.mu);
+                uint32_t t = now_ms();
+                if (state == UI_WIFI_CONNECTED) {
+                    join_until = 0;
+                    scan_at = t + SCAN_AFTER_JOIN_MS;
+                    if (!scan_at) scan_at = 1;
+                } else if ((int32_t)(join_until - t) <= 0 ||
+                           (state != UI_WIFI_CONNECTING && t - join_since >= JOIN_SEEN_MS)) {
+                    join_until = 0;
+                    scan_at = t ? t : 1;
+                }
+            }
+            if (scan_due && scan_at && (int32_t)(scan_at - now_ms()) <= 0) {
+                scan_due = 0;
+                scan_at = 0;
+                scan();
+            }
         }
         memset(pass, 0, sizeof pass);
     }

@@ -29,5 +29,5 @@ static void n_describe(void *ctx, char *out, int cap) { (void)ctx; snprintf(out,
 void out_null_create(audio_output_t *out, out_null_stats_t *stats)
 {
     memset(stats, 0, sizeof *stats);
-    *out = (audio_output_t){n_open, n_write, n_delay, n_drain, n_nop, n_pause, n_nop, n_describe, stats, NULL};
+    *out = (audio_output_t){n_open, n_write, n_delay, n_drain, n_nop, n_pause, n_nop, n_describe, stats, NULL, NULL};
 }

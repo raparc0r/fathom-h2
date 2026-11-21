@@ -36,6 +36,12 @@ static void dates(void)
     CHECK(pod_parse_date("2026-11-19T05:00:00Z") == 1795064400LL, "ISO 8601");
     CHECK(pod_parse_date("Tue, 19 Nov 26 05:00:00 +0000") == 1795064400LL, "two-digit year");
     CHECK(pod_parse_date("") == 0 && pod_parse_date("soon") == 0 && pod_parse_date(NULL) == 0, "not a date");
+    /* nonsense lengths: 0, never negative or past 32-bit milliseconds (UBSan: overflow) */
+    CHECK(pod_parse_duration("99999999999999999999:00:00") == 0 && pod_parse_duration("-5:00") == 0 &&
+          pod_parse_duration("1193047:00:00") == 0 && pod_parse_duration("3000000") == 0 &&
+          pod_parse_duration("596:31:23") == 2147483, "nonsense lengths");
+    CHECK(pod_parse_date("2026-11-19T99999999999:00:00Z") >= 0 && pod_parse_date("19 Nov 99999999999 05:00:00") == 0 &&
+          pod_parse_date("Tue, 19 Nov 2026 99999999999:00:00 +0000") >= 0, "nonsense dates");
     CHECK(pod_parse_duration("3600") == 3600 && pod_parse_duration("59:12") == 3552 &&
           pod_parse_duration("1:02:03") == 3723 && pod_parse_duration("") == 0 && pod_parse_duration("x") == 0,
           "durations");
@@ -117,6 +123,31 @@ static void opml_search_chapters(void)
         CHECK(c[2].start_ms == 1800000, "chapter 3");
     }
     free(x);
+    /* times that aren't: left out (UBSan: 1e25 * 1000 doesn't fit 32 bits) */
+    static const char bad[] = "{\"chapters\":[{\"startTime\":1e25,\"title\":\"a\"},{\"startTime\":-5,\"title\":\"b\"},"
+                              "{\"startTime\":\"nan\",\"title\":\"c\"},{\"startTime\":12.5,\"title\":\"d\"}]}";
+    n = pod_parse_chapters(bad, sizeof bad - 1, c, 8);
+    CHECK(n == 1 && c[0].start_ms == 12500 && !strcmp(c[0].title, "d"), "nonsense chapter times: %d", n);
+}
+
+/* A long feed listed oldest first: the newest episodes are the ones kept */
+static void oldest_first(void)
+{
+    size_t cap = 400 * 200 + 200, w = 0;
+    char *x = malloc(cap);
+    w += (size_t)snprintf(x + w, cap - w, "<rss><channel><title>Old first</title>");
+    for (int i = 1; i <= 300; i++)
+        w += (size_t)snprintf(x + w, cap - w,
+                              "<item><title>Ep %d</title><guid>g%d</guid><pubDate>%02d %s 20%02d 10:00:00 +0000</pubDate>"
+                              "<enclosure url=\"https://e.example/%d.mp3\" type=\"audio/mpeg\"/></item>",
+                              i, i, 1 + i % 28, (const char *[]){"Jan", "Apr", "Jul", "Oct"}[i % 4], i / 4, i);
+    w += (size_t)snprintf(x + w, cap - w, "</channel></rss>");
+    pod_show_t show;
+    pod_episode_t e[10];
+    int n = pod_parse_feed(x, w, &show, e, 10);
+    CHECK(n == 10 && !strcmp(e[0].title, "Ep 300") && !strcmp(e[9].title, "Ep 291"), "oldest first: %d, newest [%s], 10th [%s]",
+          n, n > 0 ? e[0].title : "", n > 9 ? e[9].title : "");
+    free(x);
 }
 
 static void card(void)
@@ -179,6 +210,20 @@ static void card(void)
     pod_state_find(st, n, e[2].key, &one);
     CHECK(!one.played && !one.pos_ms && !strcmp(one.key, e[2].key), "none: zero, its key");
 
+    /* a damaged state.txt: numbers as long as they go, on every line, then one more put */
+    {
+        char sp[760];
+        snprintf(sp, sizeof sp, "%s/%s/state.txt", dir, d.id);
+        FILE *sf = fopen(sp, "w");
+        for (int i = 0; sf && i < 30; i++)
+            fprintf(sf, "%012d\t4294967295\t4294967295\t-2147483648\t-9223372036854775807\n", i);
+        if (sf) fclose(sf);
+        s.pos_ms = 5;
+        snprintf(s.key, sizeof s.key, "%s", e[3].key);
+        CHECK(pod_state_put(dir, d.id, &s) == 0, "a put over a damaged state");
+        CHECK(pod_state_load(dir, d.id, st, 8) == 8, "its lines kept");
+    }
+
     /* a download */
     char p[800];
     pod_episode_path(dir, d.id, &e[0], p, sizeof p);
@@ -209,6 +254,51 @@ static void card(void)
     CHECK(n == 2 && !strcmp(got[0].title, "Hand Added") && !strcmp(got[0].url, "https://h.example/feed") &&
           !strcmp(got[1].url, "https://bare.example/rss") && !strcmp(got[1].title, "https://bare.example/rss"),
           "hand-edited: %d [%s] [%s]", n, n > 0 ? got[0].title : "", n > 1 ? got[1].title : "");
+
+    /* an OPML outline with only its address (its title the address), and
+     * addresses with another inside: each read back as added */
+    remove(path);
+    pod_show_t o[3] = {{0}};
+    snprintf(o[0].url, sizeof o[0].url, "https://o.example/feed");
+    snprintf(o[0].title, sizeof o[0].title, "%s", o[0].url);
+    snprintf(o[1].url, sizeof o[1].url, "https://proxy.example/feed?u=http://b.example/rss");
+    snprintf(o[1].title, sizeof o[1].title, "Proxied");
+    snprintf(o[2].url, sizeof o[2].url, "https://c.example/rss");
+    snprintf(o[2].title, sizeof o[2].title, "Notes on http://old.example = https://new.example");
+    for (int i = 0; i < 3; i++) CHECK(pod_shows_add(dir, &o[i]) == 1, "outline %d added", i);
+    CHECK(pod_shows_add(dir, &o[0]) == 0, "an outline's address not added twice");
+    n = pod_shows_load(dir, got, 8);
+    CHECK(n == 3, "outlines: %d", n);
+    for (int i = 0; i < n && i < 3; i++)
+        CHECK(!strcmp(got[i].url, o[i].url) && !strcmp(got[i].title, o[i].title), "outline %d read back: [%s] [%s]", i,
+              got[i].title, got[i].url);
+    w = fopen(path, "a");
+    if (w) { fputs("Proxy Hand=https://p.example/f?u=http://q.example/r\n", w); fclose(w); }
+    n = pod_shows_load(dir, got, 8);
+    CHECK(n == 4 && !strcmp(got[3].url, "https://p.example/f?u=http://q.example/r") && !strcmp(got[3].title, "Proxy Hand"),
+          "hand-written with an address inside: [%s] [%s]", n > 3 ? got[3].title : "", n > 3 ? got[3].url : "");
+
+    /* a bare address with another in its query: the whole line, not split at its '=' */
+    w = fopen(path, "w");
+    if (w) { fputs("https://feeds.example.com/rss?src=https://other.example.org/x\n", w); fclose(w); }
+    n = pod_shows_load(dir, got, 8);
+    CHECK(n == 1 && !strcmp(got[0].url, "https://feeds.example.com/rss?src=https://other.example.org/x") &&
+          !strcmp(got[0].title, got[0].url), "bare with an address inside: [%s] [%s]", n ? got[0].title : "", n ? got[0].url : "");
+
+    /* added before 0.13, when such a line was read as its inner address: the
+     * show keeps the folder it has (its episodes, places, downloads), and an
+     * unsubscribe removes that folder */
+    char old_id[13], od[700];
+    pod_hash("http://b.example/r", old_id);
+    snprintf(od, sizeof od, "%s/%s", dir, old_id);
+    mkdir(od, 0755);
+    w = fopen(path, "w");
+    if (w) { fputs("Old = https://a.example/f?u=http://b.example/r\n", w); fclose(w); }
+    n = pod_shows_load(dir, got, 8);
+    CHECK(n == 1 && !strcmp(got[0].url, "https://a.example/f?u=http://b.example/r") && !strcmp(got[0].id, old_id),
+          "an older show keeps its folder: [%s] %s", n ? got[0].url : "", n ? got[0].id : "");
+    CHECK(pod_shows_remove(dir, "https://a.example/f?u=http://b.example/r") == 0 && stat(od, &sb) != 0,
+          "...and an unsubscribe removes it");
 }
 
 /* An MP3 with chapters in its ID3 tag (CHAP frames, as podcast tools write
@@ -270,6 +360,7 @@ int main(void)
 {
     dates();
     feed();
+    oldest_first();
     opml_search_chapters();
     card();
     embedded_chapters();

@@ -2,6 +2,8 @@
 #include "engine.h"
 #include "gain.h"
 #include "tempo.h"
+#include "crossfeed.h"
+#include "core/lat.h"
 
 #include <errno.h>
 #include <math.h>
@@ -73,6 +75,7 @@ struct engine {
     float bal[2];              /* the balance: left, right (1 = untouched) */
     int writing;               /* the thread is in out.write/drain (or a seek) without mu */
     int seeking;               /* a seek under way: where to (seek_to), for the status meanwhile */
+    int draining;              /* the output plays out its queue (the end of the last track) */
     uint32_t seek_to;
     int hold;                  /* engine_switch_output() in progress: no new writes */
     int out_lost;              /* a write failed (device gone): paused */
@@ -84,6 +87,8 @@ struct engine {
     unsigned eq_gen, eq_built; /* changes asked for, and the one built */
     eq_t *eq;                  /* the filters for the current track (engine thread only) */
     int eq_in_out;             /* the output runs the EQ itself (set_eq) */
+    int xf_level;              /* crossfeed wanted (engine_set_crossfeed): XF_OFF.. */
+    crossfeed_t *xf;           /* ...its filter for the current track (engine thread only) */
     int dop;                   /* DSD goes out as DoP (engine_set_dop) */
     char path[1024];           /* the current track's */
     /* internet streams */
@@ -142,7 +147,7 @@ static audio_format_t out_format(const engine_t *e, const audio_format_t *f)
     o.stream = (uint8_t)e->dec_net;
     if (f->dop) return o;                      /* DoP: never changed, 24 bits already */
     int changed = (e->eq_on && !e->eq_in_out) || e->gain * e->track_gain != 1.0f ||
-                  (f->channels == 2 && (e->bal[0] != 1.0f || e->bal[1] != 1.0f));
+                  (f->channels == 2 && (e->bal[0] != 1.0f || e->bal[1] != 1.0f || e->xf_level != XF_OFF));
     if (changed && o.bits && o.bits < 24) o.bits = 24;
     return o;
 }
@@ -157,10 +162,43 @@ static void out_open_for(engine_t *e, const audio_format_t *of)
     if (e->out_open && e->state == ENG_PAUSED) e->out.pause(e->out.ctx, 1);
 }
 
-/* Called with mu held, on the engine thread: the EQ's filters follow the
- * profile and the track's format; the output gets deep enough for them. */
-static void eq_sync(engine_t *e)
+/* Called with mu held, on the engine thread: the EQ or crossfeed was turned on
+ * during a track the output was opened for at 16 bits, so it opens again at
+ * 24. What it had queued goes with the old one: with keep_place (mid-track),
+ * the decoder goes back to what was heard, as after a pause that dropped it,
+ * rather than carrying on that much further along. An output that can't take
+ * 24 bits opens as it was (the low bits cut, but playing). */
+static void out_deepen(engine_t *e, const audio_format_t *o, int keep_place)
 {
+    audio_format_t was = e->out_fmt;
+    long queued = e->out.delay(e->out.ctx);
+    e->out.flush(e->out.ctx);
+    e->out.close(e->out.ctx);
+    out_open_for(e, o);
+    if (!e->out_open && e->open_rc == -1) out_open_for(e, &was);
+    if (keep_place && queued > (long)e->fmt.rate / 20 && e->dec && !e->dec_net && !e->rewind) {
+        int64_t back = ahead_frames(e, queued);
+        e->rewind = 1;
+        e->rewind_to = (int64_t)e->pos_frames > back ? e->pos_frames - (uint64_t)back : 0;
+    }
+}
+
+/* Called with mu held, on the engine thread: the EQ's filters follow the
+ * profile and the track's format; the output gets deep enough for them
+ * (keep_place: mid-track, see out_deepen). */
+static void eq_sync(engine_t *e, int keep_place)
+{
+    /* crossfeed: stereo PCM only (not DoP), built for this rate */
+    int xf_want = e->xf_level != XF_OFF && !e->fmt.dop && e->fmt.rate && e->fmt.channels == 2;
+    if (!xf_want) {
+        crossfeed_free(e->xf);
+        e->xf = NULL;
+    } else if (!e->xf || crossfeed_level(e->xf) != e->xf_level || crossfeed_rate(e->xf) != e->fmt.rate) {
+        crossfeed_free(e->xf);
+        e->xf = crossfeed_new(e->xf_level, e->fmt.rate);
+        audio_format_t o = out_format(e, &e->fmt);
+        if (e->out_open && !same_out_format(&e->out_fmt, &o)) out_deepen(e, &o, keep_place);   /* on, a 16-bit output */
+    }
     if (e->eq_built != e->eq_gen) {             /* a new profile, or another output: ask it first */
         e->eq_built = e->eq_gen;
         e->eq_in_out = e->out.set_eq && e->out.set_eq(e->out.ctx, e->eq_on ? &e->eq_prof : NULL);
@@ -176,11 +214,7 @@ static void eq_sync(engine_t *e)
     eq_destroy(e->eq);
     e->eq = eq_create(&e->eq_prof, e->fmt.rate, e->fmt.channels);
     audio_format_t o = out_format(e, &e->fmt);
-    if (e->out_open && !same_out_format(&e->out_fmt, &o)) {   /* EQ on, a 16-bit output: deeper */
-        e->out.flush(e->out.ctx);
-        e->out.close(e->out.ctx);
-        out_open_for(e, &o);
-    }
+    if (e->out_open && !same_out_format(&e->out_fmt, &o)) out_deepen(e, &o, keep_place);   /* EQ on, a 16-bit output */
 }
 
 /* Called with mu held: the track that's on can't be played. Stopped, with an
@@ -252,8 +286,8 @@ static int start_track(engine_t *e, const pending_t *p, int gapless, decoder_t *
     } else if (!gapless) {
         e->out.flush(e->out.ctx);                    /* same format: just drop queued audio */
     }
-    if (!gapless) eq_reset(e->eq);                   /* (gapless: the filters carry on) */
-    eq_sync(e);
+    if (!gapless) { eq_reset(e->eq); crossfeed_reset(e->xf); }   /* (gapless: the filters carry on) */
+    eq_sync(e, 0);
     return 0;
 }
 
@@ -303,6 +337,21 @@ static void unblock(engine_t *e)
     e->out.pause(e->out.ctx, 0);
 }
 
+/* Called with mu held. Playing, the thread may be in a write that waits for
+ * room for a whole chunk (2048 frames: up to ~45 ms at 44.1 kHz, while the
+ * output plays what's queued): before a new track or a seek, whose audio
+ * replaces what's queued anyway, that write is cut short and the queue
+ * dropped, so the thread takes the command at once (as for a stop). Only on
+ * an output that allows it (output.h: can_cut; ALSA does, Bluetooth doesn't),
+ * and not while the output drains. */
+static void cut_write(engine_t *e)
+{
+    if (!e->writing || e->state != ENG_PLAYING || !e->out_open || e->hold || e->seeking || e->draining) return;
+    if (!e->out.can_cut || !e->out.can_cut(e->out.ctx)) return;   /* (Bluetooth: as before) */
+    e->cut++;
+    e->out.flush(e->out.ctx);
+}
+
 /* Called with mu held, on the engine thread: the decoder to `frame`, without
  * mu and at an ordinary priority. An MP3 with no index is read from the
  * start up to there (seconds, an hour in): holding mu meanwhile held up
@@ -338,6 +387,7 @@ static void *run(void *arg)
         if (e->cmd_play.valid) {
             pending_t p = e->cmd_play;
             e->cmd_play.valid = 0;
+            LAT("engine: play %s", p.path);
             decoder_t *nd = NULL;
             audio_format_t nf;
             if (decoder_is_stream(p.path)) {
@@ -359,6 +409,7 @@ static void *run(void *arg)
                  * nothing to play yet: not ahead of the UI. */
                 audio_thread_priority(0);
                 nd = decoder_open_ex(p.path, &nf, &e->net_abort);
+                LAT("engine: stream %s", nd ? "open" : "failed");
                 audio_thread_priority(1);
                 pthread_mutex_lock(&e->mu);
                 e->connecting = 0;
@@ -407,6 +458,7 @@ static void *run(void *arg)
             if (rc == 0) {
                 e->out.flush(e->out.ctx);
                 eq_reset(e->eq);
+                crossfeed_reset(e->xf);
                 e->pos_frames = frame;
                 e->rewind = 0;
                 e->tempo_dirty = 1;
@@ -421,6 +473,7 @@ static void *run(void *arg)
             if (decoder_seek(e->dec, e->rewind_to) == 0) {
                 e->out.flush(e->out.ctx);
                 eq_reset(e->eq);
+                crossfeed_reset(e->xf);
                 e->pos_frames = e->rewind_to;
                 e->tempo_dirty = 1;
             }
@@ -460,9 +513,11 @@ static void *run(void *arg)
             continue;
         }
 
-        eq_sync(e);                                  /* the EQ changed meanwhile */
+        eq_sync(e, 1);                               /* the EQ changed meanwhile */
+        if (!e->out_open || e->rewind) continue;     /* (reopened: back to what was heard, or it didn't open) */
         decoder_t *dec = e->dec;
         eq_t *eq = e->eq;
+        crossfeed_t *xf = e->xf;
         int ch = e->fmt.channels;
         float gain = e->fmt.dop ? 1.0f : e->gain * e->fade * e->track_gain;
         float bl = ch == 2 && !e->fmt.dop ? e->bal[0] : 1.0f, br = ch == 2 && !e->fmt.dop ? e->bal[1] : 1.0f;
@@ -505,6 +560,7 @@ static void *run(void *arg)
             if (bl != 1.0f || br != 1.0f) gain_run2(e->buf, n, gain_q28(gain * bl), gain_q28(gain * br));
             else if (gain != 1.0f) gain_run(e->buf, n * ch, gain_q28(gain));
             if (eq) eq_run(eq, e->buf, n);
+            if (xf) crossfeed_run(xf, e->buf, n);
             /* a stop, a skip or a seek while it decoded: the old track's, not written */
             pthread_mutex_lock(&e->mu);
             int old = e->cut != cut;
@@ -566,10 +622,12 @@ static void *run(void *arg)
             bad = p;                                 /* it can't be played: this one plays out first */
         }
         e->writing = 1;
+        e->draining = 1;
         pthread_mutex_unlock(&e->mu);
         e->out.drain(e->out.ctx);
         pthread_mutex_lock(&e->mu);
         e->writing = 0;
+        e->draining = 0;
         if (e->hold) pthread_cond_broadcast(&e->cv);
         if (dec == e->dec && !e->cmd_play.valid && e->state != ENG_STOPPED) {
             /* A next track queued while it drained: on to it (the end comes
@@ -633,6 +691,7 @@ void engine_free(engine_t *e)
     if (e->dec) decoder_close(e->dec);
     if (e->out_open) e->out.close(e->out.ctx);
     eq_destroy(e->eq);
+    crossfeed_free(e->xf);
     tempo_free(e->tempo);
     free(e->tbuf);
     pthread_mutex_destroy(&e->mu);
@@ -664,6 +723,7 @@ void engine_play_at(engine_t *e, const char *path, int64_t id, float gain, uint3
     set_pending(&e->cmd_play, path, id, gain, 0);
     e->cmd_play.start_ms = start_ms;
     unblock(e);        /* (paused: the thread may be waiting in a write) */
+    cut_write(e);      /* (playing: it may be too, for a chunk's worth) */
     e->ended = e->error = 0;   /* (they were the last track's) */
     e->start_paused = 0;
     e->n_next = 0;
@@ -738,6 +798,7 @@ void engine_seek_ms(engine_t *e, uint32_t ms)
     e->seek_ms = ms;
     e->cmd_seek = 1;
     unblock(e);        /* (paused: the thread may be waiting in a write) */
+    cut_write(e);
     pthread_cond_signal(&e->cv);
     pthread_mutex_unlock(&e->mu);
 }
@@ -771,6 +832,14 @@ void engine_set_eq(engine_t *e, const eq_profile_t *p)
     e->eq_on = p != NULL;
     if (p) e->eq_prof = *p;
     e->eq_gen++;
+    pthread_cond_signal(&e->cv);
+    pthread_mutex_unlock(&e->mu);
+}
+
+void engine_set_crossfeed(engine_t *e, int level)
+{
+    pthread_mutex_lock(&e->mu);
+    e->xf_level = level < XF_OFF || level >= XF_LEVELS ? XF_OFF : level;
     pthread_cond_signal(&e->cv);
     pthread_mutex_unlock(&e->mu);
 }
@@ -870,6 +939,7 @@ void engine_status(engine_t *e, eng_status_t *st)
     st->starting = e->cmd_play.valid;
     st->start_paused = e->start_paused;
     st->eq = e->eq_on && !e->fmt.dop;
+    st->crossfeed = e->xf_level != XF_OFF && !e->fmt.dop && e->fmt.channels == 2 ? e->xf_level : XF_OFF;
     st->stream = e->connecting || e->dec_net;
     uint32_t since = e->net_read_ms;
     st->connecting = e->connecting || (e->dec_net && since && mono_ms() - since > STALL_MS);
@@ -884,7 +954,7 @@ void engine_status(engine_t *e, eng_status_t *st)
     st->balance[0] = stereo ? e->bal[0] : 1.0f;
     st->balance[1] = stereo ? e->bal[1] : 1.0f;
     st->untouched = e->fmt.dop || (!e->eq_on && e->gain * e->track_gain == 1.0f && e->fade == 1.0f &&
-                                   st->balance[0] == 1.0f && st->balance[1] == 1.0f);
+                                   st->balance[0] == 1.0f && st->balance[1] == 1.0f && st->crossfeed == XF_OFF);
     if (e->fmt.rate) {
         long delay = e->out_open ? e->out.delay(e->out.ctx) : 0;
         int64_t heard = e->rewind ? (int64_t)e->rewind_to : (int64_t)e->pos_frames - ahead_frames(e, delay);

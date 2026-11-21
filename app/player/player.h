@@ -58,6 +58,12 @@ void player_play(player_t *p, const int64_t *ids, int n, int start);
 void player_cue(player_t *p, const int64_t *ids, int n, int start);
 /* Shuffle every song in the library. */
 void player_shuffle_all(player_t *p);
+/* Shuffle `ids` (an album's or an artist's songs; a copy is kept) and play,
+ * with shuffle on. Asked for by name, so audiobooks and podcasts aren't left
+ * out, nor short interludes when they're all there is; songs: shuffle the
+ * songs even when Settings > Playback shuffles whole albums (one album would
+ * otherwise just play in order). Returns how many will play (0: n was 0). */
+int  player_shuffle_these(player_t *p, const int64_t *ids, int n, int songs);
 
 void player_toggle_pause(player_t *p);
 void player_pause(player_t *p, int on);     /* on = 0 also starts a cued track */

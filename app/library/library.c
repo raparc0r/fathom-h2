@@ -2614,6 +2614,30 @@ int library_list_credit_tracks(library_t *lib, int64_t artist_id, int64_t album_
     return n;
 }
 
+int library_artist_tracks(library_t *lib, int64_t artist_id, int credited, lib_list_t *out)
+{
+    memset(out, 0, sizeof *out);
+    lib_list_t albums;
+    if (library_list(lib, credited ? LIB_CREDIT_ALBUMS : LIB_ARTIST_ALBUMS, artist_id, &albums) < 0) return -1;
+    for (int i = 0; i < albums.n; i++) {
+        lib_list_t t;
+        int n = credited ? library_list_credit_tracks(lib, artist_id, albums.ids[i], &t)
+                         : library_list(lib, LIB_ALBUM_TRACKS, albums.ids[i], &t);
+        if (n > 0) {
+            int64_t *ni = realloc(out->ids, (size_t)(out->n + t.n) * sizeof *ni);
+            if (ni) {
+                out->ids = ni;
+                memcpy(out->ids + out->n, t.ids, (size_t)t.n * sizeof *ni);
+                out->n += t.n;
+            }
+        }
+        library_list_free(&t);
+    }
+    library_list_free(&albums);
+    out->view = credited ? LIB_CREDIT_TRACKS : LIB_ALBUM_TRACKS;
+    return out->n;
+}
+
 static int64_t get_int_col(library_t *lib, const char *sql, int64_t id);
 
 int library_needs_tags(library_t *lib)

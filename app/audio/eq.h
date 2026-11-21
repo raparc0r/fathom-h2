@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Parametric EQ: AutoEQ / Equalizer APO profiles, run in integer arithmetic
- * (the H2 has no FPU) on the player's left-justified int32 samples. */
+ * (Fathom is built soft-float) on the player's left-justified int32 samples. */
 #ifndef FATHOM_EQ_H
 #define FATHOM_EQ_H
 
@@ -46,7 +46,7 @@ double eq_response_db(const eq_profile_t *p, unsigned rate, double f);
 /* The bands' response (preamp left out) at n frequencies f[] into db[]: the
  * same as eq_response_db() minus the preamp, with each band designed once and
  * the trigonometry done once a frequency (the UI's curve, redrawn as a value
- * is turned, on a CPU without an FPU). */
+ * is turned, with floats emulated: Fathom is built soft-float). */
 void eq_curve_db(const eq_profile_t *p, unsigned rate, const double *f, int n, float *db);
 
 #endif

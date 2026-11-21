@@ -87,15 +87,20 @@ int update_parse_release(const char *json, size_t len, update_release_t *r)
     int ver[3];
     if (update_parse_version(r->tag, ver) != 0) return -1;
     if (!json_member(root, "assets", &assets) || json_type(assets) != JSON_ARRAY) return -1;
-    char want[128];
-    snprintf(want, sizeof want, "fathom-h2-%s.zip", r->tag[0] == 'v' || r->tag[0] == 'V' ? r->tag + 1 : r->tag);
-    int best = 0;                                   /* 2: the exact name; 1: some fathom-h2-*.zip */
+    /* Each release carries the zip twice, byte for byte: fathom-h2-VERSION.zip
+     * for people, OTA_fathom-h2-VERSION for this updater, so GitHub's download
+     * counts tell the two apart. (0.12.0 and older know only the zip.) */
+    const char *num = r->tag[0] == 'v' || r->tag[0] == 'V' ? r->tag + 1 : r->tag;
+    char want[128], ota[128];
+    snprintf(want, sizeof want, "fathom-h2-%s.zip", num);
+    snprintf(ota, sizeof ota, "OTA_fathom-h2-%s", num);
+    int best = 0;                                   /* 3: OTA_; 2: the exact zip; 1: some fathom-h2-*.zip */
     size_t at = 0;
     while (json_next(assets, &at, &a)) {
         char name[128], url[512], state[32] = "", digest[80] = "";
         if (!json_member(a, "name", &v) || json_string(v, name, sizeof name) <= 0) continue;
         if (strchr(name, '/')) continue;                              /* (it names a file in the stage) */
-        int score = !strcmp(name, want) ? 2 : !strncmp(name, "fathom-h2-", 10) && has_suffix(name, ".zip") ? 1 : 0;
+        int score = !strcmp(name, ota) ? 3 : !strcmp(name, want) ? 2 : !strncmp(name, "fathom-h2-", 10) && has_suffix(name, ".zip") ? 1 : 0;
         if (score <= best) continue;
         if (json_member(a, "state", &v)) json_string(v, state, sizeof state);
         if (state[0] && strcmp(state, "uploaded")) continue;          /* still uploading */

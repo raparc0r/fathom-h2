@@ -25,6 +25,12 @@ typedef struct {
      * at the link's rate), takes the profile (NULL = off) and returns 1; the
      * engine then doesn't. NULL or 0: the engine runs it. */
     int  (*set_eq)(void *ctx, const eq_profile_t *p);
+    /* Optional: 1 when flush() may be called from another thread while a
+     * write() is under way, cutting it short (ALSA: the kernel wakes the
+     * write). The engine then cuts a write short for a skip or a seek; NULL or
+     * 0 (Bluetooth: its flush is a round trip to bluez-alsa and resets the
+     * resampler the write is using): it waits for the write, as before. */
+    int  (*can_cut)(void *ctx);
 } audio_output_t;
 
 int  out_sdl_create(audio_output_t *out);

@@ -6,7 +6,7 @@
  * coefficients are worked out for any sample rate from the 48 kHz design (as
  * libebur128 does).
  *
- * The filters run in fixed point: the H2 has no FPU, and emulated doubles made
+ * The filters run in fixed point: Fathom is built soft-float, and emulated doubles made
  * measuring a track take longer than playing it. Samples are taken at 24 bits,
  * coefficients in Q28, products and sums in 64 bits (a 32x32 multiply on
  * MIPS); floating point is used once per 100 ms block. The error is far below

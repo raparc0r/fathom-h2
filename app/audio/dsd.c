@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * DSD to PCM in two stages, both linear-phase FIRs (Kaiser-windowed sinc,
- * designed when a file opens; integers from there on: the H2 has no FPU).
+ * designed when a file opens; integers from there on: Fathom is built soft-float).
  *
  *  1. At the DSD rate, decimating to twice the output rate (352.8 kHz): a
  *     6 x ratio tap filter evaluated a byte at a time from tables of the sums

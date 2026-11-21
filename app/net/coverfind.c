@@ -315,6 +315,8 @@ static struct {
     cf_album_t *list;
     int list_n, next;
     int in_flight;             /* an album of the batch under way */
+    int64_t user_kept[32];     /* albums given a cover by Menu > Find cover since the batch began */
+    int n_user_kept;
     cf_batch_t bst;
     volatile int batch_abort;
     struct { int64_t id; uint16_t *large, *small; } kept[4];
@@ -505,10 +507,30 @@ static void do_load(unsigned gen, int k)
     free(small);
 }
 
+/* (with C.mu held) album was given a cover by Menu > Find cover since the batch began */
+static int user_kept(int64_t album)
+{
+    for (int i = 0; i < C.n_user_kept; i++)
+        if (C.user_kept[i] == album) return 1;
+    return 0;
+}
+
 /* One album of the batch: kept (a sure match whose picture could be read),
- * unsure (something like it), or nothing; 0, or -1 if nothing could be asked */
+ * unsure (something like it), or nothing; 0, 1 left as it is (given a cover
+ * meanwhile), or -1 if nothing could be asked */
 static int do_batch_one(const cf_album_t *a)
 {
+    /* given a cover by Menu > Find cover since the list was made (the batch
+     * takes minutes), or a found one removed meanwhile (.none): left as it is.
+     * (Not "a KEYHASH.jpg is there": one the batch put there before the
+     * player stopped, not stored yet, would be skipped for ever.) */
+    char none[1200];
+    struct stat st;
+    pthread_mutex_lock(&C.mu);
+    int kept_meanwhile = user_kept(a->id);
+    pthread_mutex_unlock(&C.mu);
+    if (kept_meanwhile || (library_found_cover_path(a->key, "none", none, sizeof none) == 0 && stat(none, &st) == 0))
+        return 1;
     cf_match_t m[CF_MAX * 2];
     int mb_n;
     int n = search(a, m, CF_MAX * 2, &C.batch_abort, &mb_n);
@@ -523,10 +545,17 @@ static int do_batch_one(const cf_album_t *a)
         snprintf(tmp, sizeof tmp, "%s/.batch.jpg", C.dir);
         uint16_t *large, *small;
         if (picture(m[picks[s]].image, tmp, &C.batch_abort, &large, &small)) continue;
-        if (library_found_cover_path(a->key, "jpg", dest, sizeof dest) || rename(tmp, dest)) {
+        /* (with the lock: a keep from Menu > Find cover for this album now
+         * either came first, and this one goes, or renames over it after) */
+        pthread_mutex_lock(&C.mu);
+        int mine = !user_kept(a->id);
+        int moved = mine && library_found_cover_path(a->key, "jpg", dest, sizeof dest) == 0 && rename(tmp, dest) == 0;
+        pthread_mutex_unlock(&C.mu);
+        if (!moved) {
             remove(tmp);
             free(large);
             free(small);
+            if (!mine) return 1;
             continue;
         }
         pthread_mutex_lock(&C.mu);
@@ -595,6 +624,7 @@ static void *worker(void *arg)
             pthread_mutex_lock(&C.mu);
             C.in_flight = 0;
             if (r == 0) C.bst.done++;
+            else if (r == 1) C.bst.total--;            /* (given a cover meanwhile: not one to look for) */
             int end = C.next >= C.list_n || r < 0 || C.batch_abort;
             if (r < 0 && !C.batch_abort) C.bst.failed = 1;
             if (end && C.bst.running) batch_end();
@@ -612,9 +642,17 @@ int cf_start(const char *dir)
     snprintf(C.dir, sizeof C.dir, "%s", dir);
     mkdir(C.dir, 0755);
     char p[600];
-    for (int k = 0; k < CF_MAX; k++) { find_file(k, p, sizeof p); remove(p); }   /* (a find left behind) */
+    char part[620];
+    for (int k = 0; k < CF_MAX; k++) {           /* (a find left behind, and a picture's download cut short) */
+        find_file(k, p, sizeof p);
+        remove(p);
+        snprintf(part, sizeof part, "%s.part", p);
+        remove(part);
+    }
     snprintf(p, sizeof p, "%s/.batch.jpg", C.dir);
     remove(p);
+    snprintf(part, sizeof part, "%s.part", p);
+    remove(part);
     C.stop = 0;
     if (pthread_create(&C.th, NULL, worker, NULL)) return -1;
     C.started = 1;
@@ -712,17 +750,27 @@ int cf_find_retry(int k)
 int cf_find_keep(int k, uint16_t *large, uint16_t *small)
 {
     char key[512], from[600], to[1200], none[1200];
+    int64_t id = 0;
     pthread_mutex_lock(&C.mu);
     int ok = C.find_state == 1 && k >= 0 && k < C.n && C.pic[k].state == 2;
     if (ok) {
         memcpy(large, C.pic[k].large, (size_t)LIB_ART_LARGE * LIB_ART_LARGE * 2);
         memcpy(small, C.pic[k].small, (size_t)LIB_ART_SMALL * LIB_ART_SMALL * 2);
         snprintf(key, sizeof key, "%s", C.album.key);
+        id = C.album.id;
     }
     pthread_mutex_unlock(&C.mu);
     if (!ok) return -1;
     find_file(k, from, sizeof from);
-    if (library_found_cover_path(key, "jpg", to, sizeof to) || rename(from, to)) return -1;
+    /* (with the lock, and noted for a batch under way: it won't put its own over this) */
+    pthread_mutex_lock(&C.mu);
+    int r = library_found_cover_path(key, "jpg", to, sizeof to) || rename(from, to) ? -1 : 0;
+    if (r == 0 && !user_kept(id)) {
+        if (C.n_user_kept == (int)(sizeof C.user_kept / sizeof C.user_kept[0])) C.n_user_kept = 0;   /* (32 in one batch: start over) */
+        C.user_kept[C.n_user_kept++] = id;
+    }
+    pthread_mutex_unlock(&C.mu);
+    if (r) return -1;
     if (library_found_cover_path(key, "none", none, sizeof none) == 0) remove(none);
     return 0;
 }
@@ -762,6 +810,7 @@ int cf_batch(const cf_album_t *list, int n)
     C.bst.total = k;
     C.list = copy;
     C.list_n = k;
+    C.n_user_kept = 0;
     C.next = 0;
     C.batch_abort = 0;
     C.bst.running = 1;

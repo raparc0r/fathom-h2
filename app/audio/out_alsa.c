@@ -20,6 +20,7 @@
 #include <sound/asound.h>
 
 #include "audio/output.h"
+#include "core/lat.h"
 
 typedef struct {
     char     dev[64];
@@ -34,6 +35,7 @@ typedef struct {
     volatile int flushes;       /* a_flush()es: a retry must not write what one dropped */
     char     desc[96];
     FILE *tap;                  /* out_alsa_set_tap(): a copy of every byte written */
+    unsigned long lat_thr, lat_queued;   /* (LAT: the start threshold, frames written since the prepare) */
 } alsa_out_t;
 
 /* ---- hw_params helpers (what alsa-lib's snd_pcm_hw_params_any/set_* do) ---- */
@@ -178,6 +180,8 @@ static int a_open(void *ctx, const audio_format_t *fmt)
      * slack it has: half the buffer (a station takes seconds to connect anyway). */
     sp.start_threshold = fmt->stream && a->buffer >= rate / 2 ? a->buffer / 2 : a->period * 2;
     sp.stop_threshold = a->buffer;            /* underrun = stop (recovered in write) */
+    a->lat_thr = sp.start_threshold;
+    a->lat_queued = 0;
     sp.xfer_align = 1;
     unsigned long boundary = a->buffer;
     while (boundary * 2 <= LONG_MAX - a->buffer) boundary *= 2;
@@ -249,12 +253,15 @@ static long a_write(void *ctx, const int32_t *frames, long n)
         if (ioctl(a->fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &x) == 0) {
             buf += (size_t)x.result * frame_bytes;
             left -= x.result;
+            if (lat_on() && a->lat_queued < a->lat_thr && (a->lat_queued += x.result) >= a->lat_thr)
+                LAT("alsa: started (%lu frames queued)", a->lat_thr);
             continue;
         }
         if (errno == EINTR) continue;
         if (errno == EPIPE || errno == ESTRPIPE) {      /* underrun: start again */
             static unsigned underruns;               /* (a gap you hear: logged, to find them) */
             fprintf(stderr, "alsa: underrun %u\n", ++underruns);
+            a->lat_queued = 0;
             if (ioctl(a->fd, SNDRV_PCM_IOCTL_PREPARE) == 0) continue;
         }
         /* The start failing (EIO; the kernel's -ENOMEM when its DMA can't
@@ -290,6 +297,7 @@ static void a_drain(void *ctx)
     if (a->fd < 0) return;
     ioctl(a->fd, SNDRV_PCM_IOCTL_DRAIN);
     ioctl(a->fd, SNDRV_PCM_IOCTL_PREPARE);
+    a->lat_queued = 0;
 }
 
 static void a_flush(void *ctx)
@@ -300,6 +308,7 @@ static void a_flush(void *ctx)
     ioctl(a->fd, SNDRV_PCM_IOCTL_DROP);
     ioctl(a->fd, SNDRV_PCM_IOCTL_PREPARE);
     a->paused = 0;
+    a->lat_queued = 0;
 }
 
 static void a_pause(void *ctx, int on)
@@ -328,6 +337,8 @@ void out_alsa_set_device(void *ctx, void *device)
     snprintf(a->dev, sizeof a->dev, "%s", (const char *)device);
 }
 
+static int a_can_cut(void *ctx) { (void)ctx; return 1; }
+
 int out_alsa_create(audio_output_t *out, const char *device)
 {
     alsa_out_t *a = calloc(1, sizeof *a);
@@ -335,7 +346,7 @@ int out_alsa_create(audio_output_t *out, const char *device)
     snprintf(a->dev, sizeof a->dev, "%s", device ? device : "/dev/snd/pcmC0D0p");
     a->fd = -1;
     if (access(a->dev, W_OK)) { free(a); return -1; }
-    *out = (audio_output_t){a_open, a_write, a_delay, a_drain, a_flush, a_pause, a_close, a_describe, a, NULL};
+    *out = (audio_output_t){a_open, a_write, a_delay, a_drain, a_flush, a_pause, a_close, a_describe, a, NULL, a_can_cut};
     return 0;
 }
 

@@ -87,6 +87,10 @@ int  library_list(library_t *lib, lib_view_t view, int64_t parent, lib_list_t *o
 void library_list_free(lib_list_t *l);
 /* An artist's songs on one album (LIB_CREDIT_TRACKS), by disc and track. */
 int  library_list_credit_tracks(library_t *lib, int64_t artist_id, int64_t album_id, lib_list_t *out);
+/* An artist's songs, album by album: credited, every song they're credited on
+ * (Artists); else every song on the albums they're the album artist of
+ * (Album artists). Returns how many, or -1. */
+int  library_artist_tracks(library_t *lib, int64_t artist_id, int credited, lib_list_t *out);
 /* How many albums an artist has as album artist, and is credited on. */
 void library_artist_counts(library_t *lib, int64_t artist_id, int *nalbums, int *ncredit_albums);
 /* Album lists whose rows show the album artist on the right, not the year:

@@ -57,6 +57,7 @@ add_library(fathom_player STATIC
   app/audio/loudness.c
   app/audio/btconv.c
   app/audio/eq.c
+  app/audio/crossfeed.c
   app/audio/tempo.c
   app/audio/out_null.c
   app/audio/out_clock.c
@@ -154,6 +155,15 @@ target_include_directories(test_podcast PRIVATE tests)
 target_compile_options(test_podcast PRIVATE ${FATHOM_WARNINGS})
 add_test(NAME podcast COMMAND test_podcast WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+add_executable(test_http tests/test_http.c)
+target_link_libraries(test_http PRIVATE fathom_player pthread)
+target_include_directories(test_http PRIVATE tests)
+target_compile_options(test_http PRIVATE ${FATHOM_WARNINGS})
+if(FFMPEG_FOUND)
+  target_compile_definitions(test_http PRIVATE FATHOM_HAVE_FFMPEG)
+endif()
+add_test(NAME http COMMAND test_http)
+
 add_executable(test_podsync tests/test_podsync.c)
 target_link_libraries(test_podsync PRIVATE fathom_player)
 target_include_directories(test_podsync PRIVATE tests)
@@ -165,6 +175,12 @@ target_link_libraries(test_coverfind PRIVATE fathom_player)
 target_include_directories(test_coverfind PRIVATE tests)
 target_compile_options(test_coverfind PRIVATE ${FATHOM_WARNINGS})
 add_test(NAME coverfind COMMAND test_coverfind WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_crossfeed tests/test_crossfeed.c)
+target_link_libraries(test_crossfeed PRIVATE fathom_player)
+target_include_directories(test_crossfeed PRIVATE tests)
+target_compile_options(test_crossfeed PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME crossfeed COMMAND test_crossfeed WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_executable(test_tempo tests/test_tempo.c)
 target_link_libraries(test_tempo PRIVATE fathom_player m)
@@ -276,6 +292,11 @@ add_executable(test_lang tests/test_lang.c)
 target_link_libraries(test_lang PRIVATE fathom_core)
 target_compile_options(test_lang PRIVATE ${FATHOM_WARNINGS})
 add_test(NAME lang COMMAND test_lang)
+add_executable(test_dnscache tests/test_dnscache.c app/net/dnscache.c)
+target_include_directories(test_dnscache PRIVATE app)
+target_link_libraries(test_dnscache PRIVATE pthread)
+target_compile_options(test_dnscache PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME dnscache COMMAND test_dnscache)
 # The player's shared certificate bundle (app/net/tls_wrap.c): only where FFmpeg and mbedTLS
 # are installed and the linker has --wrap (GNU ld or lld on Linux, not macOS's ld)
 pkg_check_modules(MBEDTLS QUIET IMPORTED_TARGET mbedtls mbedx509 mbedcrypto)

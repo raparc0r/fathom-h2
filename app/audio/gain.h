@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* A gain on left-justified int32 samples (volume levelling, a USB DAC's
- * software volume, the sleep timer's fade), in integer arithmetic: the H2 has
- * no FPU, and a float multiply per sample is a soft-float call. The gain is
+ * software volume, the sleep timer's fade), in integer arithmetic: Fathom is
+ * built soft-float (the X1000's FPU unused), so a float multiply per sample
+ * would be a library call. The gain is
  * Q4.28 (up to 8x, +18 dB), each product rounded, the result saturated. */
 #ifndef FATHOM_GAIN_H
 #define FATHOM_GAIN_H

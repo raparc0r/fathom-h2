@@ -117,5 +117,5 @@ static void c_describe(void *ctx, char *out, int cap) { (void)ctx; snprintf(out,
 
 void out_clock_create(audio_output_t *out)
 {
-    *out = (audio_output_t){c_open, c_write, c_delay, c_drain, c_flush, c_pause, c_close, c_describe, &g_clock, NULL};
+    *out = (audio_output_t){c_open, c_write, c_delay, c_drain, c_flush, c_pause, c_close, c_describe, &g_clock, NULL, NULL};
 }

@@ -180,9 +180,12 @@ on)
     # fathom-wifi-lease): not three tries and a script every 12 s while
     # nothing saved is in range. In the background from the start: -b made its first three tries (10 s)
     # before going there, and "on" waited for them. (From /: not holding the
-    # card, which USB drive mode lends to the computer.)
+    # card, which USB drive mode lends to the computer.) Each try waits 1 s for
+    # an answer (-T 1), not 3: the first goes out before the network is joined
+    # and is lost, and the owner's router answers the next about 1.8 s after
+    # the join; with 3 s the address came 6-12 s after "on", with 1 s 2.5 s.
     rm -f $RUN/asked
-    (cd / && exec udhcpc -f -i wlan0 -S -A 3 -x hostname:fathom-h2 -p $RUN/udhcpc.pid) < /dev/null > /dev/null 2>&1 &
+    (cd / && exec udhcpc -f -i wlan0 -S -A 3 -T 1 -x hostname:fathom-h2 -p $RUN/udhcpc.pid) < /dev/null > /dev/null 2>&1 &
     echo on
     ;;
 off)

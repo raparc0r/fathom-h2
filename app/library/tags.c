@@ -30,7 +30,7 @@ static const char *ext_of(const char *path)
 }
 
 /* Formats through FFmpeg (with the decoders the H2's build has: integer ones,
- * as it has no FPU). Ogg Vorbis is read here and decoded by Tremor (an .ogg
+ * as Fathom is built soft-float). Ogg Vorbis is read here and decoded by Tremor (an .ogg
  * holding Opus or FLAC goes to FFmpeg). */
 #ifdef FATHOM_HAVE_FFMPEG
 static const char *const FF_EXT[] = {"m4a", "m4b", "mp4", "alac", "aac", "wav", "wave", "w64", "aif", "aiff",

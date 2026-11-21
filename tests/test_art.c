@@ -235,6 +235,10 @@ static void test_jpeg(void)
     fclose(f);
     CHECK(art_decode_mem(head, 5000, 204, &H2, &img, &w, &h) == -1);
     CHECK(art_decode_mem((const unsigned char *)"not an image at all", 19, 204, &H2, &img, &w, &h) == -1);
+    /* a PNG of grey at 0 bits a sample: refused (it was 8 % 0: SIGFPE on the H2, UBSan here) */
+    static const unsigned char zero_depth[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 13, 'I', 'H', 'D', 'R',
+                                               0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'I', 'E', 'N', 'D'};
+    CHECK(art_decode_mem(zero_depth, sizeof zero_depth, 204, &H2, &img, &w, &h) == -1);
     free(head);
     free(src);
 }

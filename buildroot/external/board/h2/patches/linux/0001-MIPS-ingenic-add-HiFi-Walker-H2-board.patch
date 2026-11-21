@@ -163,7 +163,7 @@ diff -Naur a/arch/mips/boot/dts/ingenic/hifiwalker-h2.dts b/arch/mips/boot/dts/i
 +	/* Display and backlight: draft driver, enabled for stage-3 testing */
 +	backlight: backlight {
 +		compatible = "pwm-backlight";
-+		pwms = <&pwm 0 30000 0>;
++		pwms = <&pwm 0 20000 0>;	/* 50 kHz: no visible flicker at the lowest levels on USB power (stock: 30 us) */
 +		brightness-levels = <0 255>;
 +		num-interpolated-steps = <255>;
 +		default-brightness-level = <255>;	/* the bootloader's (full): no dip at hand-off */

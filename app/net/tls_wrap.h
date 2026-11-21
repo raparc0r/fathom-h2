@@ -5,7 +5,7 @@
  * tls_wrap.c. Linked in with
  *   -Wl,--wrap=mbedtls_x509_crt_parse_file -Wl,--wrap=mbedtls_x509_crt_free
  * so FFmpeg's tls_mbedtls (a static library we don't patch) calls it instead.
- * Nothing to call: it works by being linked. This is for the tests.
+ * It works by being linked; tls_wrap_warm() parses ahead of a connection.
  */
 #ifndef FATHOM_TLS_WRAP_H
 #define FATHOM_TLS_WRAP_H
@@ -17,6 +17,8 @@ typedef struct {
 } tls_wrap_stats_t;
 
 void tls_wrap_stats(tls_wrap_stats_t *s);
+/* The bundle parsed ahead, in the background (a connection is likely soon) */
+void tls_wrap_warm(void);
 /* How long an unused chain is kept for the next connection (default 30 s). */
 void tls_wrap_set_grace_ms(unsigned ms);
 
