@@ -70,6 +70,10 @@ typedef struct {
  * left as they are), and up to max episodes (those with an audio file),
  * newest first. Returns how many, or -1 if it isn't a podcast feed. */
 int pod_parse_feed(const char *xml, size_t len, pod_show_t *show, pod_episode_t *eps, int max);
+/* Whether a feed arrived whole: it ends with its root's closing tag (</rss>,
+ * </feed>, </rdf:RDF>). One cut off (the Wi-Fi gone mid-transfer) would read
+ * as a feed with fewer episodes. */
+int pod_feed_complete(const char *xml, size_t len);
 /* OPML: each <outline> with a feed (xmlUrl), its title and url set. How many. */
 int pod_parse_opml(const char *xml, size_t len, pod_show_t *out, int max);
 /* Apple's search answer: the shows, with a feed each. How many, -1 if it isn't one. */

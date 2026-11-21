@@ -74,6 +74,12 @@ static void feed(void)
         CHECK(!strcmp(e[2].key, k) && e[2].dur_s == 3552, "no guid: key from the url");
         CHECK(!strcmp(pod_ext(&e[2]), ".mp3"), "ext");
     }
+    /* whole or cut off: the fixture stops mid-item (no </rss>); with its end, whole */
+    CHECK(!pod_feed_complete(xml, len), "the fixture is cut off");
+    CHECK(pod_feed_complete("<rss><channel></channel></rss>\n", 31), "</rss>");
+    CHECK(pod_feed_complete("<feed xmlns=\"x\"></FEED>", 24), "</feed>, any case");
+    CHECK(pod_feed_complete("<rdf:RDF></rdf:RDF>", 19), "</rdf:RDF>");
+    CHECK(!pod_feed_complete("<rss><channel><item>", 20) && !pod_feed_complete("", 0), "cut");
     /* cut anywhere: never a crash, whole episodes only */
     for (size_t cut = 0; cut < len; cut += 7) {
         int m = pod_parse_feed(xml, cut, &s, e, 10);

@@ -13,7 +13,7 @@
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
-static int fetches, slow;
+static int fetches, slow, cut_off;   /* cut_off: the feed arrives cut off (Wi-Fi gone mid-transfer) */
 
 static long fake_fetch(const char *url, char *buf, size_t cap, const volatile int *abort)
 {
@@ -28,6 +28,14 @@ static long fake_fetch(const char *url, char *buf, size_t cap, const volatile in
     size_t n = fread(buf, 1, cap - 1, f);
     fclose(f);
     buf[n] = '\0';
+    if (strstr(file, "feed.xml")) {
+        if (cut_off) {                                /* half of it, as http_get leaves it */
+            n /= 2;
+            buf[n] = '\0';
+        } else {                                      /* (the fixture stops mid-item: whole, it ends) */
+            n += (size_t)snprintf(buf + n, cap - n, "\n</rss>\n");
+        }
+    }
     return (long)n;
 }
 
@@ -110,6 +118,23 @@ int main(void)
         pod_episode_path(dir, shows[0].id, &e[1], p, sizeof p);
         snprintf(part, sizeof part, "%s.part", p);
         CHECK(!pod_downloaded(dir, shows[0].id, &e[1]) && stat(part, &sb) != 0, "cancelled: nothing left");
+    }
+
+    /* the feed cut off by a Wi-Fi drop: the episodes stay as they were, and
+     * the refresh is said to have failed */
+    if (n && ne) {
+        cut_off = 1;
+        podsync_refresh(shows[0].url);
+        settle();
+        cut_off = 0;
+        pod_episode_t e2[10];
+        int ne2 = pod_episodes_load(dir, shows[0].id, e2, 10);
+        podsync_status(&st);
+        CHECK(ne2 == ne, "cut off: %d episodes, were %d", ne2, ne);
+        CHECK(st.last_failed && !strcmp(st.failed_what, "Slow"), "cut off: failure said [%s]", st.failed_what);
+        podsync_refresh(shows[0].url);                /* whole again: read */
+        settle();
+        CHECK(pod_episodes_load(dir, shows[0].id, e2, 10) == ne, "whole again");
     }
 
     /* search */

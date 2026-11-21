@@ -224,11 +224,23 @@ ICONS = {
         '.X..XX..X.',
         '.XX....XX.',
         '...XXXX...'],
+    # Playlists: a smart playlist (Fathom keeps it), after the update's
+    'smart': [
+        '.......X..',
+        '......XXX.',
+        '...X...X..',
+        '...X......',
+        '..XXX.....',
+        'XXX.XXX...',
+        '..XXX.....',
+        '...X......',
+        '...X......',
+        '..........'],
 }
 # (in the UI's H_* order: items added later come after settings)
 ORDER = ['nowplaying', 'shuffle', 'search', 'albums', 'artists', 'albumartists', 'songs',
          'playlists', 'favourites', 'recent', 'history', 'radio', 'settings',
-         'genres', 'composers', 'years', 'folders', 'podcasts', 'update']
+         'genres', 'composers', 'years', 'folders', 'podcasts', 'update', 'smart']
 
 
 def main(out, preview):

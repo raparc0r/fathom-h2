@@ -164,7 +164,8 @@ static int refresh_one(const char *url)
         if (!strcmp(shows[i].url, url)) at = i;
     if (at < 0) goto out;                            /* unsubscribed meanwhile */
     long n = g_fetch(url, buf, POD_FEED_MAX, &P.abort);
-    if (n == -2) n = (long)strlen(buf);              /* cut short: the episodes before the cut */
+    if (n == -2) n = (long)strlen(buf);              /* too big: the episodes before the cut */
+    else if (n > 0 && !pod_feed_complete(buf, (size_t)n)) n = -1;   /* cut off: the list stays as it was */
     if (n <= 0) { failed(shows[at].title); goto out; }
     pod_show_t s = shows[at], parsed = s;
     int m = pod_parse_feed(buf, (size_t)n, &parsed, eps, POD_MAX_EPISODES);

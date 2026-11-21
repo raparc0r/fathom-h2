@@ -148,8 +148,8 @@ static void index_search(library_t *lib, int only_missing)
  * table and index below is there and the one-off upgrades are done, so
  * later opens (a background scan's, levelling's: each a connection of its
  * own) skip them; they read the tracks table three times over and took the
- * write lock, waiting behind a scan's. */
-#define LIB_SCHEMA_V 5
+ * write lock, waiting behind a scan's. 6: the play log (plays). */
+#define LIB_SCHEMA_V 6
 #define LIB_STR_(x) #x
 #define LIB_STR(x) LIB_STR_(x)
 
@@ -240,6 +240,11 @@ static void migrate(library_t *lib, int version)
     sqlite3_exec(lib->db,
         "CREATE INDEX IF NOT EXISTS tracks_rg_todo ON tracks(id) WHERE rg_state=0;"
         "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER);",
+        NULL, NULL, NULL);
+    /* the play log: when each song was played (On repeat), a year of it */
+    sqlite3_exec(lib->db,
+        "CREATE TABLE IF NOT EXISTS plays(track_id INTEGER NOT NULL, at INTEGER NOT NULL);"
+        "CREATE INDEX IF NOT EXISTS plays_at ON plays(at);",
         NULL, NULL, NULL);
     sqlite3_exec(lib->db, "PRAGMA user_version=" LIB_STR(LIB_SCHEMA_V), NULL, NULL, NULL);
 }
@@ -2535,6 +2540,7 @@ static int64_t g_credit_album;   /* LIB_CREDIT_TRACKS: the album (library_list t
 int library_list(library_t *lib, lib_view_t view, int64_t parent, lib_list_t *out)
 {
     const char *sql = NULL;
+    int64_t smart_cut = 0;
     switch (view) {
     case LIB_ALBUMS: sql = "SELECT id FROM albums ORDER BY sort, year"; break;
     case LIB_ALBUM_ARTISTS: sql = "SELECT id FROM artists WHERE nalbums>0 ORDER BY sort"; break;
@@ -2573,6 +2579,35 @@ int library_list(library_t *lib, lib_view_t view, int64_t parent, lib_list_t *ou
         break;
     case LIB_YEARS: sql = "SELECT DISTINCT year FROM albums WHERE year>0 ORDER BY year DESC"; break;
     case LIB_YEAR_ALBUMS: sql = "SELECT id FROM albums WHERE year=?1 ORDER BY sort"; break;
+    case LIB_SMART: {   /* ?1: the time before which counts as "a while" */
+        int64_t now = (int64_t)time(NULL);
+        switch ((int)parent) {
+        case LIB_SMART_NEVER:
+            sql = "SELECT t.id FROM tracks t LEFT JOIN albums a ON a.id=t.album_id"
+                  " WHERE t.play_count=0 AND t.skip_count=0 ORDER BY a.sort, a.id, t.disc, t.track, t.path";
+            break;
+        case LIB_SMART_REPEAT:
+            smart_cut = now - 30 * 86400;
+            sql = "SELECT track_id FROM plays WHERE at>?1 AND track_id IN (SELECT id FROM tracks)"
+                  " GROUP BY track_id HAVING COUNT(*)>=2 ORDER BY COUNT(*) DESC, MAX(at) DESC LIMIT 50";
+            break;
+        case LIB_SMART_NOT_HEARD:
+            smart_cut = now - 90 * 86400;
+            sql = "SELECT id FROM tracks WHERE play_count>0 AND last_played<?1 ORDER BY last_played LIMIT 200";
+            break;
+        case LIB_SMART_FORGOTTEN:
+            smart_cut = now - 60 * 86400;
+            sql = "SELECT id FROM tracks WHERE favourite=1 AND last_played<?1 ORDER BY last_played LIMIT 100";
+            break;
+        case LIB_SMART_SKIPPED:
+            sql = "SELECT id FROM tracks WHERE skip_count>=2 ORDER BY skip_count DESC, sort LIMIT 100";
+            break;
+        default:
+            memset(out, 0, sizeof *out);
+            return -1;
+        }
+        break;
+    }
     case LIB_FOLDER:   /* the subfolders (as -id), then the songs; 0: the top folder's */
         sql = "SELECT x FROM (SELECT -id AS x, 0 AS k, sort AS o FROM folders WHERE parent=?1"
               " UNION ALL SELECT id, 1, path FROM tracks WHERE folder_id=?1) ORDER BY k, o";
@@ -2592,6 +2627,7 @@ int library_list(library_t *lib, lib_view_t view, int64_t parent, lib_list_t *ou
         view == LIB_COMPOSER_ALBUMS || view == LIB_COMPOSER_TRACKS || view == LIB_YEAR_ALBUMS || view == LIB_FOLDER)
         sqlite3_bind_int64(s, 1, parent);
     if (view == LIB_CREDIT_TRACKS || view == LIB_COMPOSER_TRACKS) sqlite3_bind_int64(s, 2, g_credit_album);
+    if (view == LIB_SMART && smart_cut) sqlite3_bind_int64(s, 1, smart_cut);
     int cap = 0;
     while (sqlite3_step(s) == SQLITE_ROW) {
         if (out->n == cap) {
@@ -2604,6 +2640,13 @@ int library_list(library_t *lib, lib_view_t view, int64_t parent, lib_list_t *ou
     }
     sqlite3_finalize(s);
     return out->n;
+}
+
+const char *library_smart_name(int which)
+{
+    static const char *const N[LIB_SMART_N] = {"", "Never played", "On repeat", "Not heard in a while",
+                                               "Forgotten favourites", "Often skipped"};
+    return which > 0 && which < LIB_SMART_N ? N[which] : "";
 }
 
 int library_list_credit_tracks(library_t *lib, int64_t artist_id, int64_t album_id, lib_list_t *out)
@@ -2695,8 +2738,8 @@ int library_row(library_t *lib, lib_view_t view, int64_t id,
                        view == LIB_COMPOSER_TRACKS) ? lib->row_track
                     : view == LIB_PLAYLISTS ? lib->row_playlist
                     : view == LIB_MOST_PLAYED ? lib->row_plays
-                    : (view == LIB_PLAYLIST_TRACKS || view == LIB_FAVOURITES || view == LIB_RECENT_PLAYED)
-                        ? lib->row_pl_track
+                    : (view == LIB_PLAYLIST_TRACKS || view == LIB_FAVOURITES || view == LIB_RECENT_PLAYED ||
+                       view == LIB_SMART) ? lib->row_pl_track
                     : lib->row_album;   /* albums, artist albums, recently added */
     sqlite3_reset(s);
     sqlite3_bind_int64(s, 1, view == LIB_FOLDER ? -id : id);
@@ -2706,7 +2749,7 @@ int library_row(library_t *lib, lib_view_t view, int64_t id,
     int v = sqlite3_column_int(s, 1);
     int track_list = view == LIB_ALBUM_TRACKS || view == LIB_SONGS || view == LIB_PLAYLIST_TRACKS || view == LIB_CREDIT_TRACKS ||
                      view == LIB_FAVOURITES || view == LIB_RECENT_PLAYED || view == LIB_MOST_PLAYED ||
-                     view == LIB_COMPOSER_TRACKS;
+                     view == LIB_COMPOSER_TRACKS || view == LIB_SMART;
     if (view == LIB_ARTISTS || view == LIB_ALBUM_ARTISTS || view == LIB_PLAYLISTS || view == LIB_GENRES ||
         view == LIB_COMPOSERS || view == LIB_YEARS)
         snprintf(meta, meta_cap, "%d", v);                                                   /* a count */
@@ -2722,7 +2765,7 @@ int library_row(library_t *lib, lib_view_t view, int64_t id,
         copy_col(s, 2, meta, meta_cap);                                                      /* album artist */
     else if (v > 0) snprintf(meta, meta_cap, "%d", v);                                       /* album year */
     if (view == LIB_PLAYLIST_TRACKS || view == LIB_FAVOURITES || view == LIB_RECENT_PLAYED ||
-        view == LIB_MOST_PLAYED) {   /* a mix of artists: "Title · Artist" */
+        view == LIB_MOST_PLAYED || view == LIB_SMART) {   /* a mix of artists: "Title · Artist" */
         const unsigned char *a = sqlite3_column_text(s, 2);
         size_t l = strlen(main);
         if (a && *a && l + 4 < main_cap) snprintf(main + l, main_cap - l, " \xC2\xB7 %s", (const char *)a);
@@ -3033,6 +3076,7 @@ int library_shuffle_tracks(library_t *lib, shuf_track_t **out)
 
 void library_played(library_t *lib, int64_t track_id, int skipped_early, int64_t now)
 {
+    /* a play: counted, and logged (On repeat), the log kept to a year */
     sqlite3_stmt *s = prep(lib->db, skipped_early
         ? "UPDATE tracks SET skip_count=skip_count+1 WHERE id=?2"
         : "UPDATE tracks SET play_count=play_count+1, last_played=?1 WHERE id=?2");
@@ -3041,6 +3085,20 @@ void library_played(library_t *lib, int64_t track_id, int skipped_early, int64_t
     sqlite3_bind_int64(s, 2, track_id);
     sqlite3_step(s);
     sqlite3_finalize(s);
+    if (skipped_early) return;
+    s = prep(lib->db, "INSERT INTO plays(track_id, at) VALUES(?2, ?1)");
+    if (s) {
+        sqlite3_bind_int64(s, 1, now);
+        sqlite3_bind_int64(s, 2, track_id);
+        sqlite3_step(s);
+        sqlite3_finalize(s);
+    }
+    s = prep(lib->db, "DELETE FROM plays WHERE at<?1");
+    if (s) {
+        sqlite3_bind_int64(s, 1, now - 366 * 86400);
+        sqlite3_step(s);
+        sqlite3_finalize(s);
+    }
 }
 
 static void set_int_col(library_t *lib, const char *sql, int64_t id, int64_t v)

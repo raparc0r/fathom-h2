@@ -1,0 +1,54 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] backlight: pwm_bl: keep the level the bootloader lit the screen at
+
+The H2's bootloader draws the boot logo and lights the backlight before
+Linux starts. The driver used to set the device tree's default at probe, and
+the player its own level later: from Fathom's bootloader on, the logo is lit
+at the user's level, so a level found on the PWM at probe (on, and short of
+full) is kept. Full (older bootloaders) or off: the default, as before.
+---
+--- a/drivers/video/backlight/pwm_bl.c
++++ b/drivers/video/backlight/pwm_bl.c
+@@ -452,6 +452,7 @@
+ 	struct platform_pwm_backlight_data *data = dev_get_platdata(&pdev->dev);
+ 	struct platform_pwm_backlight_data defdata;
+ 	struct backlight_properties props;
++	struct pwm_state boot;		/* the PWM as the bootloader left it */
+ 	struct backlight_device *bl;
+ 	struct pwm_bl_data *pb;
+ 	struct pwm_state state;
+@@ -517,6 +518,7 @@
+ 	dev_dbg(&pdev->dev, "got pwm for backlight\n");
+ 
+ 	/* Sync up PWM state. */
++	pwm_get_state(pb->pwm, &boot);
+ 	pwm_init_state(pb->pwm, &state);
+ 
+ 	/*
+@@ -611,6 +613,26 @@
+ 			 "invalid default brightness level: %u, using %u\n",
+ 			 data->dft_brightness, data->max_brightness);
+ 		data->dft_brightness = data->max_brightness;
++	}
++
++	/*
++	 * A bootloader that lit the screen at a level of its own (Fathom's: the
++	 * user's) keeps it: no jump to the default and back as the system starts.
++	 * One that left it at full (older ones) gets the default instead. The
++	 * share of the period the backlight is on: Rockbox's PWM starts low and
++	 * goes high at the half-way register, which reads as inversed polarity.
++	 */
++	if (boot.enabled && boot.period) {
++		u64 on = min(boot.duty_cycle, boot.period);
++		u64 b;
++
++		if (boot.polarity == PWM_POLARITY_INVERSED)
++			on = boot.period - on;
++		b = DIV_ROUND_CLOSEST_ULL(on * data->max_brightness, boot.period);
++		if (b >= 1 && b < data->max_brightness) {
++			dev_info(&pdev->dev, "brightness %llu, as the bootloader left it\n", b);
++			data->dft_brightness = b;
++		}
+ 	}
+ 
+ 	bl->props.brightness = data->dft_brightness;

@@ -30,6 +30,20 @@ You can also take the card out and put it back: Fathom stops, shows "No/bad card
 starts again with your new music when the card is back. Over Wi-Fi, the network drive
 (below) lets you copy music while the H2 plays.
 
+## Smart playlists
+
+At the top of Playlists, Fathom keeps a few lists up to date by itself, from what you play:
+
+- **Never played**: songs you haven't played or skipped yet, album by album.
+- **On repeat**: what you've played most in the last 30 days (2 plays or more).
+- **Not heard in a while**: songs you've played, but not in the last 3 months.
+- **Forgotten favourites**: favourites you haven't played in the last 2 months.
+- **Often skipped**: songs you skipped in their first 30 seconds twice or more.
+
+A song counts as played once it has played past its first 30 seconds. Only lists with
+songs in them show. Menu on one plays it, shuffles it, or adds it to one of your own
+playlists as it is now.
+
 ## The H2 as your computer's sound card
 
 Plug it in and choose **Use as a USB DAC** (or Settings → Sound → USB DAC mode). The

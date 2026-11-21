@@ -170,6 +170,18 @@ static void poll_pcm(void)
     pthread_mutex_unlock(&B.mu);
 }
 
+static long mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/* A connect that failed this fast was refused, not left unanswered: right
+ * after a start the controller can refuse the first try. One that took the
+ * page timeout (about 5 s) found no headphones there. */
+#define BT_REFUSED_MS 3000
+
 static void do_cmd(int cmd, const char *addr)
 {
     char c[160], out[256];
@@ -195,8 +207,20 @@ static void do_cmd(int cmd, const char *addr)
         if (addr_ok(last)) {                     /* the headphones of last time, if they're on */
             set_busy("Connecting");
             snprintf(c, sizeof c, FATHOM_BT " connect %s 2>/dev/null", last);
-            /* right after a start the first try can fail where the next works */
-            for (int i = 0; i < 3 && sh_run(c, NULL, 0) != 0; i++) { LAT("bt: connect %d failed", i); sleep(3); }
+            /* Right after a start the first try can fail at once where the
+             * next works: tried again then, up to 3 times. A try that pages
+             * the whole timeout found nobody (the headphones off or in their
+             * case): no more, as paging takes the radio Wi-Fi shares (a station
+             * took 5 s to start through 30 s of it). Headphones that come on
+             * later connect by themselves. */
+            for (int i = 0; i < 4; i++) {
+                long t0 = mono_ms();
+                if (sh_run(c, NULL, 0) == 0) break;
+                long took = mono_ms() - t0;
+                LAT("bt: connect %d failed after %ld ms", i, took);
+                if (took >= BT_REFUSED_MS || i == 3) break;
+                sleep(2);
+            }
             LAT("bt: connect done");
         }
         break;

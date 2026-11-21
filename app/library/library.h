@@ -42,6 +42,7 @@ typedef enum {
     LIB_YEARS,           /* the years albums came out, newest first; ids are the years */
     LIB_YEAR_ALBUMS,     /* parent = a year; its albums, by title */
     LIB_FOLDER,          /* parent = folder id (0: the top); subfolders (as -id), then songs (ids) */
+    LIB_SMART,           /* parent = LIB_SMART_*: a smart playlist's songs, worked out now */
 } lib_view_t;
 
 typedef struct {
@@ -85,6 +86,16 @@ void library_scan_cancel(library_t *lib);
 
 int  library_list(library_t *lib, lib_view_t view, int64_t parent, lib_list_t *out);
 void library_list_free(lib_list_t *l);
+/* Smart playlists (LIB_SMART's parent): lists Fathom keeps itself.
+ *   Never played          never played nor skipped, by album
+ *   On repeat             played 2 times or more in the last 30 days (the play log), the most first; 50
+ *   Not heard in a while  played, but not in the last 90 days, longest ago first; 200
+ *   Forgotten favourites  favourites not played in the last 60 days, longest ago first; 100
+ *   Often skipped         skipped early 2 times or more, the most first; 100 */
+enum { LIB_SMART_NEVER = 1, LIB_SMART_REPEAT, LIB_SMART_NOT_HEARD, LIB_SMART_FORGOTTEN, LIB_SMART_SKIPPED,
+       LIB_SMART_N };
+const char *library_smart_name(int which);
+
 /* An artist's songs on one album (LIB_CREDIT_TRACKS), by disc and track. */
 int  library_list_credit_tracks(library_t *lib, int64_t artist_id, int64_t album_id, lib_list_t *out);
 /* An artist's songs, album by album: credited, every song they're credited on

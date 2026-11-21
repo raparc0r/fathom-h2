@@ -336,6 +336,20 @@ static int newest_first(const void *a, const void *b)
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
+int pod_feed_complete(const char *xml, size_t len)
+{
+    static const char *const END[] = {"</rss", "</feed", "</rdf:rdf"};
+    size_t from = len > 1024 ? len - 1024 : 0;     /* (at the end, not quoted in an episode) */
+    for (size_t i = from; i < len; i++) {
+        if (xml[i] != '<' || i + 1 >= len || xml[i + 1] != '/') continue;
+        for (size_t k = 0; k < sizeof END / sizeof END[0]; k++) {
+            size_t m = strlen(END[k]);
+            if (i + m <= len && !strncasecmp(xml + i, END[k], m)) return 1;
+        }
+    }
+    return 0;
+}
+
 int pod_parse_feed(const char *xml, size_t len, pod_show_t *show, pod_episode_t *eps, int max)
 {
     xr_t x = {xml, xml + len};

@@ -91,7 +91,7 @@ static void test_open_and_levelling(const char *dir)
     library_t *lib = library_open(db, art);
     CHECK(lib && library_scan(lib, music, NULL, NULL) == 5);
     library_close(lib);
-    CHECK(db_int(db, "PRAGMA user_version") == 5);
+    CHECK(db_int(db, "PRAGMA user_version") == 6);
 
     /* a column an upgrade would fill, emptied: an open of an up-to-date
      * library leaves it (it doesn't look) */
@@ -105,7 +105,7 @@ static void test_open_and_levelling(const char *dir)
     lib = library_open(db, art);
     CHECK(lib != NULL);
     CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE sort IS NULL") == 0);
-    CHECK(db_int(db, "PRAGMA user_version") == 5);
+    CHECK(db_int(db, "PRAGMA user_version") == 6);
 
     /* levelling: the tracks left come from tracks_rg_todo, in id order */
     sqlite3 *raw = NULL;

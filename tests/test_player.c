@@ -16,6 +16,8 @@
 
 #include "audio/engine.h"
 #include "audio/output.h"
+#include <sqlite3.h>
+
 #include "library/library.h"
 #include "library/playlist.h"
 #include "player/player.h"
@@ -350,6 +352,71 @@ int main(void)
     }
     library_list_free(&aa);
     library_list_free(&ar);
+
+    /* smart playlists, on a library of their own (the plays here would change
+     * the player's tests below) */
+    {
+        char db2[300], art2[300];
+        snprintf(db2, sizeof db2, "%s/smart.db", dir);
+        snprintf(art2, sizeof art2, "%s/art2", dir);
+        library_t *sl = library_open(db2, art2);
+        CHECK(sl && library_scan(sl, music, NULL, NULL) == N);
+        lib_list_t al, st, sm;
+        CHECK(library_list(sl, LIB_ALBUMS, 0, &al) == 1 && library_list(sl, LIB_ALBUM_TRACKS, al.ids[0], &st) == N);
+        int64_t *u = st.ids, now = (int64_t)time(NULL);
+        /* nothing played: every song is never played, by album; the others empty */
+        CHECK(library_list(sl, LIB_SMART, LIB_SMART_NEVER, &sm) == N && sm.ids[0] == u[0] && sm.ids[N - 1] == u[N - 1]);
+        library_list_free(&sm);
+        for (int k = LIB_SMART_REPEAT; k < LIB_SMART_N; k++) {
+            CHECK(library_list(sl, LIB_SMART, k, &sm) == 0);
+            library_list_free(&sm);
+        }
+        library_played(sl, u[0], 1, now);                 /* u0: skipped early twice */
+        library_played(sl, u[0], 1, now);
+        library_played(sl, u[1], 0, now - 3600);          /* u1: played 3 times this month, u2 once */
+        library_played(sl, u[1], 0, now - 86400);
+        library_played(sl, u[1], 0, now - 10 * 86400);
+        library_played(sl, u[2], 0, now);
+        library_played(sl, u[3], 0, now - 100 * 86400);   /* u3: last played 100 days ago */
+        library_set_favourite(sl, u[4], 1);               /* u4: a favourite never played; u2 one played today */
+        library_set_favourite(sl, u[2], 1);
+        CHECK(library_list(sl, LIB_SMART, LIB_SMART_NEVER, &sm) == N - 4 && sm.ids[0] == u[4]);
+        library_list_free(&sm);
+        CHECK(library_list(sl, LIB_SMART, LIB_SMART_SKIPPED, &sm) == 1 && sm.ids[0] == u[0]);
+        library_list_free(&sm);
+        CHECK(library_list(sl, LIB_SMART, LIB_SMART_REPEAT, &sm) == 1 && sm.ids[0] == u[1]);
+        library_list_free(&sm);
+        CHECK(library_list(sl, LIB_SMART, LIB_SMART_NOT_HEARD, &sm) == 1 && sm.ids[0] == u[3]);
+        library_list_free(&sm);
+        CHECK(library_list(sl, LIB_SMART, LIB_SMART_FORGOTTEN, &sm) == 1 && sm.ids[0] == u[4]);
+        library_list_free(&sm);
+        /* plays more than a year old fall out of the log (and of On repeat's window anyway) */
+        library_played(sl, u[5], 0, now - 400 * 86400);
+        library_played(sl, u[5], 0, now - 399 * 86400);
+        library_played(sl, u[5], 0, now);
+        CHECK(library_list(sl, LIB_SMART, LIB_SMART_REPEAT, &sm) == 1 && sm.ids[0] == u[1]);
+        library_list_free(&sm);
+        CHECK(library_list(sl, LIB_SMART, 0, &sm) == -1 && library_list(sl, LIB_SMART, LIB_SMART_N, &sm) == -1);
+        CHECK(!strcmp(library_smart_name(LIB_SMART_REPEAT), "On repeat") && !strcmp(library_smart_name(99), ""));
+        library_close(sl);
+        /* a library from before the play log (schema 5, no plays table): the
+         * next open adds it, and plays are logged from then on */
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(db2, &raw) == SQLITE_OK &&
+              sqlite3_exec(raw, "DROP TABLE plays; PRAGMA user_version=5;", NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(raw);
+        sl = library_open(db2, art2);
+        CHECK(sl != NULL);
+        library_played(sl, u[2], 0, now);
+        CHECK(library_list(sl, LIB_SMART, LIB_SMART_REPEAT, &sm) == 0);   /* (one play logged: not yet) */
+        library_list_free(&sm);
+        library_played(sl, u[2], 0, now);
+        CHECK(library_list(sl, LIB_SMART, LIB_SMART_REPEAT, &sm) == 1 && sm.ids[0] == u[2]);
+        library_list_free(&sm);
+        library_list_free(&st);
+        library_list_free(&al);
+        library_close(sl);
+    }
 
     /* rescans: nothing changed (no rebuild), a file added, then removed again */
     CHECK(library_scan(lib, music, NULL, NULL) == N && library_scan_changes(lib) == 0);

@@ -170,12 +170,11 @@ static int64_t sim_cf_download(const char *url, const char *path, http_progress_
     return out && total ? (int64_t)total : -1;
 }
 /* What's new, as a release's whatsnew.txt gives it (the screenshots; About's row) */
-#define SIM_WHATS_NEW_VERSION "v0.13.0"
-#define SIM_WHATS_NEW "Crossfeed, for listening on headphones\n" \
-                      "Shuffle an album or an artist from its menu\n" \
-                      "Radio, skipping and Wi-Fi respond faster\n" \
-                      "No backlight flicker at low brightness\n" \
-                      "Fixes for podcasts and covers\n"
+#define SIM_WHATS_NEW_VERSION "v0.14.0"
+#define SIM_WHATS_NEW "Smart playlists that keep themselves up to date\n" \
+                      "Shuffle any playlist, album or artist from its menu\n" \
+                      "A dimmer logo while the H2 starts\n" \
+                      "Fixes for radio after starting, podcasts and moving items\n"
 static int sim_pod_opml(char *path, size_t cap)
 {
     snprintf(path, cap, "build/sim-data/podcasts/subscriptions.opml");
@@ -490,11 +489,12 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                                           "about", "update", "updatelatest", "updatefailed", "updateprogress",
                                           "updateready", "updateinstall", "battery", "battery7", "batterysince",
                                           "batteryhistory", "uninstall", "uninstallchecking", "uninstallfailed",
-                                          "uninstallnone", "uninstallpending", "homeupdate", "askupdate", "askignore", "askinstall", "eqedit", "eqband",
+                                          "uninstallnone", "uninstallpending", "homeupdate", "askupdate", "askignore", "askinstall", "askinstallwn", "eqedit", "eqband",
                                           "themesnew", "themeedit", "themecolours", "themecolour", "themesave",
                                           "podcasts", "podshow", "podsearch", "podnp", "podchapters", "podmenu", "podsettings",
                                           "libsettings", "libhelp", "xfhelp", "whatsnew", "whatsnewend", "aboutwn", "covermenu", "covermenuown", "coverfind",
-                                          "albummenu", "artistmenu", "aartistmenu"};
+                                          "albummenu", "artistmenu", "aartistmenu", "homemove",
+                                          "smartlists", "smartopen", "smartmenu"};
     static const char *const slug[] = {"studio-mint", "studio-ember", "studio-pastel", "pixel-pastel"};
     for (int t = 0; t < 4 && t < g_n_themes; t++) {   /* the built-in themes */
         ui_set_theme(t);
@@ -575,18 +575,20 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                     if (!strcmp(st[k].name, screens[s])) g_sim_uni = st[k].u;
                 ui_show("uninstall");
             } else if (!strcmp(screens[s], "homeupdate") || !strcmp(screens[s], "askupdate") ||
-                       !strcmp(screens[s], "askignore") || !strcmp(screens[s], "askinstall")) {
+                       !strcmp(screens[s], "askignore") || !strncmp(screens[s], "askinstall", 10)) {
                 /* a newer version found by the check: first on Home, and its page
                  * (the update's stand-in back at rest: its progress screen takes the keys) */
                 g_sim_upd.state = UI_UPD_IDLE;
                 ui_update_changed();
                 settings_set("update.found", "v0.11.0");
                 settings_set("update.ignored", "");
+                /* "askinstallwn": as a release has it, What's new in About first */
+                if (!strcmp(screens[s], "askinstallwn")) ui_set_whats_new(SIM_WHATS_NEW_VERSION, SIM_WHATS_NEW, 0);
                 ui_show("home");
                 for (int k = 0; k < 12; k++) ui_key(UI_KEY_UP);   /* the top: the entry */
                 ui_key(!strcmp(screens[s], "homeupdate") ? UI_KEY_DOWN : UI_KEY_OK);
                 if (!strcmp(screens[s], "askignore")) ui_key(UI_KEY_DOWN), ui_key(UI_KEY_OK);   /* Ignore: Home, without it */
-                if (!strcmp(screens[s], "askinstall")) ui_key(UI_KEY_OK);   /* Install: About > Updates */
+                if (!strncmp(screens[s], "askinstall", 10)) ui_key(UI_KEY_OK);   /* Install: About > Updates */
                 ui_set_theme(t);                            /* (the slide finished) */
                 settings_set("update.found", "");
             } else if (!strncmp(screens[s], "whatsnew", 8)) {   /* after an update: the release's points (and turned to the end) */
@@ -596,6 +598,13 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
             } else if (!strcmp(screens[s], "aboutwn")) {  /* Settings > About, its What's new row */
                 ui_set_whats_new(SIM_WHATS_NEW_VERSION, SIM_WHATS_NEW, 0);
                 ui_show("about");
+            } else if (!strcmp(screens[s], "homemove")) {  /* Settings > Home: Menu > Move, two down (the pill with it) */
+                ui_show("homeedit");
+                ui_key(UI_KEY_MENU);
+                ui_key(UI_KEY_OK);
+                ui_key(UI_KEY_DOWN);
+                ui_key(UI_KEY_DOWN);
+                ui_set_theme(t);                            /* (the pill's slide finished) */
             } else if (!strcmp(screens[s], "xfhelp")) {   /* Menu on Sound > Crossfeed: its help */
                 ui_show("sound");
                 ui_key(UI_KEY_DOWN);
@@ -632,7 +641,13 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 ui_update_changed();
             }
             if (!strncmp(screens[s], "whatsnew", 8)) ui_key(UI_KEY_BACK);   /* (put away: Back) */
-            if (!strncmp(screens[s], "whatsnew", 8) || !strcmp(screens[s], "aboutwn")) ui_set_whats_new("", "", 0);
+            if (!strcmp(screens[s], "homemove")) {          /* (back where it was, and done) */
+                ui_key(UI_KEY_UP);
+                ui_key(UI_KEY_UP);
+                ui_key(UI_KEY_OK);
+            }
+            if (!strncmp(screens[s], "whatsnew", 8) || !strcmp(screens[s], "aboutwn") || !strcmp(screens[s], "askinstallwn"))
+                ui_set_whats_new("", "", 0);
             if (!strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp"))   /* (gone before the next screens) */
                 for (uint32_t c = 0; c < lv_obj_get_child_count(lv_layer_top()); c++)
                     lv_obj_add_flag(lv_obj_get_child(lv_layer_top(), (int32_t)c), LV_OBJ_FLAG_HIDDEN);

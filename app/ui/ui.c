@@ -90,6 +90,10 @@ static int home_hidden_by_default(int h) { return h == H_COMPOSERS || h == H_YEA
 #define H_UPDATE H_N
 #define UPDATE_ICON 0xf703
 #define PODCAST_ICON 0xe000   /* drawn into the icon font: tools/fonts/add_podcast_icon.py */
+/* Playlists: a smart playlist's icon, sparkles (Tabler, copied into the icon
+ * font), and Pixel Pastel's own after the update's; yours have Home's playlist */
+#define SMART_ICON 0xf6d7
+#define PIXEL_SMART (H_N + 1)
 static const uint32_t HOME_ICON[H_N] = {0xed46, 0xf000, 0xeb1c, 0xea90, 0xef2c, 0xebf2,
                                         0xeafc, 0xeec0, 0xeabe, 0xf7c5, 0xebea, 0xef2d, 0xeb20,
                                         0xf1f6, 0xee8b, 0xea53, 0xeaad,    /* category, feather, calendar, folder */
@@ -189,7 +193,9 @@ typedef enum {
     L_CONTEXT, L_INFO, L_QUEUE, L_PICK_PLAYLIST, L_SEARCH, L_RENAME, L_USB_ASK, L_WIFI_ASK, L_RADIO,
     /* Home > Radio > Find stations: its menu, genres, countries, a list of stations, search by name */
     L_RDIR, L_RDIR_GENRES, L_RDIR_COUNTRIES, L_RDIR_RESULTS, L_RDIR_SEARCH, L_PODCASTS, L_POD_SHOW, L_POD_SEARCH, L_POD_CHAPTERS,
-    L_UPDATE, L_BATTERY, L_BAT_SPAN, L_BAT_HISTORY, L_UNINSTALL, L_UPD_ASK, L_COVER_FIND, L_PLACEHOLDER
+    L_UPDATE, L_BATTERY, L_BAT_SPAN, L_BAT_HISTORY, L_UNINSTALL, L_UPD_ASK, L_COVER_FIND,
+    L_SMART_TRACKS,   /* a smart playlist's songs (parent: LIB_SMART_*) */
+    L_PLACEHOLDER
 } list_kind_t;
 
 typedef struct {
@@ -257,6 +263,7 @@ static struct {
     ctx_action_t ctx[12]; int ctx_n;
     int64_t ctx_track, ctx_album, ctx_artist, ctx_playlist;
     int ctx_credited;                         /* ctx_artist from Artists (credited), not Album artists */
+    int smart_n[LIB_SMART_N];                 /* Playlists: each smart playlist's songs, as last opened */
     int ctx_qidx;           /* queue row the menu is for, -1 if none */
     int ctx_plpos;          /* row in your own playlist the menu is for, -1 if none */
     lib_list_t pick_ids;    /* "Add to playlist": the tracks to add */
@@ -423,7 +430,8 @@ static struct {
     int pod_ctx;                              /* the episode (or show) a menu is for */
     char pod_ctx_key[13], pod_ctx_url[512];   /* ...which (found again when the lists are read again) */
     uint32_t pod_del_armed;
-    struct { char id[13], key[13]; uint32_t pos, len, saved; } pod_play;   /* the episode playing: kept on the card */
+    struct { char id[13], key[13]; uint32_t pos, len, saved; int marked; } pod_play;   /* the episode playing: kept on the card
+                                                                                 (marked: Mark as played on it, which its saves keep) */
     uint32_t pod_auto_at;
     pod_chapter_t pod_ch[64]; int pod_nch;    /* the episode playing's chapters */
     char pod_ch_key[13];
@@ -546,14 +554,15 @@ static int library_backed(list_kind_t k)
            k == L_PLAYLISTS || k == L_PLAYLIST_TRACKS || k == L_FAVOURITES || k == L_RECENT_ADDED ||
            k == L_RECENT_PLAYED || k == L_MOST_PLAYED || k == L_GENRES || k == L_GENRE_ALBUMS ||
            k == L_COMPOSERS || k == L_COMPOSER_ALBUMS || k == L_COMPOSER_TRACKS || k == L_YEARS ||
-           k == L_YEAR_ALBUMS || k == L_FOLDER;
+           k == L_YEAR_ALBUMS || k == L_FOLDER || k == L_SMART_TRACKS;
 }
 
 /* Lists of songs (play from the chosen one) and lists of albums (open one). */
 static int is_track_list(list_kind_t k)
 {
     return k == L_TRACKS || k == L_SONGS || k == L_PLAYLIST_TRACKS || k == L_FAVOURITES ||
-           k == L_RECENT_PLAYED || k == L_MOST_PLAYED || k == L_CREDIT_TRACKS || k == L_COMPOSER_TRACKS;
+           k == L_RECENT_PLAYED || k == L_MOST_PLAYED || k == L_CREDIT_TRACKS || k == L_COMPOSER_TRACKS ||
+           k == L_SMART_TRACKS;
 }
 
 static int is_album_list(list_kind_t k)
@@ -586,6 +595,7 @@ static lib_view_t view_of(list_kind_t k)
     case L_YEARS: return LIB_YEARS;
     case L_YEAR_ALBUMS: return LIB_YEAR_ALBUMS;
     case L_FOLDER: return LIB_FOLDER;
+    case L_SMART_TRACKS: return LIB_SMART;
     default: return LIB_SONGS;
     }
 }
@@ -2455,6 +2465,11 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
     main[0] = meta[0] = '\0';
     if (library_backed(l->kind)) {
         int64_t id = l->items.ids[i];
+        if (l->kind == L_PLAYLISTS && id < 0) {          /* a smart playlist: its name, how many songs */
+            snprintf(main, mn, "%s", tr(library_smart_name((int)-id)));
+            snprintf(meta, tn, "%d", S.smart_n[-id < LIB_SMART_N ? -id : 0]);
+            return;
+        }
         if (S.lib) library_row(S.lib, view_of(l->kind), id, main, mn, meta, tn);
         if (covers_in(l->kind) && !(album_artists_on() && library_row_shows_artist(view_of(l->kind))))
             meta[0] = '\0';   /* (the cover takes the year's or length's place) */
@@ -3389,8 +3404,15 @@ static void fill_slots(const level_t *l, int n)
          * while music plays, the equalizer (or dot) takes its place, centred in
          * the icons' column */
         int hid = l->kind == L_HOME ? S.home[i] : l->kind == L_HOME_EDIT ? S.home_order[i] : -1;
-        int pix = hid >= 0 && T()->icons_pixel;
-        int glyph = hid >= 0 && !pix && S.f->icon;
+        uint32_t cp = hid < 0 ? 0 : hid == H_UPDATE ? UPDATE_ICON : HOME_ICON[hid];
+        int pic = hid;
+        if (l->kind == L_PLAYLISTS && i < l->items.n) {      /* Playlists: smart ones apart from yours */
+            int smart = l->items.ids[i] < 0;
+            cp = smart ? SMART_ICON : HOME_ICON[H_PLAYLISTS];
+            pic = smart ? PIXEL_SMART : H_PLAYLISTS;
+        }
+        int pix = pic >= 0 && T()->icons_pixel;
+        int glyph = pic >= 0 && !pix && S.f->icon;
         int col = pix || glyph;
         for (int k = 0; k < 3; k++) {          /* three bars, 11 px across */
             show(S.row_eq[j][k], eq);
@@ -3401,12 +3423,12 @@ static void fill_slots(const level_t *l, int n)
         show(S.row_picon[j], pix && !playing);
         if (glyph && !playing) {
             char u[5];
-            utf8_of(hid == H_UPDATE ? UPDATE_ICON : HOME_ICON[hid], u);
+            utf8_of(cp, u);
             set_text(S.row_icon[j], u);
             if (lv_obj_get_style_x(S.row_icon[j], 0) != x) lv_obj_set_x(S.row_icon[j], x);
         }
         if (pix && !playing) {
-            const lv_image_dsc_t *img = pixel_icon(hid);
+            const lv_image_dsc_t *img = pixel_icon(pic);
             if (lv_image_get_src(S.row_picon[j]) != img) lv_image_set_src(S.row_picon[j], img);
             int px = x + (ICON_W - PIXEL_ICON_GRID * PIXEL_ICON_SCALE) / 2;
             if (lv_obj_get_style_x(S.row_picon[j], 0) != px) lv_obj_set_x(S.row_picon[j], px);
@@ -3549,6 +3571,7 @@ static void render_list(render_mode_t mode)
         const char *msg = l->kind == L_QUEUE ? "Nothing queued after this track"
                         : l->kind == L_PLAYLISTS ? "No playlists in the music folder"
                         : l->kind == L_PLAYLIST_TRACKS ? "None of these songs are on the card"
+                        : l->kind == L_SMART_TRACKS ? "Nothing here now"
                         : l->kind == L_FAVOURITES ? "No favourites yet: Menu on a song"
                         : l->kind == L_RECENT_PLAYED || l->kind == L_MOST_PLAYED ? "Nothing played yet"
                         : l->kind == L_BAT_HISTORY ? "No time on battery yet"
@@ -4731,6 +4754,30 @@ static void render(render_mode_t mode)
 
 /* ---------- navigation ---------- */
 
+/* Playlists: the smart ones that have songs (as -LIB_SMART_*), then yours */
+static void playlists_load(level_t *l)
+{
+    library_list_free(&l->items);
+    if (!S.lib) return;
+    lib_list_t yours;
+    if (library_list(S.lib, LIB_PLAYLISTS, 0, &yours) < 0) memset(&yours, 0, sizeof yours);
+    int64_t *ids = malloc((size_t)(yours.n + LIB_SMART_N) * sizeof *ids);
+    if (!ids) { l->items = yours; return; }
+    int n = 0;
+    for (int k = 1; k < LIB_SMART_N; k++) {
+        lib_list_t t;
+        S.smart_n[k] = library_list(S.lib, LIB_SMART, k, &t);
+        library_list_free(&t);
+        if (S.smart_n[k] > 0) ids[n++] = -k;
+    }
+    if (yours.n) memcpy(ids + n, yours.ids, (size_t)yours.n * sizeof *ids);
+    n += yours.n;
+    library_list_free(&yours);
+    l->items.view = LIB_PLAYLISTS;
+    l->items.ids = ids;
+    l->items.n = n;
+}
+
 static void push_as(list_kind_t kind, const char *title, int64_t parent, int ui)
 {
     if (S.depth >= (int)(sizeof S.stack / sizeof S.stack[0])) return;
@@ -4750,7 +4797,8 @@ static void push_as(list_kind_t kind, const char *title, int64_t parent, int ui)
     l->title_ui = ui;
     l->parent = parent;
     if (kind == L_CREDIT_TRACKS || kind == L_COMPOSER_TRACKS) return;   /* push_*_tracks() fills it */
-    if (library_backed(kind) && S.lib) library_list(S.lib, view_of(kind), parent, &l->items);
+    if (kind == L_PLAYLISTS) playlists_load(l);
+    else if (library_backed(kind) && S.lib) library_list(S.lib, view_of(kind), parent, &l->items);
     if (kind == L_THEMES) l->sel = S.cur_theme;
     if (kind == L_EQ) {                    /* the profiles on the card, now; the current one selected */
         S.eq_n = S.hooks.eq_list ? S.hooks.eq_list(S.eq_names, 64) : 0;
@@ -5084,6 +5132,7 @@ static void open_quick(void)
 static int subject_tracks(lib_list_t *out)
 {
     memset(out, 0, sizeof *out);
+    if (S.ctx_playlist < 0) return library_list(S.lib, LIB_SMART, -S.ctx_playlist, out);
     if (S.ctx_playlist) return library_list(S.lib, LIB_PLAYLIST_TRACKS, S.ctx_playlist, out);
     if (S.ctx_track) {
         out->ids = malloc(sizeof *out->ids);
@@ -5338,6 +5387,10 @@ static int pod_net(void)
 static void pod_save_play(int played)
 {
     if (!S.pod_play.key[0] || !pod_dir()[0]) return;
+    if (S.pod_play.marked && !played) {          /* marked played as it plays: the card has it so */
+        S.pod_play.saved = S.pod_play.pos;
+        return;
+    }
     pod_state_t st = {0};
     snprintf(st.key, sizeof st.key, "%s", S.pod_play.key);
     st.len_ms = S.pod_play.len;
@@ -5373,6 +5426,7 @@ static int pod_track(void)
         snprintf(S.pod_play.id, sizeof S.pod_play.id, "%s", e->id);
         snprintf(S.pod_play.key, sizeof S.pod_play.key, "%s", e->key);
         S.pod_play.saved = pos;
+        S.pod_play.marked = 0;
     }
     S.pod_play.pos = pos;
     if (len) S.pod_play.len = len;
@@ -5692,9 +5746,12 @@ static int open_context(void)
         return -1;
     }
 
-    if (S.ctx_playlist) {
+    if (S.ctx_playlist < 0) {                        /* a smart one: Fathom keeps it */
+        snprintf(title, sizeof title, "%s", tr(library_smart_name((int)-S.ctx_playlist)));
+        CTX_ADD(CTX_PLAY); CTX_ADD(CTX_SHUFFLE); CTX_ADD(CTX_PLAY_NEXT); CTX_ADD(CTX_ADD_QUEUE); CTX_ADD(CTX_ADD_PLAYLIST);
+    } else if (S.ctx_playlist) {
         library_playlist_name(S.lib, S.ctx_playlist, title, sizeof title);
-        CTX_ADD(CTX_PLAY); CTX_ADD(CTX_PLAY_NEXT); CTX_ADD(CTX_ADD_QUEUE); CTX_ADD(CTX_ADD_PLAYLIST);
+        CTX_ADD(CTX_PLAY); CTX_ADD(CTX_SHUFFLE); CTX_ADD(CTX_PLAY_NEXT); CTX_ADD(CTX_ADD_QUEUE); CTX_ADD(CTX_ADD_PLAYLIST);
         if (library_playlist_writable(S.lib, S.ctx_playlist)) { CTX_ADD(CTX_PL_RENAME); CTX_ADD(CTX_PL_DELETE); }
     } else if (S.ctx_track) {
         lib_track_t t;
@@ -5883,11 +5940,13 @@ static void run_context(ctx_action_t a)
         library_list_free(&tr);
         break;
     }
-    case CTX_SHUFFLE: {                           /* an album's songs, or an artist's */
-        int n = album ? library_list(S.lib, LIB_ALBUM_TRACKS, album, &tr)
+    case CTX_SHUFFLE: {                           /* a playlist's songs, an album's, or an artist's */
+        int pl = S.ctx_playlist != 0;
+        int n = pl ? subject_tracks(&tr)
+              : album ? library_list(S.lib, LIB_ALBUM_TRACKS, album, &tr)
                       : library_artist_tracks(S.lib, artist, S.ctx_credited, &tr);
         pop_level(1);
-        if (n > 0 && S.player && player_shuffle_these(S.player, tr.ids, tr.n, album != 0)) S.now_playing_view = 1;
+        if (n > 0 && S.player && player_shuffle_these(S.player, tr.ids, tr.n, pl || album != 0)) S.now_playing_view = 1;
         else ui_toast("Nothing to shuffle", 1500);
         library_list_free(&tr);
         break;
@@ -6092,6 +6151,13 @@ static void run_context(ctx_action_t a)
             st.played = a == CTX_POD_PLAYED;
             st.played_at = st.played ? (int64_t)time(NULL) : 0;
             st.pos_ms = 0;
+            /* the one playing: it plays on, and its position saves keep the mark
+             * (else the next, within 15 s, undid it); not played: saved again */
+            if (!strcmp(S.pod_play.key, e->key) && !strcmp(S.pod_play.id, id)) {
+                S.pod_play.marked = st.played;
+                if (!st.played) st.pos_ms = S.pod_play.pos;
+                S.pod_play.saved = S.pod_play.pos;
+            }
             pod_state_put(pod_dir(), id, &st);
             pod_read_episodes();
         }
@@ -6118,8 +6184,7 @@ static void run_context(ctx_action_t a)
         if (library_playlist_delete(S.lib, victim) == 0) {
             level_t *l = &S.stack[S.depth - 1];
             if (l->kind == L_PLAYLISTS) {
-                library_list_free(&l->items);
-                library_list(S.lib, LIB_PLAYLISTS, 0, &l->items);
+                playlists_load(l);
                 if (l->sel >= l->items.n) l->sel = l->items.n ? l->items.n - 1 : 0;
             }
             ui_toast("Playlist deleted", 1500);
@@ -6469,8 +6534,9 @@ static void open_selected(void)
             S.stack[S.depth - 1].sel = SET_ABOUT;
             push_ui(L_ABOUT, "About", 0);
             level_t *a = &S.stack[S.depth - 1];
-            list_count(a);                          /* (the device's rows: about_n) */
-            a->sel = S.about_n;                     /* Check for updates */
+            int rows = list_count(a);               /* (the device's rows: about_n) */
+            for (int r = 0; r < rows; r++)          /* Check for updates (What's new may come first) */
+                if (about_row(r) == AB_CHECK) { a->sel = r; break; }
             open_selected();
         } else {
             const char *tag = update_offered();
@@ -6496,13 +6562,15 @@ static void open_selected(void)
         break;
     }
     case L_PLAYLISTS:
-        if (id >= 0 && library_playlist_name(S.lib, id, name, sizeof name) == 0) push(L_PLAYLIST_TRACKS, name, id);
+        if (id < 0 && -id < LIB_SMART_N) push(L_SMART_TRACKS, tr(library_smart_name((int)-id)), -id);
+        else if (id >= 0 && library_playlist_name(S.lib, id, name, sizeof name) == 0) push(L_PLAYLIST_TRACKS, name, id);
         break;
     case L_TRACKS:
     case L_CREDIT_TRACKS:
     case L_COMPOSER_TRACKS:
     case L_SONGS:
     case L_PLAYLIST_TRACKS:
+    case L_SMART_TRACKS:
     case L_FAVOURITES:
     case L_RECENT_PLAYED:
     case L_MOST_PLAYED:
@@ -6945,6 +7013,7 @@ void ui_library_changed(void)
         library_list_free(&l->items);
         if (l->kind == L_CREDIT_TRACKS) library_list_credit_tracks(S.lib, l->parent, l->parent2, &l->items);
         else if (l->kind == L_COMPOSER_TRACKS) library_list_composer_tracks(S.lib, l->parent, l->parent2, &l->items);
+        else if (l->kind == L_PLAYLISTS) playlists_load(l);
         else library_list(S.lib, view_of(l->kind), l->parent, &l->items);
         int sel = l->sel < l->items.n ? l->sel : (l->items.n ? l->items.n - 1 : 0);
         for (int i = 0; i < l->items.n; i++)
@@ -7196,10 +7265,7 @@ void ui_key(ui_key_t k)
                 else if (S.entry[0] && library_playlist_rename(S.lib, S.rename_id, S.entry) == 0) {
                     pop();
                     level_t *up = &S.stack[S.depth - 1];   /* show the new name */
-                    if (up->kind == L_PLAYLISTS) {
-                        library_list_free(&up->items);
-                        library_list(S.lib, LIB_PLAYLISTS, 0, &up->items);
-                    }
+                    if (up->kind == L_PLAYLISTS) playlists_load(up);
                     ui_toast("Playlist renamed", 1500);
                 } else {
                     ui_toast(S.entry[0] ? "Can't rename the playlist" : "Type a name first", 1500);
@@ -7247,7 +7313,7 @@ void ui_key(ui_key_t k)
         } else if (k == UI_KEY_OK || k == UI_KEY_BACK) {
             S.moving = 0;
         }
-        render(R_CONTENT);
+        render(R_ANIMATE);                 /* (the pill goes with the item) */
         return;
     }
     if (S.moving && l->kind == L_HOME_EDIT) {   /* moving a Home item with the wheel */
@@ -7261,7 +7327,7 @@ void ui_key(ui_key_t k)
         } else if (k == UI_KEY_OK || k == UI_KEY_BACK) {
             S.moving = 0;
         }
-        render(R_CONTENT);
+        render(R_ANIMATE);                 /* (the pill goes with the item) */
         return;
     }
     if (S.moving && l->kind == L_QUEUE) {   /* moving a queued track with the wheel */
@@ -7271,7 +7337,7 @@ void ui_key(ui_key_t k)
         case UI_KEY_OK: case UI_KEY_BACK: S.moving = 0; break;
         default: break;
         }
-        render(R_CONTENT);
+        render(R_ANIMATE);                 /* (the pill goes with the item) */
         return;
     }
     if (S.editing && (l->kind == L_THEME_EDIT || l->kind == L_THEME_COLOURS)) {   /* a theme's value, with the wheel */
@@ -7427,15 +7493,23 @@ void ui_show(const char *what)
         if (!strcmp(what, "tracks") && l->items.n && S.lib &&
             library_album_name(S.lib, l->items.ids[l->sel], name, sizeof name) == 0)
             push(L_TRACKS, name, l->items.ids[l->sel]);
-    } else if (!strcmp(what, "playlists") || !strcmp(what, "playlist")) {
+    } else if (!strcmp(what, "playlists") || !strcmp(what, "playlist") || !strncmp(what, "smart", 5)) {
+        /* Playlists: the third of yours ("playlists"), opened ("playlist"); the
+         * first smart one ("smartlists"), opened ("smartopen"), its menu ("smartmenu") */
         S.stack[0].sel = home_index(H_PLAYLISTS);
         push_ui(L_PLAYLISTS, "Playlists", 0);
         level_t *l = &S.stack[S.depth - 1];
-        l->sel = l->items.n > 2 ? 2 : 0;
+        int first = 0;
+        while (first < l->items.n && l->items.ids[first] < 0) first++;   /* (the smart ones first) */
+        int smart = !strncmp(what, "smart", 5);
+        l->sel = smart ? 0 : first + 2 < l->items.n ? first + 2 : first;
         char name[128];
-        if (!strcmp(what, "playlist") && l->items.n && S.lib &&
+        if (!strcmp(what, "playlist") && l->sel < l->items.n && S.lib &&
             library_playlist_name(S.lib, l->items.ids[l->sel], name, sizeof name) == 0)
             push(L_PLAYLIST_TRACKS, name, l->items.ids[l->sel]);
+        if (!strcmp(what, "smartopen") && l->items.n && l->items.ids[0] < 0)
+            push(L_SMART_TRACKS, tr(library_smart_name((int)-l->items.ids[0])), -l->items.ids[0]);
+        if (!strcmp(what, "smartmenu")) open_context();
     } else if (!strcmp(what, "share")) {
         S.stack[0].sel = home_index(H_SETTINGS);
         push_ui(L_SETTINGS, "Settings", 0);
