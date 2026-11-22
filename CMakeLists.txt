@@ -23,6 +23,8 @@ add_library(fathom_core STATIC
   app/core/intern.c
   app/core/lang.c
   app/core/batlog.c
+  app/core/datetime.c
+  app/core/tz.c
   app/library/keys.c
   app/shuffle/shuffle.c
   app/ui/theme.c)
@@ -40,6 +42,7 @@ add_library(fathom_player STATIC
   app/net/podcast.c
   app/net/podsync.c
   app/net/coverfind.c
+  app/net/netclock.c
   app/net/sha256.c
   app/net/unzip.c
   app/net/update.c
@@ -318,6 +321,28 @@ if(MBEDTLS_FOUND AND FFMPEG_FOUND AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     -Wl,--wrap=mbedtls_x509_crt_parse_file -Wl,--wrap=mbedtls_x509_crt_free)
   add_test(NAME tls_wrap COMMAND test_tls_wrap WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
+# The clock and HTTPS (app/net/netclock.c): the Date header and the year check; where
+# mbedTLS is installed, its HTTPS request too, against a server of its own (tests/tls)
+add_executable(test_netclock tests/test_netclock.c app/net/netclock.c app/core/datetime.c)
+target_include_directories(test_netclock PRIVATE app tests)
+target_compile_options(test_netclock PRIVATE ${FATHOM_WARNINGS})
+if(MBEDTLS_FOUND)
+  target_compile_definitions(test_netclock PRIVATE FATHOM_HAVE_MBEDTLS)
+  target_link_libraries(test_netclock PRIVATE PkgConfig::MBEDTLS pthread)
+endif()
+add_test(NAME netclock COMMAND test_netclock WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# Setting the clock by hand: a date and time a field at a time (app/core/datetime.c)
+add_executable(test_datetime tests/test_datetime.c)
+target_link_libraries(test_datetime PRIVATE fathom_core)
+target_compile_options(test_datetime PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME datetime COMMAND test_datetime)
+# Time zones for it (app/core/tz.c), against the C library's reading of the same rules
+add_executable(test_tz tests/test_tz.c)
+target_link_libraries(test_tz PRIVATE fathom_core)
+target_compile_options(test_tz PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME tz COMMAND test_tz)
+# The udhcpc hook that sets the clock by NTP, trying again while it gets no answer
+add_test(NAME fathom_ntp COMMAND sh tests/test_fathom_ntp.sh WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 # HiBy's update files, for Uninstall Fathom: read, check, mark the bootloader, undo
 add_executable(test_hibyupt tests/test_hibyupt.c app/sys/hibyupt.c app/sys/md5.c app/sys/uninstall.c)
 target_include_directories(test_hibyupt PRIVATE app)

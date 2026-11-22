@@ -56,6 +56,8 @@ add_executable(fathom-player
   ${ROOT}/app/core/settings.c
   ${ROOT}/app/core/lang.c
   ${ROOT}/app/core/batlog.c
+  ${ROOT}/app/core/datetime.c
+  ${ROOT}/app/core/tz.c
   ${ROOT}/app/core/intern.c
   ${ROOT}/app/library/keys.c
   ${ROOT}/app/library/tags.c
@@ -77,6 +79,7 @@ add_executable(fathom-player
   ${ROOT}/app/net/podcast.c
   ${ROOT}/app/net/podsync.c
   ${ROOT}/app/net/coverfind.c
+  ${ROOT}/app/net/netclock.c
   ${ROOT}/app/net/sha256.c
   ${ROOT}/app/net/unzip.c
   ${ROOT}/app/net/update.c
@@ -129,7 +132,7 @@ set_property(SOURCE main.c bt.c wifi.c share.c ssh.c shell.c tlscert.c radiometa
   ${ROOT}/app/library/tags.c ${ROOT}/app/library/cue.c ${ROOT}/app/library/playlist.c
   ${ROOT}/app/shuffle/shuffle.c
   ${ROOT}/app/net/http.c ${ROOT}/app/net/json.c ${ROOT}/app/net/radiodir.c
-  ${ROOT}/app/net/podcast.c ${ROOT}/app/net/podsync.c ${ROOT}/app/net/coverfind.c
+  ${ROOT}/app/net/podcast.c ${ROOT}/app/net/podsync.c ${ROOT}/app/net/coverfind.c ${ROOT}/app/net/netclock.c
   ${ROOT}/app/net/unzip.c ${ROOT}/app/net/update.c
   ${ROOT}/app/player/player.c ${ROOT}/app/player/radio.c ${ROOT}/app/player/rfmeta.c
   ${ROOT}/app/ui/theme.c ${ROOT}/app/ui/fonts.c ${ROOT}/app/ui/assets.c ${ROOT}/app/ui/ui.c

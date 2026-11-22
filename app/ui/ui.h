@@ -225,6 +225,9 @@ typedef struct {
                         "added terms, no warranty. " \
                         "Licence: fathom/LICENSE."
     int  (*about)(int i, char *label, size_t lc, char *value, size_t vc);
+    /* About > Clock, set by hand (Date and time): t is seconds since 1970, UTC.
+     * 0 once it's set (and kept for the next start). NULL: not settable here. */
+    int  (*clock_set)(int64_t t);
     /* About > Check for updates (NULL hides it). update_do: UI_UPD_CHECK (ask
      * GitHub), UI_UPD_START (download, check and unpack the release offered),
      * UI_UPD_CANCEL, UI_UPD_INSTALL (then the H2 restarts). The device says

@@ -14,13 +14,14 @@
 #include "net/http.h"
 #include "net/json.h"
 
-/* The directory's servers (its mirror list, https://api.radio-browser.info),
- * tried in turn from the one that answered last; all.api is the project's
- * round-robin name for whichever are up. A name that no longer exists fails
- * at once (DNS); one that doesn't answer costs http_get's timeout. */
+/* The directory's servers, tried in turn from the one that answered last.
+ * all.api is the project's own round-robin name for whichever servers are up
+ * (https://api.radio-browser.info), so it comes first: a list of named ones
+ * goes stale (fi1 and nl1 no longer existed by 2026-11, each costing a failed
+ * lookup before an answer). The two named ones that were still up follow, in
+ * case all.api's answer is the one that's down. */
 static const char *const SERVERS[] = {
-    "de1.api.radio-browser.info", "de2.api.radio-browser.info", "fi1.api.radio-browser.info",
-    "nl1.api.radio-browser.info", "all.api.radio-browser.info",
+    "all.api.radio-browser.info", "de1.api.radio-browser.info", "de2.api.radio-browser.info",
 };
 #define N_SERVERS ((int)(sizeof SERVERS / sizeof SERVERS[0]))
 
@@ -301,8 +302,8 @@ static int first_server(void)
     pthread_mutex_lock(&mu);
     int s = g_server;
     pthread_mutex_unlock(&mu);
-    /* none has answered yet: start with one of the named mirrors, at random, to share the load */
-    return s >= 0 ? s : (int)(time(NULL) % 2);
+    /* none has answered yet: all.api (it shares the load across the servers itself) */
+    return s >= 0 ? s : 0;
 }
 
 static void *job_run(void *arg)

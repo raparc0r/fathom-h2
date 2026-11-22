@@ -30,6 +30,7 @@
 #include <unistd.h>
 
 #include "net/http.h"
+#include "net/netclock.h"
 #include "net/update.h"
 
 #define ANSWER_MAX (64 << 10)        /* GitHub's answer for 0.7.0: 8 KB, most of it the notes */
@@ -127,7 +128,7 @@ static void *check_thread(void *arg)
     }
     snprintf(U.st.latest, sizeof U.st.latest, "%s", r.tag);
     if (U.abort) U.st.state = UI_UPD_IDLE;
-    else if (n < 0) fail_locked(UPDATE_ERR_NET, NULL);
+    else if (n < 0) fail_locked(UPDATE_ERR_NET, netclock_unset() ? netclock_why(NULL) : NULL);   /* (HTTPS needs the date: asked for) */
     else if (n == 0) fail_locked(UPDATE_ERR_ANSWER, NULL);
     else if (r.tag[0] && !update_is_newer(r.tag, U.st.current)) U.st.state = UI_UPD_LATEST;
     else if (parsed) fail_locked(UPDATE_ERR_ANSWER, NULL);   /* newer, but nothing to install */

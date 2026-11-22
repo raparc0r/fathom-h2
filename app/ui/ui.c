@@ -15,6 +15,8 @@
 #include "ui/ui.h"
 #include "core/lang.h"
 #include "core/settings.h"
+#include "core/datetime.h"
+#include "core/tz.h"
 #include "library/cue.h"
 #include "library/playlist.h"
 #include "core/rng.h"
@@ -22,6 +24,7 @@
 #include "net/podcast.h"
 #include "net/podsync.h"
 #include "net/coverfind.h"
+#include "net/netclock.h"
 
 #include <math.h>
 #include <stddef.h>
@@ -323,6 +326,8 @@ static struct {
     int about_n, help_shown;
     uint32_t about_at;
     char about_lbl[ABOUT_MAX][32], about_val[ABOUT_MAX][48];
+    dt_t clk;               /* About > Clock: the date and time being set */
+    lv_obj_t *clk_ov;       /* ...on its own screen, over everything */
     /* "Turn on Wi-Fi?" answered Turn on: what to do once it connects, if
      * the screen it was asked from is still there (wifi_then_run) */
     struct {
@@ -1556,8 +1561,11 @@ static void fmt_full(char *b, size_t n, int h10)
     else snprintf(b, n, "\xe2\x80\x93");             /* (too little to say) */
 }
 
-/* A span's day: Today, Yesterday, 16 Nov (UTC, as About's clock); without a
- * clock ever set, how many days back */
+/* The time zone times are shown in (About > Clock: clock.tz; UTC unless chosen) */
+static int ui_zone(void) { return tz_find(settings_get("clock.tz", "UTC")); }
+
+/* A span's day: Today, Yesterday, 16 Nov (in the time zone, as About's
+ * clock); without a clock ever set, how many days back */
 static void bat_day(char *b, size_t n, int64_t t)
 {
     int64_t now = S.bat.t1;
@@ -1568,16 +1576,17 @@ static void bat_day(char *b, size_t n, int64_t t)
         else tr_num(b, n, "%s days ago", d);
         return;
     }
-    long dn = (long)(now / 86400), dt = (long)(t / 86400);
+    int z = ui_zone();
+    int64_t lnow = tz_to_local(z, now), lt = tz_to_local(z, t);
+    long dn = (long)(lnow / 86400), dt = (long)(lt / 86400);
     if (dt == dn) { snprintf(b, n, "%s", tr("Today")); return; }
     if (dt == dn - 1) { snprintf(b, n, "%s", tr("Yesterday")); return; }
     static const char *const MON[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-    time_t tt = (time_t)t;
-    struct tm tm;
-    gmtime_r(&tt, &tm);
+    dt_t d;
+    dt_split(lt, &d);
     char day[8];
-    snprintf(day, sizeof day, "%d", tm.tm_mday);
-    snprintf(b, n, "%s %s", day, tr(MON[tm.tm_mon]));
+    snprintf(day, sizeof day, "%d", d.day);
+    snprintf(b, n, "%s %s", day, tr(MON[(d.mon + 11) % 12]));
 }
 
 static const batspan_t *bat_cur(void)
@@ -1630,11 +1639,10 @@ static void battery_row(list_kind_t k, int i, char *main, size_t mn, char *meta,
             const batspan_t *x = &S.bat.span[i];
             bat_day(main, mn, x->start);
             if (S.bat.clock_ok) {                  /* (two on one day: when each began) */
-                time_t tt = (time_t)x->start;
-                struct tm tm;
-                gmtime_r(&tt, &tm);
+                dt_t at;
+                dt_split(tz_to_local(ui_zone(), x->start), &at);
                 size_t l = strlen(main);
-                snprintf(main + l, mn - l, ", %02d:%02d", tm.tm_hour, tm.tm_min);
+                snprintf(main + l, mn - l, ", %02d:%02d", at.hour, at.min);
             }
             fmt_dur(d, sizeof d, x->on_s);
             snprintf(m1, sizeof m1, "%d%s%d %%, %s", x->pct_start, dash, x->pct_end, d);
@@ -1712,21 +1720,20 @@ static void battery_labels(void)
     int lbl_y = BAT_GRAPH_H - lv_font_get_line_height(S.f->meta);   /* (the wider fonts are taller) */
     if (lbl_y < BAT_GY1 + 4) lbl_y = BAT_GY1 + 4;   /* (below the charging strip) */
     int64_t step = S.bat_days == 7 ? 86400 : 6 * 3600;
-    int64_t first = (t0 / step + 1) * step;
+    /* the marks at midnights (or every 6 hours) in the time zone: lt, at tt */
+    int z = S.bat.clock_ok ? ui_zone() : 0;
+    int64_t first = (tz_to_local(z, t0) / step + 1) * step;
     char b[32];
-    for (int64_t tt = first; tt < t1 && n < 8; tt += step) {
+    for (int64_t lt = first, tt = tz_to_utc(z, lt); tt < t1 && n < 8; lt += step, tt = tz_to_utc(z, lt)) {
         int x = BAT_GX0 + (int)((tt - t0) * BATREP_COLS / span);
         lv_point_t sz;
         lv_text_get_size(&sz, "00:00", S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
         if (x + sz.x / 2 + 4 > last_x || x - sz.x / 2 < 2) continue;
         if (S.bat.clock_ok && S.bat_days == 7) {
             static const char *const WD[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-            time_t ttt = (time_t)tt;
-            struct tm tm;
-            gmtime_r(&ttt, &tm);
-            snprintf(b, sizeof b, "%s", tr(WD[tm.tm_wday]));
+            snprintf(b, sizeof b, "%s", tr(WD[(lt / 86400 + 4) % 7]));   /* (1970-01-01 was a Thursday) */
         } else if (S.bat.clock_ok) {
-            snprintf(b, sizeof b, "%02d:00", (int)((tt / 3600) % 24));
+            snprintf(b, sizeof b, "%02d:00", (int)((lt / 3600) % 24));
         } else {
             char ago[24];
             tr_num(ago, sizeof ago, S.bat_days == 7 ? "%s d" : "%s h",
@@ -2130,7 +2137,7 @@ static void pod_found_row(int i, char *main, size_t mn, char *meta, size_t tn, i
 {
     if (S.pod_nf <= 0) {
         snprintf(main, mn, "%s", tr(S.pod_search == 0 ? "Searching\xE2\x80\xA6"
-                                    : S.pod_search == -2 ? "Couldn't reach the directory" : "No podcasts found"));
+                                    : S.pod_search == -2 ? netclock_why("Couldn't reach the directory") : "No podcasts found"));
         return;
     }
     if (i >= S.pod_nf) return;
@@ -4609,7 +4616,9 @@ static const char *row_help(const level_t *l)
         case AB_CHECK: return "Check for a newer version of Fathom.";
         default:
             if (!strcmp(S.about_lbl[i], UI_ABOUT_CREDIT)) return UI_ABOUT_NOTICE;
-            if (!strcmp(S.about_lbl[i], "Clock")) return "Set from the internet over Wi-Fi. In UTC.";
+            if (!strcmp(S.about_lbl[i], "Clock"))
+                return S.hooks.clock_set ? "Set from the internet over Wi-Fi, or by hand: press Play. Your time zone is there too."
+                                         : "Set from the internet over Wi-Fi. In UTC.";
             if (!strcmp(S.about_lbl[i], "Charge cycles")) return "Battery wear, in full charges used.";
             return NULL;
         }
@@ -4924,6 +4933,8 @@ static int rd_ready(char *why, size_t cap)
 }
 
 #define RD_UNREACHABLE "Couldn't reach the station directory. Play tries again"
+/* (an HTTPS request that failed: the clock, while it isn't set, netclock.h) */
+#define RD_FAILED_WHY() netclock_why(RD_UNREACHABLE)
 
 /* Ask for the list on top: stations for q, or (NULL) the countries. */
 static void rd_ask(const rdir_query_t *q)
@@ -5010,7 +5021,7 @@ static void rd_random_done(rdir_result_t *r)
     /* the directory didn't answer (Wi-Fi is on: it was asked): one of your own stations, at random */
     S.radio_n = S.hooks.radio_stations ? S.hooks.radio_stations(S.radio, RADIO_MAX) : -1;
     radio_station_t *mix = S.radio_n > 0 ? malloc((size_t)S.radio_n * sizeof *mix) : NULL;
-    if (!mix) { ui_toast("Couldn't reach the station directory", 2500); return; }
+    if (!mix) { ui_toast(netclock_why("Couldn't reach the station directory"), 2500); return; }
     static rng_t rng;
     static int seeded;
     if (!seeded) { rng_seed(&rng, rng_os_seed(), 11); seeded = 1; }
@@ -5023,7 +5034,7 @@ static void rd_random_done(rdir_result_t *r)
     }
     player_radio_play(S.player, mix, S.radio_n, 0);
     free(mix);
-    ui_toast("Couldn't reach the directory: one of your stations", 3000);
+    ui_toast(netclock_why("Couldn't reach the directory: one of your stations"), 3000);
     rd_to_np();
 }
 
@@ -5047,7 +5058,7 @@ static void rd_list_done(rdir_result_t *r, int depth)
     }
     if (r->n < 0) {
         S.rd_state = RD_FAILED;
-        snprintf(S.rd_msg, sizeof S.rd_msg, "%s", RD_UNREACHABLE);
+        snprintf(S.rd_msg, sizeof S.rd_msg, "%s", RD_FAILED_WHY());
     }
     int n = list_count(l);
     if (l->sel >= n) l->sel = n ? n - 1 : 0;
@@ -5932,7 +5943,7 @@ static int cf_poll(void)
     if (b.seq != S.cf_batch_seq) {
         if (S.cf_batch_seq || b.seq > 1 || !b.running) {
             char msg[160];
-            if (b.failed && !b.done) snprintf(msg, sizeof msg, "%s", tr("Couldn't reach MusicBrainz or Apple"));
+            if (b.failed && !b.done) snprintf(msg, sizeof msg, "%s", tr(netclock_why("Couldn't reach MusicBrainz or Apple")));
             else if (b.total == 0) snprintf(msg, sizeof msg, "%s", tr("No covers to look for"));
             else {
                 char f[48], u[48], z[48];
@@ -6398,6 +6409,220 @@ static void setting_ok(setting_t st)
     }
 }
 
+/* ---- About > Clock, set by hand: Date and time, on a screen of its own ----
+ * The date and time on one row, 2026 Nov 22 18:05, in the time zone below it
+ * (its offset from UTC over the row). The wheel goes from field to field, the
+ * zone last; Play on one changes it (arrows over and under it): the wheel then
+ * changes its value, Play (or Back) keeps it. Back leaves, setting the clock
+ * to what the row shows if a field was changed, and keeping the zone if it
+ * was. A zone chosen before the time is changed shows the same moment in it;
+ * after, the time typed is taken as that zone's. The H2's clock stays in UTC
+ * (clock.tz only changes how it's shown); seconds start at :00. NTP or an
+ * HTTPS answer sets it again when Wi-Fi can (device/main.c). */
+enum { CK_ZONE = DT_FIELDS };          /* the places the wheel goes: the fields, then the zone */
+static struct {
+    int cur, editing;
+    int zone, zone0;                   /* the zone shown, and as it was (clock.tz) */
+    int typed;                         /* a field of the date or time changed */
+    lv_obj_t *field[DT_FIELDS], *val[DT_FIELDS], *zfield, *zlbl, *offs, *up, *down, *hint;
+} CK;
+static const char *const CK_MON[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+static void clock_close(void)
+{
+    if (S.clk_ov) lv_obj_delete(S.clk_ov);
+    S.clk_ov = NULL;
+}
+
+/* The clock now, as it reads in the zone shown (or 2026-01-01 while it isn't set) */
+static void clock_now(void)
+{
+    int64_t now = (int64_t)time(NULL);
+    dt_from_time(netclock_unset_at(now) ? 0 : tz_to_local(CK.zone, now), &S.clk);
+}
+
+/* The fields' values */
+static void clock_update_values(void)
+{
+    const dt_t *d = &S.clk;
+    char v[16];
+    snprintf(v, sizeof v, "%d", d->year);
+    lv_label_set_text(CK.val[DT_YEAR], v);
+    lv_label_set_text(CK.val[DT_MONTH], tr(CK_MON[(d->mon + 11) % 12]));
+    snprintf(v, sizeof v, "%d", d->day);
+    lv_label_set_text(CK.val[DT_DAY], v);
+    snprintf(v, sizeof v, "%02d", d->hour);
+    lv_label_set_text(CK.val[DT_HOUR], v);
+    snprintf(v, sizeof v, "%02d", d->min);
+    lv_label_set_text(CK.val[DT_MIN], v);
+}
+
+/* ...the zone, which one is chosen, and whether it's being changed */
+static void clock_update(void)
+{
+    if (!S.clk_ov) return;
+    const theme_t *t = T();
+    clock_update_values();
+    lv_label_set_text(CK.zlbl, TZ_ZONES[CK.zone].name);
+    char o[16];
+    tz_offset_text(CK.zone, tz_to_utc(CK.zone, dt_to_time(&S.clk)), o, sizeof o);
+    lv_label_set_text(CK.offs, o);
+    for (int i = 0; i <= CK_ZONE; i++) {
+        lv_obj_t *b = i < CK_ZONE ? CK.field[i] : CK.zfield, *l = i < CK_ZONE ? CK.val[i] : CK.zlbl;
+        int on = CK.cur == i;
+        fill(b, on ? t->select_bg : t->surface);
+        lv_obj_set_style_text_color(l, C(on ? t->select_fg : t->text), 0);
+    }
+    lv_obj_update_layout(S.clk_ov);
+    show(CK.up, CK.editing);
+    show(CK.down, CK.editing);
+    if (CK.editing) {
+        lv_obj_t *b = CK.cur < CK_ZONE ? CK.field[CK.cur] : CK.zfield;
+        lv_obj_align_to(CK.up, b, LV_ALIGN_OUT_TOP_MID, 0, -2);
+        lv_obj_align_to(CK.down, b, LV_ALIGN_OUT_BOTTOM_MID, 0, 2);
+    }
+    lv_label_set_text(CK.hint, tr(CK.editing ? "Turn to change, Play to keep it" : "Turn to choose, Play to change. Back when done"));
+}
+
+static void clock_open(void)
+{
+    clock_close();
+    CK.cur = DT_YEAR;
+    CK.editing = CK.typed = 0;
+    CK.zone = CK.zone0 = tz_find(settings_get("clock.tz", "UTC"));
+    clock_now();
+    const theme_t *t = T();
+    int radius = t->corner == THEME_CORNER_ROUND ? (t->radius < 8 ? t->radius : 8) : 0;
+    S.clk_ov = box(lv_layer_top(), 0, 0, UI_W, UI_H);
+    fill(S.clk_ov, t->bg);
+    lv_obj_t *title = lv_label_create(S.clk_ov);
+    style_label(title, S.f->title, t->text);
+    lv_label_set_text(title, tr("Date and time"));
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+    CK.offs = lv_label_create(S.clk_ov);                 /* the zone's offset: UTC+1 */
+    style_label(CK.offs, S.f->meta, t->text_muted);
+    lv_obj_set_width(CK.offs, UI_W);
+    lv_obj_set_style_text_align(CK.offs, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(CK.offs, LV_ALIGN_TOP_MID, 0, 42);
+    /* the row: year month day  hours:minutes */
+    lv_obj_t *row = box(S.clk_ov, 0, 84, UI_W, 44);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 5, 0);
+    for (int i = 0; i < DT_FIELDS; i++) {
+        if (i == DT_HOUR) box(row, 0, 0, 6, 1);       /* (a wider gap between the date and the time) */
+        if (i == DT_MIN) {                             /* hours:minutes */
+            lv_obj_t *colon = lv_label_create(row);
+            style_label(colon, S.f->title, t->text);
+            lv_label_set_text(colon, ":");
+        }
+        CK.field[i] = box(row, 0, 0, LV_SIZE_CONTENT, 40);
+        lv_obj_set_style_pad_hor(CK.field[i], 7, 0);
+        lv_obj_set_style_radius(CK.field[i], radius, 0);
+        CK.val[i] = lv_label_create(CK.field[i]);
+        style_label(CK.val[i], S.f->title, t->text);
+        lv_obj_center(CK.val[i]);
+    }
+    /* a wide font (Pixel's): closer together, then smaller, to fit the screen */
+    for (int pass = 0; pass < 2; pass++) {
+        clock_update_values();
+        lv_obj_update_layout(row);
+        int32_t w = 0;
+        for (uint32_t c = 0; c < lv_obj_get_child_count(row); c++) w += lv_obj_get_width(lv_obj_get_child(row, (int32_t)c));
+        w += (int32_t)(lv_obj_get_child_count(row) - 1) * lv_obj_get_style_pad_column(row, 0);
+        if (w <= UI_W - 12) break;
+        lv_obj_set_style_pad_column(row, 2, 0);
+        for (int i = 0; i < DT_FIELDS; i++) {
+            lv_obj_set_style_pad_hor(CK.field[i], 4, 0);
+            if (pass) style_label(CK.val[i], S.f->body, t->text);
+        }
+    }
+    /* the time zone */
+    CK.zfield = box(S.clk_ov, 0, 0, LV_SIZE_CONTENT, 38);
+    lv_obj_set_style_min_width(CK.zfield, 180, 0);
+    lv_obj_set_style_pad_hor(CK.zfield, 14, 0);
+    lv_obj_set_style_radius(CK.zfield, radius, 0);
+    lv_obj_align(CK.zfield, LV_ALIGN_TOP_MID, 0, 148);
+    CK.zlbl = lv_label_create(CK.zfield);
+    style_label(CK.zlbl, S.f->body, t->text);
+    lv_obj_center(CK.zlbl);
+    CK.up = lv_label_create(S.clk_ov);
+    CK.down = lv_label_create(S.clk_ov);
+    style_label(CK.up, &lv_font_montserrat_14, t->select_bg);
+    style_label(CK.down, &lv_font_montserrat_14, t->select_bg);
+    lv_label_set_text(CK.up, LV_SYMBOL_UP);
+    lv_label_set_text(CK.down, LV_SYMBOL_DOWN);
+    CK.hint = lv_label_create(S.clk_ov);
+    style_label(CK.hint, S.f->meta, t->text_muted);
+    lv_obj_set_width(CK.hint, UI_W - 24);
+    lv_obj_set_style_text_align(CK.hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(CK.hint, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_move_background(S.clk_ov);                 /* toasts and the volume bar stay over it */
+    clock_update();
+}
+
+/* Back: the clock set to what's shown if a field was changed, the zone kept if it was */
+static void clock_leave(void)
+{
+    int zoned = CK.zone != CK.zone0;
+    if (CK.typed) {
+        if (!S.hooks.clock_set || S.hooks.clock_set(tz_to_utc(CK.zone, dt_to_time(&S.clk)))) {
+            ui_toast("Couldn't set the clock", 2500);
+            return;                                    /* (still here: Back again to leave it) */
+        }
+    }
+    if (zoned) {
+        settings_set("clock.tz", TZ_ZONES[CK.zone].name);
+        settings_save();
+    }
+    clock_close();
+    S.about_at = 0;                                    /* (About shows the new time) */
+    if (CK.typed) ui_toast("Clock set", 1500);
+    else if (zoned) ui_toast("Time zone set", 1500);
+    render(R_CONTENT);
+    CK.typed = 0;
+    CK.zone0 = CK.zone;
+}
+
+/* A key while it's up: 1 if it was the clock's. */
+static int clock_key(ui_key_t k)
+{
+    switch (k) {
+    case UI_KEY_PLAY: case UI_KEY_PREV: case UI_KEY_NEXT: case UI_KEY_SEEK_BACK: case UI_KEY_SEEK_FWD:
+    case UI_KEY_BRIGHTER: case UI_KEY_DIMMER:
+        return 0;                                      /* the music's and the screen's, as anywhere */
+    case UI_KEY_UP:
+    case UI_KEY_DOWN: {
+        int d = k == UI_KEY_DOWN ? 1 : -1;
+        if (!CK.editing) {
+            CK.cur = CK.cur + d < 0 ? 0 : CK.cur + d > CK_ZONE ? CK_ZONE : CK.cur + d;
+        } else if (CK.cur < CK_ZONE) {
+            dt_adjust(&S.clk, CK.cur, d);
+            CK.typed = 1;
+        } else {
+            int n = tz_count();
+            CK.zone = (CK.zone + d + n) % n;
+            if (!CK.typed) clock_now();                /* (the same moment, in that zone) */
+        }
+        break;
+    }
+    case UI_KEY_OK:
+        CK.editing = !CK.editing;
+        break;
+    case UI_KEY_BACK:
+    case UI_KEY_BACK_LONG:
+        if (CK.editing) {
+            CK.editing = 0;                            /* (kept, as Play) */
+            break;
+        }
+        clock_leave();
+        return 1;
+    default: break;
+    }
+    clock_update();
+    return 1;
+}
+
 static void open_selected(void)
 {
     level_t *l = &S.stack[S.depth - 1];
@@ -6707,7 +6932,9 @@ static void open_selected(void)
         break;
     }
     case L_ABOUT:
-        if (about_row(l->sel) == AB_WHATSNEW) {
+        if (about_row(l->sel) == AB_INFO && !strcmp(S.about_lbl[l->sel], "Clock") && S.hooks.clock_set) {
+            clock_open();
+        } else if (about_row(l->sel) == AB_WHATSNEW) {
             whats_new_open();
         } else if (about_row(l->sel) == AB_CHECK) {    /* Check for updates: from here, or */
             if (wifi_ask_if_off(WT_OK)) break;
@@ -7169,6 +7396,7 @@ void ui_key(ui_key_t k)
     if (S.upd_ov && update_overlay_key(k)) return;
     if (S.wn_ov && whats_new_key(k)) return;
     if (S.uni_ov && uninstall_overlay_key(k)) return;
+    if (S.clk_ov && clock_key(k)) return;
     /* keys that do the same thing everywhere */
     switch (k) {
     case UI_KEY_PLAY: if (pl) player_toggle_pause(pl); render(R_CONTENT); return;
@@ -7521,6 +7749,7 @@ int ui_list_state(int *sel, int *n, int *home_edit)
 
 void ui_show(const char *what)
 {
+    clock_close();
     S.scrubbing = 0;
     finish_transition();
     pending_free();
@@ -7574,6 +7803,17 @@ void ui_show(const char *what)
         l->sel = S.about_n;                         /* Check for updates (or what follows) */
         if (!strcmp(what, "update")) push_ui(L_UPDATE, "Updates", 0);
         ui_update_changed();
+    } else if (!strcmp(what, "clockset")) {         /* About > Clock, set by hand: on the day */
+        S.stack[0].sel = home_index(H_SETTINGS);
+        push_ui(L_SETTINGS, "Settings", 0);
+        S.stack[S.depth - 1].sel = SET_ABOUT;
+        push_ui(L_ABOUT, "About", 0);
+        clock_open();
+        CK.zone = tz_find("Paris, Berlin");
+        S.clk = (dt_t){2026, 11, 22, 18, 5};          /* the day being changed */
+        clock_key(UI_KEY_DOWN);
+        clock_key(UI_KEY_DOWN);
+        clock_key(UI_KEY_OK);
     } else if (!strcmp(what, "eqedit") || !strcmp(what, "eqband")) {
         /* the EQ editor on a profile, its curve over it: the 8.9 kHz band selected,
          * or its own page with the gain being turned up */

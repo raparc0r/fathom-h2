@@ -23,7 +23,7 @@ SOURCES = ['app/ui/ui.c', 'app/net/radiodir.c', 'device/main.c', 'device/bt.c', 
            'device/share.c', 'device/ssh.c']
 # Sources whose other strings are SQL, logs or file formats: only the texts on
 # a line that translates (or, in the updater, says why an update failed)
-TR_ONLY = ['app/library/library.c', 'app/net/update.c', 'device/updater.c', 'app/sys/hibyupt.c', 'app/sys/uninstall.c']
+TR_ONLY = ['app/library/library.c', 'app/net/update.c', 'app/net/netclock.c', 'device/updater.c', 'app/sys/hibyupt.c', 'app/sys/uninstall.c']
 TRANSLATES = re.compile(r'\b(tr|tr_fill|tr_num|N_|fail_locked)\(')
 PRINTF = re.compile(r'%[-+ #0]*\d*(\.\d+)?(hh|h|ll|l|z)?[diouxXeEfgGcp%\[]')
 LITERAL = re.compile(r'"((?:[^"\\\n]|\\.)*)"')

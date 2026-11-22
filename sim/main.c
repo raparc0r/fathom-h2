@@ -27,6 +27,8 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "core/datetime.h"
+#include "core/tz.h"
 #include "core/lang.h"
 #include "core/settings.h"
 #include "audio/engine.h"
@@ -418,15 +420,35 @@ static int sim_battery_report(batrep_t *rep, int days)
 }
 
 /* About's first rows, as on the H2 (the rest is the device's) */
+/* The clock as set in About > Clock (0: not set, as on a new H2; the
+ * computer's own clock is left alone) */
+static int64_t g_sim_clock;
+
+static int sim_clock_set(int64_t t)
+{
+    g_sim_clock = t;
+    return 0;
+}
+
 static int sim_about(int i, char *label, size_t lc, char *value, size_t vc)
 {
-    if (i > 1) return -1;
+    if (i > 2) return -1;
+    if (i == 2) {
+        snprintf(label, lc, "Clock");
+        int z = tz_find(settings_get("clock.tz", "UTC"));   /* (as the device shows it) */
+        dt_t t;
+        static const char *const MON[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+        dt_split(tz_to_local(z, g_sim_clock), &t);
+        if (g_sim_clock) snprintf(value, vc, "%d %s %d, %02d:%02d%s", t.day, MON[(t.mon + 11) % 12], t.year, t.hour, t.min, z ? "" : " UTC");
+        else snprintf(value, vc, "Not set: Play sets it");
+        return 0;
+    }
     snprintf(label, lc, "%s", i == 0 ? UI_ABOUT_CREDIT : "Version");
     snprintf(value, vc, "%s", i == 0 ? "" : "v0.15.0");
     return 0;
 }
 
-static const ui_hooks_t g_hooks = {.about = sim_about, .fonts = ui_theme_fonts, .icon = ui_theme_icon, .radio_stations = sim_radio,
+static const ui_hooks_t g_hooks = {.about = sim_about, .clock_set = sim_clock_set, .fonts = ui_theme_fonts, .icon = ui_theme_icon, .radio_stations = sim_radio,
                                    .radio_add = sim_radio_add, .radio_remove = sim_radio_remove,
                                    .share_state = sim_share_state, .share_do = sim_share_do,
                                    .ssh_state = sim_ssh_state, .ssh_do = sim_ssh_do,
@@ -494,9 +516,9 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                                           "usbask", "wifiask", "interface", "usbdrive", "scrub", "sound", "radio", "radionp", "share", "ssh", "toast", "abouthelp", "genres", "folders", "folder", "years", "homeend", "homeall", "signal", "purenp",
                                           "rdir", "rdirgenres", "rdirresults", "rdirbusy", "rdircountries", "rdirsearch",
                                           "rdirctx", "rdirerror", "rdirnp", "rdirnpmenu", "rdirrandom",
-                                          "about", "update", "updatelatest", "updatefailed", "updateprogress",
+                                          "about", "clockset", "clockdone", "update", "updatelatest", "updatefailed", "updateprogress",
                                           "updateready", "updateinstall", "battery", "battery7", "batterysince",
-                                          "batteryhistory", "uninstall", "uninstallchecking", "uninstallfailed",
+                                          "batteryhistory", "battery7-tokyo", "batteryhistory-tokyo", "uninstall", "uninstallchecking", "uninstallfailed",
                                           "uninstallnone", "uninstallpending", "homeupdate", "askupdate", "askignore", "askinstall", "askinstallwn", "eqedit", "eqband",
                                           "themesnew", "themeedit", "themecolours", "themecolour", "themesave",
                                           "podcasts", "podshow", "podsearch", "podnp", "podchapters", "podmenu", "podsettings",
@@ -628,6 +650,63 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
             } else if (!strncmp(screens[s], "cv-", 3)) {   /* Covers in lists: Albums, songs (then back) */
                 settings_set_int("display.covers", 3);
                 ui_show(screens[s] + 3);
+            } else if (!strcmp(screens[s], "clockdone")) {   /* About > Clock set by hand, with the keys: checked */
+                g_sim_clock = 0;
+                settings_set("clock.tz", "UTC");
+                int64_t t0 = (int64_t)time(NULL);       /* (where it starts: the computer's clock) */
+                ui_show("about");                       /* (on Check for updates: the Clock row is above) */
+                static const ui_key_t keys[] = {
+                    UI_KEY_UP, UI_KEY_OK,               /* Date and time, from the clock as it is, in UTC */
+                    UI_KEY_BACK,                        /* left at once: nothing set */
+                    UI_KEY_OK,
+                    UI_KEY_OK, UI_KEY_DOWN, UI_KEY_OK,  /* the year: one on */
+                    UI_KEY_DOWN, UI_KEY_OK, UI_KEY_UP, UI_KEY_BACK,   /* the month: one back (Back keeps it) */
+                    UI_KEY_DOWN, UI_KEY_OK, UI_KEY_UP, UI_KEY_OK,     /* the day: one back */
+                    UI_KEY_DOWN, UI_KEY_OK, UI_KEY_DOWN, UI_KEY_DOWN, UI_KEY_OK,   /* the hours: two on */
+                    UI_KEY_DOWN, UI_KEY_OK, UI_KEY_UP, UI_KEY_OK,     /* the minutes: one back */
+                    UI_KEY_DOWN, UI_KEY_DOWN, UI_KEY_OK, UI_KEY_DOWN, UI_KEY_DOWN, UI_KEY_OK,   /* the zone: two on (no further) */
+                    UI_KEY_BACK};                       /* left: set, the time typed taken as that zone's */
+                int left = 1;
+                for (size_t q = 0; q < sizeof keys / sizeof keys[0]; q++) {
+                    ui_key(keys[q]);
+                    if (q == 2) left = g_sim_clock == 0;
+                }
+                int64_t t1 = (int64_t)time(NULL), want[2];
+                int zone = tz_find(TZ_ZONES[2].name);   /* (UTC, then two on) */
+                for (int w = 0; w < 2; w++) {           /* (the minute may have turned meanwhile) */
+                    dt_t dt;
+                    dt_from_time(w ? t1 : t0, &dt);
+                    dt_adjust(&dt, DT_YEAR, 1);
+                    dt_adjust(&dt, DT_MONTH, -1);
+                    dt_adjust(&dt, DT_DAY, -1);
+                    dt_adjust(&dt, DT_HOUR, 1);
+                    dt_adjust(&dt, DT_HOUR, 1);
+                    dt_adjust(&dt, DT_MIN, -1);
+                    want[w] = tz_to_utc(zone, dt_to_time(&dt));
+                }
+                if (!left || (g_sim_clock != want[0] && g_sim_clock != want[1]) ||
+                    strcmp(settings_get("clock.tz", ""), TZ_ZONES[2].name)) {
+                    fprintf(stderr, "clock set by hand: %lld in %s, expected %lld in %s (left unset first: %d)\n",
+                            (long long)g_sim_clock, settings_get("clock.tz", ""), (long long)want[0], TZ_ZONES[2].name, left);
+                    return 1;
+                }
+                /* a zone alone: the clock left as it is */
+                int64_t before = g_sim_clock;
+                ui_show("about");
+                static const ui_key_t zkeys[] = {UI_KEY_UP, UI_KEY_OK, UI_KEY_DOWN, UI_KEY_DOWN, UI_KEY_DOWN, UI_KEY_DOWN,
+                                                 UI_KEY_DOWN, UI_KEY_OK, UI_KEY_UP, UI_KEY_OK, UI_KEY_BACK};
+                for (size_t q = 0; q < sizeof zkeys / sizeof zkeys[0]; q++) ui_key(zkeys[q]);
+                if (g_sim_clock != before || strcmp(settings_get("clock.tz", ""), TZ_ZONES[1].name)) {
+                    fprintf(stderr, "a time zone alone: clock %lld (was %lld), zone %s, expected %s\n", (long long)g_sim_clock,
+                            (long long)before, settings_get("clock.tz", ""), TZ_ZONES[1].name);
+                    return 1;
+                }
+                ui_show("about");                       /* (its Clock row: the time set, in that zone) */
+            } else if (strstr(screens[s], "-tokyo")) {   /* in a time zone (UTC+9): its days and hours */
+                char base[32];
+                snprintf(base, sizeof base, "%.*s", (int)(strstr(screens[s], "-tokyo") - screens[s]), screens[s]);
+                settings_set("clock.tz", "Tokyo, Seoul");
+                ui_show(base);
             } else if (!strcmp(screens[s], "toast")) {    /* a long one: it wraps */
                 ui_show("ssh");
                 ui_toast("Over USB and Wi-Fi, with the password", 3000);
@@ -635,7 +714,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 ui_show(screens[s]);
             }
             int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp") ||
-                         !strncmp(screens[s], "whatsnew", 8) || !strcmp(screens[s], "abouthelp") ||
+                         !strncmp(screens[s], "whatsnew", 8) || !strcmp(screens[s], "abouthelp") || !strcmp(screens[s], "clockset") ||
                          (g_sim_upd.state >= UI_UPD_DOWNLOADING && g_sim_upd.state <= UI_UPD_RESTARTING) ||
                          !strcmp(screens[s], "uninstallpending") || !strcmp(screens[s], "uninstallnone");   /* (the update's progress screen) */
             lv_obj_t *what = on_top ? lv_layer_top() : lv_screen_active();
@@ -657,6 +736,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 ui_update_changed();
             }
             if (!strncmp(screens[s], "cv-", 3)) settings_set_int("display.covers", UI_COVERS_DEFAULT);
+            if (!strcmp(screens[s], "clockdone") || strstr(screens[s], "-tokyo")) settings_set("clock.tz", "UTC");
             if (!strncmp(screens[s], "whatsnew", 8)) ui_key(UI_KEY_BACK);   /* (put away: Back) */
             if (!strcmp(screens[s], "homemove")) {          /* (back where it was, and done) */
                 ui_key(UI_KEY_UP);
@@ -665,7 +745,8 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
             }
             if (!strncmp(screens[s], "whatsnew", 8) || !strcmp(screens[s], "aboutwn") || !strcmp(screens[s], "askinstallwn"))
                 ui_set_whats_new("", "", 0);
-            if (!strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp") || !strcmp(screens[s], "abouthelp"))   /* (gone before the next screens) */
+            if (!strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp") || !strcmp(screens[s], "abouthelp") ||
+                !strcmp(screens[s], "clockset"))   /* (gone before the next screens) */
                 for (uint32_t c = 0; c < lv_obj_get_child_count(lv_layer_top()); c++)
                     lv_obj_add_flag(lv_obj_get_child(lv_layer_top(), (int32_t)c), LV_OBJ_FLAG_HIDDEN);
             printf("%s\n", path);

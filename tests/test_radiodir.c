@@ -210,7 +210,7 @@ int main(void)
     fail_all = 1;
     calls = 0;
     CHECK(rdir_start(&q) == 0 && wait_done(&r) == 1 && r.n == -1 && !r.st);
-    CHECK(calls == 5);
+    CHECK(calls == 3);                            /* (all.api, de1, de2) */
     fail_all = 0;
 
     /* cancelled while it waits: the answer is dropped, the thread ends by itself */

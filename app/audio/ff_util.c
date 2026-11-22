@@ -120,8 +120,13 @@ void ff_set_ca_file(const char *path)
 
 /* Always checked: without the bundle nothing verifies, so HTTPS fails
  * rather than trusting whoever answers (updates are installed from it). */
+static void (*g_before_net)(void);
+
+void ff_set_before_net(void (*fn)(void)) { g_before_net = fn; }
+
 void ff_tls_options(AVDictionary **opt)
 {
+    if (g_before_net) g_before_net();
     if (g_ca_file[0]) av_dict_set(opt, "ca_file", g_ca_file, 0);
     av_dict_set(opt, "tls_verify", "1", 0);
 }

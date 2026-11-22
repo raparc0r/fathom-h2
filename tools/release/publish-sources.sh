@@ -26,8 +26,9 @@ gh api user --jq .login | grep -qx raparc0r || fail "the active gh account isn't
 if ! gh repo view "$repo" > /dev/null 2>&1; then
     printf 'Create the public repository %s? [y/N] ' "$repo"
     read -r a; [ "$a" = y ] || fail "stopped"
-    gh repo create "$repo" --public \
+    gh repo create "$repo" --public --add-readme \
         --description "Source of the third-party components in Fathom's releases (github.com/raparc0r/fathom-h2)"
+    # (--add-readme: GitHub makes no release in a repository without a commit)
 fi
 if ! gh release view "$tag" --repo "$repo" > /dev/null 2>&1; then
     printf 'Create its release "%s"? [y/N] ' "$tag"
@@ -44,13 +45,15 @@ if [ -n "$missing" ]; then
     printf 'Upload them? [y/N] '
     read -r a; [ "$a" = y ] || fail "stopped"
     tmp=$(mktemp -d)
+    # All in one container: docker/run.sh first chowns the whole cache, minutes
+    # each time (no terminal: binary)
+    docker/run.sh sh -c "cd /cache/fathom-sources && tar -cf - $(echo $missing)" < /dev/null | tar -xf - -C "$tmp"
     for n in $missing; do
-        docker/run.sh sh -c "cat /cache/fathom-sources/$n" < /dev/null > "$tmp/$n"   # (no terminal: binary)
         want=$(awk -v n="$n" '$1 == n {print $2}' "$list")
         [ "$(shasum -a 256 "$tmp/$n" | cut -c1-64)" = "$want" ] || fail "$n in the cache isn't the listed one: collect-sources.sh again"
-        gh release upload "$tag" "$tmp/$n" --repo "$repo"
-        rm -f "$tmp/$n"
     done
+    (cd "$tmp" && gh release upload "$tag" $missing --repo "$repo")
+    for n in $missing; do rm -f "$tmp/$n"; done
     rmdir "$tmp"
 fi
 

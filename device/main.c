@@ -43,8 +43,11 @@
 #include "core/lang.h"
 #include "core/batlog.h"
 #include "core/settings.h"
+#include "core/datetime.h"
+#include "core/tz.h"
 #include "core/lat.h"
 #include "net/dnscache.h"
+#include "net/netclock.h"
 #include "net/tls_wrap.h"
 #include "audio/mixer_alsa.h"
 #include "audio_route.h"
@@ -1263,9 +1266,123 @@ static void hook_ssh_do(int what)
     }
 }
 
+/* ---- the clock from HTTPS, where NTP gets no answer ----
+ * fathom-ntp (the udhcpc hook) keeps trying NTP while Wi-Fi is up, and counts
+ * the tries that got no answer in /var/run/fathom-ntp-fails. While the clock
+ * is plainly unset (before 2025) one is enough, else three: then the time is
+ * taken from an HTTPS answer of the update check's host instead (netclock.c,
+ * which says why its certificate's dates aren't checked), on a worker thread.
+ * Once for each new count, so no more often than NTP is tried (1, 5, 15, then
+ * every 30 minutes), until it has worked once. And at once when a secure
+ * connection has just failed for want of the time (netclock_want: Find
+ * stations, covers, the update check), at most every 30 s. */
+#define CLOCK_HOST "api.github.com"          /* (UPDATE_API's) */
+#define NTP_FAILS "/var/run/fathom-ntp-fails"
+static volatile int g_https_clock_busy;     /* a worker is asking */
+static volatile int g_https_clock_set;      /* it set the clock: for net_poll to keep */
+static volatile int g_https_clock_done;     /* it had an answer: not asked again */
+static volatile int g_clock_by_hand;        /* set in Settings since (it may be a little ahead) */
+
+/* The time from one HTTPS answer of CLOCK_HOST, set if later (netclock_take):
+ * the player's netclock fetcher, so one at a time (netclock_fetch, _ensure).
+ * Blocking, seconds: worker threads only. 0 if the clock is set after it. */
+static int clock_from_https(void)
+{
+    int64_t t = 0;
+    const char *ca = ff_ca_file();
+    if (!ca || netclock_https_date(CLOCK_HOST, 443, ca, &t) != 0) {
+        fprintf(stderr, "clock: no answer from %s\n", CLOCK_HOST);
+        return -1;
+    }
+    int64_t now = (int64_t)time(NULL);
+    if (netclock_take(t, now, g_clock_by_hand ? NETCLOCK_HAND_BACK : 0)) {
+        struct timeval tv = {(time_t)t, 0};
+        if (settimeofday(&tv, NULL)) { perror("settimeofday"); return -1; }
+        g_https_clock_set = g_https_clock_done = 1;
+        g_clock_by_hand = 0;
+    } else {
+        fprintf(stderr, "clock: %s's time (%lld) isn't later: kept\n", CLOCK_HOST, (long long)t);
+        g_https_clock_done = 1;              /* (the clock is fine as it is) */
+    }
+    return netclock_unset() ? -1 : 0;
+}
+
+static void *https_clock_thread(void *arg)
+{
+    (void)arg;
+    netclock_fetch();
+    g_https_clock_busy = 0;
+    return NULL;
+}
+
+/* Before every network connection (ff_set_before_net, on its thread): with
+ * the clock unset, the time first, then the connection, which then succeeds:
+ * Find stations, covers, podcasts, the update check, a station over https. */
+static void before_net(void)
+{
+    if (!netclock_unset() || !wifi_connected()) return;
+    fprintf(stderr, "clock: unset before a secure connection: asking %s first\n", CLOCK_HOST);
+    netclock_ensure();
+}
+
+static void https_clock_poll(void)
+{
+    static int last, ticks, asked_up;
+    static uint32_t asked_at, up_since;      /* (ms_now; 0: never, not up) */
+    if (g_https_clock_done || g_https_clock_busy || ++ticks % 10) return;   /* (every 5 s) */
+    /* a fresh install (no clock.last), say: still unset 10 s after Wi-Fi joined,
+     * NTP's first try not answered yet: asked then, once for each joining */
+    int up = wifi_connected();
+    if (!up) up_since = asked_up = 0;
+    else if (!up_since) up_since = ms_now() | 1;
+    int start = up && !asked_up && netclock_unset() && ms_now() - up_since >= 10000;
+    int want = netclock_wanted() && netclock_unset() &&
+               (!asked_at || ms_now() - asked_at >= 30000);   /* (a network that blocks it too: not hammered) */
+    int fails = 0;
+    FILE *f = fopen(NTP_FAILS, "re");
+    if (f) {
+        if (fscanf(f, "%d", &fails) != 1) fails = 0;
+        fclose(f);
+    }
+    if (fails < last) last = 0;              /* counting again (a new address) */
+    int ntp = fails != last && (fails >= 3 || (fails >= 1 && netclock_unset()));
+    if (!up || (!ntp && !want && !start)) return;
+    if (ntp) last = fails;
+    if (start) asked_up = 1;
+    asked_at = ms_now() | 1;
+    if (ntp) fprintf(stderr, "clock: no answer from NTP (%d): asking %s\n", fails, CLOCK_HOST);
+    else if (start) fprintf(stderr, "clock: unset 10 s after Wi-Fi joined: asking %s\n", CLOCK_HOST);
+    else fprintf(stderr, "clock: wanted for a secure connection: asking %s\n", CLOCK_HOST);
+    pthread_attr_t a;
+    pthread_t t;
+    pthread_attr_init(&a);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&a, 192 * 1024);
+    g_https_clock_busy = 1;
+    if (pthread_create(&t, &a, https_clock_thread, NULL)) g_https_clock_busy = 0;
+    pthread_attr_destroy(&a);
+}
+
+/* About > Clock, set by hand (UTC): kept for the next start at once. NTP, or
+ * an HTTPS answer (which may then move it back a day at most), sets it again
+ * when Wi-Fi can. */
+static int clock_set_by_hand(int64_t t)
+{
+    struct timeval tv = {(time_t)t, 0};
+    if (netclock_unset_at(t) || settimeofday(&tv, NULL)) { perror("settimeofday"); return -1; }
+    fprintf(stderr, "clock: set by hand\n");
+    clock_save();
+    settings_save();
+    if (g_batlog_on) batlog_clock_set(&g_batlog, time(NULL), mono_s());
+    g_clock_by_hand = 1;
+    g_https_clock_done = 0;                  /* (an HTTPS answer may set it right again) */
+    return 0;
+}
+
 /* Twice a second: the drive follows Wi-Fi; music copied to it (or moved,
  * deleted) is picked up once the copying has stopped for a while; and the
- * clock, when NTP has just set it (fathom-ntp), is kept for the next start. */
+ * clock, when NTP (fathom-ntp) or an HTTPS answer has just set it, is kept
+ * for the next start. */
 static int g_share_rescan;
 static volatile int g_scan_state;          /* (background scans, below) */
 static int g_usb_drive;
@@ -1288,12 +1405,15 @@ static void net_poll(lv_timer_t *t)
         sync();                         /* the scan reads the FAT directly */
         scan_start();
     }
-    if (!access("/var/run/fathom-clock", F_OK)) {
+    int by_https = g_https_clock_set;
+    g_https_clock_set = 0;
+    if (!access("/var/run/fathom-clock", F_OK) || by_https) {
         unlink("/var/run/fathom-clock");
-        fprintf(stderr, "clock: set by NTP\n");
+        fprintf(stderr, "clock: set by %s\n", by_https ? CLOCK_HOST "'s answer" : "NTP");
         clock_save();
         if (g_batlog_on) batlog_clock_set(&g_batlog, time(NULL), mono_s());   /* (how long it was off, known now) */
     }
+    https_clock_poll();
 }
 
 /* ---- updates (Settings > About > Check for updates) ----
@@ -2301,18 +2421,21 @@ static int about(int i, char *label, size_t lc, char *value, size_t vc)
         }
         return 0;
     }
-    case 5: {   /* set by the network (NTP) once Wi-Fi has connected; UTC */
-        time_t now = time(NULL);
-        struct tm tm;
+    case 5: {   /* set by the network (NTP, or an HTTPS answer) once Wi-Fi has connected, or by hand;
+                 * shown in the time zone chosen there (clock.tz), UTC by default */
+        int64_t now = (int64_t)time(NULL);
         snprintf(label, lc, "Clock");
-        if (now > 1735689600 && gmtime_r(&now, &tm)) {
+        if (!netclock_unset_at(now)) {
             static const char *const MON[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+            int z = tz_find(settings_get("clock.tz", "UTC"));
+            dt_t t;
+            dt_split(tz_to_local(z, now), &t);
             char d[8], date[48];
-            snprintf(d, sizeof d, "%d", tm.tm_mday);
-            snprintf(date, sizeof date, "%s %s", d, tr(MON[tm.tm_mon]));   /* (as the battery's days) */
-            snprintf(value, vc, "%s %d, %02d:%02d UTC", date, tm.tm_year + 1900, tm.tm_hour, tm.tm_min);
+            snprintf(d, sizeof d, "%d", t.day);
+            snprintf(date, sizeof date, "%s %s", d, tr(MON[(t.mon + 11) % 12]));   /* (as the battery's days) */
+            snprintf(value, vc, "%s %d, %02d:%02d%s", date, t.year, t.hour, t.min, z ? "" : " UTC");
         }
-        else snprintf(value, vc, "Not set: needs Wi-Fi");
+        else snprintf(value, vc, "Not set: Play sets it");   /* (or Wi-Fi) */
         return 0;
     }
     case 6: snprintf(label, lc, "Licence"); snprintf(value, vc, "GPL; fonts OFL"); return 0;
@@ -2555,6 +2678,8 @@ int main(int argc, char **argv)
     clock_restore();
     /* HTTPS (radio): certificates checked against the bundle on the card */
     ff_set_ca_file("/mnt/sd/fathom/share/ca-certificates.crt");
+    netclock_set_fetcher(clock_from_https);   /* (the time before a secure connection, when unset) */
+    ff_set_before_net(before_net);
 
     lv_init();
     lv_tick_set_cb(ms_now);
@@ -2673,6 +2798,7 @@ int main(int argc, char **argv)
         .battery_report = hook_battery_report,
         .languages = hook_languages, .language_set = hook_language_set,
         .rescan = rescan, .restart = restart_player, .usb_drive = usb_drive, .usb_dac = usb_dac_mode, .about = about,
+        .clock_set = clock_set_by_hand,
         .eq_list = hook_eq_list, .eq_set = hook_eq_set, .eq_get = hook_eq_get, .eq_put = hook_eq_put,
         .eq_preview = hook_eq_preview, .eq_remove = hook_eq_remove,
         .theme_save = hook_theme_save, .themes_reload = hook_themes_reload, .theme_remove = hook_theme_remove,

@@ -26,6 +26,10 @@ int ff_to_s32(const AVFrame *f, int channels, int32_t *out);
  * bundle) for every network fetch that gets ff_tls_options(), redirects
  * included. NULL or a missing file: not checked (the simulator, a card without it). */
 void ff_set_ca_file(const char *path);
+/* Called first by ff_tls_options(), so before every network connection (on
+ * the connecting thread, never the UI's): the player gets the time there when
+ * the clock isn't set, or every certificate would look out of date. NULL: none. */
+void ff_set_before_net(void (*fn)(void));
 void ff_tls_options(AVDictionary **opt);
 /* The bundle set, or NULL. (The player parses it once for all connections:
  * app/net/tls_wrap.c.) */

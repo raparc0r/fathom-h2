@@ -2,22 +2,76 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Additional terms under GPLv3 section 7: see LICENSE.
 #
-# The H2 has no running clock: each time Wi-Fi gets an address (bound, renew),
-# the time is fetched once by NTP (busybox ntpd -q: set, then exit), from the
-# network's own server when DHCP names one, else pool.ntp.org. The player keeps
-# it (clock.last) for the next start without Wi-Fi.
-case "$1" in bound|renew) ;; *) exit 0 ;; esac
+# The H2 has no running clock: when Wi-Fi gets an address (bound, renew), the
+# time is fetched by NTP (busybox ntpd -q: set, then exit), from the network's
+# own server when DHCP names one, else pool.ntp.org. The player keeps it
+# (clock.last) for the next start without Wi-Fi.
+#
+# Some networks answer NTP slowly or not at all (guest and school networks
+# often block it). Without the time, every HTTPS certificate looks out of date
+# and the radio directory, covers and updates all fail. So a try that gets no
+# answer is tried again, after 1, 5 and 15 minutes, then every 30, for as long
+# as Wi-Fi stays connected, and stops once the clock is set. One loop at a time
+# (this script again, "loop", in the background; $LOCK holds its pid): a new
+# address while it waits only wakes it (SIGUSR1) to try now; losing the address
+# (deconfig) ends it. The tries without an answer are counted in $FAILS: after
+# a few the player asks an HTTPS server the time instead (device/main.c).
+RUN=/var/run
+CARRIER=/sys/class/net/wlan0/carrier       # 1 while a network is joined
+LOCK=$RUN/fathom-ntp.lock                  # the loop's: its pid in $LOCK/pid
+PEERS=$RUN/fathom-ntp.peers                # the servers to ask, from the latest lease
+FAILS=$RUN/fathom-ntp-fails                # tries without an answer, so far
+WAITS="60 300 900 1800"                    # seconds before each next try (the last repeats)
+TRY=30                                     # seconds a try is given
+
+alive() { p=; read -r p 2>/dev/null < $LOCK/pid && [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+
+if [ "$1" = loop ]; then
+    mkdir $LOCK 2>/dev/null || exit 0      # (one running already)
+    echo $$ > $LOCK/pid
+    w=; sl=
+    trap 'rm -rf $LOCK' EXIT
+    trap 'kill $w $sl 2>/dev/null; exit 0' TERM                  # (the try or the wait with it)
+    trap '[ -n "$sl" ] && kill $sl 2>/dev/null' USR1             # a new address: try now
+    # A child waited for, through signals (a trap cuts wait short): its status
+    run() { "$@" & w=$!; while :; do wait $w; r=$?; kill -0 $w 2>/dev/null || { w=; return $r; }; done; }
+    n=0
+    while :; do
+        c=; read -r c 2>/dev/null < $CARRIER
+        [ "$c" = 1 ] || exit 0              # Wi-Fi gone: the next address starts again
+        peers=; read -r peers 2>/dev/null < $PEERS
+        if run timeout $TRY ntpd -n -q $peers > /dev/null 2>&1; then
+            logger -t fathom-ntp "clock set: $(date)"
+            rm -f $FAILS
+            date +%s > $RUN/fathom-clock    # the player saves it (clock.last)
+            exit 0
+        fi
+        n=$((n + 1))
+        echo $n > $FAILS
+        set -- $WAITS
+        i=1; while [ $i -lt $n ] && [ $# -gt 1 ]; do shift; i=$((i + 1)); done
+        logger -t fathom-ntp "no answer from $peers ($n): again in $1 s"
+        sleep $1 & sl=$!; wait $sl; kill $sl 2>/dev/null; sl=
+    done
+fi
+
 [ "$interface" = wlan0 ] || exit 0
-pidof ntpd > /dev/null && exit 0
-peers=
-for s in $ntpsrv; do peers="$peers -p $s"; done
-[ -n "$peers" ] || peers="-p 0.pool.ntp.org -p 1.pool.ntp.org"
-(
-    if timeout 30 ntpd -n -q $peers > /dev/null 2>&1; then
-        logger -t fathom-ntp "clock set: $(date)"
-        date +%s > /var/run/fathom-clock     # the player saves it (clock.last)
+case "$1" in
+bound|renew)
+    peers=
+    for s in $ntpsrv; do peers="$peers -p $s"; done
+    [ -n "$peers" ] || peers="-p 0.pool.ntp.org -p 1.pool.ntp.org"
+    echo $peers > $PEERS
+    if alive; then
+        kill -USR1 "$p"                     # waiting: try now (trying: nothing)
     else
-        logger -t fathom-ntp "no answer from$peers"
+        rm -rf $LOCK                        # (one that died without tidying up)
+        "$0" loop < /dev/null > /dev/null 2>&1 &
     fi
-) < /dev/null > /dev/null 2>&1 &
+    ;;
+deconfig)
+    alive && kill "$p"
+    rm -f $FAILS
+    ;;
+esac
 exit 0
