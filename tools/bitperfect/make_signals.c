@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * make-bitperfect: FLAC test files with known samples, for checking that the
  * player hands the sound card exactly what's in the file (tools/bitperfect).

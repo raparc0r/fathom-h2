@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Bluetooth for the player (see bt.c). All of it is safe from the UI thread. */
 #ifndef FATHOM_BT_H
 #define FATHOM_BT_H

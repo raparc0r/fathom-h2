@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Settings (app/core/settings.c): every entry and every value of a file kept
  * through a load and a save, however many and however long.

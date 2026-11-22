@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * fathom-sim: the Fathom UI on the desktop.
  *
@@ -416,7 +417,16 @@ static int sim_battery_report(batrep_t *rep, int days)
     return 0;
 }
 
-static const ui_hooks_t g_hooks = {.fonts = ui_theme_fonts, .icon = ui_theme_icon, .radio_stations = sim_radio,
+/* About's first rows, as on the H2 (the rest is the device's) */
+static int sim_about(int i, char *label, size_t lc, char *value, size_t vc)
+{
+    if (i > 1) return -1;
+    snprintf(label, lc, "%s", i == 0 ? UI_ABOUT_CREDIT : "Version");
+    snprintf(value, vc, "%s", i == 0 ? "" : "v0.15.0");
+    return 0;
+}
+
+static const ui_hooks_t g_hooks = {.about = sim_about, .fonts = ui_theme_fonts, .icon = ui_theme_icon, .radio_stations = sim_radio,
                                    .radio_add = sim_radio_add, .radio_remove = sim_radio_remove,
                                    .share_state = sim_share_state, .share_do = sim_share_do,
                                    .ssh_state = sim_ssh_state, .ssh_do = sim_ssh_do,
@@ -481,7 +491,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
     static const char *const screens[] = {"home", "albums", "tracks", "playlists", "playlist", "nowplaying", "themes",
                                           "quick", "context", "info", "queue", "glyphs", "search",
                                           "artists", "artist", "artistsongs", "albumartists", "homeedit",
-                                          "usbask", "wifiask", "interface", "usbdrive", "scrub", "sound", "radio", "radionp", "share", "ssh", "toast", "genres", "folders", "folder", "years", "homeend", "homeall", "signal", "purenp",
+                                          "usbask", "wifiask", "interface", "usbdrive", "scrub", "sound", "radio", "radionp", "share", "ssh", "toast", "abouthelp", "genres", "folders", "folder", "years", "homeend", "homeall", "signal", "purenp",
                                           "rdir", "rdirgenres", "rdirresults", "rdirbusy", "rdircountries", "rdirsearch",
                                           "rdirctx", "rdirerror", "rdirnp", "rdirnpmenu", "rdirrandom",
                                           "about", "update", "updatelatest", "updatefailed", "updateprogress",
@@ -492,7 +502,8 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                                           "podcasts", "podshow", "podsearch", "podnp", "podchapters", "podmenu", "podsettings",
                                           "libsettings", "libhelp", "xfhelp", "whatsnew", "whatsnewend", "aboutwn", "covermenu", "covermenuown", "coverfind",
                                           "albummenu", "artistmenu", "aartistmenu", "homemove",
-                                          "smartlists", "smartopen", "smartmenu"};
+                                          "smartlists", "smartopen", "smartmenu",
+                                          "cv-tracks", "cv-artist", "cv-artistsongs", "cv-playlist", "cv-queue"};
     static const char *const slug[] = {"studio-mint", "studio-ember", "studio-pastel", "pixel-pastel"};
     for (int t = 0; t < 4 && t < g_n_themes; t++) {   /* the built-in themes */
         ui_set_theme(t);
@@ -610,6 +621,13 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
             } else if (!strcmp(screens[s], "libhelp")) {  /* Menu on Find missing covers: its help */
                 ui_show("libsettings");
                 ui_key(UI_KEY_MENU);
+            } else if (!strcmp(screens[s], "abouthelp")) {   /* About's credit, and Menu: the legal notice */
+                ui_show("about");
+                for (int k = 0; k < 8; k++) ui_key(UI_KEY_UP);
+                ui_key(UI_KEY_MENU);
+            } else if (!strncmp(screens[s], "cv-", 3)) {   /* Covers in lists: Albums, songs (then back) */
+                settings_set_int("display.covers", 3);
+                ui_show(screens[s] + 3);
             } else if (!strcmp(screens[s], "toast")) {    /* a long one: it wraps */
                 ui_show("ssh");
                 ui_toast("Over USB and Wi-Fi, with the password", 3000);
@@ -617,7 +635,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 ui_show(screens[s]);
             }
             int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp") ||
-                         !strncmp(screens[s], "whatsnew", 8) ||
+                         !strncmp(screens[s], "whatsnew", 8) || !strcmp(screens[s], "abouthelp") ||
                          (g_sim_upd.state >= UI_UPD_DOWNLOADING && g_sim_upd.state <= UI_UPD_RESTARTING) ||
                          !strcmp(screens[s], "uninstallpending") || !strcmp(screens[s], "uninstallnone");   /* (the update's progress screen) */
             lv_obj_t *what = on_top ? lv_layer_top() : lv_screen_active();
@@ -638,6 +656,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 g_sim_upd.state = UI_UPD_IDLE;
                 ui_update_changed();
             }
+            if (!strncmp(screens[s], "cv-", 3)) settings_set_int("display.covers", UI_COVERS_DEFAULT);
             if (!strncmp(screens[s], "whatsnew", 8)) ui_key(UI_KEY_BACK);   /* (put away: Back) */
             if (!strcmp(screens[s], "homemove")) {          /* (back where it was, and done) */
                 ui_key(UI_KEY_UP);
@@ -646,7 +665,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
             }
             if (!strncmp(screens[s], "whatsnew", 8) || !strcmp(screens[s], "aboutwn") || !strcmp(screens[s], "askinstallwn"))
                 ui_set_whats_new("", "", 0);
-            if (!strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp"))   /* (gone before the next screens) */
+            if (!strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp") || !strcmp(screens[s], "abouthelp"))   /* (gone before the next screens) */
                 for (uint32_t c = 0; c < lv_obj_get_child_count(lv_layer_top()); c++)
                     lv_obj_add_flag(lv_obj_get_child(lv_layer_top(), (int32_t)c), LV_OBJ_FLAG_HIDDEN);
             printf("%s\n", path);

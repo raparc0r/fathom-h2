@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * One certificate bundle for all HTTPS connections (tls_wrap.h). For each
  * connection, FFmpeg 6.1's tls_open (tls_mbedtls.c) parses the bundle into

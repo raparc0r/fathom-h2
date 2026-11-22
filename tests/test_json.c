@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Reading JSON in place (app/net/json.c). */
 #include <stdio.h>
 #include <string.h>

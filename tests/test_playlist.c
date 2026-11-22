@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* M3U parsing, path normalisation and loose keys (app/library/playlist.c). */
 #include <stdio.h>
 #include <stdlib.h>

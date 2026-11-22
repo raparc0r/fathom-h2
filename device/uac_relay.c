@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * USB DAC mode: the computer plays to the H2 as to any USB DAC (USB Audio
  * Class 2, set up by fathom-usbgadget), and this copies what arrives on the

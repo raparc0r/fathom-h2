@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * ALSA output straight on the kernel's PCM ioctls (no alsa-lib/tinyalsa): the
  * player stays one static binary, and every step is under our control.
@@ -36,7 +37,8 @@ typedef struct {
     volatile int flushes;       /* a_flush()es: a retry must not write what one dropped */
     char     desc[96];
     FILE *tap;                  /* out_alsa_set_tap(): a copy of every byte written */
-    unsigned long lat_thr, lat_queued;   /* (LAT: the start threshold, frames written since the prepare) */
+    unsigned long lat_thr, lat_queued;   /* the start threshold, and frames written since the prepare (up
+                                         * to it): below it the PCM hasn't started, nothing's been heard */
     pcmring_t hist;             /* what was last written, for a_flush_soft (up to the buffer, 256 KB at most) */
     int soft_tail;              /* a soft flush left a tail playing: an underrun after it is its end */
 } alsa_out_t;
@@ -268,7 +270,7 @@ static long a_write(void *ctx, const int32_t *frames, long n)
             a->soft_tail = 0;
             buf += (size_t)x.result * frame_bytes;
             left -= x.result;
-            if (lat_on() && a->lat_queued < a->lat_thr && (a->lat_queued += x.result) >= a->lat_thr)
+            if (a->lat_queued < a->lat_thr && (a->lat_queued += x.result) >= a->lat_thr && lat_on())
                 LAT("alsa: started (%lu frames queued)", a->lat_thr);
             continue;
         }
@@ -289,6 +291,7 @@ static long a_write(void *ctx, const int32_t *frames, long n)
         if ((e == EIO || e == ENOMEM) && tries < 3 && a->flushes == flushes &&
             ioctl(a->fd, SNDRV_PCM_IOCTL_PREPARE) == 0) {
             fprintf(stderr, "alsa: write: %s, again\n", strerror(e));
+            a->lat_queued = 0;                       /* (prepared: what was queued is gone) */
             tries++;
             usleep(20000);
             if (a->flushes == flushes) continue;
@@ -341,13 +344,19 @@ static int ring_format(int format)
  * ahead), and the 8 ms after it written again from the copy, faded to
  * silence. The PCM keeps running; what comes next follows the fade. Only
  * from the writing thread, between writes (output.h: flush_soft). Paused,
- * not started, DoP, or a rewind the driver refuses: a_flush. */
+ * not started, DoP, or a rewind the driver refuses: a_flush. (Not started:
+ * DELAY counts what's queued and REWIND takes it, so a fade of audio never
+ * heard would go out once it starts: a station left while it was still
+ * filling its buffer, heard for a moment before the next one.) */
 static void a_flush_soft(void *ctx)
 {
     alsa_out_t *a = ctx;
     if (a->fd < 0) return;
     snd_pcm_sframes_t d = 0;
-    if (a->paused || !a->hist.buf || ioctl(a->fd, SNDRV_PCM_IOCTL_DELAY, &d) || d <= 0) { a_flush(a); return; }
+    if (a->paused || !a->hist.buf || a->lat_queued < a->lat_thr || ioctl(a->fd, SNDRV_PCM_IOCTL_DELAY, &d) || d <= 0) {
+        a_flush(a);
+        return;
+    }
     unsigned fade = a->fmt.rate / 125 > 16 ? a->fmt.rate / 125 : 16;
     if ((unsigned long)d <= a->period + fade) return;     /* (as little as that left: it plays out) */
     unsigned long want = (unsigned long)d - a->period;

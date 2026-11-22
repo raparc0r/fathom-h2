@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # The certificates test_tls_wrap checks (made once; the keys aren't kept, so
 # nothing here can sign anything). Needs OpenSSL 3.4 or later (-not_before).

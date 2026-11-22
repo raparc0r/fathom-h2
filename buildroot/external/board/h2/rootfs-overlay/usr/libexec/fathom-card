@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 # Programs kept on the card instead of the RAM disk (post-build.sh), run by
 # the name they're called by: these are links to this script.
 #   dropbear, dropbearkey, dropbearconvert, dbclient, ssh, scp   fathom/ssh

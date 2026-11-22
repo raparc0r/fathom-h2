@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Playback engine: one thread decodes and writes to an audio output.
  * Gapless: a queued next track is opened when the current one ends; if the

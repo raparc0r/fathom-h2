@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Cover images decoded small (artdec.h). */
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE

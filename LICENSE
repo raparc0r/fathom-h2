@@ -4,13 +4,57 @@ applies depends on the part:
   The player, tools, Buildroot tree and     GPL-3.0-or-later   (the first text below)
   everything else not listed here
   The bootloader (bootloader/, derived       GPL-2.0-or-later   (the second text below)
-  from Rockbox)
+  from Rockbox), what builds it into a
+  release (tools/release/make-upt.sh,
+  tools/logo/png2rle.py, png2ppm.py) and
+  the logo built into it (assets/logo.png)
   The Linux kernel patches                   GPL-2.0-only       (the second text below)
   (buildroot/external/board/h2/patches/linux/)
+  The kernel's and BusyBox's settings        GPL-2.0-or-later   (the second text below)
+  (buildroot/external/board/h2/linux.fragment,
+  busybox.fragment) and the Buildroot
+  configuration (configs/fathom_h2_defconfig)
 
 Each source file names its licence in an SPDX-License-Identifier line. The
 fonts in assets/fonts/ carry their own licences next to them (SIL Open Font
 License 1.1; Tabler Icons: MIT).
+
+Fathom is Copyright (C) 2026 m11n/raparc0r. The bootloader is also the work of the
+Rockbox project's authors, whose copyright notices are in its files; the Rockbox
+files Fathom changed say so (bootloader/patches/), with the dates.
+
+--------------------------------------------------------------------------------
+Additional terms (GNU GPL version 3, section 7)
+--------------------------------------------------------------------------------
+
+The parts under GPL-3.0-or-later come with these additional terms, as
+section 7 of the GPL version 3 allows. They don't apply to the parts under
+GPL-2.0 (the bootloader, the kernel patches) or to anything that carries its
+own licence (the fonts, third_party/).
+
+  a) Attribution (section 7(b)). Keep the copyright notices and these terms
+     intact. Anything you distribute that contains this material and shows
+     Appropriate Legal Notices must keep this credit in them:
+
+         Fathom by m11n/raparc0r (https://github.com/raparc0r/fathom-h2)
+
+     or, in a modified version, "Based on Fathom by m11n/raparc0r" with the
+     same address. Fathom shows its notices on the first row of
+     Settings > About (the credit, and with Menu the licence); a modified
+     version may show them anywhere a user can easily find them.
+
+  b) Modified versions (section 7(c)). A modified version must be marked as
+     changed from the original, and must not be presented as Fathom itself
+     or as made by m11n/raparc0r.
+
+  c) A name of its own (section 7(c)). As part of marking it as changed, a
+     modified version that is distributed must not use "Fathom", or Fathom's
+     logo, as its own name or logo. Saying it is based on Fathom, as in (a),
+     is fine. This is a condition of this licence, not a trademark claim.
+
+Anyone passing this material on, changed or not, passes these terms on with
+it. They add nothing beyond what section 7 allows; everything else is the
+GPL version 3 below.
 
 ================================================================================
 

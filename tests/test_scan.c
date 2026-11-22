@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* The library's connections and scans (app/library/library.c): opening an
  * up-to-date database does no upgrade work, levelling's next track comes
  * from an index; a background scan lets the player's connection write
@@ -14,6 +15,10 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#endif
 
 #include <sqlite3.h>
 
@@ -62,6 +67,40 @@ static int64_t db_int(const char *db, const char *sql)
     sqlite3_finalize(q);
     sqlite3_close(raw);
     return v;
+}
+
+/* The groups as they stand (albums, artists, credits, genres, composers,
+ * folders, and each track's place in them), as text: covers and search
+ * left out */
+static char *groups_text(const char *db)
+{
+    static const char *const Q[] = {
+        "SELECT id, album_id, artist_id, sort, genre_id, composer_id, folder_id FROM tracks ORDER BY id",
+        "SELECT artist_id, track_id FROM credits ORDER BY 1, 2",
+        "SELECT * FROM albums ORDER BY id", "SELECT * FROM artists ORDER BY id", "SELECT * FROM genres ORDER BY id",
+        "SELECT * FROM composers ORDER BY id", "SELECT * FROM folders ORDER BY id",
+    };
+    sqlite3 *raw = NULL;
+    sqlite3_str *out = NULL;
+    if (sqlite3_open(db, &raw) == SQLITE_OK) out = sqlite3_str_new(raw);
+    for (size_t i = 0; out && i < sizeof Q / sizeof *Q; i++) {
+        sqlite3_stmt *q = NULL;
+        if (sqlite3_prepare_v2(raw, Q[i], -1, &q, NULL) != SQLITE_OK) { sqlite3_str_appendf(out, "(%s?)", Q[i]); continue; }
+        sqlite3_str_appendf(out, "%s\n", Q[i]);
+        while (sqlite3_step(q) == SQLITE_ROW) {
+            for (int c = 0; c < sqlite3_column_count(q); c++) {
+                const char *n = sqlite3_column_name(q, c);
+                if (!strcmp(n, "art") || !strcmp(n, "art_sig") || !strcmp(n, "search")) continue;
+                const unsigned char *v = sqlite3_column_text(q, c);
+                sqlite3_str_appendf(out, "%s=%s ", n, v ? (const char *)v : "NULL");
+            }
+            sqlite3_str_appendchar(out, 1, '\n');
+        }
+        sqlite3_finalize(q);
+    }
+    char *text = out ? sqlite3_str_finish(out) : NULL;
+    sqlite3_close(raw);
+    return text;
 }
 
 static int db_exec(const char *db, const char *sql)
@@ -162,12 +201,15 @@ typedef struct {
     const char *cancel_unless;         /* ...whose path doesn't have this in it */
     useconds_t nap;                    /* each progress call: slower files, as the H2's card */
     volatile int done;
+    char where[160];                   /* the last progress call: a file, "covers" (for a slow write's report) */
 } scan_job_t;
 
 static void job_progress(int done, int total, const char *path, void *ctx)
 {
     scan_job_t *j = ctx;
     (void)done;
+    const char *base = path ? strrchr(path, '/') : NULL;
+    snprintf(j->where, sizeof j->where, "%s", total < 0 ? "covers" : base ? base + 1 : path ? path : "?");
     if (total < 0) return;                         /* (covers) */
     j->calls++;
     if (j->nap) usleep(j->nap);
@@ -221,17 +263,31 @@ static void test_scans(const char *dir)
     scan_job_t job = {.lib = library_open(db, art), .music = music, .nap = 80000};
     pthread_t th;
     CHECK(job.lib && pthread_create(&th, NULL, job_run, &job) == 0);
+#ifdef __linux__
+    /* the player's writes come from its UI thread, at normal priority; the
+     * scan (as the player's) at nice 19, as the H2 run is (started first:
+     * a thread starts at its maker's) */
+    id_t me = (id_t)syscall(SYS_gettid);
+    int was = getpriority(PRIO_PROCESS, me);
+    setpriority(PRIO_PROCESS, me, 0);
+#endif
     double worst = 0, t0 = now();
     int writes = 0, kept = 1;
     while (!job.done) {
         double t = now();
         library_set_favourite(player, tid, writes & 1);
-        if (now() - t > worst) worst = now() - t;
+        double w = now() - t;
+        if (w > worst) worst = w;
+        if (w > 0.25)                             /* (where the scan was: what held the lock) */
+            fprintf(stderr, "slow write: %.2f s, %.1f s in, the scan at %s (%d files)\n", w, t - t0, job.where, job.calls);
         kept &= library_favourite(player, tid) == (writes & 1);
         writes++;
         usleep(20000);
     }
     pthread_join(th, NULL);
+#ifdef __linux__
+    setpriority(PRIO_PROCESS, me, was);
+#endif
     double took = now() - t0;
     CHECK(job.result == 620);
     CHECK(took > 1.5 && writes > 20);             /* (long enough to tell) */
@@ -381,6 +437,55 @@ static void test_scans(const char *dir)
     }
     chmod(path, 0644);
     CHECK(library_scan(player, music, NULL, NULL) == 640);
+
+    /* 9. The groups a scan writes (only what changed, see shadow_apply) are
+     * the ones a whole rebuild makes: after an album gone (its id given
+     * to the next new one), a new one, songs moved to another album and
+     * artist, and an artist's name respelled */
+    for (int i = 1; i <= 20; i++) {
+        snprintf(path, sizeof path, "%s/Album 03/%03d.flac", music, i);
+        unlink(path);
+    }
+    make_album(music, "Zz Later", 3);
+    snprintf(path, sizeof path, "%s/Album 04/%03d.flac", music, 1);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/Album 04/moved.flac", music);
+    CHECK(write_flac(path, "Moved", "Other Artist", "Album 06", 1) == 0);
+    snprintf(path, sizeof path, "%s/Album 07/respelled.flac", music);
+    CHECK(write_flac(path, "Respelled", "SOME artist", "Album 07", 21) == 0);
+    bg = library_open(db, art);
+    CHECK(bg && library_scan(bg, music, NULL, NULL) == 624 && library_scan_changes(bg) > 0);
+    library_close(bg);
+    library_close(player);
+    char *aside = groups_text(db);
+    CHECK(db_exec(db, "PRAGMA user_version=3") == SQLITE_OK);   /* (opened: groups made again, all at once) */
+    player = library_open(db, art);
+    library_close(player);
+    char *whole = groups_text(db);
+    CHECK(aside && whole && strlen(aside) > 1000 && !strcmp(aside, whole));
+    if (aside && whole && strcmp(aside, whole)) {
+        size_t k = 0;
+        while (aside[k] && aside[k] == whole[k]) k++;
+        while (k && aside[k - 1] != '\n') k--;
+        fprintf(stderr, "groups differ from:\n  aside: %.200s\n  whole: %.200s\n", aside + k, whole + k);
+    }
+    sqlite3_free(aside);
+    sqlite3_free(whole);
+
+    /* 10. A song removed: its play log goes with it (its id is given to the
+     * next new song, which would show in On repeat, never played) */
+    snprintf(path, sizeof path, "%s/Album 06/020.flac", music);
+    int64_t gone = db_int(db, "SELECT id FROM tracks WHERE path LIKE '%/Album 06/020.flac'");
+    player = library_open(db, art);
+    CHECK(player && gone > 0);
+    if (player && gone > 0) {
+        library_played(player, gone, 0, (int64_t)time(NULL) - 60);
+        library_played(player, gone, 0, (int64_t)time(NULL));
+        CHECK(db_int(db, "SELECT COUNT(*) FROM plays") >= 2);
+        unlink(path);
+        CHECK(library_scan(player, music, NULL, NULL) == 623);
+        CHECK(db_int(db, "SELECT COUNT(*) FROM plays WHERE track_id NOT IN (SELECT id FROM tracks)") == 0);
+    }
     library_close(player);
 }
 

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* H2 buttons (gpio-keys) and scroll wheel (rotary-encoder) through evdev,
  * and Bluetooth headphones' buttons (AVRCP). */
 #ifndef FATHOM_INPUT_H

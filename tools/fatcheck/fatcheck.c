@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * fathom-fatcheck (on the H2): list a folder with fatwalk (reading the FAT
  * directly) and with readdir + stat (as the kernel shows it), and compare

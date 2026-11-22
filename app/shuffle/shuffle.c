@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 #include "shuffle.h"
 
 #include <stdlib.h>
@@ -158,7 +159,7 @@ long shuf_build(const shuf_track_t *t, size_t n, const shuf_opts_t *o,
         const shuf_track_t *x = &t[i];
         int grouped = (o->mode == SHUF_MODE_ALBUMS) || (o->keep_units && x->unit != 0);
         if (x->flags & SHUF_F_NEVER) continue;
-        if (o->exclude_spoken && (x->flags & SHUF_F_SPOKEN)) continue;
+        if (o->exclude_spoken && (x->flags & SHUF_F_SPOKEN) && (int64_t)i != o->first) continue;   /* (one picked plays) */
         if (o->skip_interludes && !grouped && x->duration_ms > 0 &&
             x->duration_ms < o->interlude_ms && (int64_t)i != o->first)
             continue;
@@ -285,11 +286,19 @@ long shuf_build(const shuf_track_t *t, size_t n, const shuf_opts_t *o,
         }
     }
 
-    /* 7. Expand units into track indices. */
+    /* 7. Expand units into track indices. The first unit, if it holds the
+     * requested track, from that track on (an album shuffled from its song 7:
+     * 7, 8... then the next album, as an album started part way; its 1-6
+     * wait for the next cycle). It began with the unit's first track, not
+     * the one chosen, and turning shuffle on mid-song played 2 next. */
     long w = 0;
     for (uint32_t i = 0; i < nu; i++) {
         const unit_t *x = &u[ord[i]];
-        for (uint32_t j = 0; j < x->count; j++)
+        uint32_t j0 = 0;
+        if (i == 0 && fixed)
+            for (uint32_t j = 0; j < x->count; j++)
+                if ((int64_t)m[x->first + j].idx == o->first) { j0 = j; break; }
+        for (uint32_t j = j0; j < x->count; j++)
             out[w++] = m[x->first + j].idx;
     }
 

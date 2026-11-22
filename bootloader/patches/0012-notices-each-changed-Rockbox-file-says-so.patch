@@ -1,0 +1,126 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] Notices: each Rockbox file Fathom changed says so, and when
+
+GPL version 2, section 2(a): modified files must carry prominent notices
+that they were changed, and the date of any change. Each file the patches
+before this one change gets a line under its copyright notice with the
+dates of those changes (from the patches' history) and where they are.
+---
+--- a/bootloader/SOURCES
++++ b/bootloader/SOURCES
+@@ -1,3 +1,5 @@
++/* Changed for Fathom by m11n/raparc0r (2026-11-17 to 2026-11-21): see bootloader/patches/
++ * at https://github.com/raparc0r/fathom-h2 */
+ #ifndef SONY_PSP
+ common.c
+ format.c
+--- a/bootloader/x1000/boot.c
++++ b/bootloader/x1000/boot.c
+@@ -7,6 +7,8 @@
+  *                     \/            \/     \/    \/            \/
+  *
+  * Copyright (C) 2021-2022 Aidan MacDonald
++ * Changed for Fathom by m11n/raparc0r (2026-11-15 to 2026-11-21): see bootloader/patches/
++ * at https://github.com/raparc0r/fathom-h2
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public License
+--- a/bootloader/x1000/gui.c
++++ b/bootloader/x1000/gui.c
+@@ -7,6 +7,8 @@
+  *                     \/            \/     \/    \/            \/
+  *
+  * Copyright (C) 2021-2022 Aidan MacDonald
++ * Changed for Fathom by m11n/raparc0r (2026-11-15): see bootloader/patches/
++ * at https://github.com/raparc0r/fathom-h2
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public License
+--- a/bootloader/x1000/install.c
++++ b/bootloader/x1000/install.c
+@@ -7,6 +7,8 @@
+  *                     \/            \/     \/    \/            \/
+  *
+  * Copyright (C) 2021-2022 Aidan MacDonald
++ * Changed for Fathom by m11n/raparc0r (2026-11-15): see bootloader/patches/
++ * at https://github.com/raparc0r/fathom-h2
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public License
+--- a/bootloader/x1000/main.c
++++ b/bootloader/x1000/main.c
+@@ -7,6 +7,8 @@
+  *                     \/            \/     \/    \/            \/
+  *
+  * Copyright (C) 2021 Aidan MacDonald
++ * Changed for Fathom by m11n/raparc0r (2026-11-15 to 2026-11-17): see bootloader/patches/
++ * at https://github.com/raparc0r/fathom-h2
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public License
+--- a/bootloader/x1000/recovery.c
++++ b/bootloader/x1000/recovery.c
+@@ -7,6 +7,8 @@
+  *                     \/            \/     \/    \/            \/
+  *
+  * Copyright (C) 2021-2022 Aidan MacDonald
++ * Changed for Fathom by m11n/raparc0r (2026-11-17): see bootloader/patches/
++ * at https://github.com/raparc0r/fathom-h2
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public License
+--- a/bootloader/x1000/utils.c
++++ b/bootloader/x1000/utils.c
+@@ -7,6 +7,8 @@
+  *                     \/            \/     \/    \/            \/
+  *
+  * Copyright (C) 2022 Aidan MacDonald
++ * Changed for Fathom by m11n/raparc0r (2026-11-17): see bootloader/patches/
++ * at https://github.com/raparc0r/fathom-h2
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public License
+--- a/bootloader/x1000/x1000bootloader.h
++++ b/bootloader/x1000/x1000bootloader.h
+@@ -7,6 +7,8 @@
+  *                     \/            \/     \/    \/            \/
+  *
+  * Copyright (C) 2021-2022 Aidan MacDonald
++ * Changed for Fathom by m11n/raparc0r (2026-11-15 to 2026-11-19): see bootloader/patches/
++ * at https://github.com/raparc0r/fathom-h2
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public License
+--- a/firmware/target/mips/ingenic/nand-ingenic.c
++++ b/firmware/target/mips/ingenic/nand-ingenic.c
+@@ -7,6 +7,8 @@
+  *                     \/            \/     \/    \/            \/
+  *
+  * Copyright (C) 2021 Aidan MacDonald
++ * Changed for Fathom by m11n/raparc0r (2026-11-15): see bootloader/patches/
++ * at https://github.com/raparc0r/fathom-h2
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public License
+--- a/firmware/target/mips/ingenic/nand-ingenic.h
++++ b/firmware/target/mips/ingenic/nand-ingenic.h
+@@ -7,6 +7,8 @@
+  *                     \/            \/     \/    \/            \/
+  *
+  * Copyright (C) 2021 Aidan MacDonald
++ * Changed for Fathom by m11n/raparc0r (2026-11-15): see bootloader/patches/
++ * at https://github.com/raparc0r/fathom-h2
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public License
+--- a/firmware/usbstack/usb_core.c
++++ b/firmware/usbstack/usb_core.c
+@@ -7,6 +7,8 @@
+  *                     \/            \/     \/    \/            \/
+  *
+  * Copyright (C) 2007 by Björn Stenberg
++ * Changed for Fathom by m11n/raparc0r (2026-11-17): see bootloader/patches/
++ * at https://github.com/raparc0r/fathom-h2
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public License

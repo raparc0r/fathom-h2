@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Ogg Vorbis: decoding (app/audio/vorbis.c through decoder.c) and tags and
  * covers (app/library/tags.c), on files made here with libvorbisenc. */
 #include <math.h>

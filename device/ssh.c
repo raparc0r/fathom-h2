@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* SSH (Settings > SSH): fathom-ssh sets root's password (the one on the
  * screen, also the serial console's) and runs dropbear while SSH is on, over
  * the USB link and Wi-Fi alike. A worker thread runs it, so the UI never

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Downloads (net/http.h) at the same time: the podcasts' worker and the
  * covers' each download in their own thread. Needs FFmpeg: the files come
  * from a small HTTP server of the test's own on 127.0.0.1 (FFmpeg's file:

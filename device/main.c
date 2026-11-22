@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * fathom-player: the Fathom player on the HiFi Walker H2.
  *
@@ -128,7 +129,8 @@ static int hook_theme_remove(const char *file)
     return r;
 }
 
-/* kill -USR1 $(pidof fathom-player): the screen as it is now, to /tmp/fathom-screen.bmp */
+/* kill -USR1 $(pidof fathom-player): the screen as it is now, to /tmp/fathom-screen.bmp
+ * (with what shows over it: messages, help, the level bar) */
 static volatile sig_atomic_t g_shot, g_usb_req;
 static void on_usr1(int s) { (void)s; g_shot = 1; }
 /* kill -USR2 $(pidof fathom-player): USB drive mode, as if chosen (development, tests) */
@@ -143,6 +145,29 @@ static void screen_shot(void)
         if (lv_obj_get_width(c) >= LV_HOR_RES && lv_obj_get_height(c) >= LV_VER_RES) { what = c; break; }
     }
     lv_draw_buf_t *img = lv_snapshot_take(what, LV_COLOR_FORMAT_RGB888);
+    /* the top layer's other things shown, drawn over it (blended: round corners) */
+    for (uint32_t i = 0; img && what == lv_screen_active() && i < lv_obj_get_child_count(top); i++) {
+        lv_obj_t *c = lv_obj_get_child(top, (int32_t)i);
+        if (lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN)) continue;
+        lv_draw_buf_t *o = lv_snapshot_take(c, LV_COLOR_FORMAT_ARGB8888);
+        if (!o) continue;
+        lv_area_t a;
+        lv_obj_get_coords(c, &a);
+        /* (the snapshot is the object with its shadow's margin all round) */
+        int32_t ext = ((int32_t)o->header.w - lv_area_get_width(&a)) / 2, x0 = a.x1 - ext, y0 = a.y1 - ext;
+        for (int32_t y = 0; y < (int32_t)o->header.h; y++) {
+            if (y0 + y < 0 || y0 + y >= (int32_t)img->header.h) continue;
+            const uint8_t *s = o->data + (size_t)y * o->header.stride;
+            uint8_t *d = img->data + (size_t)(y0 + y) * img->header.stride;
+            for (int32_t x = 0; x < (int32_t)o->header.w; x++) {
+                if (x0 + x < 0 || x0 + x >= (int32_t)img->header.w) continue;
+                const uint8_t *p = s + 4 * x;            /* B, G, R, A */
+                uint8_t *q = d + 3 * (x0 + x);
+                for (int k = 0; k < 3; k++) q[k] = (uint8_t)((p[k] * p[3] + q[k] * (255 - p[3])) / 255);
+            }
+        }
+        lv_draw_buf_destroy(o);
+    }
     FILE *f = img ? fopen("/tmp/fathom-screen.bmp", "wbe") : NULL;
     if (f) {
         int w = img->header.w, h = img->header.h, row = (w * 3 + 3) & ~3;
@@ -1627,6 +1652,7 @@ static void screen_apply(void)
 static void screen_set(int on)
 {
     if (on != g_screen_on) ui_set_awake(on);
+    if (on && !g_screen_on) wifi_wake();                     /* (out and back: a saved network may be in range) */
     if (!on && g_screen_on) library_release_memory(g_lib);   /* the database's cache: nothing browses meanwhile */
     g_screen_on = on;
     g_dimmed = 0;
@@ -2181,7 +2207,8 @@ static void rg_stop(void)
     g_rg_lib = NULL;
 }
 
-/* Every second: start measuring while charging and idle, stop otherwise. */
+/* Every second: start measuring while charging and idle, with levelling on
+ * (off, the default: no use for it; measured songs are kept), stop otherwise. */
 static void rg_poll(lv_timer_t *t)
 {
     (void)t;
@@ -2191,7 +2218,8 @@ static void rg_poll(lv_timer_t *t)
         player_now(g_player, &now);
         playing = now.playing;
     }
-    int want = g_charging && !playing && !g_scan_state && !g_usb_drive && !g_relay && g_db_path[0];
+    int want = g_charging && !playing && !g_scan_state && !g_usb_drive && !g_relay && g_db_path[0] &&
+               settings_get_int("sound.levelling", LEVEL_OFF) != LEVEL_OFF;
     if (g_rg_lib && (!want || !g_rg_running)) rg_stop();   /* stopped, or out of tracks */
     else if (want && !g_rg_lib) {
         static int64_t done_at;             /* nothing left: look again in a while (new music) */
@@ -2229,8 +2257,13 @@ static void rescan(void)
 static int about(int i, char *label, size_t lc, char *value, size_t vc)
 {
     char a[32], b[32];
-    switch (i) {
-    case 0: snprintf(label, lc, "Fathom"); snprintf(value, vc, "%s", FATHOM_VERSION); return 0;
+    if (i == 0) {                       /* the credit (ui.h), a row of its own: never cut short */
+        snprintf(label, lc, "%s", UI_ABOUT_CREDIT);
+        value[0] = '\0';
+        return 0;
+    }
+    switch (i - 1) {
+    case 0: snprintf(label, lc, "Version"); snprintf(value, vc, "%s", FATHOM_VERSION); return 0;
     case 1: {
         struct utsname u;
         snprintf(label, lc, "Linux");
@@ -2758,8 +2791,10 @@ int main(int argc, char **argv)
                 power_off("Powering off");
             } else if (ev.kind == IN_POWER && g_charge_mode) {
                 charge_mode_end();                   /* start as usual */
-            } else if (g_charge_mode && (ev.kind == IN_UI || ev.kind == IN_VOLUME)) {
+            } else if (g_charge_mode && ev.kind == IN_UI) {
                 charge_screen_show();                /* nothing plays in charging mode */
+            } else if (g_charge_mode && ev.kind == IN_MEDIA) {
+                ;                                    /* nor from headphones: Bluetooth ones send Play as they connect */
             } else if (ev.kind == IN_MEDIA) {
                 media_key(ev.ui_key);                /* the headphones' buttons; the screen stays as it is */
             } else if (ev.kind == IN_POWER) {

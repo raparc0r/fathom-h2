@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * rg-bench: how long volume levelling takes to measure a track, and whether the
  * faster measurement (app/audio/loudness.c) still gives what 0.8.3's did

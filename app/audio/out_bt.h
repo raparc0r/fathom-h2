@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Bluetooth output through bluez-alsa (see out_bt.c). */
 #ifndef FATHOM_OUT_BT_H
 #define FATHOM_OUT_BT_H

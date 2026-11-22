@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # Build the H2 bootloader inside the Docker build image:
 #   docker/run.sh bootloader/build.sh

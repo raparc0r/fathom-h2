@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Normalized grouping keys for artists and albums (used by the library and shuffle). */
 #ifndef FATHOM_KEYS_H
 #define FATHOM_KEYS_H

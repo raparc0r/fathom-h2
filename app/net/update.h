@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Updates over Wi-Fi: the parts that need no network, so the desktop tests
  * can run them (the device's updater.c fetches and drives them).

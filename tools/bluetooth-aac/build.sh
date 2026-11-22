@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # AAC for Bluetooth headphones, built by you, for your own H2 (see README.md):
 #

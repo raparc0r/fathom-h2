@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # Fathom build environment: Buildroot (rootfs + cross toolchain), the Linux
 # kernel, the bootloader, and the host-side tests. Used on the Mac through

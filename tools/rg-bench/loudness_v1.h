@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* The loudness measurement as it was up to 0.8.3 (loudness_v1.c, a frozen copy
  * of app/audio/loudness.c with its names prefixed), kept so rg-bench and the
  * tests can check the faster one against it on the same samples. */

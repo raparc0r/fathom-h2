@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Cover art (app/library/artdec.c, library.c's covers): big images decoded
  * small within the H2's limits, and where covers are found.
@@ -603,6 +604,17 @@ static void test_library(void)
     CHECK(lib && library_needs_art(lib));
     CHECK(library_scan(lib, music, NULL, NULL) == 6 && !library_needs_art(lib));
     library_close(lib);
+    /* a scan's cover pass cut short (the player stopped or restarted mid-way):
+     * the albums it hadn't reached yet, never looked at, get a scan at the next
+     * start, and their covers */
+    CHECK(sqlite3_open(db, &raw) == SQLITE_OK &&
+          sqlite3_exec(raw, "UPDATE albums SET art=0, art_sig=0 WHERE title='Album A'", NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(raw);
+    lib = library_open(db, art);
+    CHECK(lib && library_needs_art(lib));
+    CHECK(library_scan(lib, music, NULL, NULL) == 6 && !library_needs_art(lib));
+    library_close(lib);
+    CHECK(album_art(db, "Album A") == 1);
     /* nothing changed: D isn't looked at again (no change to count) */
     lib = library_open(db, art);
     CHECK(lib && library_scan(lib, music, NULL, NULL) == 6);

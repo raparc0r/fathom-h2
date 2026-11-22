@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Radio stations often publish a playlist (.m3u, .pls) that names the stream
  * rather than the stream itself. These read one (no network here: the decoder

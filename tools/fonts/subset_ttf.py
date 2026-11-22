@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 """
 Subset a TrueType (glyf) font to the characters the player needs, with the
 standard library only. Fonts are kept whole in RAM on the H2 (32 MiB), so a

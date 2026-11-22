@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 #include "disp_drm.h"
 #include "hw_paths.h"
 #include "core/lat.h"

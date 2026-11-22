@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* PCG32 random number generator (O'Neill, pcg-random.org) with unbiased helpers. */
 #ifndef FATHOM_RNG_H
 #define FATHOM_RNG_H

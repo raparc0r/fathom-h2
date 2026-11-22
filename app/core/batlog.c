@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Battery history: the log and what it says (batlog.h). */
 #include "core/batlog.h"
 

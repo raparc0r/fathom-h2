@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * DNS answers kept a while (app/net/dnscache.c): a name asked again within two
  * minutes isn't looked up again, with the port asked for; an older answer is

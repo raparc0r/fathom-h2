@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Wi-Fi for the player: a worker thread runs fathom-wifi (on, off, scan,
  * connect, forget) so nothing slow happens on the UI thread, and polls its
  * status (state, network, address, signal) while Wi-Fi is on. The UI thread
@@ -14,6 +15,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -42,7 +46,17 @@
 #define JOIN_SEEN_MS 2500
 #define SCAN_AFTER_JOIN_MS 5000
 
-enum { CMD_NONE, CMD_START, CMD_STOP, CMD_SCAN, CMD_CONNECT, CMD_FORGET };
+/* Searching while nothing saved is in range (out of the house with Wi-Fi
+ * on): wpa_supplicant looks every 5 s, the radio off for half a second each
+ * time (battery, and a likely gap in Bluetooth audio). It looks less often
+ * the longer nothing turns up: 5 s, then 10, 20, 40, and every 60 s. Back
+ * to 5 s, with a look at once, when there's a reason to expect a network:
+ * the screen waking, Settings > Wi-Fi opened, Wi-Fi turned on, or a network
+ * just left. */
+#define PACE_MIN_S 5
+#define PACE_MAX_S 60
+#define WAKE_LOOK_MS 10000   /* a screen woken again within this: no new look */
+enum { CMD_NONE, CMD_START, CMD_STOP, CMD_SCAN, CMD_CONNECT, CMD_FORGET, CMD_WAKE };
 
 static struct {
     pthread_mutex_t mu;
@@ -66,6 +80,10 @@ static void changed_locked(void) { W.seq++; }
  * join_until 0 = none); the first scan still to do, and when (0: not yet) */
 static uint32_t join_since, join_until, scan_at;
 static int scan_due;
+/* (the worker's own) the search interval wpa_supplicant has (s), and when it
+ * goes up next (0: not backing off: connected, joining or off) */
+static int pace_s = PACE_MIN_S;
+static uint32_t pace_next;
 
 static uint32_t now_ms(void)
 {
@@ -143,6 +161,62 @@ static int poll_status(void)
     return changed;
 }
 
+/* A command to wpa_supplicant over its control socket ("OK" back): no shell,
+ * no wpa_cli. 0 if it answered OK. */
+static int wpa_ctrl(const char *cmd)
+{
+    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un me = {.sun_family = AF_UNIX}, it = {.sun_family = AF_UNIX};
+    snprintf(me.sun_path, sizeof me.sun_path, "/var/run/fathom-wifi/ctrl-%d", (int)getpid());
+    snprintf(it.sun_path, sizeof it.sun_path, "/var/run/wpa_supplicant/wlan0");
+    unlink(me.sun_path);
+    char reply[64] = "";
+    int ok = -1;
+    struct timeval tv = {2, 0};
+    if (bind(fd, (struct sockaddr *)&me, sizeof me) == 0) {
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        if (connect(fd, (struct sockaddr *)&it, sizeof it) == 0 && send(fd, cmd, strlen(cmd), 0) >= 0) {
+            ssize_t n = recv(fd, reply, sizeof reply - 1, 0);
+            if (n > 0) { reply[n] = '\0'; ok = strncmp(reply, "OK", 2) ? -1 : 0; }
+        }
+        unlink(me.sun_path);
+    }
+    close(fd);
+    return ok;
+}
+
+/* wpa_supplicant's search interval; look: one search now as well */
+static void pace_set(int s, int look)
+{
+    char c[32];
+    snprintf(c, sizeof c, "SCAN_INTERVAL %d", s);
+    if (wpa_ctrl(c) == 0) {
+        if (s != pace_s) fprintf(stderr, "wifi: nothing joined: searching every %d s\n", s);
+        pace_s = s;
+    }
+    if (look) wpa_ctrl("SCAN");
+    pace_next = 0;
+}
+
+/* After a status poll: back off while nothing is joined, start over once
+ * something is (for the next time it's left) */
+static void pace_follow(int state)
+{
+    uint32_t t = now_ms();
+    if (join_until || state == UI_WIFI_CONNECTED || state == UI_WIFI_CONNECTING || state == UI_WIFI_OFF) {
+        if (pace_s != PACE_MIN_S) pace_set(PACE_MIN_S, 0);
+        pace_next = 0;
+    } else if (!pace_next) {
+        pace_next = t + (uint32_t)pace_s * 1000u;
+        if (!pace_next) pace_next = 1;
+    } else if ((int32_t)(pace_next - t) <= 0 && pace_s < PACE_MAX_S) {
+        pace_set(pace_s * 2 > PACE_MAX_S ? PACE_MAX_S : pace_s * 2, 0);
+        pace_next = t + (uint32_t)pace_s * 1000u;
+        if (!pace_next) pace_next = 1;
+    }
+}
+
 static void scan(void)
 {
     LAT("wifi: scan");
@@ -193,6 +267,8 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
             return;
         }
         fprintf(stderr, "wifi: on\n");
+        pace_s = PACE_MIN_S;                     /* (a new wpa_supplicant: its own 5 s) */
+        pace_next = 0;
         poll_status();
         join_since = now_ms();                    /* (see POLL_JOIN_MS) */
         join_until = join_since + JOIN_WINDOW_MS;
@@ -204,6 +280,8 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
     case CMD_STOP:
         join_until = scan_at = 0;
         scan_due = 0;
+        pace_s = PACE_MIN_S;
+        pace_next = 0;
         set_busy("Stopping");
         sh_run(FATHOM_WIFI " off >/dev/null 2>&1", NULL, 0);
         pthread_mutex_lock(&W.mu);
@@ -216,9 +294,22 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
         fprintf(stderr, "wifi: off\n");
         break;
     case CMD_SCAN:
+        if (pace_s != PACE_MIN_S) pace_set(PACE_MIN_S, 0);   /* (Settings > Wi-Fi open: a network may be wanted) */
+        pace_next = 0;
         scan();
         scan_due = 0;
         break;
+    case CMD_WAKE: {                             /* the screen on: nothing joined, look now */
+        static uint32_t last;
+        pthread_mutex_lock(&W.mu);
+        int state = W.st.state;
+        pthread_mutex_unlock(&W.mu);
+        uint32_t t = now_ms();
+        if (join_until || state != UI_WIFI_ON || (last && t - last < WAKE_LOOK_MS)) break;
+        last = t ? t : 1;
+        pace_set(PACE_MIN_S, 1);
+        break;
+    }
     case CMD_CONNECT: {
         join_until = scan_at = 0;                /* (it scans when done) */
         scan_due = 0;
@@ -277,6 +368,10 @@ static void *worker(void *arg)
                 int32_t left = (int32_t)(scan_at - now_ms());
                 if (left < ms) ms = left < 0 ? 0 : left;
             }
+            if (pace_next && pace_s < PACE_MAX_S) {   /* searching less often, when due */
+                int32_t left = (int32_t)(pace_next - now_ms());
+                if (left < ms) ms = left < 0 ? 0 : left;
+            }
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_sec += ms / 1000;
@@ -319,6 +414,10 @@ static void *worker(void *arg)
                 scan_at = 0;
                 scan();
             }
+            pthread_mutex_lock(&W.mu);
+            int st_now = W.st.state;
+            pthread_mutex_unlock(&W.mu);
+            pace_follow(st_now);
         }
         memset(pass, 0, sizeof pass);
     }
@@ -381,6 +480,16 @@ void wifi_ui_do(int what, const char *ssid, const char *password)
     case UI_WIFI_CONNECT: if (on && ssid && *ssid) request(CMD_CONNECT, ssid, password); break;
     case UI_WIFI_FORGET: if (on && ssid && *ssid) request(CMD_FORGET, ssid, NULL); break;
     }
+}
+
+void wifi_wake(void)
+{
+    pthread_mutex_lock(&W.mu);
+    if (W.on && !W.cmd && W.st.state == UI_WIFI_ON) {   /* (a command waiting stays: it's the user's) */
+        W.cmd = CMD_WAKE;
+        pthread_cond_signal(&W.cv);
+    }
+    pthread_mutex_unlock(&W.mu);
 }
 
 unsigned wifi_seq(void)

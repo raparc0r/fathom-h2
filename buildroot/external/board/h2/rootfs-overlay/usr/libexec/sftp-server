@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 # SFTP for SSH logins (dropbear runs this): the Green End SFTP server, from the
 # card with the network drive's programs (post-build.sh). Behind the music:
 # nice 19 (dropbear's 10, plus 9), and what it reads leaves the page cache once

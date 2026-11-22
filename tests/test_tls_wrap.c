@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* app/net/tls_wrap.c: one parsed certificate bundle lent to every connection,
  * verifying as a private parse would. Linked with the same --wrap options as
  * the player, so these calls go through the wrapper as FFmpeg's do.

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * fathom-nocache.so: file data read by the network drive (lighttpd) and SFTP
  * (gesftpserver) leaves the page cache as soon as it's been read, loaded

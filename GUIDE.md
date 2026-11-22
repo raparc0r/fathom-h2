@@ -110,6 +110,13 @@ Recordings with instruments panned hard to one side are less tiring on headphone
 **Light**, **Medium** and **Strong** set how much; like the EQ, each output keeps its own
 (off by default), so it can be on for your headphones and off for the line out.
 
+**Volume levelling** (Settings → Sound) plays every song at about the same loudness
+(**Track**), or keeps each album's own loud and quiet songs (**Album**). Songs with
+ReplayGain tags are levelled straight away; the rest are measured on the H2, only while it
+is charging and not playing, which can take hours for a big library. While it measures, the
+setting shows how far it has got ("Track, 63%"), and Menu on it gives the number of songs.
+With levelling off (the default) nothing is measured.
+
 **Pure mode** (Settings → Sound) turns off the EQ, crossfeed, balance and volume levelling in
 one go, and Now Playing shows "Bit+" while the music reaches the DAC exactly as in the file.
 

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Phase-0 UI skeleton: one list model (28 px header + 5 rows at a 42 px pitch),
  * Now Playing, live theme switching, and motion:
@@ -1094,6 +1095,26 @@ static void eqe_new(void)
  * network's, a device's or an EQ's name stays as it is) */
 static void pod_speed_text(int pct, char *out, size_t cap);
 
+/* Volume levelling's measuring: songs ready (gains from tags, or measured)
+ * of all; looked up again at most every 5 s (the rows are drawn each
+ * second). The percent ready, or -1: levelling off, or nothing left. */
+static int levelling_left(int *done, int *total)
+{
+    static int d, n;
+    static uint32_t at;
+    static int looked;
+    if (!looked || lv_tick_elaps(at) >= 5000) {
+        d = n = 0;
+        if (S.lib) library_rg_progress(S.lib, &d, &n);
+        at = lv_tick_get();
+        looked = 1;
+    }
+    if (done) *done = d;
+    if (total) *total = n;
+    if (settings_get_int("sound.levelling", LEVEL_OFF) == LEVEL_OFF || n <= 0 || d >= n) return -1;
+    return (int)((int64_t)d * 100 / n);   /* (99 till the last one) */
+}
+
 static void setting_row(setting_t st, int editing, char *main, size_t mn, char *meta, size_t tn)
 {
     switch (st) {
@@ -1151,7 +1172,9 @@ static void setting_row(setting_t st, int editing, char *main, size_t mn, char *
         static const char *const how[] = {"Off", "Track", "Album"};
         int v = settings_get_int("sound.levelling", LEVEL_OFF);
         snprintf(main, mn, "%s", tr("Volume levelling"));
-        snprintf(meta, tn, "%s", tr(S.pure ? "Bypassed" : how[v >= 0 && v <= 2 ? v : 0]));
+        int pc = S.pure ? -1 : levelling_left(NULL, NULL);
+        if (pc >= 0) snprintf(meta, tn, "%s, %d%%", tr(how[v >= 0 && v <= 2 ? v : 0]), pc);   /* (measuring) */
+        else snprintf(meta, tn, "%s", tr(S.pure ? "Bypassed" : how[v >= 0 && v <= 2 ? v : 0]));
         break;
     }
     case ST_EQ:
@@ -2471,8 +2494,9 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
             return;
         }
         if (S.lib) library_row(S.lib, view_of(l->kind), id, main, mn, meta, tn);
-        if (covers_in(l->kind) && !(album_artists_on() && library_row_shows_artist(view_of(l->kind))))
-            meta[0] = '\0';   /* (the cover takes the year's or length's place) */
+        if (covers_in(l->kind) && is_album_list(l->kind) &&
+            !(album_artists_on() && library_row_shows_artist(view_of(l->kind))))
+            meta[0] = '\0';   /* (an album's cover takes the year's place; a song keeps its length) */
         if (S.moving && l->kind == L_PLAYLIST_TRACKS && i == l->sel) snprintf(meta, tn, "%s", tr("Moving"));
         if (S.now.active) {
             if (is_track_list(l->kind) || l->kind == L_FOLDER) *playing = id == S.now.track.id;
@@ -3201,12 +3225,14 @@ static int ui_text_list(list_kind_t k)
 }
 
 /* Settings > Interface > Covers in lists (display.covers: 1 Albums, the default; 2 Songs):
- * each album's cover before it, or each song's album's, in place of the year
- * or the length */
+ * in every list of albums (an artist's, a genre's, Recently added...) each
+ * album's cover before it, in place of the year; in every list of songs (an
+ * album's, playlists, Favourites, History, the play queue...) each song's
+ * album's, the length kept */
 static int covers_in(list_kind_t k)
 {
     int v = settings_get_int("display.covers", UI_COVERS_DEFAULT);
-    return (k == L_ALBUMS && (v & 1)) || (k == L_SONGS && (v & 2));
+    return (is_album_list(k) && (v & 1)) || ((is_track_list(k) || k == L_QUEUE) && (v & 2));
 }
 
 /* Albums' covers: the last COV_CACHE read, so scrolling a row reads one, not a
@@ -3382,7 +3408,9 @@ static void fill_slots(const level_t *l, int n)
         int cover = covers_in(l->kind) && S.lib && covers_take();   /* the album's cover (none: a plain square) */
         show(S.row_cov[j], cover);
         if (cover) {
-            int64_t id = l->kind == L_ALBUMS ? l->items.ids[i] : library_track_album(S.lib, l->items.ids[i]);
+            int64_t tid = l->kind == L_QUEUE ? (S.player ? player_queue_at(S.player, i) : -1)   /* (the queue: the player's) */
+                        : l->items.ids[i];
+            int64_t id = is_album_list(l->kind) ? tid : tid >= 0 ? library_track_album(S.lib, tid) : -1;
             if (S.cov_id[j] != id) {
                 const uint16_t *px = cover_px(id);
                 uint16_t *to = g_cov->slot[j];
@@ -4477,7 +4505,7 @@ static const char *setting_help(setting_t st)
 {
     switch (st) {
     case ST_THEME: return "Pick how Fathom looks. More themes can go in fathom/themes.";
-    case ST_COVERS: return "Show album covers when browsing Albums/Songs.";
+    case ST_COVERS: return "Show album covers in lists of albums and of songs.";
     case ST_ALBUM_ARTISTS: return "Display artist name when browsing albums.";
     case ST_BRIGHTNESS: return "How bright the screen is. Press Play, then turn the wheel.";
     case ST_TIMEOUT: return "How long the screen stays on. Saves battery.";
@@ -4580,6 +4608,7 @@ static const char *row_help(const level_t *l)
         case AB_AUTO: return "Check for updates once a day over Wi-Fi.";
         case AB_CHECK: return "Check for a newer version of Fathom.";
         default:
+            if (!strcmp(S.about_lbl[i], UI_ABOUT_CREDIT)) return UI_ABOUT_NOTICE;
             if (!strcmp(S.about_lbl[i], "Clock")) return "Set from the internet over Wi-Fi. In UTC.";
             if (!strcmp(S.about_lbl[i], "Charge cycles")) return "Battery wear, in full charges used.";
             return NULL;
@@ -4596,7 +4625,20 @@ static const char *row_help(const level_t *l)
         default: return NULL;
         }
     default:
-        return is_setting_level(l->kind) && l->kind != L_QUICK && i < n ? setting_help(setting_at(l, i)) : NULL;
+        if (!is_setting_level(l->kind) || l->kind == L_QUICK || i >= n) return NULL;
+        if (setting_at(l, i) == ST_LEVELLING && !S.pure) {   /* (and how far its measuring is) */
+            static char h[240];
+            int done, total;
+            if (levelling_left(&done, &total) >= 0) {
+                char d[16], t[16];
+                snprintf(d, sizeof d, "%d", done);
+                snprintf(t, sizeof t, "%d", total);
+                subst(h, sizeof h, tr("%s of %s songs ready. The rest are measured while charging and not playing."),
+                      d, t);
+                return h;
+            }
+        }
+        return setting_help(setting_at(l, i));
     }
 }
 
@@ -6286,14 +6328,14 @@ static void setting_ok(setting_t st)
         settings_set_int("sound.levelling", v);
         if (S.player) player_set_levelling(S.player, (levelling_t)v);
         int done = 0, total = 0;
-        if (S.lib) library_rg_progress(S.lib, &done, &total);
-        if (v != LEVEL_OFF && done < total) {
-            char msg[96];
+        if (v == LEVEL_TRACK && levelling_left(&done, &total) >= 0) {   /* (just turned on) */
+            char msg[200];
             char d[16], n[16];
             snprintf(d, sizeof d, "%d", done);
             snprintf(n, sizeof n, "%d", total);
-            subst(msg, sizeof msg, tr("%s of %s tracks measured: the rest while charging"), d, n);
-            ui_toast(msg, 3000);
+            subst(msg, sizeof msg, tr("%s of %s songs ready. The rest are measured while the H2 is charging"
+                                      " and not playing, which can take hours."), d, n);
+            toast_show(msg, 7000, S.f->sub);
         }
         break;
     }
@@ -7503,6 +7545,7 @@ void ui_show(const char *what)
         while (first < l->items.n && l->items.ids[first] < 0) first++;   /* (the smart ones first) */
         int smart = !strncmp(what, "smart", 5);
         l->sel = smart ? 0 : first + 2 < l->items.n ? first + 2 : first;
+        if (l->sel >= l->items.n) l->sel = l->items.n > 0 ? l->items.n - 1 : 0;   /* (only smart ones: none of yours) */
         char name[128];
         if (!strcmp(what, "playlist") && l->sel < l->items.n && S.lib &&
             library_playlist_name(S.lib, l->items.ids[l->sel], name, sizeof name) == 0)

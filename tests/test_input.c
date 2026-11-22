@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * device/input.c on the host: its events come from a pipe instead of
  * /dev/input (tests/fake holds the Linux headers it needs). A headphone jack

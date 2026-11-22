@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 """
 flash-check: sanity-check a full H2 flash dump (flash.img from the bootloader's
 "Dump entire flash") against the stock firmware update file.

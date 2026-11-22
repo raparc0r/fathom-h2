@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # The unit tests, built for the H2 and run on it: what the Mac's C library
 # hides shows here (the battery log's header at every flush, 2026-11-19, came
@@ -73,7 +74,7 @@ echo "== running"
 $H2SSH "cd $DIR && fails=0 && for t in \$(cat run-list.txt); do
         s=\$(date +%s); FATHOM_NO_RT=1 SQLITE_TMPDIR=$DIR/t LD_LIBRARY_PATH=$DIR/lib TMPDIR=$DIR/t nice -n 19 ./\$t > \$t.log 2>&1; rc=\$?
         printf '%-18s %s  %ss\n' \$t \$([ \$rc = 0 ] && echo ok || echo FAILED) \$((\$(date +%s) - s))
-        [ \$rc = 0 ] || { fails=\$((fails + 1)); sed 's/^/    /' \$t.log | tail -40; }
+        [ \$rc = 0 ] || { fails=\$((fails + 1)); grep -E '[.]c:[0-9]+: |FAIL|slow write|a write waited' \$t.log | head -20 | sed 's/^/    check: /'; sed 's/^/    /' \$t.log | tail -40; }
         [ \$rc != 0 ] || [ $VERBOSE = 0 ] || sed 's/^/    /' \$t.log | tail -40
         rm -rf $DIR/t/*
     done; cd / && rm -rf $DIR; echo; [ \$fails = 0 ] && echo 'all passed on the H2' || { echo \"\$fails failed on the H2\"; exit 1; }"

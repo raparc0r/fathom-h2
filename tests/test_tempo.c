@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Faster without the pitch going up (audio/tempo.h): length, pitch, smoothness, and its cost. */
 #include <math.h>
 #include <stdio.h>

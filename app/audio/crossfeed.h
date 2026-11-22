@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Crossfeed for headphones: each ear also hears the other channel, low-passed
  * (the head shading what reaches the far ear), as it would from speakers, so

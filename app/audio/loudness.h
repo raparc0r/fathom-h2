@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Integrated loudness (EBU R128 / ITU-R BS.1770-4) and sample peak, for
  * volume levelling (ReplayGain 2.0: gain = -18 LUFS - loudness). Feed it the

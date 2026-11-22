@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * CUE sheets (app/library/cue.c): the parser (encodings, INDEX times, what's
  * missing), then a generated album as one FLAC with a .cue next to it and

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * ITU-R BS.1770-4: K-weighting (a high shelf, then a high pass), mean square
  * over 400 ms blocks every 100 ms, an absolute gate at -70 LUFS and a relative

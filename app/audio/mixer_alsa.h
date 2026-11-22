@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Hardware volume through an ALSA integer mixer control (Linux only). */
 #ifndef FATHOM_MIXER_ALSA_H
 #define FATHOM_MIXER_ALSA_H

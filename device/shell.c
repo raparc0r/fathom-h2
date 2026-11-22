@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Shell helpers shared by the workers that drive fathom-wifi, fathom-bt,
  * fathom-share and fathom-ssh (see shell.h). */
 #include "shell.h"

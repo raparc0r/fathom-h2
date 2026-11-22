@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Podcasts over the network (net/podcast.h for the files): one worker thread
  * does one job at a time, in the order asked:

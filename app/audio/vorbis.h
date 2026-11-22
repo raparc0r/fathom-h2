@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Ogg Vorbis files. On the H2 through Tremor (libvorbisidec: integer, as
  * floating point is slow on the X1000), on a computer through Tremor or

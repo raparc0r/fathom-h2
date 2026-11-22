@@ -1,4 +1,5 @@
 ; SPDX-License-Identifier: GPL-3.0-or-later
+; Additional terms under GPLv3 section 7: see LICENSE.
 ; Pixel Pastel's colours with the Studio look: Atkinson, round corners, line icons.
 [theme]
 name    = Studio Pastel

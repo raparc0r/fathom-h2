@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* DNS results kept for a while (dnscache.h).
  *
  * Measured on the H2 (2026-11-21, the owner's router): a lookup takes 30 ms to

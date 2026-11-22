@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Decoders produce interleaved signed 32-bit samples, left-justified: a 16-bit
  * source sample s becomes s << 16, a 24-bit one s << 8. So the original bits are

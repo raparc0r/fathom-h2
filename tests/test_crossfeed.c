@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Crossfeed (audio/crossfeed.h): the whole-number filter against the same
  * design in doubles, and what it's for: each preset's bass separation, wide
  * separation in the treble, mono at its own level, no wrap-around at full

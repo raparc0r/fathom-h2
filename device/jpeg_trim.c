@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * libjpeg-turbo 3 decodes 12- and 16-bit JPEGs too (medical and lossless
  * images; browsers don't show them either), through a second and third copy

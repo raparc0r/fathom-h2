@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * A small coverage-guided fuzzer for Fathom's parsers (macOS's clang has no
  * libFuzzer): the libraries are built with -fsanitize-coverage=trace-pc-guard

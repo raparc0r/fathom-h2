@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Bluetooth output format: 16-bit stereo at the link's rate (44.1 or 48 kHz,
  * fixed while the headphones are connected: changing it mid-link drops many
  * of them). From the track's own format, in up to three steps:

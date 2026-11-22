@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Faster without the pitch going up: WSOLA in whole numbers (tempo.h). */
 #include "audio/tempo.h"
 

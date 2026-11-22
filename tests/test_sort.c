@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* How albums and songs sort (app/library/library.c): leading punctuation
  * skipped, "the " too for albums, and an older library re-sorted on opening. */
 #include <FLAC/metadata.h>

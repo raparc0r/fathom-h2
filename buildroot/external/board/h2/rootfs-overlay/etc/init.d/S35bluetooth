@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # Bluetooth is the player's to start (Settings > Bluetooth, through fathom-bt):
 # at boot the chip stays powered down; at shutdown the stack stops, which also

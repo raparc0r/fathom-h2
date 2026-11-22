@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 """
 Add Home's Podcasts icon to the cut-down icon font (assets/fonts/TablerIcons-Home.ttf),
 drawn here in the Tabler Icons' style (a 24-unit grid, 2-unit strokes with

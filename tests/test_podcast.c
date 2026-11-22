@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Podcasts: feeds, OPML, search answers, chapters, and the files on the card (net/podcast.h). */
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,6 +81,13 @@ static void feed(void)
     CHECK(pod_feed_complete("<feed xmlns=\"x\"></FEED>", 24), "</feed>, any case");
     CHECK(pod_feed_complete("<rdf:RDF></rdf:RDF>", 19), "</rdf:RDF>");
     CHECK(!pod_feed_complete("<rss><channel><item>", 20) && !pod_feed_complete("", 0), "cut");
+    {   /* over a KB after the end (a comment, whitespace): still complete */
+        char tail[4200];
+        int k = snprintf(tail, sizeof tail, "<rss><channel></channel></rss>\n<!--");
+        memset(tail + k, 'x', 4000);
+        memcpy(tail + k + 4000, "-->", 4);
+        CHECK(pod_feed_complete(tail, strlen(tail)), "</rss> then 4 KB");
+    }
     /* cut anywhere: never a crash, whole episodes only */
     for (size_t cut = 0; cut < len; cut += 7) {
         int m = pod_parse_feed(xml, cut, &s, e, 10);
@@ -195,6 +203,14 @@ static void card(void)
     CHECK(pod_episodes_load(dir, d.id, back, 10) == ne, "episodes read back");
     for (int i = 0; i < ne; i++)
         CHECK(!memcmp(&e[i], &back[i], sizeof e[i]), "episode %d the same", i);
+    if (ne > 0) {   /* a key that isn't hex (the file edited by hand): that episode left out */
+        pod_episode_t bad[10];
+        memcpy(bad, e, sizeof bad[0] * (size_t)ne);
+        snprintf(bad[0].key, sizeof bad[0].key, "../../../../");
+        CHECK(pod_episodes_save(dir, d.id, bad, ne) == 0, "episodes saved, one key bad");
+        CHECK(pod_episodes_load(dir, d.id, back, 10) == ne - 1, "the bad key left out");
+        CHECK(pod_episodes_save(dir, d.id, e, ne) == 0, "episodes saved again");
+    }
 
     /* state */
     pod_state_t s = {0}, st[8], one;

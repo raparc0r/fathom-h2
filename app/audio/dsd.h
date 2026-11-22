@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * DSD files (DSF, and DSDIFF/DFF uncompressed): their headers, and their
  * playback as PCM through a low-pass decimating filter in integer arithmetic,

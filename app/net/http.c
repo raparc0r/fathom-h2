@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Fetching over HTTP(S) (http.h): FFmpeg's avio, as the radio uses it. */
 #include "net/http.h"
 
@@ -6,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 /* Who's asking: Fathom, its version and where it's from (MusicBrainz asks
@@ -41,7 +43,10 @@ static AVIOContext *open_url(const char *url, const volatile int *abort, int *go
     AVDictionary *opt = NULL;
     av_dict_set(&opt, "rw_timeout", HTTP_TIMEOUT_US, 0);
     av_dict_set(&opt, "user_agent", g_ua, 0);
-    av_dict_set(&opt, "follow", "1", 0);          /* (FFmpeg follows redirects by default) */
+    /* (FFmpeg follows redirects by itself.) Only the network: a podcast
+     * feed's enclosure or image is a URL from anyone, and file:, a device
+     * path or a bare tcp: to a LAN host would be opened as readily */
+    av_dict_set(&opt, "protocol_whitelist", "http,https,tls,tcp,httpproxy", 0);
     ff_tls_options(&opt);
     int r = avio_open2(&pb, url, AVIO_FLAG_READ, &icb, &opt);
     av_dict_free(&opt);
@@ -77,6 +82,17 @@ long http_get(const char *url, char *buf, size_t cap, const volatile int *abort)
     return cut ? -2 : (long)n;
 }
 
+/* A download stops before the card has less than this free: a server that
+ * never stops sending (a live stream given as an episode or a cover, with no
+ * length) would fill it, and the library, settings and an update with it */
+#define DOWNLOAD_FLOOR (32ULL * 1024 * 1024)
+
+static int card_nearly_full(FILE *f)
+{
+    struct statvfs v;
+    return fstatvfs(fileno(f), &v) == 0 && (unsigned long long)v.f_bavail * v.f_frsize < DOWNLOAD_FLOOR;
+}
+
 int64_t http_download(const char *url, const char *path, http_progress_fn progress, void *ctx,
                       const volatile int *abort)
 {
@@ -101,7 +117,11 @@ int64_t http_download(const char *url, const char *path, http_progress_fn progre
         /* Each MB to the card and out of the page cache: a 16 MB download
          * would otherwise push out the player's own code (run from the card,
          * in 24 MB of RAM) and leave it all to write at once. */
-        if ((done & 0xFFFFF) < (uint64_t)k && (fflush(f) || fdatasync(fileno(f)))) { ok = 0; break; }
+        if ((done & 0xFFFFF) < (uint64_t)k && (fflush(f) || fdatasync(fileno(f)) || card_nearly_full(f))) {
+            if (card_nearly_full(f)) fprintf(stderr, "http: download stopped: the card is nearly full\n");
+            ok = 0;
+            break;
+        }
 #ifdef POSIX_FADV_DONTNEED
         if ((done & 0xFFFFF) < (uint64_t)k) posix_fadvise(fileno(f), 0, 0, POSIX_FADV_DONTNEED);
 #endif

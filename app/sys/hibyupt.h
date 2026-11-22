@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * HiBy's update files (update.upt), for Uninstall Fathom: read one, check it,
  * and mark its bootloader for installing, in place.

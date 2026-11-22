@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Radio France's live API answer: the step on now (levels[0].position). */
 #include "player/rfmeta.h"
 

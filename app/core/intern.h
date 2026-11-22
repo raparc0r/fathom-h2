@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* String interning: maps strings to dense ids 1..n (0 is reserved for "none"). */
 #ifndef FATHOM_INTERN_H
 #define FATHOM_INTERN_H

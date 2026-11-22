@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * drm-test: show a test pattern through DRM/KMS (dumb buffer + SETCRTC),
  * the same path the player's display backend uses. Bring-up tool only.

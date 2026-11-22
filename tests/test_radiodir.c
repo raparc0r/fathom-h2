@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* The station directory (app/net/radiodir.c), on answers saved from
  * radio-browser.info (tests/fixtures/radiodir, 2026-11-17). */
 #include <pthread.h>

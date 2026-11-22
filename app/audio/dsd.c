@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * DSD to PCM in two stages, both linear-phase FIRs (Kaiser-windowed sinc,
  * designed when a file opens; integers from there on: Fathom is built soft-float).

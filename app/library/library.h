@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Music library: SQLite database of tracks, albums and artists, an incremental
  * scanner, and a cover-art cache (pre-scaled RGB565, the panel's native format).
@@ -124,9 +125,12 @@ int  library_artist_name(library_t *lib, int64_t artist_id, char *out, size_t ca
 /* Tracks read before tags added later (the composer, a CUE sheet in the
  * tags): a scan reads just those from them, once. 1 if there are any. */
 int  library_needs_tags(library_t *lib);
-/* Albums without a cover that no scan has looked at since covers could come
- * from more places (FLAC pictures of any type, other tracks, a disc's album
- * folder, big images): one background scan finds theirs. */
+/* Albums whose cover no scan has looked at: since covers could come from more
+ * places (FLAC pictures of any type, other tracks, a disc's album folder, big
+ * images), or at all (a scan's cover pass cut short by a stop or a restart,
+ * which goes through albums in the order they were added: the last ones were
+ * left without, until something else made a scan run). One background scan
+ * finds theirs. */
 int  library_needs_art(library_t *lib);
 /* A composer's tracks on one album (LIB_COMPOSER_TRACKS). */
 int  library_list_composer_tracks(library_t *lib, int64_t composer_id, int64_t album_id, lib_list_t *out);

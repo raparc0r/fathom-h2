@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* LVGL configuration for the H2 (DRM display, evdev input handled by Fathom). Only overrides. */
 #if 1
 #ifndef LV_CONF_H

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 """
 The header's Wi-Fi icon: a dot and three arcs (a 90 degree fan), anti-aliased, as
 an A8 image the UI tints with the theme's colour. Sized like the header's other

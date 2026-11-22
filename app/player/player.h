@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Player: the play queue on top of the engine. A context (album, artist, all
  * songs, a playlist) is played in natural order or as a shuffle cycle.

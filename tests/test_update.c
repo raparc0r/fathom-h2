@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Updates over Wi-Fi without the network (app/net/update.c, unzip.c, sha256.c):
  * versions, GitHub's answer (a real one, tests/data; its author and uploader

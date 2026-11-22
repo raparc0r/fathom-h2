@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * The H2's hardware as its kernel shows it: one name for each, for the player
  * and its helpers (cardout). A USB DAC or another card is found at run time.

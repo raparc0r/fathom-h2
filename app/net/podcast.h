@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Podcasts (Home > Podcasts): the parts that need no network, so the desktop
  * tests run them; net/podsync.h fetches and downloads with them.

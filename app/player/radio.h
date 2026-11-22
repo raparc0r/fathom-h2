@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Internet radio stations: fathom/radio.txt on the card (assets/radio.txt is
  * an example). One station per line,

@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # Bluetooth audio: D-Bus, BlueZ and bluez-alsa, all run from the card
 # (fathom/bt), the chip through fathom-bluetooth. The player calls this:

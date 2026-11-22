@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * fathom-bitperfect (on the H2): play files back to back through the player's
  * own engine and ALSA output, and record every byte written to the card.

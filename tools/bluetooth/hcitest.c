@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * fathom-hcitest: is the Bluetooth chip alive? Talks HCI straight to hci0
  * through the kernel's user channel (no BlueZ, no D-Bus), so it runs on the

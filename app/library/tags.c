@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 #define _FILE_OFFSET_BITS 64   /* DSD files pass 2 GB */
 #include "tags.h"
 

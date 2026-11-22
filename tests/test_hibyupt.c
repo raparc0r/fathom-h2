@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * HiBy's update files (app/sys/hibyupt.c, md5.c), on images made here in
  * HiBy's layout (ISO 9660 names "UBOOT.BIN;1", Rock Ridge-like extra bytes, no

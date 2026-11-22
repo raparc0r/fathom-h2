@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Fathom: DHCP server for the USB network link to the computer
 CONFIG_UDHCPD=y
 # Fathom: the clock from the network when Wi-Fi connects (udhcpc hook fathom-ntp)

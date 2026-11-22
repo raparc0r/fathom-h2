@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * SHA-256 (FIPS 180-4), for checking updates against the release's
  * SHA256SUMS and GitHub's digest. Our own: the desktop build has no mbedTLS,

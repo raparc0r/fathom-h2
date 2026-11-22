@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * slcd-poke: bring-up probe for the X1000 smart-LCD controller on the H2.
  * Drives the controller's MDATA register directly through /dev/mem, so the

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * fathom-cardout: the screen while the microSD card is out. fathom-sdcard
  * starts it once the player has gone (the player, its fonts and everything it

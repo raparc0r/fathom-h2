@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 # Desktop simulator: the player UI at 320x240 in an SDL window (or headless screenshots).
 include(FetchContent)
 find_package(PkgConfig REQUIRED)

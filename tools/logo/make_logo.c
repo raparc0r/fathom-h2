@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * make-logo: draw Fathom's boot screen (320x240): a drop falling into four
  * rings of ripples, and FATHOM below it, in Pixel Pastel's lavenders.

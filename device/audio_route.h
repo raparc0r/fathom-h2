@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* The H2's output switch (PB5 STEREOSW_SEL): headphone jack or line-out jack. */
 #ifndef FATHOM_AUDIO_ROUTE_H
 #define FATHOM_AUDIO_ROUTE_H

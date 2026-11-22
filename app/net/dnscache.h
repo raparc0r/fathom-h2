@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Names looked up lately, kept for a while (musl keeps none, and every
  * connection asks the router again: 30 ms to a second on the H2's Wi-Fi, and a
  * router that refuses now and then costs musl its whole 5 s timeout). In the

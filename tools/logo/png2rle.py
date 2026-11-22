@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 """
 Turn assets/logo.png into a C header for the bootloader (h2boot), which shows
 the logo while it loads the kernel: a palette and run-length pairs (count,

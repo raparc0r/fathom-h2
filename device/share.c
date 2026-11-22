@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* The network drive: a worker thread runs fathom-share (lighttpd's WebDAV over
  * HTTPS, with the H2's own certificate from tlscert.c, and mdnsd, from the
  * card) while the drive is wanted and Wi-Fi is connected, and

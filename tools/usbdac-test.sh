@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # USB DAC bring-up on the H2, for when the cable to the computer is unplugged
 # (no ssh): waits for a USB audio card, logs what the kernel found, sets the

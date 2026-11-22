@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 # USB-C port role: sink for computers and chargers, dual role to find USB DACs.
 # (it logs to syslog itself: no shell or logger kept running for it)
 case "$1" in

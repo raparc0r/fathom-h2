@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * The station directory (Home > Radio > Find stations): radio-browser.info's
  * public API, https://api.radio-browser.info. Asked only when someone opens a

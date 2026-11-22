@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 include $(sort $(wildcard $(BR2_EXTERNAL_FATHOM_PATH)/package/*/*.mk))
 
 # aptX for bluez-alsa through libfreeaptx (LGPL), not Buildroot's libopenaptx,

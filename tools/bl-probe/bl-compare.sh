@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # Compare backlight PWM frequencies by eye on the H2, without a new kernel.
 # Runs on the H2 (over SSH), next to bl-probe:

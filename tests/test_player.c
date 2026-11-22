@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * The player's queue, repeat modes, stop-after and saved queue, against a tiny
  * generated library: six 0.3 s FLAC files played through the real engine and a
@@ -294,6 +295,96 @@ static void test_unplayable(const char *dir)
     library_close(lib);
 }
 
+/* Songs a scan removed since the queue was made: passed over, not the end of
+ * playback; one chosen that's gone: the next that's still there */
+static void test_removed(const char *dir)
+{
+    char music[300], path[400], db[300], art[300];
+    snprintf(music, sizeof music, "%s/removed", dir);
+    snprintf(db, sizeof db, "%s/removed.db", dir);
+    snprintf(art, sizeof art, "%s/removed-art", dir);
+    mkdir(music, 0755);
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof path, "%s/%02d.flac", music, i + 1);
+        CHECK(write_flac(path, i + 1) == 0);
+    }
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 4);
+    lib_list_t albums, tr;
+    CHECK(library_list(lib, LIB_ALBUMS, 0, &albums) == 1);
+    CHECK(library_list(lib, LIB_ALBUM_TRACKS, albums.ids[0], &tr) == 4);
+    snprintf(path, sizeof path, "%s/02.flac", music);   /* track 2 gone */
+    unlink(path);
+    CHECK(library_scan(lib, music, NULL, NULL) == 3);
+    out_null_stats_t ns;
+    out_null_create(&g_inner, &ns);
+    engine_t *eng = engine_new(&g_inner);
+    player_t *p = player_new(lib, eng);
+
+    player_play(p, tr.ids, 4, 0);                 /* 1, (2 gone), 3, 4 */
+    WAIT_FOR(p, cur_id(p) == tr.ids[3] || !playing(p), SLOW);
+    CHECK(cur_id(p) == tr.ids[3]);
+    player_play(p, tr.ids, 4, 1);                 /* 2 chosen: 3 plays */
+    WAIT_FOR(p, playing(p), SLOW);
+    CHECK(playing(p) && cur_id(p) == tr.ids[2]);
+
+    player_free(p);
+    engine_free(eng);
+    library_list_free(&tr);
+    library_list_free(&albums);
+    library_close(lib);
+}
+
+/* A long file's place, cued after a restart (not played since) and left for
+ * another song: kept (it was only in memory, lost) */
+static void test_long_cued(const char *dir)
+{
+    char music[300], path[400], db[300], art[300], queue[300];
+    snprintf(music, sizeof music, "%s/long", dir);
+    snprintf(db, sizeof db, "%s/long.db", dir);
+    snprintf(art, sizeof art, "%s/long-art", dir);
+    snprintf(queue, sizeof queue, "%s/long-queue.txt", dir);
+    mkdir(music, 0755);
+    snprintf(path, sizeof path, "%s/01.flac", music);
+    CHECK(write_flac_long(path, 21 * 60) == 0);      /* (a long file: 20 minutes or more) */
+    snprintf(path, sizeof path, "%s/02.flac", music);
+    CHECK(write_flac(path, 2) == 0);
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 2);
+    lib_list_t tr;
+    CHECK(library_list(lib, LIB_SONGS, 0, &tr) == 2);
+    lib_track_t lt;
+    if (tr.n == 2 && library_track(lib, tr.ids[0], &lt) == 0 && lt.duration_ms < 60000) {   /* the long one first */
+        int64_t x = tr.ids[0];
+        tr.ids[0] = tr.ids[1];
+        tr.ids[1] = x;
+    }
+    out_null_stats_t ns;
+    out_null_create(&g_inner, &ns);
+    engine_t *eng = engine_new(&g_inner);
+    player_t *p = player_new(lib, eng);
+    player_play(p, tr.ids, 2, 0);
+    WAIT_FOR(p, playing(p), SLOW);
+    player_seek_by(p, 5 * 60 * 1000);
+    WAIT_FOR(p, now_pos(p) >= 5 * 60 * 1000, SLOW);
+    player_pause(p, 1);
+    WAIT_FOR(p, 0, 200);
+    CHECK(player_save(p, queue) == 0);
+    player_free(p);                                  /* (switched off) */
+    engine_stop(eng);
+    player_t *q = player_new(lib, eng);
+    CHECK(player_restore(q, queue) == 0 && cur_id(q) == tr.ids[0] && !playing(q));
+    player_play(q, &tr.ids[1], 1, 0);                /* something else, the long one never started */
+    WAIT_FOR(q, playing(q), SLOW);
+    uint32_t at = library_resume(lib, tr.ids[0]);
+    CHECK(at >= 5 * 60 * 1000 && at < 6 * 60 * 1000);
+    if (!(at >= 5 * 60 * 1000 && at < 6 * 60 * 1000)) fprintf(stderr, "long file kept at %u ms\n", at);
+    player_free(q);
+    engine_free(eng);
+    library_list_free(&tr);
+    library_close(lib);
+}
+
 int main(void)
 {
     char dir[200];
@@ -309,6 +400,8 @@ int main(void)
     test_engine_depth(dir);
     test_engine_eq(dir);
     test_unplayable(dir);
+    test_removed(dir);
+    test_long_cued(dir);
     char db[300], art[300], queue[300];
     snprintf(db, sizeof db, "%s/lib.db", dir);
     snprintf(art, sizeof art, "%s/art", dir);
@@ -522,6 +615,19 @@ int main(void)
     player_play(p, t, N, 5);
     WAIT_FOR(p, idx_of(p, t, N) >= 0 && idx_of(p, t, N) < 5, SLOW);   /* (wrapped: the first, or past it) */
     CHECK(idx_of(p, t, N) >= 0 && idx_of(p, t, N) < 5 && player_repeat(p) == REPEAT_ALL);
+
+    /* end of album with repeat all on one album: stops at its end (it wrapped
+     * and played on); and with repeat one, at the end of the track */
+    player_play(p, t, N, 5);
+    player_set_sleep(p, PLAYER_SLEEP_END_ALBUM);
+    WAIT_FOR(p, !playing(p), SLOW);
+    CHECK(!playing(p) && player_sleep_minutes(p) == 0);
+    player_set_repeat(p, REPEAT_ONE);
+    player_play(p, t, N, 4);
+    player_set_sleep(p, PLAYER_SLEEP_END_ALBUM);
+    WAIT_FOR(p, !playing(p), SLOW);
+    CHECK(!playing(p) && player_sleep_minutes(p) == 0);
+    player_set_repeat(p, REPEAT_ALL);
 
     /* repeat off: the last track ends and playback stops */
     player_set_repeat(p, REPEAT_OFF);
@@ -771,6 +877,37 @@ int main(void)
         library_list_free(&at);
     }
     library_list_free(&arts);
+
+    /* Next and Prev while paused: another track, still paused (a press in a
+     * pocket starts nothing); and with nothing started (a restored queue),
+     * only cued, which Play then starts */
+    {
+        player_set_shuffle(p, 0);
+        player_set_repeat(p, REPEAT_OFF);
+        player_play(p, t, N, 1);
+        player_pause(p, 1);
+        player_next(p);
+        WAIT_FOR(p, 0, 600);                              /* (two 0.3 s tracks' time) */
+        CHECK(cur_id(p) == t[2] && !playing(p));
+        player_prev(p);
+        WAIT_FOR(p, 0, 600);
+        CHECK(cur_id(p) == t[1] && !playing(p));
+        CHECK(player_save(p, queue) == 0);
+        engine_stop(eng);
+        player_t *c = player_new(lib, eng);
+        CHECK(player_restore(c, queue) == 0 && cur_id(c) == t[1] && !playing(c));
+        player_next(c);
+        player_next(c);
+        player_prev(c);
+        WAIT_FOR(c, 0, 600);
+        eng_status_t es;
+        engine_status(eng, &es);
+        CHECK(cur_id(c) == t[2] && !playing(c) && es.state == ENG_STOPPED);
+        player_toggle_pause(c);                           /* Play: from there */
+        WAIT_FOR(c, cur_id(c) != t[2], SLOW);
+        CHECK(cur_id(c) != t[2]);
+        player_free(c);
+    }
 
     player_free(p);
     engine_free(eng);

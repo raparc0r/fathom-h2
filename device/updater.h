@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Updates over Wi-Fi for the player (see updater.c and app/net/update.h).
  * Only ever when asked (Settings > About > Check for updates), or a check by

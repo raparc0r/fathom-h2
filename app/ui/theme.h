@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Theme files (THEMES.md): parsing and legibility validation. */
 #ifndef FATHOM_THEME_H
 #define FATHOM_THEME_H

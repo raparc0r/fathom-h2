@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # Which Wi-Fi network the address came from: fathom-wifi status compares it with
 # the network joined now, and asks for a new address when wpa_supplicant has

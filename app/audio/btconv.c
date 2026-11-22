@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Integer arithmetic throughout the signal path: Fathom is built soft-float
  * (the X1000's FPU unused), and a float MAC there costs a library call. Samples are
  * Q31, coefficients Q30, sums 64-bit (MIPS madd). The filters are designed in

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * PB5 through the GPIO character device (v2 ABI): 0 routes the amplifier to
  * the headphone jack, 1 to the line-out jack.

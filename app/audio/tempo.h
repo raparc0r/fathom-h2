@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Playing faster without the pitch going up (podcasts at 1.25x, 1.5x...):
  * WSOLA, as SoundTouch's TDStretch does it. The sound is cut into 40 ms

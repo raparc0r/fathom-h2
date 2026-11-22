@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
 #define _GNU_SOURCE   /* strcasestr (glibc, musl) */
@@ -17,6 +18,10 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#endif
 
 #include <sqlite3.h>
 
@@ -434,7 +439,33 @@ static int idset_has(const idset_t *s, int64_t id)
  * before reading files again, or once BATCH_S old. */
 #define BATCH_S 0.25
 
-typedef struct { sqlite3 *db; double since; int open; } batch_t;
+typedef struct { sqlite3 *db; double since; int open, nice; } batch_t;
+
+/* While a write holds the lock, the thread runs at normal priority: a scan
+ * or the levelling runs at nice 19, and with another such thread busy (the
+ * levelling of a big library) a hold stretched to over half a second, which
+ * the UI's and the player's writes waited out. Returns the nice to put back
+ * (or NO_NICE: nothing changed). */
+#define NO_NICE (-1000)
+static int lock_boost(void)
+{
+#ifdef __linux__
+    id_t tid = (id_t)syscall(SYS_gettid);
+    errno = 0;
+    int n = getpriority(PRIO_PROCESS, tid);
+    if (errno == 0 && n > 0 && setpriority(PRIO_PROCESS, tid, 0) == 0) return n;
+#endif
+    return NO_NICE;
+}
+
+static void lock_unboost(int n)
+{
+#ifdef __linux__
+    if (n != NO_NICE) setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), n);
+#else
+    (void)n;
+#endif
+}
 
 /* Every statement reset (one left on a row keeps its read open, and a
  * write on that old snapshot fails): only where none is being stepped. */
@@ -453,6 +484,7 @@ static void batch_end(batch_t *b)
     if (sqlite3_exec(b->db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK && !sqlite3_get_autocommit(b->db))
         sqlite3_exec(b->db, "ROLLBACK", NULL, NULL, NULL);
     b->open = 0;
+    lock_unboost(b->nice);
 }
 
 /* Before a write. IMMEDIATE: the write lock at once (waiting for another
@@ -461,7 +493,9 @@ static void batch_write(batch_t *b)
 {
     if (b->open) return;
     reset_all(b->db);
+    b->nice = lock_boost();   /* (before: once it has the lock, no moment at nice 19) */
     b->open = sqlite3_exec(b->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK;   /* (else: one at a time) */
+    if (!b->open) lock_unboost(b->nice);
     b->since = now_s();
 }
 
@@ -995,11 +1029,13 @@ static const char *const SHADOWED[] = {"albums", "artists", "credits", "genres",
 
 static void shadow_drop(sqlite3 *db)
 {
-    sqlite3_exec(db, "DROP TABLE IF EXISTS temp.tracks", NULL, NULL, NULL);
+    sqlite3_exec(db, "DROP TABLE IF EXISTS temp.tracks; DROP TABLE IF EXISTS temp.d_tracks;", NULL, NULL, NULL);
     for (size_t i = 0; i < sizeof SHADOWED / sizeof *SHADOWED; i++) {
-        char sql[80];
-        snprintf(sql, sizeof sql, "DROP TABLE IF EXISTS temp.%s", SHADOWED[i]);
-        sqlite3_exec(db, sql, NULL, NULL, NULL);
+        char *sql = sqlite3_mprintf("DROP TABLE IF EXISTS temp.%s; DROP TABLE IF EXISTS temp.dg_%s;"
+                                    " DROP TABLE IF EXISTS temp.dc_%s; DROP TABLE IF EXISTS temp.dn_%s;",
+                                    SHADOWED[i], SHADOWED[i], SHADOWED[i], SHADOWED[i]);
+        if (sql) sqlite3_exec(db, sql, NULL, NULL, NULL);
+        sqlite3_free(sql);
     }
 }
 
@@ -1043,8 +1079,11 @@ static int shadow_copy(sqlite3 *db, const char *table)
  * ones updated (compared exactly: a NOCASE name respelled is a change).
  * albums keep their cover state (written by the cover step and the player),
  * unless the id now holds another album (SQLite gives a removed album's id
- * to the next new one). */
-static int shadow_apply(sqlite3 *db, const char *table)
+ * to the next new one). In two steps: which rows (dg_, dc_, dn_: gone,
+ * changed, new), found before the write lock, reading only (only scans
+ * write these tables: they stay right till the write); then, holding it,
+ * those rows written. */
+static int shadow_apply(sqlite3 *db, const char *table, int write)
 {
     char *pragma = sqlite3_mprintf("PRAGMA main.table_info(%s)", table);
     sqlite3_stmt *ti = pragma ? prep(db, pragma) : NULL;
@@ -1064,12 +1103,16 @@ static int shadow_apply(sqlite3 *db, const char *table)
         sqlite3_str_appendall(set, ", art=CASE WHEN m.key IS t.key THEN m.art ELSE 0 END,"
                                    " art_sig=CASE WHEN m.key IS t.key THEN m.art_sig ELSE 0 END");
     char *s_set = sqlite3_str_finish(set), *s_cmp = sqlite3_str_finish(cmp), *s_cols = sqlite3_str_finish(cols);
-    char *sql = s_set && s_cmp && s_cols && *s_cmp ? sqlite3_mprintf(
-        "DELETE FROM main.%s WHERE id NOT IN (SELECT id FROM temp.%s);"
-        "UPDATE main.%s AS m SET %s FROM temp.%s AS t WHERE t.id=m.id AND (%s);"
-        "INSERT INTO main.%s(id%s) SELECT id%s FROM temp.%s AS t"
+    char *sql = !(s_set && s_cmp && s_cols && *s_cmp) ? NULL : !write ? sqlite3_mprintf(
+        "CREATE TEMP TABLE dg_%s AS SELECT id FROM main.%s WHERE id NOT IN (SELECT id FROM temp.%s);"
+        "CREATE TEMP TABLE dc_%s AS SELECT t.id FROM temp.%s AS t JOIN main.%s AS m ON m.id=t.id WHERE %s;"
+        "CREATE TEMP TABLE dn_%s AS SELECT id FROM temp.%s AS t"
         " WHERE NOT EXISTS (SELECT 1 FROM main.%s AS m WHERE m.id=t.id);",
-        table, table, table, s_set, table, s_cmp, table, s_cols, s_cols, table, table) : NULL;
+        table, table, table, table, table, table, s_cmp, table, table, table) : sqlite3_mprintf(
+        "DELETE FROM main.%s WHERE id IN (SELECT id FROM temp.dg_%s);"
+        "UPDATE main.%s AS m SET %s FROM temp.%s AS t WHERE t.id=m.id AND m.id IN (SELECT id FROM temp.dc_%s);"
+        "INSERT INTO main.%s(id%s) SELECT id%s FROM temp.%s WHERE id IN (SELECT id FROM temp.dn_%s);",
+        table, table, table, s_set, table, table, table, s_cols, s_cols, table, table);
     int rc = sql ? shadow_exec(db, sql) : -1;
     sqlite3_free(sql);
     sqlite3_free(s_set);
@@ -1105,31 +1148,47 @@ static int rebuild_groups_aside(library_t *lib, batch_t *b)
         shadow_drop(db);
         return -1;
     }
+    /* what differs, found reading only (see shadow_apply) */
+    rc = shadow_exec(db,
+        "CREATE TEMP TABLE d_tracks AS SELECT t.id FROM temp.tracks AS t JOIN main.tracks AS m ON m.id=t.id WHERE"
+        " m.album_id IS NOT t.album_id OR m.artist_id IS NOT t.artist_id OR m.sort IS NOT t.sort COLLATE BINARY"
+        " OR m.genre_id IS NOT t.genre_id OR m.composer_id IS NOT t.composer_id OR m.folder_id IS NOT t.folder_id;"
+        "CREATE TEMP TABLE dg_credits AS SELECT m.rowid AS r FROM main.credits AS m WHERE NOT EXISTS"
+        " (SELECT 1 FROM temp.credits AS t WHERE t.artist_id=m.artist_id AND t.track_id=m.track_id);"
+        "CREATE TEMP TABLE dn_credits AS SELECT artist_id, track_id FROM temp.credits"
+        " EXCEPT SELECT artist_id, track_id FROM main.credits;");
+    for (size_t i = 0; !rc && i < sizeof SHADOWED / sizeof *SHADOWED; i++)
+        if (strcmp(SHADOWED[i], "credits")) rc = shadow_apply(db, SHADOWED[i], 0);
+    if (rc) { shadow_drop(db); return -1; }
     double t1 = now_s();
     batch_write(b);
     if (!b->open) { shadow_drop(db); return -1; }
     rc = shadow_exec(db,
         "UPDATE main.tracks AS m SET album_id=t.album_id, artist_id=t.artist_id, sort=t.sort, genre_id=t.genre_id,"
-        " composer_id=t.composer_id, folder_id=t.folder_id FROM temp.tracks AS t WHERE t.id=m.id AND"
-        " (m.album_id IS NOT t.album_id OR m.artist_id IS NOT t.artist_id OR m.sort IS NOT t.sort COLLATE BINARY"
-        " OR m.genre_id IS NOT t.genre_id OR m.composer_id IS NOT t.composer_id OR m.folder_id IS NOT t.folder_id);"
-        "DELETE FROM main.credits WHERE rowid IN (SELECT m.rowid FROM main.credits AS m WHERE NOT EXISTS"
-        " (SELECT 1 FROM temp.credits AS t WHERE t.artist_id=m.artist_id AND t.track_id=m.track_id));"
-        "INSERT OR IGNORE INTO main.credits(artist_id, track_id) SELECT artist_id, track_id FROM temp.credits;");
+        " composer_id=t.composer_id, folder_id=t.folder_id FROM temp.tracks AS t WHERE t.id=m.id"
+        " AND m.id IN (SELECT id FROM temp.d_tracks);"
+        "DELETE FROM main.credits WHERE rowid IN (SELECT r FROM temp.dg_credits);"
+        "INSERT OR IGNORE INTO main.credits(artist_id, track_id) SELECT artist_id, track_id FROM temp.dn_credits;");
     for (size_t i = 0; !rc && i < sizeof SHADOWED / sizeof *SHADOWED; i++)
-        if (strcmp(SHADOWED[i], "credits")) rc = shadow_apply(db, SHADOWED[i]);
+        if (strcmp(SHADOWED[i], "credits")) rc = shadow_apply(db, SHADOWED[i], 1);
     if (rc) {                                  /* (nothing of it kept) */
         reset_all(db);
         sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
         b->open = 0;
+        lock_unboost(b->nice);
         shadow_drop(db);
         return -1;
     }
-    shadow_drop(db);
-    index_search(lib, 1);                      /* changed tracks (their search cleared), new albums and artists */
     batch_end(b);
+    double t2 = now_s();
+    shadow_drop(db);                           /* (temp only: no need of the lock) */
     sqlite3_db_release_memory(db);             /* (the copies' pages) */
-    fprintf(stderr, "library: groups aside %.2f s, written in %.2f s\n", t1 - t0, now_s() - t1);
+    /* changed tracks (their search cleared), new albums and artists: a hold
+     * of its own (they turn up in Search a moment after the lists) */
+    batch_write(b);
+    index_search(lib, 1);
+    batch_end(b);
+    fprintf(stderr, "library: groups aside %.2f s, written in %.2f s\n", t1 - t0, t2 - t1);
     return 0;
 }
 
@@ -2479,6 +2538,10 @@ int library_scan(library_t *lib, const char *root, lib_progress_cb cb, void *ctx
         sqlite3_finalize(del);
         sqlite3_finalize(delc);
         cue_put_sheets(&sc.cs, &cv);
+        /* the play log of songs gone: their ids are given to new ones (the
+         * highest first), which would show in On repeat, never played */
+        if (ngone || sheets)
+            sqlite3_exec(db, "DELETE FROM plays WHERE track_id NOT IN (SELECT id FROM tracks)", NULL, NULL, NULL);
         if (!groups && composers) rebuild_composers(db);
         batch_end(&sc.b);
         /* the groups follow (scan_pending says so until then): made aside,
@@ -2691,7 +2754,8 @@ int library_needs_tags(library_t *lib)
 
 int library_needs_art(library_t *lib)
 {
-    return get_int_col(lib, "SELECT EXISTS(SELECT 1 FROM albums WHERE art=2 AND COALESCE(art_sig, 0)=0)", 0) > 0;
+    /* (art=0: never looked at, a scan's cover pass cut short by a stop or a restart) */
+    return get_int_col(lib, "SELECT EXISTS(SELECT 1 FROM albums WHERE art=0 OR (art=2 AND COALESCE(art_sig, 0)=0))", 0) > 0;
 }
 
 int library_list_composer_tracks(library_t *lib, int64_t composer_id, int64_t album_id, lib_list_t *out)
@@ -3450,7 +3514,9 @@ void library_rg_store(library_t *lib, int64_t id, const lib_rg_t *rg)
     if (rg->has_album) sqlite3_bind_double(s, 4, rg->album_gain); else sqlite3_bind_null(s, 4);
     if (rg->has_album && rg->album_peak > 0) sqlite3_bind_double(s, 5, rg->album_peak); else sqlite3_bind_null(s, 5);
     sqlite3_bind_int64(s, 6, id);
+    int nice = lock_boost();
     sqlite3_step(s);
+    lock_unboost(nice);
     sqlite3_finalize(s);
 }
 

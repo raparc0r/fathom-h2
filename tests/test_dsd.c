@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * DSD: DSF and DFF files made here (sines through a second-order sigma-delta
  * modulator) decode to PCM at the right rate and length, the tones at their

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # Host build (macOS/Linux): core libraries, desktop simulator, tools and tests.
 # Device builds go through Buildroot (buildroot/) inside the Docker image (docker/).

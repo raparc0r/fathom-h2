@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* The radio's extras, fetched on a worker thread: what's playing on stations
  * whose streams don't say (radio.txt "info:", app/player/rfmeta.h), and the
  * cover of the song playing, when the station names one. */

@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # The H2 has no running clock: each time Wi-Fi gets an address (bound, renew),
 # the time is fetched once by NTP (busybox ntpd -q: set, then exit), from the

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Parametric EQ: AutoEQ / Equalizer APO profiles, run in integer arithmetic
  * (Fathom is built soft-float) on the player's left-justified int32 samples. */
 #ifndef FATHOM_EQ_H

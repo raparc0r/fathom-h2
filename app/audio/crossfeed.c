@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Crossfeed for headphones: Bauer's filter in whole numbers (crossfeed.h). */
 #include "audio/crossfeed.h"
 

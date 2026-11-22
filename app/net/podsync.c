@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Podcasts over the network: one worker, one job at a time (podsync.h). */
 #include "net/podsync.h"
 
@@ -229,7 +230,12 @@ static void download(job_t *j)
     mkdir(sd, 0755);
     long cluster;
     int64_t free_b = update_free_space(P.dir, &cluster);
-    if (free_b >= 0 && free_b < MIN_FREE + j->ep.size) { failed("The card is nearly full"); touched(); return; }
+    /* (the size is the feed's word: a huge or negative one mustn't wrap the sum) */
+    if (free_b >= 0 && (free_b < MIN_FREE || (j->ep.size > 0 && free_b - MIN_FREE < j->ep.size))) {
+        failed("The card is nearly full");
+        touched();
+        return;
+    }
     pod_episode_path(P.dir, j->id, &j->ep, path, sizeof path);
     int64_t got = g_download(j->ep.url, path, progress, j, &P.abort);
     if (got > 0 && j->ep.chapters[0]) {          /* the feed's chapters, kept beside it */

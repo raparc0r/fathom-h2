@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Parametric EQ. The coefficients are worked out once in double precision
  * (Robert Bristow-Johnson's "Audio EQ Cookbook": peaking and shelving filters,

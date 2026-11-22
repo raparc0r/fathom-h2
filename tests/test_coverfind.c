@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Covers found online (net/coverfind.h): names compared, answers read and
  * rated, and the worker, with MusicBrainz's and Apple's answers from saved
  * files (tests/data/covers) and a made-up picture. */

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Just enough of Linux's <sys/inotify.h> to build device/input.c on any host
  * (tests/test_input.c): no watch is ever made there. */
 #ifndef FATHOM_FAKE_SYS_INOTIFY_H

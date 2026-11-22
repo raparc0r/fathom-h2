@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * FROZEN: app/audio/loudness.c as of 0.8.3, names prefixed v1_, for comparison
  * (tools/rg-bench, tests/test_loudness.c). Don't change it.

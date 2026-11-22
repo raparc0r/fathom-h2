@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Uninstall Fathom (Settings > About > Uninstall Fathom), on a worker thread
  * at the lowest priority (nice 19, as the updater's), one step at a time,

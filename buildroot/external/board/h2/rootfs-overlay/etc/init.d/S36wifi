@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # Wi-Fi is the player's to start (Settings > Wi-Fi, through fathom-wifi): at boot
 # the chip is found and then powered down (MSC1 unbound); at shutdown it stops.

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * alsa-tone: play a 1 kHz sine through the player's ALSA output (out_alsa.c),
  * at a given rate, bit depth, level and length. Bring-up tool for the H2.

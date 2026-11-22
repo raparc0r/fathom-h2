@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Hardware volume through an ALSA mixer control (the ES9018K2M's own
  * attenuator on the H2): kernel control ioctls only, no alsa-lib.

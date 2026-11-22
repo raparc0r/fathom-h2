@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * alsa-ctl: list a card's mixer controls, or set a volume. Bring-up tool.
  *

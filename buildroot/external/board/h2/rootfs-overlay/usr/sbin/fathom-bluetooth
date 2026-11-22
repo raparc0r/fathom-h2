@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # The Bluetooth chip (BCM4343A1 on UART0, kernel driver hci_uart_bcm):
 #   fathom-bluetooth on       power it up and load its firmware patch: hci0

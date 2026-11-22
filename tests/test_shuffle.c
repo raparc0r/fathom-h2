@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Property tests for the shuffle engine and grouping keys. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -100,6 +101,28 @@ static void test_flags_and_first(void)
     for (uint64_t s = 0; s < 20; s++) {
         c = shuf_build(t, 6, &o, s, NULL, 0, out);
         CHECK(c == 3 && out[0] == 5);
+    }
+    o.first = 2;    /* a picked spoken track plays, spoken ones left out or not */
+    c = shuf_build(t, 6, &o, 3, NULL, 0, out);
+    CHECK(c == 4 && out[0] == 2);
+
+    /* by albums: a song picked part way through its album plays first, then
+     * the rest of that album in order */
+    shuf_track_t b[8];
+    memset(b, 0, sizeof b);
+    for (int i = 0; i < 8; i++) {
+        b[i].id = (uint32_t)(200 + i);
+        b[i].artist = (uint32_t)(1 + i / 4);
+        b[i].album = (uint32_t)(20 + i / 4);   /* two albums of four */
+        b[i].track = (uint16_t)(1 + i % 4);
+        b[i].duration_ms = 200000;
+    }
+    shuf_default_opts(&o, NOW);
+    o.mode = SHUF_MODE_ALBUMS;
+    o.first = 2;                               /* album 20's third song */
+    for (uint64_t s = 0; s < 10; s++) {
+        c = shuf_build(b, 8, &o, s, NULL, 0, out);
+        CHECK(out[0] == 2 && out[1] == 3 && c == 6);   /* 3, 4, then the other album */
     }
 }
 

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Podcasts: feeds, OPML, Apple's search and the files on the card (podcast.h). */
 #define _GNU_SOURCE   /* memmem */
 #include "net/podcast.h"
@@ -339,7 +340,9 @@ static int newest_first(const void *a, const void *b)
 int pod_feed_complete(const char *xml, size_t len)
 {
     static const char *const END[] = {"</rss", "</feed", "</rdf:rdf"};
-    size_t from = len > 1024 ? len - 1024 : 0;     /* (at the end, not quoted in an episode) */
+    /* at the end, not quoted in an episode: in the last 16 KB (some feeds
+     * end with a comment or whitespace after it, over a KB) */
+    size_t from = len > 16384 ? len - 16384 : 0;
     for (size_t i = from; i < len; i++) {
         if (xml[i] != '<' || i + 1 >= len || xml[i + 1] != '/') continue;
         for (size_t k = 0; k < sizeof END / sizeof END[0]; k++) {
@@ -840,7 +843,11 @@ int pod_episodes_load(const char *dir, const char *id, pod_episode_t *eps, int m
         snprintf(e.url, sizeof e.url, "%s", field(&p));
         snprintf(e.chapters, sizeof e.chapters, "%s", field(&p));
         snprintf(e.title, sizeof e.title, "%s", p ? p : "");
-        if (strlen(e.key) == 12 && e.url[0]) eps[n++] = e;
+        /* (the key names files: twelve hex digits, nothing else, from a file
+         * that may have been edited by hand) */
+        int hex = strlen(e.key) == 12;
+        for (int k = 0; hex && k < 12; k++) hex = isxdigit((unsigned char)e.key[k]) != 0;
+        if (hex && e.url[0]) eps[n++] = e;
     }
     free(t);
     return n;

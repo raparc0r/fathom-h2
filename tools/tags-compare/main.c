@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * The one-pass FLAC tag reader (app/library/tags.c) against libFLAC's, on
  * every FLAC under a folder (read only): every field must match.

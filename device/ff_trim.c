@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * FFmpeg's transforms (libavutil/tx.c) list their codelets for every sample
  * type, so a static link pulls in the float and double ones (480 KB of code,

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 """
 List the UI's texts to translate, as a language file to fill in
 (app/core/lang.h describes the format):

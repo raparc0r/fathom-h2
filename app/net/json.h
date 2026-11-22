@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Reading JSON in place (the radio directory's results, GitHub's release
  * list): no tree is built and nothing is allocated. A json_t is a value's

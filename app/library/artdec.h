@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Cover images decoded small, straight from where they are (a cover.jpg, or
  * a picture inside a FLAC), in little memory whatever their size: the H2 has

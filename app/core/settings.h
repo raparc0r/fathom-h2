@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Settings: one human-readable file of `key = value` lines (fathom/settings.ini
  * on the H2). Keys are dotted ("display.brightness"). Comments start with ';'

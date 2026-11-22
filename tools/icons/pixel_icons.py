@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 """
 Pixel Pastel's Home icons, drawn on a 10x10 grid (Ark Pixel's grid, shown at
 2x on the H2). Writes them as C (app/ui/pixel_icons.h: one bit string per row)

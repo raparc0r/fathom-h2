@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # The network drive: the card's music folder as a WebDAV share over Wi-Fi,
 # for Finder's "Connect to Server" and Windows' "Map network drive":

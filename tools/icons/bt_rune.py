@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 """
 The header's Bluetooth icon: the plain rune (no box), anti-aliased, as an A8
 image the UI tints with the theme's colour. Sized and placed like the header's

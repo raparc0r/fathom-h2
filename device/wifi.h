@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Wi-Fi for the player (see wifi.c). All of it is safe from the UI thread. */
 #ifndef FATHOM_WIFI_H
 #define FATHOM_WIFI_H
@@ -18,5 +19,6 @@ unsigned wifi_seq(void);                      /* changes when anything above doe
 int  wifi_on(void);
 int  wifi_connected(void);                    /* joined, with an address */
 int  wifi_take_message(char *out, size_t cap);
+void wifi_wake(void);                         /* the screen turned on: nothing joined, look for networks now */
 
 #endif

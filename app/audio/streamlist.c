@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Reading a station's playlist (.m3u, .pls, HLS) for its stream's URL: see streamlist.h. */
 #include "audio/streamlist.h"
 

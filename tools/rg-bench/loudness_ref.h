@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* BS.1770-4 integrated loudness in double precision (loudness_ref.c): the
  * yardstick for app/audio/loudness.c. Same interface; the peak is of the
  * 32-bit samples, 0..1. */

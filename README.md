@@ -2,7 +2,7 @@
 
 # Fathom
 
-Latest version: [0.14.1](https://github.com/raparc0r/fathom-h2/releases/tag/v0.14.1) released November 21st 2026
+Latest version: [0.15.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.15.0) released November 22nd 2026
 
 [Features](#features) · [Compatibility](#compatibility) · [Installing](#installing) · [Navigation](#navigation) · [Licence](#licence) · [How it was made](#how-it-was-made)
 
@@ -37,7 +37,8 @@ I recommend you check it out: [rockbox.org](https://www.rockbox.org).
 - **Internet radio.** You can search and browse thousands of stations on the H2 itself.
 - **Podcasts.** Find shows on the H2, or import them from another app; new episodes
   download while it charges.
-- **Smart playlists.** Never played, On repeat, Not heard in a while, Forgotten favorites, Often skipped.
+- **Smart playlists.** Never played, On repeat, Not heard in a while, Forgotten favourites,
+  Often skipped.
 - **A network drive**, so you can copy music to the H2 over Wi-Fi while it plays.
 - **Bluetooth headphones** (SBC and aptX), and their buttons work.
 - **USB DACs.** The H2 can play through one, or be your computer's sound card.
@@ -102,12 +103,15 @@ on any setting says in a line or two what it does. More in [GUIDE.md](GUIDE.md).
 
 ## Licence
 
-Fathom is GPL-3.0-or-later. The bootloader, being Rockbox's, is GPL-2.0-or-later, and the
-Linux kernel patches are GPL-2.0-only. The full texts are in [LICENSE](LICENSE). The fonts
+Fathom is GPL-3.0-or-later. The bootloader, being Rockbox's, is GPL-2.0-or-later (with
+the scripts that build it and the logo it shows), and the Linux kernel patches are
+GPL-2.0-only. The full texts are in [LICENSE](LICENSE). The fonts
 come with their own licences (SIL Open Font License; the icons are MIT). The screenshots
 show a made-up library.
 
-If you build on Fathom, we request attribution for the kernel, system and player.
+The GPL-3.0 parts come with a few additional terms, as the GPL's section 7 allows: keep the
+credit "Fathom by m11n/raparc0r" (or "Based on Fathom by m11n/raparc0r") in About, mark a
+changed version as changed, and give a fork a name of its own. They're at the top of [LICENSE](LICENSE).
 
 Fathom isn't affiliated with HiFi Walker, AIGO or HiBy.
 

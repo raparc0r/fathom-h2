@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Updates over Wi-Fi (Settings > About > Check for updates), on a worker
  * thread at the lowest priority (nice 19: the audio thread is SCHED_FIFO and

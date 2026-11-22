@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* EBU R128 integrated loudness (app/audio/loudness.c) against reference signals,
  * 0.8.3's measurement (to the bit) and a double-precision one. */
 #include <math.h>

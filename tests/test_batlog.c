@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Battery history (app/core/batlog.c), driven as the player drives it: a
  * battery drained at known rates for each activity, noted every 10 s, the

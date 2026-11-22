@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Covers for albums that have none, looked up online: MusicBrainz first (its
  * album, then that album's front cover from the Cover Art Archive), then

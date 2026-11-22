@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Read tags, stream format and embedded cover art from audio files. */
 #ifndef FATHOM_TAGS_H
 #define FATHOM_TAGS_H

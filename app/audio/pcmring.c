@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* What an output last wrote, and a fade-out over it (pcmring.h). */
 #include "audio/pcmring.h"
 

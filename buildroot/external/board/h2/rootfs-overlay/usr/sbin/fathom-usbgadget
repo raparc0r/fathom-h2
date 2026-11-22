@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # What the H2 is to a computer, switched by the player:
 #   fathom-usbgadget dac      a USB DAC: a USB Audio Class 2 input (stereo,

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Bluetooth output: a bluez-alsa PCM, raw S16_LE stereo at the link's sampling
  * rate. The link's rate is fixed while connected (fathom-bt asks bluez-alsa for
  * 44.1 kHz: changing it mid-link drops many headphones); btconv brings each

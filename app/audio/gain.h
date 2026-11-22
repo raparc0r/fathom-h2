@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* A gain on left-justified int32 samples (volume levelling, a USB DAC's
  * software volume, the sleep timer's fade), in integer arithmetic: Fathom is
  * built soft-float (the X1000's FPU unused), so a float multiply per sample

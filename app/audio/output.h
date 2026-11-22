@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Audio output backends: ALSA hw: on the H2, SDL on the desktop, null for tests. */
 #ifndef FATHOM_OUTPUT_H
 #define FATHOM_OUTPUT_H

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Fathom for the HiFi Walker H2 (X1000, hw4).:
 # kernel + small initramfs, booted from the SD card by the Rockbox bootloader.
 

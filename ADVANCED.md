@@ -49,7 +49,8 @@ release's `sd/` folder over the card.
 If the stock firmware's updater won't run, or the H2 doesn't start at all, the H2's chip
 has a USB-boot mode that can't be overwritten. Rockbox's `jztool` loads the bootloader
 into the H2's memory through it, from a Mac or Linux computer with a USB-C cable that
-carries data. The release has it for macOS in `recovery/`. On Linux, build it from
+carries data. The release has it for macOS in `recovery/`: for Intel and Apple-silicon
+Macs, macOS 11 or later, with nothing to install. On Linux, build it from
 Rockbox's source (Debian and Ubuntu package names; on Fedora, `libusb1-devel`):
 
 ```bash

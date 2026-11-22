@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 # Hardware watchdog: busybox feeds it every 2 s; if userspace stops running
 # for 8 s (a kernel hang), the X1000 resets. RAM survives a watchdog reset, so
 # pstore still has the console log. Stopping the daemon disarms it.

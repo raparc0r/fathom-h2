@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # The root filesystem is an initramfs, so every byte in it costs RAM. The player
 # links its libraries statically and runs from the SD card: drop the shared

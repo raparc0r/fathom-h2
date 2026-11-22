@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* What the decoder and the tag reader share about FFmpeg (formats other than FLAC and MP3). */
 #ifndef FATHOM_FF_UTIL_H
 #define FATHOM_FF_UTIL_H

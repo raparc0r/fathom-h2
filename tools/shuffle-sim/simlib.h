@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Test libraries (synthetic or loaded from a library export) and shuffle quality metrics. */
 #ifndef FATHOM_SIMLIB_H
 #define FATHOM_SIMLIB_H

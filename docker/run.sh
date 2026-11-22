@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # Run a command inside the Fathom build container, with the repo at /work.
 #   docker/run.sh                 interactive shell

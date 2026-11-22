@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 """Copy the H2's Bluetooth and Wi-Fi firmware out of a backup of its flash.
 
     python3 extract-firmware.py flash.img [OUT]          Bluetooth: OUT (BCM43430A1.hcd)

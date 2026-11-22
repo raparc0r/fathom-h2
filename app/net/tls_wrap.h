@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * The certificate bundle (ff_set_ca_file) parsed once and lent to every HTTPS
  * connection, not parsed again for each (about 400 KB and a CPU spike each):

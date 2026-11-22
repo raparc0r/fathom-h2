@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Just enough of Linux's <linux/input.h> to build device/input.c on any host
  * (tests/test_input.c). The real codes; the ioctls are never made there. */
 #ifndef FATHOM_FAKE_LINUX_INPUT_H

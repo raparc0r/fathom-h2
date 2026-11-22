@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* LVGL display on DRM/KMS: one dumb buffer, LVGL renders into it directly and
  * each flushed area is sent to the panel with DIRTYFB (only what changed). */
 #ifndef FATHOM_DISP_DRM_H

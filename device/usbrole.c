@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * fathom-usbrole: which role the H2's USB-C port offers, through the TCS1421's
  * CFG1:CFG0 pins (PB30, PD5): 00 = sink only, 11 = dual role (DRP).

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* The parametric EQ: AutoEQ files, an exact pass-through when flat, the
  * integer filters against the double-precision design, low-frequency noise at
  * high rates, saturation. */

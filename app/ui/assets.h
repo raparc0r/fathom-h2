@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Themes and fonts. Built-in themes come from the assets folder (assets/ in the
  * repo, fathom/assets on the H2's card); contributed ones from a themes folder

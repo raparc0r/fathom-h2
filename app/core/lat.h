@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* A timing trace for development: LAT("what") prints "lat <ms>: what" to the
  * log (monotonic ms, so from the kernel's start), only while /tmp/fathom-lat,
  * or the card's fathom/test/fathom-lat (for a start-up: /tmp is new then),

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Translations of the UI (lang.h): an open-addressing hash table over one
  * buffer holding the file's text. */
 #include "core/lang.h"

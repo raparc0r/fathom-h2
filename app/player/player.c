@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 #include "player.h"
 
 #include <stdio.h>
@@ -211,10 +212,17 @@ static void queue_next(player_t *p)
     char path[ENGINE_AHEAD][sizeof ((lib_track_t *)0)->path];
     int n = 0;
     uint32_t ms = 0;
-    for (int np = after(p, p->pos); np >= 0 && n < ENGINE_AHEAD && ms < AHEAD_MS; np = after(p, np)) {
+    int looked = 0;
+    for (int was = p->pos, np = after(p, p->pos);
+         np >= 0 && n < ENGINE_AHEAD && ms < AHEAD_MS && looked++ < p->n_order + ENGINE_AHEAD;
+         was = np, np = after(p, np)) {
         lib_track_t t;
-        if (library_track(p->lib, id_at(p, np), &t) != 0) break;
-        if (p->sleep_album && t.album_id != p->sleep_album) break;   /* sleep timer: end of album */
+        /* one a scan has removed since the queue was made: passed over (it
+         * stopped the lining up there, and playback with it) */
+        if (library_track(p->lib, id_at(p, np), &t) != 0) continue;
+        /* sleep timer, end of album: the next is another album, or the same
+         * one again (repeat one, or all on one album: it would never end) */
+        if (p->sleep_album && (t.album_id != p->sleep_album || np <= was)) break;
         if (!++p->last_tag) p->last_tag = 1;   /* (0 is engine_play's) */
         snprintf(path[n], sizeof path[n], "%s", t.path);
         q[n] = (engine_track_t){path[n], t.id, track_gain(p, t.id), p->last_tag};
@@ -239,8 +247,12 @@ static void remember_position(player_t *p)
     if (!p->have_cur || p->cur.duration_ms < LONG_FILE_MS) return;
     eng_status_t st;
     engine_status(p->eng, &st);
-    if (st.state == ENG_STOPPED || st.track_id != p->cur.id) return;
-    uint32_t at = st.pos_ms;
+    uint32_t at;
+    if (st.state != ENG_STOPPED && st.track_id == p->cur.id) at = st.pos_ms;
+    /* cued, not started (a restored queue: switched off in an audiobook): its
+     * place was only in resume_ms, lost when something else was played */
+    else if (st.state == ENG_STOPPED && p->resume_ms && !p->radio && !p->pod) at = p->resume_ms;
+    else return;
     if (at < LONG_FILE_EDGE_MS || at + LONG_FILE_EDGE_MS > p->cur.duration_ms) at = 0;
     library_set_resume(p->lib, p->cur.id, at);
 }
@@ -249,23 +261,48 @@ static void remember_position(player_t *p)
 static void radio_leave(player_t *p);
 static void pod_leave(player_t *p);
 
+/* How a track is gone to: started, started paused, or only cued (the engine
+ * left stopped, as after a restart: Play starts it). */
+enum { GO_PLAY, GO_PAUSED, GO_CUE };
+
 /* resume: a long file from where it was left (library_resume); at: from there (ms; 0 none) */
-static void start_at_opt(player_t *p, int order_pos, int resume, uint32_t at)
+static void go_to(player_t *p, int order_pos, int resume, uint32_t at, int how)
 {
     if (order_pos < 0 || order_pos >= p->n_order) return;
     radio_leave(p);
     pod_leave(p);
+    /* a track a scan has removed since: the next one still there (none:
+     * left as it was, rather than an empty Now Playing that Play can't start) */
+    lib_track_t t;
+    while (order_pos < p->n_order && library_track(p->lib, id_at(p, order_pos), &t) != 0) order_pos++;
+    if (order_pos >= p->n_order) return;
     remember_position(p);
     p->fails = 0;
     set_pos(p, order_pos);
-    if (library_track(p->lib, id_at(p, order_pos), &p->cur) != 0) return;
+    p->cur = t;
     p->have_cur = 1;
     p->resume_ms = 0;
     p->own_start = 1;
+    /* end of album, set for one and another chosen: the end of this one (the
+     * old one's id would stop it after its first track) */
+    if (p->sleep_album && p->cur.album_id) p->sleep_album = p->cur.album_id;
+    if (how == GO_CUE) {                /* (a long file's place: start_cued looks it up) */
+        if (!resume && p->cur.duration_ms >= LONG_FILE_MS) library_set_resume(p->lib, p->cur.id, 0);
+        p->own_start = 0;
+        p->resume_ms = at;
+        p->seq++;
+        return;
+    }
     if (!at && resume && p->cur.duration_ms >= LONG_FILE_MS) at = library_resume(p->lib, p->cur.id);
     engine_play_at(p->eng, p->cur.path, p->cur.id, track_gain(p, p->cur.id), at);   /* (from there: nothing before it heard) */
+    if (how == GO_PAUSED) engine_pause(p->eng, 1);   /* (it starts paused) */
     p->seq++;
     queue_next(p);
+}
+
+static void start_at_opt(player_t *p, int order_pos, int resume, uint32_t at)
+{
+    go_to(p, order_pos, resume, at, GO_PLAY);
 }
 
 static void start_at(player_t *p, int order_pos) { start_at_opt(p, order_pos, 1, 0); }
@@ -420,29 +457,57 @@ static int new_cycle(player_t *p)
 
 static void radio_station(player_t *p, int i);
 
+/* How Next and Prev go to a track: playing on if it was playing, and paused
+ * if it was paused (a press in a pocket starts nothing), or only cued if
+ * nothing was started (as after a restart, or the queue at its end). */
+static int skip_how(player_t *p)
+{
+    eng_status_t st;
+    engine_status(p->eng, &st);
+    if (st.starting) return st.start_paused ? GO_PAUSED : GO_PLAY;
+    if (st.state == ENG_PAUSED) return GO_PAUSED;
+    if (st.state == ENG_STOPPED) return GO_CUE;
+    return GO_PLAY;
+}
+
+/* Radio: the station before or after; paused (not connected), only chosen. */
+static void radio_skip(player_t *p, int by)
+{
+    int i = (p->ri + p->rn + by) % p->rn;
+    if (p->r_want) { radio_station(p, i); return; }
+    p->ri = i;
+    p->r_tries = 0;
+    p->r_failed = 0;
+    p->r_meta[0] = p->r_meta_url[0] = p->r_artist[0] = p->r_title[0] = p->r_art[0] = '\0';
+    p->seq++;
+}
+
 void player_next(player_t *p)
 {
-    if (p->radio) { radio_station(p, (p->ri + 1) % p->rn); return; }
+    if (p->radio) { radio_skip(p, 1); return; }
     if (p->pod) { player_seek_by(p, PLAYER_SKIP_FWD_MS); return; }
     if (!p->have_cur) return;
     catch_up(p);
+    int how = skip_how(p);
     played_t was = record_take(p, 1);
-    if (p->pos + 1 < p->n_order) start_at(p, p->pos + 1);
-    else if (p->repeat == REPEAT_ALL && new_cycle(p) == 0) start_at(p, 0);
-    else if (p->repeat == REPEAT_ALL) start_at(p, 0);
+    if (p->pos + 1 < p->n_order) go_to(p, p->pos + 1, 1, 0, how);
+    else if (p->repeat == REPEAT_ALL && new_cycle(p) == 0) go_to(p, 0, 1, 0, how);
+    else if (p->repeat == REPEAT_ALL) go_to(p, 0, 1, 0, how);
     record_put(p, &was);
 }
 
 void player_prev(player_t *p)
 {
-    if (p->radio) { radio_station(p, (p->ri + p->rn - 1) % p->rn); return; }
+    if (p->radio) { radio_skip(p, -1); return; }
     if (p->pod) { player_seek_by(p, -PLAYER_SKIP_BACK_MS); return; }
     if (!p->have_cur) return;
     catch_up(p);
+    int how = skip_how(p);
     eng_status_t st;
     engine_status(p->eng, &st);
-    if (st.pos_ms > RESTART_MS || p->pos == 0) start_at_opt(p, p->pos, 0, 0);   /* restart: from the top */
-    else start_at(p, p->pos - 1);
+    uint32_t in = how == GO_CUE ? p->resume_ms : st.pos_ms;
+    if (in > RESTART_MS || p->pos == 0) go_to(p, p->pos, 0, 0, how);   /* restart: from the top */
+    else go_to(p, p->pos - 1, 1, 0, how);
 }
 
 void player_seek_by(player_t *p, int delta_ms)

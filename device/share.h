@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* The network drive for the player (see share.c). All of it is safe from the UI thread. */
 #ifndef FATHOM_SHARE_H
 #define FATHOM_SHARE_H

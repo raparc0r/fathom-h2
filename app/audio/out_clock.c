@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Clock output: accepts audio at real-time speed and discards it. Stands in
  * for a sound card on the H2 until the ALSA backend exists, so playback

@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # The installer for an H2 that still has its stock firmware: an update file that
 # the stock firmware's own updater (System Settings > Firmware Update) applies,

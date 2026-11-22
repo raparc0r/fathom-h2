@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* The network drive's certificate, made on the H2 with the mbedTLS the player
  * already has (FFmpeg's https): an ECDSA P-256 key and a certificate it signs
  * itself, naming the H2 (fathom-h2.local). Nobody vouches for it, so a computer

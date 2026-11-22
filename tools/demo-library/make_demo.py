@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 """A made-up music library, for screenshots and demos with nothing real in them.
 
     python3 tools/demo-library/make_demo.py DIR

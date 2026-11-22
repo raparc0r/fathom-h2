@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* USB DAC mode: the computer's audio (USB Audio Class 2 gadget) to the H2's DAC. */
 #ifndef FATHOM_UAC_RELAY_H
 #define FATHOM_UAC_RELAY_H

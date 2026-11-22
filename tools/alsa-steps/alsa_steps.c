@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * alsa-steps: open, configure, prepare and start a playback stream one step at
  * a time, logging (and syncing) each step to a file first, with a pause after.

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Bluetooth for the player: a worker thread runs fathom-bt (start, scan,
  * pair, connect, ...) so nothing slow happens on the UI thread, and watches
  * bluez-alsa for a connected device's playback PCM. The UI thread reads a

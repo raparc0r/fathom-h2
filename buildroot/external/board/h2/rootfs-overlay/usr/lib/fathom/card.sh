@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # The microSD card, for the scripts that mount it or wait for it (S01bootlog,
 # fathom-sdcard, fathom-usbdisk, S90fathom): sourced, ". /usr/lib/fathom/card.sh".

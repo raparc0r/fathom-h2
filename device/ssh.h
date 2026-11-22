@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* SSH for the player (see ssh.c). All of it is safe from the UI thread. */
 #ifndef FATHOM_SSH_H
 #define FATHOM_SSH_H

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* The Bluetooth format converter: rates, a flat passband, no aliasing below
  * 20 kHz, and plain 16-bit output at the track's own rate. */
 #include "audio/btconv.h"

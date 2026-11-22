@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * M3U / M3U8 playlists: read one into a list of paths, resolved against the
  * playlist's own folder, and the helpers used to match those paths to the

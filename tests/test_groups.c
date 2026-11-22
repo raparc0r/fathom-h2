@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Genres, Composers, Years and Folders (app/library/library.c), on a small
  * generated library in nested folders. */
 #include <FLAC/metadata.h>

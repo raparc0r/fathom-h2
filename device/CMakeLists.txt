@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # The Fathom player for the H2, cross-compiled by Buildroot (package fathom-player):
 # one static binary that runs from the SD card. LVGL is fetched at the same

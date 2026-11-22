@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Desktop output through SDL's audio queue. SDL converts to whatever the Mac's
  * device runs at, so this path is for listening and UI work, not bit-perfect

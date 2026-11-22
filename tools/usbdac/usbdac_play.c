@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * usbdac-play: play a known signal to one Core Audio device (the H2 in USB
  * DAC mode), at a given rate, without touching the Mac's default output.

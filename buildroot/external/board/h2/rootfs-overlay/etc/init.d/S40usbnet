@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 # USB network to the computer: the H2 is 10.42.0.1, the computer gets 10.42.0.2.
 case "$1" in
     start)

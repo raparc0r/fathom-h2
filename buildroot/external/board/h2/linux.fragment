@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Fathom H2 kernel options, applied on top of mainline's cu1000-neo_defconfig.
 
 # Board

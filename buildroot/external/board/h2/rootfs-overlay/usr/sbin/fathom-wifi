@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
 #
 # Wi-Fi: the BCM43438 on SDIO (MSC1), driver brcmfmac, run from the card:
 #   fathom-wifi on                load the driver, power the chip, start

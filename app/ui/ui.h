@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Fathom player UI (LVGL). Platform code (simulator or device) feeds keys and ticks. */
 #ifndef FATHOM_UI_H
 #define FATHOM_UI_H
@@ -215,7 +216,14 @@ typedef struct {
      * Add / Remove in the menus. */
     int  (*radio_add)(const radio_station_t *st);
     int  (*radio_remove)(const char *url);
-    /* About: row i's label and value; returns -1 past the last row. */
+    /* About: row i's label and value; returns -1 past the last row. Row 0 is
+     * UI_ABOUT_CREDIT, alone (row 1 the version): with its help (UI_ABOUT_NOTICE) it is
+     * the "Appropriate Legal Notices" of GPLv3 section 0, which the attribution
+     * term in LICENSE (section 7(b)) asks a modified version to keep. */
+#define UI_ABOUT_CREDIT "Fathom by m11n/raparc0r"
+#define UI_ABOUT_NOTICE "Copyright 2026 m11n/raparc0r. GPL 3 or later with " \
+                        "added terms, no warranty. " \
+                        "Licence: fathom/LICENSE."
     int  (*about)(int i, char *label, size_t lc, char *value, size_t vc);
     /* About > Check for updates (NULL hides it). update_do: UI_UPD_CHECK (ask
      * GitHub), UI_UPD_START (download, check and unpack the release offered),

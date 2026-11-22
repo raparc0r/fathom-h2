@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * The engine against outputs that behave as the H2's do: one whose write waits
  * while it's paused (ALSA: a paused USB DAC takes no more), one that can't open

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * theme-check: check themes against the format and the legibility rules
  * (THEMES.md), the same way the player does when it lists them.

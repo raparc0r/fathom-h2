@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Works for shuffle's "Keep works together" (library_shuffle_tracks): consecutive
  * tracks of an album whose titles share a prefix before ": ", two or more, form
  * one unit; a prefix on its own, or split by another track, doesn't. */

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * List a FAT32 folder tree by reading the partition directly: one read per
  * directory cluster, instead of the kernel's many small ones (on the H2's

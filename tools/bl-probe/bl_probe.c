@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * bl-probe: the H2's backlight PWM (X1000 TCU channel 0 on PC25) through
  * /dev/mem, to measure it and to try other PWM settings by eye without a new

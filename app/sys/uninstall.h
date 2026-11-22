@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Uninstall Fathom, on the card (Settings > About > Uninstall Fathom): find
  * HiBy's update file at the card's top, list its bootloader (sys/hibyupt.h)
