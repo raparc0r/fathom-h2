@@ -107,6 +107,8 @@ Linux kernel patches are GPL-2.0-only. The full texts are in [LICENSE](LICENSE).
 come with their own licences (SIL Open Font License; the icons are MIT). The screenshots
 show a made-up library.
 
+If you build on Fathom, we request attribution for the kernel, system and player.
+
 Fathom isn't affiliated with HiFi Walker, AIGO or HiBy.
 
 ## How it was made
