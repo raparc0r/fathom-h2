@@ -123,13 +123,17 @@ static void *worker(void *arg)
     (void)arg;
     int running = 0, failed = 0;
     unsigned seen = ~0u;
+    sh_wait_home(3000);                          /* (Home first: shell.h) */
+    /* One left from a player that crashed is stopped first. Here, not in
+     * share_init: the script (a shell, seq, two rm, a sync of everything) was
+     * 40 to 80 ms of the main thread before Home was drawn. Nothing can start
+     * a drive before it's done: only this thread starts one, in the loop below,
+     * whatever share_set() and share_set_wifi() ask for meanwhile. */
+    sh_run(FATHOM_SHARE " off >/dev/null 2>&1", NULL, 0);
     for (;;) {
         pthread_mutex_lock(&S.mu);
         if (running) {                       /* its log, once a second */
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += 1;
-            pthread_cond_timedwait(&S.cv, &S.mu, &ts);
+            mono_cond_wait_ms(&S.cv, &S.mu, 1000);
         } else {                             /* off: nothing to look at until something changes */
             while (S.kick == seen) pthread_cond_wait(&S.cv, &S.mu);
         }
@@ -183,8 +187,8 @@ void share_init(const char *music, int on, const char *password)
     S.want = on;
     S.state = on ? UI_SHARE_WAITING : UI_SHARE_OFF;
     pthread_mutex_unlock(&S.mu);
-    sh_run(FATHOM_SHARE " off >/dev/null 2>&1", NULL, 0);    /* one left from a player that crashed */
-    pthread_t th;
+    pthread_t th;                       /* (the worker first stops a drive left from a player that crashed) */
+    mono_cond_init(&S.cv);
     if (pthread_create(&th, NULL, worker, NULL)) return;
     pthread_detach(th);
 }

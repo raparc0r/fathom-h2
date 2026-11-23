@@ -11,6 +11,8 @@
  *   fathom-sim --bench [SECONDS]               headless: the UI's wakeups, redraws and CPU per second
  *   fathom-sim --lang-check FILE               headless: every screen's words through the menus, in
  *                                              the language FILE (tools/lang/check.py)
+ *   fathom-sim --wifi-wait                     headless: a station chosen while Wi-Fi is still joining
+ *                                              plays once it has joined (a test)
  *
  * Keys: Up/Down = wheel, Enter = centre (Play), Esc/Backspace = Back,
  *       N = long-press Back (Now Playing), Space = play/pause,
@@ -19,6 +21,8 @@
  *       T = next theme, Q = quit.
  */
 #include <SDL.h>
+#include <ftw.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +43,7 @@
 #include "net/podcast.h"
 #include "net/podsync.h"
 #include "net/coverfind.h"
+#include "net/radioicon.h"
 #include "audio/crossfeed.h"
 #include "lvgl.h"
 #include "player/player.h"
@@ -63,8 +68,7 @@ static int g_n_themes;      /* built-in themes, then any in build/sim-data/theme
 static int g_shots;
 static int sim_radio(radio_station_t *out, int max)
 {
-    int n = g_shots ? -1 : radio_load(SIM_RADIO, out, max);
-    return n >= 0 ? n : radio_load("assets/radio.txt", out, max);
+    return g_shots ? radio_load("assets/radio.txt", out, max) : radio_load_list(SIM_RADIO, "assets/radio.txt", out, max);
 }
 static int sim_radio_add(const radio_station_t *st) { return g_shots ? 1 : radio_add(SIM_RADIO, "assets/radio.txt", st); }
 static int sim_radio_remove(const char *url) { return g_shots ? 0 : radio_remove(SIM_RADIO, "assets/radio.txt", url); }
@@ -97,17 +101,22 @@ static long sim_dir_fetch(const char *url, char *buf, size_t cap, const volatile
     return more ? -2 : (long)n;
 }
 /* Podcasts: feeds and Apple's search from tests/data/podcasts (no network
- * here); a download is a small stand-in file. The screenshots start from
- * sample shows of their own (sim_pod_seed). */
+ * here); a download is a small stand-in file, a show's image the picture in
+ * tests/data/covers. The screenshots start from sample shows of their own
+ * (sim_pod_seed). */
 static long sim_pod_fetch(const char *url, char *buf, size_t cap, const volatile int *abort)
 {
     (void)abort;
-    const char *file = strstr(url, "itunes.apple.com") ? "tests/data/podcasts/search.json" : "tests/data/podcasts/feed.xml";
+    int feed = !strstr(url, "itunes.apple.com");
+    const char *file = feed ? "tests/data/podcasts/feed.xml" : "tests/data/podcasts/search.json";
     FILE *f = fopen(file, "rb");
     if (!f) return -1;
     size_t n = fread(buf, 1, cap - 1, f);
     fclose(f);
     buf[n] = '\0';
+    /* (the saved feed stops mid-item, and one that doesn't end is taken for
+     * cut off and not read: ended here, as tests/test_podsync.c does) */
+    if (feed) n += (size_t)snprintf(buf + n, cap - n, "\n</rss>\n");
     return (long)n;
 }
 static int64_t sim_pod_download(const char *url, const char *path, http_progress_fn progress, void *ctx,
@@ -124,6 +133,15 @@ static int64_t sim_pod_download(const char *url, const char *path, http_progress
     fprintf(f, "%s\n", url);
     fclose(f);
     return 1;
+}
+static int64_t sim_cf_download(const char *url, const char *path, http_progress_fn progress, void *ctx,
+                               const volatile int *abort);
+static int64_t sim_pod_get(const char *url, const char *path, http_progress_fn progress, void *ctx,
+                           const volatile int *abort)
+{
+    size_t n = strlen(url);
+    if (n > 4 && !strcmp(url + n - 4, ".jpg")) return sim_cf_download(url, path, progress, ctx, abort);   /* a show's image */
+    return sim_pod_download(url, path, progress, ctx, abort);
 }
 /* Covers found online: MusicBrainz "finds" the album asked for (its title and
  * artist read back from the question), and once more live; Apple nothing;
@@ -172,6 +190,46 @@ static int64_t sim_cf_download(const char *url, const char *path, http_progress_
     if (out) fclose(out);
     return out && total ? (int64_t)total : -1;
 }
+/* Radio stations' icons: every logo is the picture in tests/data/covers (no
+ * network here). The screenshots fetch none: theirs are put there before
+ * (sim_icon_seed), so each run shows the same. */
+static int g_icons_seeded;
+static long sim_icon_fetch(const char *url, char *buf, size_t cap, const volatile int *abort)
+{
+    (void)url; (void)abort;
+    if (g_icons_seeded) return -1;
+    FILE *f = fopen("tests/data/covers/cover.jpg", "rb");
+    if (!f) return -1;
+    size_t n = fread(buf, 1, cap - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return (long)n;
+}
+/* The example stations' icons for the screenshots: albums' covers from the
+ * library stand in for the logos (after ricon_start) */
+static void sim_icon_seed(const char *dir)
+{
+    char cmd[300];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (system(cmd)) {}
+    mkdir(dir, 0755);
+    g_icons_seeded = 1;
+    radio_station_t st[8];
+    int n = radio_load("assets/radio.txt", st, 8), at = 0;
+    lib_list_t al;
+    static uint16_t px[LIB_ART_LARGE * LIB_ART_LARGE], small[LIB_ART_SMALL * LIB_ART_SMALL];
+    if (!g_lib || library_list(g_lib, LIB_ALBUMS, 0, &al) <= 0) return;
+    for (int i = 0; i < n; i++) {
+        char p[700];
+        if (ricon_path(st[i].icon, p, sizeof p)) continue;
+        for (at += 3; at < al.n; at++)             /* (not the ones the podcasts took) */
+            if (library_art(g_lib, al.ids[at], LIB_ART_LARGE, px) == 0 && library_art(g_lib, al.ids[at], LIB_ART_SMALL, small) == 0) break;
+        if (at >= al.n) break;
+        FILE *f = fopen(p, "wb");
+        if (f) { fwrite(small, 1, sizeof small, f); fwrite(px, 1, sizeof px, f); fclose(f); }
+    }
+    library_list_free(&al);
+}
 /* What's new, as a release's whatsnew.txt gives it (the screenshots; About's row) */
 #define SIM_WHATS_NEW_VERSION "v0.14.1"
 #define SIM_WHATS_NEW "Hotfix: Eliminates clicking sound when you skip, go back or seek\n" \
@@ -184,7 +242,9 @@ static int sim_pod_opml(char *path, size_t cap)
     return f ? 1 : 0;
 }
 /* Sample shows for the screenshots: one read (three episodes: the newest not
- * on the card, one half heard and downloaded, one played), two with new episodes */
+ * on the card, one half heard and downloaded, one played), two with new
+ * episodes; each with a picture (albums' covers from the library stand in
+ * for the shows' images) */
 static void sim_pod_seed(const char *dir)
 {
     char cmd[300];
@@ -203,6 +263,23 @@ static void sim_pod_seed(const char *dir)
         s.latest = 1795064400;
         pod_show_save(dir, &s);
         pod_show_seen(dir, s.id, i == 0 ? 1795064400 : 1795000000);
+    }
+    lib_list_t al;
+    static uint16_t px[LIB_ART_LARGE * LIB_ART_LARGE], small[LIB_ART_SMALL * LIB_ART_SMALL];
+    if (g_lib && library_list(g_lib, LIB_ALBUMS, 0, &al) > 0) {
+        int show = 0;
+        for (int i = 0; i < al.n && show < 3; i++) {
+            if (library_art(g_lib, al.ids[i], LIB_ART_LARGE, px) || library_art(g_lib, al.ids[i], LIB_ART_SMALL, small)) continue;
+            char id[13], p[800];
+            pod_hash(SHOWS[show++][1], id);
+            pod_cover_path(dir, id, p, sizeof p);
+            FILE *c = fopen(p, "wb");
+            if (c) { fwrite(px, 1, sizeof px, c); fclose(c); }
+            pod_thumb_path(dir, id, p, sizeof p);
+            c = fopen(p, "wb");
+            if (c) { fwrite(small, 1, sizeof small, c); fclose(c); }
+        }
+        library_list_free(&al);
     }
     char buf[8192];
     FILE *f = fopen("tests/data/podcasts/feed.xml", "rb");
@@ -229,19 +306,6 @@ static void sim_pod_seed(const char *dir)
     pod_episode_path(dir, s.id, &e[1], p, sizeof p);
     f = fopen(p, "wb");
     if (f) { fputs("stand-in", f); fclose(f); }
-    /* its cover (an album's from the library stands in for the show's image) */
-    lib_list_t al;
-    static uint16_t px[LIB_ART_LARGE * LIB_ART_LARGE];
-    if (g_lib && library_list(g_lib, LIB_ALBUMS, 0, &al) > 0) {
-        for (int i = 0; i < al.n; i++)
-            if (library_art(g_lib, al.ids[i], LIB_ART_LARGE, px) == 0) {
-                pod_cover_path(dir, s.id, p, sizeof p);
-                FILE *c = fopen(p, "wb");
-                if (c) { fwrite(px, 1, sizeof px, c); fclose(c); }
-                break;
-            }
-        library_list_free(&al);
-    }
     /* and its chapters, as fetched with the download */
     pod_chapters_path(dir, s.id, e[1].key, p, sizeof p);
     FILE *in = fopen("tests/data/podcasts/chapters.json", "rb"), *out = fopen(p, "wb");
@@ -440,7 +504,7 @@ static int sim_about(int i, char *label, size_t lc, char *value, size_t vc)
         static const char *const MON[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
         dt_split(tz_to_local(z, g_sim_clock), &t);
         if (g_sim_clock) snprintf(value, vc, "%d %s %d, %02d:%02d%s", t.day, MON[(t.mon + 11) % 12], t.year, t.hour, t.min, z ? "" : " UTC");
-        else snprintf(value, vc, "Not set: Play sets it");
+        else snprintf(value, vc, "Not set: <Play> sets it");
         return 0;
     }
     snprintf(label, lc, "%s", i == 0 ? UI_ABOUT_CREDIT : "Version");
@@ -448,7 +512,18 @@ static int sim_about(int i, char *label, size_t lc, char *value, size_t vc)
     return 0;
 }
 
-static const ui_hooks_t g_hooks = {.about = sim_about, .clock_set = sim_clock_set, .fonts = ui_theme_fonts, .icon = ui_theme_icon, .radio_stations = sim_radio,
+/* Rescan's screen: a scan made up, at one step (the screenshots) */
+static ui_scan_t g_sim_scan;
+static int g_sim_scanning;
+static int sim_scan_progress(ui_scan_t *p)
+{
+    if (!g_sim_scanning) return 0;
+    *p = g_sim_scan;
+    return 1;
+}
+static void sim_rescan(void) { g_sim_scanning = 1; }
+
+static const ui_hooks_t g_hooks = {.about = sim_about, .rescan = sim_rescan, .scan_progress = sim_scan_progress, .clock_set = sim_clock_set, .fonts = ui_theme_fonts, .icon = ui_theme_icon, .radio_stations = sim_radio,
                                    .radio_add = sim_radio_add, .radio_remove = sim_radio_remove,
                                    .share_state = sim_share_state, .share_do = sim_share_do,
                                    .ssh_state = sim_ssh_state, .ssh_do = sim_ssh_do,
@@ -505,6 +580,8 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
     lv_display_t *d = lv_display_create(UI_W, UI_H);
     lv_display_set_buffers(d, g_fb, NULL, sizeof g_fb, LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(d, null_flush);
+    ui_set_new_install(getenv("SIM_NEW_INSTALL") != NULL);   /* (a fresh install's Home) */
+    ui_set_music_missing(getenv("SIM_NO_MUSIC") != NULL);   /* (no Music folder) */
     ui_init(lv_screen_active(), themes, g_n_themes, fonts, 1, g_lib, g_player);
     ui_set_hooks(&g_hooks);
     ui_set_battery(86, 1);   /* the desktop has no H2 battery: a fixed sample value, charging (two icons) */
@@ -525,12 +602,14 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                                           "libsettings", "libhelp", "xfhelp", "whatsnew", "whatsnewend", "aboutwn", "covermenu", "covermenuown", "coverfind",
                                           "albummenu", "artistmenu", "aartistmenu", "homemove",
                                           "smartlists", "smartopen", "smartmenu",
-                                          "cv-tracks", "cv-artist", "cv-artistsongs", "cv-playlist", "cv-queue"};
+                                          "cv-tracks", "cv-artist", "cv-artistsongs", "cv-playlist", "cv-queue",
+                                          "welcome", "welcomeend", "abouttips", "rescan", "rescanalbums", "rescancovers"};
     static const char *const slug[] = {"studio-mint", "studio-ember", "studio-pastel", "pixel-pastel"};
     for (int t = 0; t < 4 && t < g_n_themes; t++) {   /* the built-in themes */
         ui_set_theme(t);
         for (size_t s = 0; s < sizeof screens / sizeof screens[0]; s++) {
             lv_obj_t *sample = NULL;
+            if (g_sim_scanning) { g_sim_scanning = 0; ui_show_scan(); }   /* (the last one's put away) */
             if (!strcmp(screens[s], "glyphs")) {    /* digits vs letters, and the fallback font */
                 ui_show("home");
                 const ui_fonts_t *ff = ui_theme_fonts(&themes[t]);
@@ -569,6 +648,16 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 }
                 if (!strcmp(screens[s], "rdirnpmenu")) ui_key(UI_KEY_MENU);
                 ui_set_theme(t);                            /* (the slide finished) */
+            } else if (!strncmp(screens[s], "rescan", 6)) {   /* Settings > Library > Rescan, at each step */
+                ui_show("libsettings");
+                memset(&g_sim_scan, 0, sizeof g_sim_scan);
+                if (!strcmp(screens[s], "rescan")) {
+                    g_sim_scan = (ui_scan_t){.step = UI_SCAN_SONGS, .done = 1225, .total = 9812};
+                    snprintf(g_sim_scan.file, sizeof g_sim_scan.file, "%s", "07 - The Long Way Round (Live at the Roundhouse).flac");
+                } else if (!strcmp(screens[s], "rescanalbums")) g_sim_scan.step = UI_SCAN_ALBUMS;
+                else g_sim_scan = (ui_scan_t){.step = UI_SCAN_COVERS, .done = 12, .total = 31};
+                g_sim_scanning = 1;
+                ui_show_scan();
             } else if (!strcmp(screens[s], "purenp")) {    /* Pure mode: the badge */
                 sim_pure_toggle();
                 ui_show("nowplaying");
@@ -647,6 +736,12 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 ui_show("about");
                 for (int k = 0; k < 8; k++) ui_key(UI_KEY_UP);
                 ui_key(UI_KEY_MENU);
+            } else if (!strncmp(screens[s], "welcome", 7)) {   /* a fresh install's (and turned to the end) */
+                ui_show("home");
+                ui_show_welcome();
+                if (!strcmp(screens[s], "welcomeend")) for (int k = 0; k < 8; k++) ui_key(UI_KEY_DOWN);
+            } else if (!strcmp(screens[s], "abouttips")) {     /* Settings > About, its Tips row */
+                ui_show("about");
             } else if (!strncmp(screens[s], "cv-", 3)) {   /* Covers in lists: Albums, songs (then back) */
                 settings_set_int("display.covers", 3);
                 ui_show(screens[s] + 3);
@@ -714,7 +809,8 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 ui_show(screens[s]);
             }
             int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp") ||
-                         !strncmp(screens[s], "whatsnew", 8) || !strcmp(screens[s], "abouthelp") || !strcmp(screens[s], "clockset") ||
+                         !strncmp(screens[s], "whatsnew", 8) || !strncmp(screens[s], "welcome", 7) || !strcmp(screens[s], "abouthelp") ||
+                         !strcmp(screens[s], "clockset") || !strncmp(screens[s], "rescan", 6) ||
                          (g_sim_upd.state >= UI_UPD_DOWNLOADING && g_sim_upd.state <= UI_UPD_RESTARTING) ||
                          !strcmp(screens[s], "uninstallpending") || !strcmp(screens[s], "uninstallnone");   /* (the update's progress screen) */
             lv_obj_t *what = on_top ? lv_layer_top() : lv_screen_active();
@@ -737,7 +833,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
             }
             if (!strncmp(screens[s], "cv-", 3)) settings_set_int("display.covers", UI_COVERS_DEFAULT);
             if (!strcmp(screens[s], "clockdone") || strstr(screens[s], "-tokyo")) settings_set("clock.tz", "UTC");
-            if (!strncmp(screens[s], "whatsnew", 8)) ui_key(UI_KEY_BACK);   /* (put away: Back) */
+            if (!strncmp(screens[s], "whatsnew", 8) || !strncmp(screens[s], "welcome", 7)) ui_key(UI_KEY_BACK);   /* (put away: Back) */
             if (!strcmp(screens[s], "homemove")) {          /* (back where it was, and done) */
                 ui_key(UI_KEY_UP);
                 ui_key(UI_KEY_UP);
@@ -859,6 +955,8 @@ static int lang_check(const char *file, theme_t *themes, const ui_fonts_t *fonts
     lv_display_set_flush_cb(d, null_flush);
     if (lang_load(file)) { fprintf(stderr, "cannot load %s\n", file); return 1; }
     g_lang_check = 1;
+    ui_set_new_install(getenv("SIM_NEW_INSTALL") != NULL);   /* (a fresh install's Home) */
+    ui_set_music_missing(getenv("SIM_NO_MUSIC") != NULL);   /* (no Music folder) */
     ui_init(lv_screen_active(), themes, g_n_themes, fonts, 1, g_lib, g_player);
     ui_set_hooks(&g_hooks);
     ui_set_battery(86, 0);
@@ -872,6 +970,169 @@ static int lang_check(const char *file, theme_t *themes, const ui_fonts_t *fonts
     ui_show("nowplaying"); ui_key(UI_KEY_MENU_LONG); lc_dump("Quick settings");
     ui_show("home"); ui_toast("Over USB and Wi-Fi, with the password", 3000); lc_dump("Toast");
     return 0;
+}
+
+/* ---- a station chosen before Wi-Fi has joined (the ui_wifi_wait test) ----
+ * Wi-Fi as the UI sees it, faked: off, starting, on with nothing joined, or
+ * connected. Nothing here reaches a network: the stations are made up and
+ * this build's player has nothing that could open them. */
+static struct { int on, state, toggles, wakes; char busy[16]; } g_ww;
+static int ww_state(char *busy, size_t cap, ui_wifi_status_t *st)
+{
+    snprintf(busy, cap, "%s", g_ww.busy);
+    if (st) *st = (ui_wifi_status_t){.state = g_ww.state};
+    return g_ww.on;
+}
+static int ww_networks(ui_wifi_net_t *out, int max) { (void)out; (void)max; return 0; }
+static void ww_do(int what, const char *ssid, const char *password)
+{
+    (void)ssid; (void)password;
+    if (what == UI_WIFI_TOGGLE) g_ww.toggles++;
+}
+static void ww_wake(void) { g_ww.wakes++; }
+static int ww_ready(char *why, size_t cap)
+{
+    if (g_ww.state == UI_WIFI_CONNECTED) return 0;
+    snprintf(why, cap, "%s", g_ww.on || g_ww.busy[0] ? "Not connected yet: Settings > Wi-Fi" : "Wi-Fi is off: Settings > Wi-Fi");
+    return -1;
+}
+static int ww_stations(radio_station_t *out, int max)
+{
+    static const radio_station_t st[2] = {{.name = "One", .url = "http://127.0.0.1:9/one"},
+                                          {.name = "Two", .url = "http://127.0.0.1:9/two"}};
+    int n = max < 2 ? max : 2;
+    memcpy(out, st, (size_t)n * sizeof *out);
+    return n;
+}
+static void ww_set(int on, int state, const char *busy)
+{
+    g_ww.on = on;
+    g_ww.state = state;
+    snprintf(g_ww.busy, sizeof g_ww.busy, "%s", busy);
+    ui_wifi_changed();
+}
+/* the station on the radio (1, 2), 0 off the radio */
+static int ww_on_air(void)
+{
+    const radio_station_t *s = player_radio_station(g_player);
+    return !s ? 0 : !strcmp(s->name, "One") ? 1 : 2;
+}
+static int g_ww_bad;
+#define WW(cond) do { if (!(cond)) { fprintf(stderr, "wifi-wait: line %d: %s\n", __LINE__, #cond); g_ww_bad++; } } while (0)
+
+/* A scratch folder to run in (the library and settings go in build/sim-data
+ * under where the simulator is run), removed afterwards. */
+static int ww_scratch(char *dir, size_t cap)
+{
+    const char *t = getenv("TMPDIR");
+    snprintf(dir, cap, "%s/fathom-wifi-wait-XXXXXX", t && *t ? t : "/tmp");
+    if (!mkdtemp(dir) || chdir(dir) || mkdir("build", 0755)) { perror("wifi-wait: scratch folder"); return -1; }
+    return 0;
+}
+static int ww_rm(const char *path, const struct stat *st, int type, struct FTW *f)
+{
+    (void)st; (void)type; (void)f;
+    return remove(path);
+}
+
+/* Radio's list with station `row` (1, 2) selected */
+static void ww_radio_list(int row)
+{
+    ui_show("radio");
+    int sel = 0;
+    for (int g = 0; g < 8 && ui_list_state(&sel, NULL, NULL) && sel != row; g++) ui_key(sel < row ? UI_KEY_DOWN : UI_KEY_UP);
+    advance(300);
+}
+
+static int wifi_wait_check(theme_t *themes, const ui_fonts_t *fonts)
+{
+    lv_tick_set_cb(fake_tick);
+    lv_display_t *d = lv_display_create(UI_W, UI_H);
+    lv_display_set_buffers(d, g_fb, NULL, sizeof g_fb, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(d, null_flush);
+    if (!g_player) { fprintf(stderr, "wifi-wait: no player\n"); return 1; }
+    ui_init(lv_screen_active(), themes, g_n_themes, fonts, 1, g_lib, g_player);
+    ui_hooks_t hooks = g_hooks;
+    hooks.wifi_state = ww_state;
+    hooks.wifi_networks = ww_networks;
+    hooks.wifi_do = ww_do;
+    hooks.wifi_wake = ww_wake;
+    hooks.radio_ready = ww_ready;
+    hooks.radio_stations = ww_stations;
+    ui_set_hooks(&hooks);
+    ui_set_battery(86, 0);
+    ui_set_theme(0);
+    int depth, sel = -1;
+
+    /* Wi-Fi starting (as at boot): Play on a station is kept, not thrown away */
+    ww_set(0, UI_WIFI_OFF, "Starting");
+    ww_radio_list(1);
+    depth = ui_list_state(&sel, NULL, NULL);
+    WW(depth > 0 && sel == 1);
+    ui_key(UI_KEY_OK);
+    advance(100);
+    WW(ww_on_air() == 0);                         /* not yet */
+    WW(ui_list_state(NULL, NULL, NULL) == depth); /* and not asked "Turn on Wi-Fi?" */
+    WW(g_ww.wakes == 1 && g_ww.toggles == 0);
+    ww_set(1, UI_WIFI_ON, "");                    /* started, nothing joined yet */
+    WW(ww_on_air() == 0);
+    ww_set(1, UI_WIFI_CONNECTING, "");
+    WW(ww_on_air() == 0);
+    ww_set(1, UI_WIFI_CONNECTED, "");             /* joined: the station chosen starts */
+    advance(100);
+    WW(ww_on_air() == 1);
+
+    /* on with nothing joined: the same, for the other station */
+    ww_set(1, UI_WIFI_ON, "");
+    ww_radio_list(2);
+    ui_key(UI_KEY_OK);
+    WW(ww_on_air() == 1 && g_ww.wakes == 2);
+    ww_set(1, UI_WIFI_CONNECTED, "");
+    advance(100);
+    WW(ww_on_air() == 2);
+
+    /* moved to another row meanwhile: nothing starts by itself */
+    ww_set(1, UI_WIFI_ON, "");
+    ww_radio_list(1);
+    ui_key(UI_KEY_OK);
+    ui_key(UI_KEY_UP);
+    ww_set(1, UI_WIFI_CONNECTED, "");
+    advance(100);
+    WW(ww_on_air() == 2 && g_ww.wakes == 3);
+
+    /* never joined: given up after 45 s, and a connection later starts nothing */
+    ww_set(1, UI_WIFI_ON, "");
+    ww_radio_list(1);
+    ui_key(UI_KEY_OK);
+    for (int s = 0; s < 46; s++) { g_fake_ms += 1000; ui_tick_1s(); }
+    ww_set(1, UI_WIFI_CONNECTED, "");
+    advance(100);
+    WW(ww_on_air() == 2 && g_ww.wakes == 4);
+
+    /* Wi-Fi off: asked as before (nothing woken), and Turn on still leads to the station */
+    ww_set(0, UI_WIFI_OFF, "");
+    ww_radio_list(1);
+    depth = ui_list_state(NULL, NULL, NULL);
+    ui_key(UI_KEY_OK);
+    advance(400);
+    WW(ui_list_state(NULL, NULL, NULL) == depth + 1);   /* "Turn on Wi-Fi?" */
+    WW(g_ww.wakes == 4 && g_ww.toggles == 0);
+    ui_key(UI_KEY_OK);                            /* Turn on */
+    advance(400);
+    WW(g_ww.toggles == 1 && ww_on_air() == 2);
+    ww_set(0, UI_WIFI_OFF, "Starting");
+    ww_set(1, UI_WIFI_CONNECTED, "");
+    advance(100);
+    WW(ww_on_air() == 1);
+
+    /* connected: Play plays at once */
+    ww_radio_list(2);
+    ui_key(UI_KEY_OK);
+    WW(ww_on_air() == 2 && g_ww.wakes == 4);
+
+    player_pause(g_player, 1);
+    printf("wifi-wait: %s\n", g_ww_bad ? "FAILED" : "ok");
+    return g_ww_bad ? 1 : 0;
 }
 
 static int frame(const char *dir, const char *name)
@@ -893,6 +1154,8 @@ static int motion(const char *dir, theme_t *themes, const ui_fonts_t *fonts, int
     lv_display_t *d = lv_display_create(UI_W, UI_H);
     lv_display_set_buffers(d, g_fb, NULL, sizeof g_fb, LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(d, null_flush);
+    ui_set_new_install(getenv("SIM_NEW_INSTALL") != NULL);   /* (a fresh install's Home) */
+    ui_set_music_missing(getenv("SIM_NO_MUSIC") != NULL);   /* (no Music folder) */
     ui_init(lv_screen_active(), themes, g_n_themes, fonts, 1, g_lib, g_player);
     ui_set_hooks(&g_hooks);
     ui_set_battery(86, 0);   /* the desktop has no H2 battery: a fixed sample value */
@@ -1051,6 +1314,8 @@ static int bench(theme_t *themes, const ui_fonts_t *fonts, int seconds)
     lv_display_set_color_format(d, LV_COLOR_FORMAT_RGB565);
     lv_display_set_buffers(d, fb, NULL, sizeof g_bench_fb, LV_DISPLAY_RENDER_MODE_DIRECT);
     lv_display_set_flush_cb(d, count_flush);
+    ui_set_new_install(getenv("SIM_NEW_INSTALL") != NULL);   /* (a fresh install's Home) */
+    ui_set_music_missing(getenv("SIM_NO_MUSIC") != NULL);   /* (no Music folder) */
     ui_init(lv_screen_active(), themes, g_n_themes, fonts, 1, g_lib, g_player);
     ui_set_hooks(&g_hooks);
     ui_set_battery(86, 0);
@@ -1177,7 +1442,7 @@ static void setup_player(const char *music, int silent)
 int main(int argc, char **argv)
 {
     const char *shots = NULL, *motion_dir = NULL, *music = NULL, *lang_file = NULL;
-    int theme = 0, zoom = 3, bench_s = 0;
+    int theme = 0, zoom = 3, bench_s = 0, wifi_wait = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--screenshots") && i + 1 < argc) shots = argv[++i];
         else if (!strcmp(argv[i], "--motion") && i + 1 < argc) motion_dir = argv[++i];
@@ -1185,8 +1450,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--zoom") && i + 1 < argc) zoom = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--music") && i + 1 < argc) music = argv[++i];
         else if (!strcmp(argv[i], "--lang-check") && i + 1 < argc) lang_file = argv[++i];
+        else if (!strcmp(argv[i], "--wifi-wait")) wifi_wait = 1;
         else if (!strcmp(argv[i], "--bench")) { bench_s = i + 1 < argc && atoi(argv[i + 1]) > 0 ? atoi(argv[++i]) : 5; g_bench = 1; }
-        else { fprintf(stderr, "usage: %s [--theme N] [--zoom Z] [--music DIR] | --screenshots DIR | --motion DIR | --bench [S]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "usage: %s [--theme N] [--zoom Z] [--music DIR] | --screenshots DIR | --motion DIR | --bench [S] | --wifi-wait\n", argv[0]); return 2; }
     }
 
     lv_init();
@@ -1195,12 +1461,19 @@ int main(int argc, char **argv)
     g_n_themes = ui_load_themes(FATHOM_ASSETS_DIR, SIM_THEMES, themes, UI_MAX_THEMES);
     const ui_fonts_t *fonts = g_n_themes > 0 ? ui_theme_fonts(&themes[0]) : NULL;
     if (!fonts) return 1;
-    setup_player(music, shots || motion_dir || bench_s || lang_file);
+    char scratch[PATH_MAX] = "";
+    if (wifi_wait && ww_scratch(scratch, sizeof scratch)) return 1;   /* (its own empty library, wherever it's run from) */
+    setup_player(music, shots || motion_dir || bench_s || lang_file || wifi_wait);
     if (bench_s) return bench(themes, fonts, bench_s);
+    if (wifi_wait) {
+        int bad = wifi_wait_check(themes, fonts);
+        nftw(scratch, ww_rm, 8, FTW_DEPTH | FTW_PHYS);
+        return bad;
+    }
     rdir_set_fetch(sim_dir_fetch);
     g_shots = shots != NULL;
     podsync_set_fetch(sim_pod_fetch);
-    podsync_set_download(sim_pod_download);
+    podsync_set_download(sim_pod_get);
     if (shots || lang_file) sim_pod_seed("build/sim-data/podcasts-shots");
     podsync_start(shots || lang_file ? "build/sim-data/podcasts-shots" : "build/sim-data/podcasts");
     const char *covers = shots || lang_file ? "build/sim-data/covers-shots" : "build/sim-data/covers";
@@ -1209,6 +1482,9 @@ int main(int argc, char **argv)
     cf_set_download(sim_cf_download);
     if (shots || lang_file) cf_set_mb_gap_ms(0);
     cf_start(covers);
+    ricon_set_fetch(sim_icon_fetch);
+    ricon_start(shots || lang_file ? "build/sim-data/radio-icons-shots" : "build/sim-data/radio-icons");
+    if (shots || lang_file) sim_icon_seed("build/sim-data/radio-icons-shots");
     if (lang_file) { g_shots = 1; return lang_check(lang_file, themes, fonts); }
     if (shots) return screenshots(shots, themes, fonts);
     if (motion_dir) return motion(motion_dir, themes, fonts, theme);
@@ -1220,6 +1496,8 @@ int main(int argc, char **argv)
     lv_group_t *g = lv_group_create();
     lv_indev_set_group(kb, g);
 
+    ui_set_new_install(getenv("SIM_NEW_INSTALL") != NULL);   /* (a fresh install's Home) */
+    ui_set_music_missing(getenv("SIM_NO_MUSIC") != NULL);   /* (no Music folder) */
     ui_init(lv_screen_active(), themes, g_n_themes, fonts, 1, g_lib, g_player);
     ui_set_hooks(&g_hooks);
     ui_set_battery(86, 0);   /* the desktop has no H2 battery: a fixed sample value */

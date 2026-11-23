@@ -10,9 +10,23 @@ supported yet, and the installer refuses them.
 
 **You need:**
 
-- a microSD card formatted **FAT32** (exFAT won't work);
+- a microSD card formatted **FAT32** (exFAT won't work: see below);
 - the H2 charged above 50 %;
 - the release, `fathom-h2-VERSION.zip`, unzipped on a computer.
+
+### A FAT32 card
+
+Cards bigger than 32 GB come formatted exFAT, which the H2's bootloader can't read, so
+they need formatting as FAT32 first. Formatting erases the card: copy anything on it to
+the computer first, and back afterwards. FAT32 works on cards of any size; it only can't
+hold a single file over 4 GB (an hour or more of DSD256, say).
+
+- **Mac:** Disk Utility, View > Show All Devices, select the card itself (not the volume
+  under it), Erase: Format **MS-DOS (FAT)**, Scheme **Master Boot Record**.
+- **Windows:** its own formatter offers FAT32 only up to 32 GB. For a bigger card, use a
+  free formatter that does FAT32 at any size, such as Rufus (rufus.ie: Boot selection
+  "Non bootable", File system "Large FAT32").
+- **Linux:** `sudo mkfs.vfat -F 32 /dev/sdX1` (your card's partition).
 
 ## 1. Put your music in a `Music` folder
 

@@ -7,6 +7,12 @@
  * then the radio directory, covers and updates all fail. These say so in
  * plain words, and, where NTP doesn't answer, take the time from an HTTPS
  * server's answer instead.
+ *
+ * Later starts begin at the last shutdown's time (the player saves it): right
+ * enough to look set, and days behind after days off, so a server whose
+ * certificate is newer than that fails ("not valid yet") until the network
+ * gives the time. Until it has, since the player started, the clock isn't
+ * confirmed, and a connection that fails asks for the time as well.
  */
 #ifndef FATHOM_NETCLOCK_H
 #define FATHOM_NETCLOCK_H
@@ -25,13 +31,28 @@ const char *netclock_unset_text(void);
 int netclock_unset_at(int64_t t);
 int netclock_unset(void);
 
+/* The network gave the time since the player started (NTP, or an HTTPS
+ * answer, whether it moved the clock or found it right): 1. Set by hand: 0
+ * again. netclock_doubtful(): unset, or not confirmed. */
+void netclock_set_confirmed(int yes);
+int netclock_confirmed(void);
+int netclock_doubtful(void);
+
 /* What to say about an HTTPS request that failed: netclock_unset_text() while
- * the clock isn't set (the likely reason), else otherwise. While it isn't set,
- * it also asks for the time now (netclock_want). */
+ * the clock isn't set (the likely reason), else otherwise. While the clock is
+ * doubtful, it also asks for the time now (netclock_want). */
 const char *netclock_why(const char *otherwise);
 
-/* A secure connection failed because the clock isn't set: the player asks an
- * HTTPS server for the time at once (device/main.c), rather than after NTP's
+/* A connection to url (http, https: a plain one may lead to a secure one)
+ * couldn't be opened. While the clock is doubtful that may be why, so the
+ * time is asked for (netclock_want): the next try finds it set. Any thread. */
+/* (weak: the small tools that play or fetch without a clock to mind, the
+ * bit-perfect check and the levelling bench, are linked without this file;
+ * callers ask whether it's there) */
+void netclock_net_failed(const char *url) __attribute__((weak));
+
+/* A secure connection failed, perhaps for want of the time: the player asks
+ * an HTTPS server for it at once (device/main.c), rather than after NTP's
  * next try, minutes away. Any thread. netclock_wanted(): whether it was asked
  * for since the last call (and clears it). */
 void netclock_want(void);

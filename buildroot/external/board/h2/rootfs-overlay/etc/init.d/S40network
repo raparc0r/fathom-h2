@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
+#
+# The loopback interface up (all /etc/network/interfaces asks for: Wi-Fi is
+# fathom-wifi's, the USB network S40usbnet's). Buildroot's script runs ifup -a,
+# which reads that file and starts a program a step: 70 ms of every start.
+case "$1" in
+start)   ip link set lo up 2>/dev/null || ifconfig lo 127.0.0.1 up ;;
+stop)    ;;
+esac
+exit 0

@@ -38,6 +38,63 @@ int main(void)
     CHECK(!strcmp(r[4].url, "https://t.example/a"));
     CHECK(radio_parse(t, r, 2) == 2);
 
+    /* a station's icon: after the stream, with or without an info source, in either order */
+    char long_icon[400] = "https://long.example/";
+    memset(long_icon + strlen(long_icon), 'a', 300);
+    char tl[2048];
+    snprintf(tl, sizeof tl,
+        "A = http://a.example/s | icon: https://a.example/logo.png\n"
+        "B = http://b.example/s | info: radiofrance:7 | icon: https://b.example/l.jpg\n"
+        "C = http://c.example/s | icon: https://c.example/l.jpg | info: radiofrance:1\n"
+        "D = http://d.example/s | icon: https://d.example/a b.png\n"
+        "E = http://e.example/s | icon: ftp://e.example/l.png | info: x\n"
+        "F = http://f.example/s|icon:https://f.example/l.png?a=1&b=2|info:y\n"
+        "G = http://g.example/s | info: z | later: something | icon: %s\n"
+        "H = http://h.example/s | icon:\n", long_icon);
+    radio_station_t ic[8];
+    n = radio_parse(tl, ic, 8);
+    CHECK(n == 8);
+    CHECK(!strcmp(ic[0].url, "http://a.example/s") && !strcmp(ic[0].icon, "https://a.example/logo.png") && !ic[0].info[0]);
+    CHECK(!strcmp(ic[1].info, "radiofrance:7") && !strcmp(ic[1].icon, "https://b.example/l.jpg"));
+    CHECK(!strcmp(ic[2].info, "radiofrance:1") && !strcmp(ic[2].icon, "https://c.example/l.jpg"));
+    CHECK(!ic[3].icon[0] && !strcmp(ic[3].url, "http://d.example/s"));     /* a space in it: left out */
+    CHECK(!ic[4].icon[0] && !strcmp(ic[4].info, "x"));                    /* not http(s) */
+    CHECK(!strcmp(ic[5].url, "http://f.example/s") && !strcmp(ic[5].icon, "https://f.example/l.png?a=1&b=2") && !strcmp(ic[5].info, "y"));
+    CHECK(!ic[6].icon[0] && !strcmp(ic[6].info, "z"));                    /* too long to keep whole: left out, not cut */
+    CHECK(!ic[7].icon[0] && !strcmp(ic[7].name, "H"));
+    /* written and read back the same; without an icon, the line as it always was */
+    for (int i = 0; i < 3; i++) {
+        char line[1024];
+        radio_station_t back;
+        radio_line(&ic[i], line, sizeof line);
+        CHECK(radio_parse(line, &back, 1) == 1 && !memcmp(&back, &ic[i], sizeof back));
+    }
+    char one[1024];
+    radio_line(&ic[1], one, sizeof one);
+    CHECK(!strcmp(one, "B = http://b.example/s | info: radiofrance:7 | icon: https://b.example/l.jpg"));
+    radio_line(&ic[0], one, sizeof one);
+    CHECK(!strcmp(one, "A = http://a.example/s | icon: https://a.example/logo.png"));
+    radio_station_t odd = {.name = "Odd", .url = "http://o.example/s", .icon = "https://o.example/a|b.png"};
+    radio_line(&odd, one, sizeof one);
+    CHECK(!strcmp(one, "Odd = http://o.example/s"));                      /* a '|' would cut the line there */
+    snprintf(odd.icon, sizeof odd.icon, "https://o.example/a b.png");
+    radio_line(&odd, one, sizeof one);
+    CHECK(!strcmp(one, "Odd = http://o.example/s"));
+    snprintf(odd.icon, sizeof odd.icon, "file:///etc/passwd");
+    radio_line(&odd, one, sizeof one);
+    CHECK(!strcmp(one, "Odd = http://o.example/s"));
+    CHECK(radio_icon_ok("http://x.example/i.png") && radio_icon_ok("https://x.example/i") && !radio_icon_ok("") &&
+          !radio_icon_ok(NULL) && !radio_icon_ok("//x.example/i.png") && !radio_icon_ok(long_icon));
+    /* the longest line there can be fits the buffers that hold one */
+    radio_station_t full;
+    memset(&full, 'x', sizeof full);
+    full.name[sizeof full.name - 1] = full.url[sizeof full.url - 1] = full.info[sizeof full.info - 1] = full.icon[sizeof full.icon - 1] = '\0';
+    memcpy(full.url, "http://", 7);
+    memcpy(full.icon, "https://", 8);
+    radio_line(&full, one, sizeof one);
+    radio_station_t back;
+    CHECK(strlen(one) < 920 && radio_parse(one, &back, 1) == 1 && !memcmp(&back, &full, sizeof back));
+
     /* the example shipped for the card */
     n = radio_load("assets/radio.txt", r, 8);
     CHECK(n == 4);
@@ -110,6 +167,45 @@ int main(void)
     CHECK(radio_load(path2, big, RADIO_MAX + 4) == RADIO_MAX);
     radio_station_t more = {.name = "More", .url = "http://more.example/"};
     CHECK(radio_add(path2, NULL, &more) == -2);
+    /* a station added with its icon: in its line; and with an info source too */
+    char path3[128], ex[128];
+    snprintf(path3, sizeof path3, "%s/icons.txt", dir);
+    snprintf(ex, sizeof ex, "%s/example.txt", dir);
+    radio_station_t withicon = {.name = "Logo FM", .url = "http://logo.example/s", .icon = "https://logo.example/l.png"};
+    f = fopen(path3, "wb");
+    if (f) { fputs("Mine = http://mine.example/s\nTheirs = http://theirs.example/s | info: radiofrance:3\n", f); fclose(f); }
+    CHECK(radio_add(path3, NULL, &withicon) == 1);
+    snprintf(withicon.name, sizeof withicon.name, "Both");
+    snprintf(withicon.url, sizeof withicon.url, "http://both.example/s");
+    snprintf(withicon.info, sizeof withicon.info, "radiofrance:9");
+    CHECK(radio_add(path3, NULL, &withicon) == 1);
+    f = fopen(path3, "rb");
+    if (f) { text[fread(text, 1, sizeof text - 1, f)] = '\0'; fclose(f); }
+    CHECK(!strcmp(text, "Mine = http://mine.example/s\nTheirs = http://theirs.example/s | info: radiofrance:3\n"
+                        "Logo FM = http://logo.example/s | icon: https://logo.example/l.png\n"
+                        "Both = http://both.example/s | info: radiofrance:9 | icon: https://logo.example/l.png\n"));
+    n = radio_load(path3, big, RADIO_MAX);
+    CHECK(n == 4 && !strcmp(big[2].icon, "https://logo.example/l.png") && !strcmp(big[3].info, "radiofrance:9") && !big[0].icon[0]);
+    CHECK(radio_remove(path3, NULL, "http://logo.example/s") == 0 && radio_load(path3, big, RADIO_MAX) == 3);
+    /* Home > Radio's list: yours; a station of yours without an icon takes the
+     * example's for the same stream (a list made from the example before it had any) */
+    f = fopen(ex, "wb");
+    if (f) {
+        fputs("Mine = http://mine.example/s | icon: https://mine.example/m.png\n"
+              "Both = http://both.example/s | icon: https://other.example/o.png\n"
+              "Only here = http://only.example/s | icon: https://only.example/o.png\n", f);
+        fclose(f);
+    }
+    n = radio_load_list(path3, ex, big, RADIO_MAX);
+    CHECK(n == 3 && !strcmp(big[0].name, "Mine") && !strcmp(big[0].icon, "https://mine.example/m.png"));
+    CHECK(n == 3 && !big[1].icon[0] && !strcmp(big[1].info, "radiofrance:3"));          /* (not in the example) */
+    CHECK(n == 3 && !strcmp(big[2].icon, "https://logo.example/l.png"));               /* its own stays */
+    CHECK(radio_load_list(path3, NULL, big, RADIO_MAX) == 3 && !big[0].icon[0]);
+    remove(path3);
+    n = radio_load_list(path3, ex, big, RADIO_MAX);                                    /* no list yet: the example */
+    CHECK(n == 3 && !strcmp(big[2].name, "Only here") && !strcmp(big[2].icon, "https://only.example/o.png"));
+    CHECK(radio_load_list(path3, NULL, big, RADIO_MAX) == -1);
+    remove(ex);
     /* nowhere to write */
     CHECK(radio_add("/nonexistent-dir/radio.txt", "assets/radio.txt", &more) == -1);
     remove(path);

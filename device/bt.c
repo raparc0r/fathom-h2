@@ -36,6 +36,19 @@ extern char **environ;
 #define CLI "LD_LIBRARY_PATH=/mnt/sd/fathom/bt/usr/lib /mnt/sd/fathom/bt/usr/bin/bluealsa-cli"
 #define MAX_DEV 16
 #define POLL_MS 5000                /* only while the monitor isn't running */
+/* While Bluetooth is on, `fathom-bt health` once a minute (its daemons' pids
+ * and hci0 looked at: nothing is asked of them, so it wakes none), and at once
+ * when the monitor ends as soon as it began. A daemon killed for memory or
+ * crashed, or the chip gone, left Bluetooth "on" and silent until it was turned
+ * off and on by hand. Something gone is looked at once more a few seconds
+ * later, and if it still is, Bluetooth is stopped and started again (the
+ * headphones of last time are connected again by the start): at most three
+ * times, a minute apart, until it has then stayed well for five minutes. Only
+ * the AVRCP helper gone, it alone is started again: the music isn't
+ * interrupted for it. Nothing is ever done on anything but the script's own
+ * "gone" (exit 3): an answer that didn't come is not a reason. */
+#define HEALTH_MS 60000
+#define HEALTH_AGAIN_MS 5000
 #define BT_LIBS "/mnt/sd/fathom/bt/usr/lib"
 #define BT_CLI "/mnt/sd/fathom/bt/usr/bin/bluealsa-cli"
 
@@ -59,6 +72,7 @@ static struct {
     char msg[96];                 /* a toast for the UI, once */
     unsigned seq;
     int pcm_dirty;                /* bluez-alsa said something changed: look again */
+    int health_due;               /* the monitor ended at once: is everything still there? */
     pid_t mon_pid;                /* the bluealsa-cli monitor, 0 if none */
 } B = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, .want_vol = -1, .vol = -1, .max = 127};
 
@@ -280,23 +294,72 @@ static void do_cmd(int cmd, const char *addr)
     set_busy("");
 }
 
+/* (the worker's) See HEALTH_MS. Returns how long until it's asked again (ms). */
+static long health_check(void)
+{
+    static int suspect, revived, said;
+    static long revived_at;
+    char what[96] = "";
+    int st = sh_run_for(FATHOM_BT " health 2>/dev/null", what, sizeof what, 20);
+    long t = mono_ms();
+    if (st != 3) {                               /* well (or no answer: nothing is done on a guess) */
+        suspect = 0;
+        if (st == 0 && revived && t - revived_at >= 5 * 60000L) revived = said = 0;
+        return HEALTH_MS;
+    }
+    what[strcspn(what, "\r\n")] = '\0';
+    if (!suspect) {                              /* once more before anything is done about it */
+        suspect = 1;
+        fprintf(stderr, "bt: gone: %s (looking once more)\n", what);
+        return HEALTH_AGAIN_MS;
+    }
+    suspect = 0;
+    if (revived >= 3 || (revived && t - revived_at < 60000)) {
+        if (revived >= 3 && !said) {
+            said = 1;
+            fprintf(stderr, "bt: still gone: %s: started again three times already, left as it is\n", what);
+        }
+        return HEALTH_MS;
+    }
+    revived++;
+    revived_at = t;
+    if (!strcmp(what, "avrcp")) {
+        fprintf(stderr, "bt: its AVRCP helper is gone: started again (%d)\n", revived);
+        sh_run_for(FATHOM_BT " avrcp 2>/dev/null", NULL, 0, 20);
+        return HEALTH_MS;
+    }
+    fprintf(stderr, "bt: gone: %s: Bluetooth stopped and started again (%d)\n", what, revived);
+    do_cmd(CMD_RESTART, "");
+    pthread_mutex_lock(&B.mu);
+    int on = B.on;
+    pthread_mutex_unlock(&B.mu);
+    if (on) say("Bluetooth restarted");          /* (not started: do_cmd has said so) */
+    return HEALTH_MS;
+}
+
 static void *worker(void *arg)
 {
     (void)arg;
+    long health_at = 0;                          /* when fathom-bt health is next asked (0: Bluetooth is off) */
+    sh_wait_home(3000);                          /* (Home first: shell.h) */
     for (;;) {
         pthread_mutex_lock(&B.mu);
-        if (!B.cmd && B.want_vol < 0 && !B.pcm_dirty) {
-            if (B.mon_pid > 0 || !B.on) {
-                pthread_cond_wait(&B.cv, &B.mu);    /* the monitor, a command or a volume wakes us (off: only a command) */
+        if (!B.cmd && B.want_vol < 0 && !B.pcm_dirty && !B.health_due) {
+            if (!B.on) {
+                pthread_cond_wait(&B.cv, &B.mu);    /* off: only a command wakes us */
             } else {
-                struct timespec ts;
-                clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_sec += POLL_MS / 1000;
-                pthread_cond_timedwait(&B.cv, &B.mu, &ts);
+                /* the monitor, a command or a volume wakes us; with no monitor, the look every 5 s;
+                 * and the health look when it's due */
+                long ms = B.mon_pid > 0 ? HEALTH_MS : POLL_MS;
+                long left = health_at - mono_ms();
+                if (health_at && left < ms) ms = left < 0 ? 0 : left;
+                mono_cond_wait_ms(&B.cv, &B.mu, (int)ms);
             }
         }
         int cmd = B.cmd, vol = B.want_vol, on = B.on, look = B.pcm_dirty || B.mon_pid <= 0;
+        int health = B.health_due;
         B.pcm_dirty = 0;
+        B.health_due = 0;
         char addr[18], pcm[200];
         snprintf(addr, sizeof addr, "%s", B.cmd_addr);
         snprintf(pcm, sizeof pcm, "%s", B.pcm);
@@ -310,6 +373,13 @@ static void *worker(void *arg)
         }
         if (cmd) do_cmd(cmd, addr);
         else if (on && look) poll_pcm();
+        pthread_mutex_lock(&B.mu);
+        on = B.on;
+        pthread_mutex_unlock(&B.mu);
+        long t = mono_ms();
+        if (!on) health_at = 0;
+        else if (cmd || !health_at) health_at = t + HEALTH_MS;   /* (just started, or busy for the user: in a minute) */
+        else if (health || t >= health_at) health_at = t + health_check();
     }
     return NULL;
 }
@@ -346,6 +416,7 @@ static void *monitor(void *arg)
         pthread_mutex_lock(&B.mu);
         B.mon_pid = pid;
         pthread_mutex_unlock(&B.mu);
+        time_t began = time(NULL);
         /* read(), not stdio: a FILE blocked in fgets() holds its lock, and the
          * C library's exit() takes every FILE's lock to flush it, so the
          * player would hang on its way out. Any output is a reason to look. */
@@ -365,7 +436,22 @@ static void *monitor(void *arg)
         pthread_cond_broadcast(&B.cv);
         pthread_mutex_unlock(&B.mu);
         waitpid(pid, NULL, 0);
-        sleep(2);                                /* (bluez-alsa restarting, or Bluetooth off) */
+        /* bluez-alsa restarting, or Bluetooth off: again in 2 s. Its bus gone
+         * for good (a daemon died), it would exit at once each time: a program
+         * from the card and a look at the link every 2 s for ever (the load
+         * that once made the radio stutter). So longer each time it ends
+         * within a few seconds of starting, up to a minute. */
+        static int quick;
+        quick = time(NULL) - began < 5 ? quick + 1 : 0;
+        if (quick) {                             /* is everything still there? (the worker asks: HEALTH_MS) */
+            pthread_mutex_lock(&B.mu);
+            if (B.on) {
+                B.health_due = 1;
+                pthread_cond_broadcast(&B.cv);
+            }
+            pthread_mutex_unlock(&B.mu);
+        }
+        sleep(quick > 5 ? 60 : quick > 2 ? 10 : 2);
     }
     return NULL;
 }
@@ -401,6 +487,7 @@ void bt_init(int on, const char *last)
     if (access(FATHOM_BT, X_OK) || access("/mnt/sd/fathom/bt", F_OK)) return;
     if (addr_ok(last)) snprintf(B.last, sizeof B.last, "%s", last);
     pthread_t th;
+    mono_cond_init(&B.cv);
     if (pthread_create(&th, NULL, worker, NULL)) return;
     pthread_detach(th);
     monitor_kill_strays();
@@ -448,7 +535,10 @@ void bt_ui_do(int what, const char *addr)
     for (int i = 0; addr && i < B.n_dev; i++)
         if (!strcmp(B.dev[i].addr, addr)) d = B.dev[i];
     pthread_mutex_unlock(&B.mu);
-    if (busy) return;                            /* one thing at a time */
+    /* one thing at a time; but the toggle always goes through (it waits its
+     * turn): dropped while "Connecting" or "Searching", the setting was saved
+     * as off with Bluetooth still on, and it stayed off at the next start */
+    if (busy && what != UI_BT_TOGGLE) return;
     switch (what) {
     case UI_BT_TOGGLE: bt_request(on ? CMD_STOP : CMD_START, NULL); break;
     case UI_BT_SCAN: bt_request(CMD_SCAN, NULL); break;

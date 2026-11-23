@@ -66,7 +66,7 @@ struct engine {
     uint32_t tag;              /* the current track's, as lined up (engine_queue_ahead) */
     uint32_t seq;
     uint64_t pos_frames;       /* frames of the current track written */
-    int ended, error;
+    int ended, error, error_output;
     unsigned stop_seq;         /* +1 each time playback stops by itself (ended, or a track failed) */
     int rewind;                /* paused, and the output dropped what it had: at the resume, */
     uint64_t rewind_to;        /* ...the decoder goes back here (what was heard) */
@@ -74,7 +74,10 @@ struct engine {
     float fade;                /* the sleep timer's fade-out; applied on top of gain */
     float track_gain;          /* the playing track's levelling; changes exactly at its first sample */
     float bal[2];              /* the balance: left, right (1 = untouched) */
-    int writing;               /* the thread is in out.write/drain (or a seek) without mu */
+    int writing;               /* the thread is in out.write/drain (or a seek, or a file's open) without mu */
+    int opening;               /* a play command taken up, its file being opened without mu: still
+                                * "starting" (the status, a pause); a stop clears it (the open is dropped) */
+    uint32_t open_start_ms;    /* ...and where it starts from, for the status meanwhile */
     int seeking;               /* a seek under way: where to (seek_to), for the status meanwhile */
     int draining;              /* the output plays out its queue (the end of the last track) */
     uint32_t seek_to;
@@ -82,7 +85,7 @@ struct engine {
     int out_lost;              /* a write failed (device gone): paused */
     unsigned cut;              /* +1 when another thread drops the output's queue: a write
                                 * failing meanwhile is that, not a device gone */
-    int start_paused;          /* paused while a play command was still pending */
+    int start_paused;          /* the pending play command starts paused (asked with it, or by a pause since) */
     eq_profile_t eq_prof;      /* the EQ wanted (engine_set_eq) */
     int eq_on;
     unsigned eq_gen, eq_built; /* changes asked for, and the one built */
@@ -108,10 +111,65 @@ struct engine {
     int tempo_ch;
     int32_t *tbuf;
 
+    /* an output that queues more than it has to (output.h: join_depth) */
+    uint32_t shallow_until;    /* (monotonic ms, 0 = not) kept down to that till then: a sound setting changed */
+    uint32_t nap_since;        /* waiting for the queue to play down since (0 = not) */
+
     int32_t buf[CHUNK_FRAMES * MAX_CH];
 };
 
 #define TBUF_FRAMES (CHUNK_FRAMES * 2 + 4 * TEMPO_MAX_SEQ)
+
+/* ---- An output that queues more than it has to (the H2's DAC: about a
+ * second of a file, against a card busy with something else) ----
+ * What's queued is heard that much later, so the queue is let play down to
+ * what's enough (join_depth) where a second would be noticed:
+ *  - before a gapless successor becomes the track that's on (run(): the
+ *    screen would show it, and count the one before as played, a second
+ *    before it's heard);
+ *  - while a fade is under way (the sleep timer's: it would end a second
+ *    short, and the pause after it would leave a faded second queued);
+ *  - for a few seconds after a sound setting changes (the EQ, crossfeed,
+ *    balance, speed): the first change is heard up to a second later, the
+ *    ones after it at once.
+ * Then the 8 periods are all there is between a stall and a gap, as they
+ * always were before. */
+#define SHALLOW_AFTER_MS 8000
+#define NAP_MS 10
+#define NAP_MAX_MS 3000        /* (a queue that doesn't play down: not waited for) */
+
+/* Called with mu held. */
+static void sound_changed(engine_t *e)
+{
+    e->shallow_until = mono_ms() + SHALLOW_AFTER_MS;
+    if (!e->shallow_until) e->shallow_until = 1;
+}
+
+static int shallow_now(const engine_t *e)
+{
+    return e->fade != 1.0f || (e->shallow_until && (int32_t)(e->shallow_until - mono_ms()) > 0);
+}
+
+/* Called with mu held: the output has more queued than is enough. */
+static int queue_over(engine_t *e)
+{
+    if (!e->out_open || !e->out.join_depth) return 0;
+    long enough = e->out.join_depth(e->out.ctx);
+    return enough > 0 && e->out.delay(e->out.ctx) > enough;
+}
+
+/* Called with mu held, which it lets go of for a moment: 1 after a short
+ * wait for the queue to play down, 0 when that has gone on too long. */
+static int nap(engine_t *e)
+{
+    uint32_t now = mono_ms();
+    if (!e->nap_since) e->nap_since = now ? now : 1;
+    if (now - e->nap_since > NAP_MAX_MS) return 0;
+    pthread_mutex_unlock(&e->mu);
+    usleep(NAP_MS * 1000);
+    pthread_mutex_lock(&e->mu);
+    return 1;
+}
 
 /* What the output still has to play, in the track's frames (sped up: more of
  * the track than of the output), and what the stretch holds */
@@ -229,12 +287,13 @@ static void eq_sync(engine_t *e, int keep_place)
 
 /* Called with mu held: the track that's on can't be played. Stopped, with an
  * error, so the player moves on past it. */
-static void failed(engine_t *e)
+static void failed(engine_t *e, int output)
 {
     e->pos_frames = 0;
     e->rewind = 0;
     e->state = ENG_STOPPED;
     e->error = 1;
+    e->error_output = output;
     e->ended = 1;
     e->stop_seq++;
 }
@@ -247,19 +306,30 @@ static void track_failed(engine_t *e, const pending_t *p)
     e->track_id = p->id;
     e->tag = p->tag;
     e->seq++;
-    failed(e);
+    failed(e, 0);
 }
 
 /* Called with mu held. Opens `p` (or takes `d`, already opened, with its format
  * in *df); returns 0 and makes it current (the output may not have opened for
- * it: see run()), or -1. */
-static int start_track(engine_t *e, const pending_t *p, int gapless, decoder_t *d, const audio_format_t *df)
+ * it: see run()), or -1. flushed: what the output had queued was dropped
+ * already (a play command, before its file was opened): not again here. */
+static int start_track(engine_t *e, const pending_t *p, int gapless, decoder_t *d, const audio_format_t *df,
+                       int flushed)
 {
     audio_format_t f;
     /* DoP only while nothing would change the samples (a USB DAC with its own
      * volume): a gain on DoP would be noise at full scale */
+    int given = d != NULL;
     if (d) f = *df;
     else d = decoder_open_flags(p->path, &f, e->dop && e->gain == 1.0f ? DECODER_DOP : 0);
+    if (lat_on()) {
+        /* The join's margin: what the output still had to play when the next
+         * file was open (gapless: under a chunk's worth left means a gap). */
+        long queued = e->out_open ? e->out.delay(e->out.ctx) : 0;
+        LAT("engine: decoder %s (%s), %s, %ld frames queued (%ld ms)", !d ? "failed" : given ? "ready" : "opened",
+            d ? f.codec : "-", gapless ? "gapless" : "not gapless", queued,
+            e->out_open && e->out_fmt.rate ? queued * 1000 / (long)e->out_fmt.rate : 0);
+    }
     if (!d || f.channels == 0 || f.channels > MAX_CH) {
         if (d && d != e->dec) decoder_close(d);
         e->error = 1;
@@ -287,20 +357,23 @@ static int start_track(engine_t *e, const pending_t *p, int gapless, decoder_t *
     e->ended = 0;
 
     audio_format_t of = out_format(e, &f);
-    if (!e->out_open || !same_out_format(&e->out_fmt, &of)) {
+    int reopened = !e->out_open || !same_out_format(&e->out_fmt, &of);
+    if (reopened) {
         if (e->out_open) {
             if (gapless) e->out.drain(e->out.ctx);   /* let the previous track finish */
             else if (e->out.flush_soft) {            /* another rate: faded, and that played out, */
-                e->out.flush_soft(e->out.ctx);       /* before the close (dropped mid-waveform, it */
-                e->out.drain(e->out.ctx);            /* clicked: about 30 ms, the fade's tail) */
-            } else {
+                if (!flushed) e->out.flush_soft(e->out.ctx);   /* before the close (dropped mid-waveform, */
+                e->out.drain(e->out.ctx);            /* it clicked: about 30 ms, the fade's tail) */
+            } else if (!flushed) {
                 e->out.flush(e->out.ctx);
             }
         }
         out_open_for(e, &of);
-    } else if (!gapless) {
+    } else if (!gapless && !flushed) {
         out_flush_soft(e);                           /* same format: drop queued audio (fading it) */
     }
+    LAT("engine: output %s for %u Hz, %u bits, %u ch (%s)", !reopened ? "kept" : e->out_open ? "opened" : "not opened",
+        of.rate, of.bits, of.channels, gapless ? "gapless" : "not gapless");
     if (!gapless) { eq_reset(e->eq); crossfeed_reset(e->xf); }   /* (gapless: the filters carry on) */
     eq_sync(e, 0);
     return 0;
@@ -394,6 +467,36 @@ static int seek_unlocked(engine_t *e, uint64_t frame, uint32_t ms)
     return rc;
 }
 
+/* Called with mu held, on the engine thread: a play command's file opened
+ * without mu, as seek_unlocked() seeks. A file not read lately costs the
+ * card's time to open (its folder, the FAT, its header: tens of ms, more for
+ * a big tag): holding mu meanwhile held up everyone asking the engine's
+ * status (the UI, at every key and tick). `writing` keeps
+ * engine_switch_output() from changing things meanwhile; `opening` keeps the
+ * command "starting" for the status and for a pause, now that cmd_play is
+ * free for a newer one. The caller looks, on return, at whether it was
+ * stopped (opening cleared) or replaced (cmd_play) meanwhile. */
+static decoder_t *open_unlocked(engine_t *e, const pending_t *p, audio_format_t *f)
+{
+    /* DoP only while nothing would change the samples (see start_track) */
+    unsigned flags = e->dop && e->gain == 1.0f ? DECODER_DOP : 0;
+    e->writing = 1;
+    e->opening = 1;
+    e->open_start_ms = p->start_ms;
+    pthread_mutex_unlock(&e->mu);
+    decoder_t *d = decoder_open_flags(p->path, f, flags);
+    pthread_mutex_lock(&e->mu);
+    e->writing = 0;
+    if (e->hold) pthread_cond_broadcast(&e->cv);
+    /* DoP turned off while it opened (another output, a volume): never DoP
+     * to a DAC that may not know it. Opened again as PCM (rare: here, with mu). */
+    if (d && f->dop && !(e->dop && e->gain == 1.0f)) {
+        decoder_close(d);
+        d = decoder_open_flags(p->path, f, 0);
+    }
+    return d;
+}
+
 static void *run(void *arg)
 {
     engine_t *e = arg;
@@ -406,6 +509,7 @@ static void *run(void *arg)
             LAT("engine: play %s", p.path);
             decoder_t *nd = NULL;
             audio_format_t nf;
+            int flushed = 0, opened = 1;
             if (decoder_is_stream(p.path)) {
                 /* Connecting takes seconds: not with mu held. Whatever is playing
                  * stops meanwhile (a stream's connection is dropped). */
@@ -440,8 +544,28 @@ static void *run(void *arg)
                     e->start_paused = 0;
                     continue;
                 }
+            } else {
+                /* A file. What was playing stops sounding now, at the key
+                 * press: its queue is dropped (faded) before the new file is
+                 * opened, not after (a file not read lately takes a while to
+                 * open, and the old track played on through it). This thread
+                 * writes nothing meanwhile. */
+                if (e->out_open) {
+                    out_flush_soft(e);
+                    flushed = 1;
+                }
+                nd = open_unlocked(e, &p, &nf);
+                if (!e->opening || e->cmd_play.valid || e->quit) {
+                    /* stopped, or another asked for, while it opened: this one
+                     * is dropped unheard (start_paused is the new command's) */
+                    e->opening = 0;
+                    if (nd) decoder_close(nd);
+                    continue;
+                }
+                e->opening = 0;
+                opened = nd != NULL;
             }
-            if (start_track(e, &p, 0, nd, &nf) == 0) {
+            if (opened && start_track(e, &p, 0, nd, &nf, flushed) == 0) {
                 e->state = e->start_paused ? ENG_PAUSED : ENG_PLAYING;
                 if (e->out_open) e->out.pause(e->out.ctx, e->start_paused);
                 e->start_paused = 0;
@@ -520,7 +644,7 @@ static void *run(void *arg)
                 decoder_close(e->dec);
                 e->dec = NULL;
                 e->dec_net = 0;
-                failed(e);
+                failed(e, 1);
             }
             continue;
         }
@@ -531,6 +655,7 @@ static void *run(void *arg)
 
         eq_sync(e, 1);                               /* the EQ changed meanwhile */
         if (!e->out_open || e->rewind) continue;     /* (reopened: back to what was heard, or it didn't open) */
+        if (shallow_now(e) && queue_over(e) && nap(e)) continue;   /* (a fade, a setting just changed) */
         decoder_t *dec = e->dec;
         eq_t *eq = e->eq;
         crossfeed_t *xf = e->xf;
@@ -624,8 +749,14 @@ static void *run(void *arg)
         }
         if (n > 0) {
             e->pos_frames += (uint64_t)n;
+            e->nap_since = 0;
             continue;
         }
+        /* The end of the track, with one to follow: not yet, while the
+         * output has more queued than it needs (the end comes round again:
+         * commands are taken meanwhile, and the decoder says 0 again). */
+        if (e->n_next && !e->cmd_play.valid && queue_over(e) && nap(e)) continue;
+        e->nap_since = 0;
         /* end of track: gapless successor, or stop (a play asked for meanwhile comes first) */
         pending_t bad = {.valid = 0};
         if (e->n_next && !e->cmd_play.valid) {
@@ -633,8 +764,8 @@ static void *run(void *arg)
             audio_format_t cf;
             memmove(&e->next[0], &e->next[1], (size_t)--e->n_next * sizeof e->next[0]);
             /* the next CUE track of the same file: the decoder just carries on */
-            if (decoder_continue(dec, p.path, &cf) == 0 && start_track(e, &p, 1, dec, &cf) == 0) continue;
-            if (!decoder_is_stream(p.path) && start_track(e, &p, 1, NULL, NULL) == 0) continue;
+            if (decoder_continue(dec, p.path, &cf) == 0 && start_track(e, &p, 1, dec, &cf, 0) == 0) continue;
+            if (!decoder_is_stream(p.path) && start_track(e, &p, 1, NULL, NULL, 0) == 0) continue;
             bad = p;                                 /* it can't be played: this one plays out first */
         }
         e->writing = 1;
@@ -730,10 +861,10 @@ void engine_queue_next(engine_t *e, const char *path, int64_t id) { engine_queue
 
 void engine_play_gain(engine_t *e, const char *path, int64_t id, float gain)
 {
-    engine_play_at(e, path, id, gain, 0);
+    engine_play_at(e, path, id, gain, 0, 0);
 }
 
-void engine_play_at(engine_t *e, const char *path, int64_t id, float gain, uint32_t start_ms)
+void engine_play_at(engine_t *e, const char *path, int64_t id, float gain, uint32_t start_ms, int paused)
 {
     pthread_mutex_lock(&e->mu);
     set_pending(&e->cmd_play, path, id, gain, 0);
@@ -741,7 +872,7 @@ void engine_play_at(engine_t *e, const char *path, int64_t id, float gain, uint3
     unblock(e);        /* (paused: the thread may be waiting in a write) */
     cut_write(e);      /* (playing: it may be too, for a chunk's worth) */
     e->ended = e->error = 0;   /* (they were the last track's) */
-    e->start_paused = 0;
+    e->start_paused = !!paused;   /* (with the command, under the one lock: the thread can't start it playing first) */
     e->n_next = 0;
     e->cmd_seek = 0;   /* (a seek still pending was for the old track; a resume seeks after this) */
     if (e->connecting || e->dec_net) e->net_abort = 1;   /* stop waiting on the network */
@@ -767,9 +898,10 @@ void engine_queue_ahead(engine_t *e, const engine_track_t *t, int n)
 void engine_pause(engine_t *e, int on)
 {
     pthread_mutex_lock(&e->mu);
-    if (on && e->cmd_play.valid) {
+    int starting = e->cmd_play.valid || e->opening;   /* (asked for, or its file being opened) */
+    if (on && starting) {
         e->start_paused = 1;            /* the track about to start starts paused */
-    } else if (!on && e->cmd_play.valid) {
+    } else if (!on && starting) {
         e->start_paused = 0;
     } else if (on && e->state == ENG_PLAYING) {
         e->state = ENG_PAUSED;
@@ -797,6 +929,7 @@ void engine_stop(engine_t *e)
     pthread_mutex_lock(&e->mu);
     e->n_next = 0;
     e->cmd_play.valid = 0;
+    e->opening = 0;                     /* (a file being opened for a play command: dropped, as the command) */
     if (e->connecting || e->dec_net) e->net_abort = 1;
     if (e->out_open) {
         e->cut++;                       /* a write this cuts short isn't an unplugged device */
@@ -837,14 +970,17 @@ void engine_describe_output(engine_t *e, char *out, int cap)
 void engine_set_balance(engine_t *e, float left, float right)
 {
     pthread_mutex_lock(&e->mu);
-    e->bal[0] = left < 0 ? 0 : left > 1 ? 1 : left;
-    e->bal[1] = right < 0 ? 0 : right > 1 ? 1 : right;
+    float l = left < 0 ? 0 : left > 1 ? 1 : left, r = right < 0 ? 0 : right > 1 ? 1 : right;
+    if (l != e->bal[0] || r != e->bal[1]) sound_changed(e);
+    e->bal[0] = l;
+    e->bal[1] = r;
     pthread_mutex_unlock(&e->mu);
 }
 
 void engine_set_eq(engine_t *e, const eq_profile_t *p)
 {
     pthread_mutex_lock(&e->mu);
+    if (e->eq_on != (p != NULL) || (p && memcmp(&e->eq_prof, p, sizeof *p))) sound_changed(e);
     e->eq_on = p != NULL;
     if (p) e->eq_prof = *p;
     e->eq_gen++;
@@ -855,7 +991,9 @@ void engine_set_eq(engine_t *e, const eq_profile_t *p)
 void engine_set_crossfeed(engine_t *e, int level)
 {
     pthread_mutex_lock(&e->mu);
-    e->xf_level = level < XF_OFF || level >= XF_LEVELS ? XF_OFF : level;
+    int xl = level < XF_OFF || level >= XF_LEVELS ? XF_OFF : level;
+    if (xl != e->xf_level) sound_changed(e);
+    e->xf_level = xl;
     pthread_cond_signal(&e->cv);
     pthread_mutex_unlock(&e->mu);
 }
@@ -899,6 +1037,7 @@ void engine_set_speed(engine_t *e, int speed_pct)
     if (s != e->speed) {
         e->speed = s;
         e->tempo_dirty = 1;
+        sound_changed(e);
     }
     pthread_mutex_unlock(&e->mu);
 }
@@ -950,9 +1089,10 @@ void engine_status(engine_t *e, eng_status_t *st)
     st->tag = e->tag;
     st->ended = e->ended;
     st->error = e->error;
+    st->error_output = e->error && e->error_output;
     st->stop_seq = e->stop_seq;
     st->output_lost = e->out_lost;
-    st->starting = e->cmd_play.valid;
+    st->starting = e->cmd_play.valid || e->opening;
     st->start_paused = e->start_paused;
     st->eq = e->eq_on && !e->fmt.dop;
     st->crossfeed = e->xf_level != XF_OFF && !e->fmt.dop && e->fmt.channels == 2 ? e->xf_level : XF_OFF;
@@ -982,5 +1122,6 @@ void engine_status(engine_t *e, eng_status_t *st)
     if (e->cmd_seek && e->dec) st->pos_ms = e->seek_ms;
     else if (e->seeking) st->pos_ms = e->seek_to;
     if (e->cmd_play.valid) st->start_ms = e->cmd_play.start_ms;
+    else if (e->opening) st->start_ms = e->open_start_ms;
     pthread_mutex_unlock(&e->mu);
 }

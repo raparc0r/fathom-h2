@@ -16,6 +16,8 @@
 #include "library/tags.h"
 
 #include <math.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -269,6 +271,18 @@ static int bench(void)
     uint8_t *bits = modulate(DSD64, t, 1, 2 * n, 0);  /* reused as DSD128's second */
     int32_t *out = malloc(DSD_CHUNK * 2 * sizeof *out);
     double host[2];
+    /* making a converter: its tables designed (the first of a ratio), then kept */
+    for (int r = 0; r < 3; r++) {
+        double t0 = now_s();
+        dsd2pcm_t *first = dsd2pcm_new(16u << r, 2);
+        double t1 = now_s();
+        dsd2pcm_t *again = dsd2pcm_new(16u << r, 2);
+        double t2 = now_s();
+        printf("DSD%d converter made in %.2f ms the first time (tables designed), %.3f ms after (kept)\n", 64 << r,
+               (t1 - t0) * 1e3, (t2 - t1) * 1e3);
+        dsd2pcm_free(first);
+        dsd2pcm_free(again);
+    }
     for (int r = 0; r < 2; r++) {
         unsigned ratio = 16 << r, g = ratio / 8;
         dsd2pcm_t *c = dsd2pcm_new(ratio, 2);
@@ -342,11 +356,100 @@ static int bench(void)
 
 /* ---------- the tests ---------- */
 
+/* The converter's tables are designed once for a ratio and kept: a converter
+ * made from the kept tables gives the same samples, bit for bit, as one that
+ * designs its own, at every DSD rate; and one made, run and freed leaves the
+ * kept tables good for the next. */
+static void test_kept_tables(void)
+{
+    for (unsigned ratio = 16; ratio <= 64; ratio *= 2) {
+        unsigned g = ratio / 8;
+        long frames = 40 * DSD_CHUNK;
+        size_t bytes = (size_t)frames * g;
+        uint8_t *in[2] = {malloc(bytes), malloc(bytes)};
+        uint32_t x = 0x1234567u * ratio;                  /* DSD-like enough: every byte value, no pattern */
+        for (size_t i = 0; i < bytes; i++) {
+            x = x * 1664525u + 1013904223u;
+            in[0][i] = (uint8_t)(x >> 24);
+            in[1][i] = (uint8_t)(x >> 13);
+        }
+        int32_t *out[4];
+        unsigned delay[4], span[4];
+        for (int v = 0; v < 4; v++) {
+            /* 0: its own tables, none kept; 1: designed and kept; 2 and 3: the kept ones */
+            dsd2pcm_keep_tables(v != 0);
+            dsd2pcm_t *c = dsd2pcm_new(ratio, 2);
+            out[v] = malloc((size_t)frames * 2 * sizeof *out[v]);
+            CHECK(c && out[v], "ratio %u: no converter", ratio);
+            if (!c || !out[v]) continue;
+            delay[v] = dsd2pcm_delay(c);
+            span[v] = dsd2pcm_span(c);
+            for (long at = 0; at < frames; at += DSD_CHUNK) {
+                memcpy(dsd2pcm_in(c, 0), in[0] + (size_t)at * g, (size_t)DSD_CHUNK * g);
+                memcpy(dsd2pcm_in(c, 1), in[1] + (size_t)at * g, (size_t)DSD_CHUNK * g);
+                dsd2pcm_run(c, DSD_CHUNK, out[v] + at * 2);
+            }
+            dsd2pcm_free(c);
+        }
+        int loud = 0;
+        for (long i = 0; i < frames * 2 && !loud; i++) loud = out[0][i] != 0;
+        CHECK(loud, "ratio %u: silence out", ratio);
+        for (int v = 1; v < 4; v++)
+            CHECK(!memcmp(out[0], out[v], (size_t)frames * 2 * sizeof *out[0]) && delay[v] == delay[0] && span[v] == span[0],
+                  "ratio %u: converter %d (kept tables) differs from one with its own", ratio, v);
+        for (int v = 0; v < 4; v++) free(out[v]);
+        free(in[0]);
+        free(in[1]);
+    }
+    /* a ratio no file has, with the three kept: its own tables, and still right to free */
+    dsd2pcm_t *odd = dsd2pcm_new(48, 1), *odd2 = dsd2pcm_new(48, 2);
+    CHECK(odd && odd2, "ratio 48");
+    dsd2pcm_free(odd);
+    dsd2pcm_free(odd2);
+    dsd2pcm_keep_tables(1);
+}
+
+/* Converters of a ratio made at the same moment on several threads, none
+ * kept yet (the playback thread opening a file while the loudness scan
+ * opens another): each gets tables that work, and the same samples. */
+#define RACERS 8
+static int32_t race_out[RACERS][DSD_CHUNK * 2];
+static volatile int race_go;
+
+static void *race_run(void *arg)
+{
+    int me = (int)(intptr_t)arg;
+    while (!race_go) { }
+    dsd2pcm_t *c = dsd2pcm_new(32, 2);
+    if (!c) return NULL;
+    for (int k = 0; k < 2; k++)
+        for (unsigned i = 0; i < DSD_CHUNK * 4; i++) dsd2pcm_in(c, (unsigned)k)[i] = (uint8_t)(i * 37 + (i >> 3) * 11 + (unsigned)k);
+    dsd2pcm_run(c, DSD_CHUNK, race_out[me]);
+    dsd2pcm_free(c);
+    return (void *)1;
+}
+
+static void test_tables_race(void)
+{
+    pthread_t th[RACERS];
+    for (int i = 0; i < RACERS; i++) pthread_create(&th[i], NULL, race_run, (void *)(intptr_t)i);
+    race_go = 1;
+    for (int i = 0; i < RACERS; i++) {
+        void *ok = NULL;
+        pthread_join(th[i], &ok);
+        CHECK(ok, "converter %d of %d made at once: none", i, RACERS);
+    }
+    for (int i = 1; i < RACERS; i++)
+        CHECK(!memcmp(race_out[0], race_out[i], sizeof race_out[0]), "converter %d of %d made at once differs", i, RACERS);
+}
+
 static void path_in(char *out, size_t cap, const char *dir, const char *name) { snprintf(out, cap, "%s/%s", dir, name); }
 
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "--bench")) return bench();
+    test_tables_race();
+    test_kept_tables();
     char dir[200];
     test_tmp(dir, sizeof dir, "fathom-test-dsd");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
@@ -446,7 +549,7 @@ int main(int argc, char **argv)
         /* the same through the engine: one open, the whole file's samples */
         keep_t k = {.cap = 176400 + 4096};
         k.buf = calloc((size_t)k.cap * 2, sizeof *k.buf);
-        audio_output_t out = {k_open, k_write, k_delay, k_nop, k_nop, k_pause, k_nop, k_describe, &k, NULL, NULL, NULL};
+        audio_output_t out = {k_open, k_write, k_delay, k_nop, k_nop, k_pause, k_nop, k_describe, &k, NULL, NULL, NULL, NULL};
         engine_t *e = engine_new(&out);
         engine_play(e, a, 1);
         engine_pause(e, 1);                           /* b must be queued before a ends */
@@ -555,7 +658,7 @@ int main(int argc, char **argv)
          * back to PCM at once when the output changes */
         keep_t k = {.cap = 176400 + 4096};
         k.buf = calloc((size_t)k.cap * 2, sizeof *k.buf);
-        audio_output_t out = {k_open, k_write, k_delay, k_nop, k_nop, k_pause, k_nop, k_describe, &k, NULL, NULL, NULL};
+        audio_output_t out = {k_open, k_write, k_delay, k_nop, k_nop, k_pause, k_nop, k_describe, &k, NULL, NULL, NULL, NULL};
         engine_t *e = engine_new(&out);
         engine_set_dop(e, 1);
         engine_set_balance(e, 1.0f, 0.5f);

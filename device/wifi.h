@@ -20,5 +20,11 @@ int  wifi_on(void);
 int  wifi_connected(void);                    /* joined, with an address */
 int  wifi_take_message(char *out, size_t cap);
 void wifi_wake(void);                         /* the screen turned on: nothing joined, look for networks now */
+/* The screen went on or off (on until told): off, the signal's strength isn't
+ * asked for while connected (nobody sees it; each asking wakes the chip) */
+void wifi_screen(int on);
+/* fathom/wifi.txt (core/wifitxt.h): its networks joined and saved as if typed,
+ * once Wi-Fi is on (the caller turns it on), and the file deleted */
+void wifi_import(const char *path);
 
 #endif

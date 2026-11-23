@@ -26,6 +26,11 @@ typedef struct {
 int  input_open(void);
 /* Current jack-detect switches (headphones, line out). */
 void input_jacks(int *hp, int *lo);
+/* Whether the screen is on (it is until told otherwise). IN_POWER means
+ * "switch the screen": with the screen off it comes when Power goes down
+ * (the wake isn't kept waiting for the release), with it on when Power comes
+ * back up before the 2 s of IN_POWER_OFF. Tell it at every change. */
+void input_set_screen(int on);
 /* Fills pollfds for the main loop. Returns the count. */
 int  input_pollfds(struct pollfd *fds, int max);
 /* Reads pending events and timers. Call after poll() and on every loop.

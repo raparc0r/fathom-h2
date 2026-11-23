@@ -94,6 +94,8 @@ int main(void)
     CHECK(st[0].info[0] == '\0');
     CHECK(!strcmp(meta[0].detail, "AAC 128"));
     CHECK(strlen(meta[0].uuid) == 36);
+    CHECK(!strcmp(st[0].icon, "https://zip.wf/chfm.jpg"));                 /* its logo, as the directory has it */
+    CHECK(!strcmp(st[1].icon, "https://armisa.it/assets/favicon/android-chrome-512x512.png"));
     CHECK(!strcmp(st[1].name, "Radio Armisa") && !strcmp(meta[1].detail, "MP3"));   /* no bitrate given */
     CHECK(!strcmp(st[2].name, "RTL") && !strcmp(meta[2].detail, "AAC 64"));          /* HLS, codec known */
     CHECK(rdir_parse_stations(t, len, st, meta, 10) == 10);
@@ -114,6 +116,15 @@ int main(void)
     n = rdir_parse_stations(t, len, st, meta, RDIR_MAX_STATIONS);
     CHECK(n == 30);
     CHECK(!strcmp(st[0].name, "FIP") && !strcmp(meta[0].detail, "AAC 107"));
+    int with = 0, without = 0;
+    for (int i = 0; i < n; i++) {
+        if (st[i].icon[0]) with++;
+        else without++;
+        CHECK(!st[i].icon[0] || radio_icon_ok(st[i].icon));
+        if (!strcmp(st[i].name, "FIP (hifi.aac)")) CHECK(!st[i].icon[0]);   /* none in the directory: none here */
+        if (!strcmp(st[i].name, "FIP Jazz")) CHECK(!strcmp(st[i].icon, "https://www.fip.fr/dist/favicons/logo-120.png"));
+    }
+    CHECK(with > 20 && without > 0);
     free(t);
 
     /* what's left out, and what's kept */
@@ -121,20 +132,29 @@ int main(void)
         "[{\"name\":\"WMA\",\"url\":\"http://a.example/1\",\"url_resolved\":\"\",\"codec\":\"WMA\",\"bitrate\":64,\"hls\":0},"
         " {\"name\":\"TV\",\"url_resolved\":\"https://a.example/2.m3u8\",\"codec\":\"AAC,H.264\",\"hls\":1},"
         " {\"name\":\"Unknown\",\"url_resolved\":\"https://a.example/3\",\"codec\":\"UNKNOWN\",\"hls\":0},"
-        " {\"name\":\"HLS\",\"url_resolved\":\"https://a.example/4.m3u8\",\"codec\":\"UNKNOWN\",\"hls\":1,\"stationuuid\":\"9617a958-0601-11e8-ae97-52543be04c81\"},"
+        " {\"name\":\"HLS\",\"url_resolved\":\"https://a.example/4.m3u8\",\"codec\":\"UNKNOWN\",\"hls\":1,\"stationuuid\":\"9617a958-0601-11e8-ae97-52543be04c81\","
+        "  \"favicon\":\"/favicon.ico\"},"
         " {\"name\":\"Twice\",\"url_resolved\":\"https://a.example/4.m3u8\",\"codec\":\"AAC\",\"hls\":1},"
-        " {\"name\":\" Line\\nbreak\\t\\t here \",\"url\":\"http://a.example/5\",\"url_resolved\":\"\",\"codec\":\"mp3\",\"bitrate\":128},"
+        " {\"name\":\" Line\\nbreak\\t\\t here \",\"url\":\"http://a.example/5\",\"url_resolved\":\"\",\"codec\":\"mp3\",\"bitrate\":128,"
+        "  \"favicon\":\"http://a.example/logo.png?v=2\"},"
         " {\"name\":\"FTP\",\"url_resolved\":\"ftp://a.example/6\",\"codec\":\"MP3\"},"
         " {\"name\":\"Spaces\",\"url_resolved\":\"http://a.example/a b\",\"codec\":\"MP3\"},"
         " {\"name\":\"\",\"url_resolved\":\"http://a.example/7\",\"codec\":\"MP3\"},"
         " {\"name\":\"Dead\",\"url_resolved\":\"http://a.example/8\",\"codec\":\"MP3\",\"lastcheckok\":0},"
         " {\"name\":\"\\u00c9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9"
         "\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9x\","
-        "  \"url_resolved\":\"https://a.example/9\",\"codec\":\"OGG\",\"bitrate\":0,\"stationuuid\":\"bad id!\"},"
-        " {\"name\":\"Opus\",\"url_resolved\":\"https://a.example/10\",\"codec\":\"OPUS\",\"bitrate\":96},"
+        "  \"url_resolved\":\"https://a.example/9\",\"codec\":\"OGG\",\"bitrate\":0,\"stationuuid\":\"bad id!\","
+        "  \"favicon\":\"https://a.example/my logo.png\"},"
+        " {\"name\":\"Opus\",\"url_resolved\":\"https://a.example/10\",\"codec\":\"OPUS\",\"bitrate\":96,"
+        "  \"favicon\":\"data:image/png;base64,iVBORw0KGgo=\"},"
+        " {\"name\":\"Bar\",\"url_resolved\":\"https://a.example/11\",\"codec\":\"MP3\",\"favicon\":\"https://a.example/a|b.png\"},"
+        " {\"name\":\"Null\",\"url_resolved\":\"https://a.example/12\",\"codec\":\"MP3\",\"favicon\":null},"
         " \"not an object\", 3]";
     n = rdir_parse_stations(odd, strlen(odd), st, meta, RDIR_MAX_STATIONS);
-    CHECK(n == 4);
+    CHECK(n == 6);
+    /* a logo: only an http(s) address that can go on a line of radio.txt */
+    CHECK(n == 6 && !st[0].icon[0] && !strcmp(st[1].icon, "http://a.example/logo.png?v=2") && !st[2].icon[0] &&
+          !st[3].icon[0] && !st[4].icon[0] && !st[5].icon[0]);
     CHECK(n > 0 && !strcmp(st[0].name, "HLS") && !strcmp(meta[0].detail, "HLS") && meta[0].uuid[0]);
     CHECK(n > 1 && !strcmp(st[1].name, "Line break here") && !strcmp(st[1].url, "http://a.example/5") &&
           !strcmp(meta[1].detail, "MP3 128"));
@@ -227,14 +247,33 @@ int main(void)
     CHECK(rdir_start(&q) == 0 && rdir_start(NULL) == 0 && wait_done(&r) == 1 && r.countries && r.n == 223);
     rdir_result_free(&r);
 
-    /* counting a play */
+    /* counting a play: not at once (the station is connecting then), and of
+     * two chosen within the wait only the second */
     calls = 0;
+    rdir_test_click_wait(300);
+    rdir_count_click("11111111-0601-11e8-ae97-52543be04c81");
+    nap(100);
+    CHECK(calls == 0);
     rdir_count_click("9617a958-0601-11e8-ae97-52543be04c81");
-    for (int i = 0; i < 100 && !calls; i++) nap(10);
+    for (int i = 0; i < 300 && !calls; i++) nap(10);
     pthread_mutex_lock(&mu);
     CHECK(calls == 1 && strstr(last_url, "/json/url/9617a958-0601-11e8-ae97-52543be04c81"));
     pthread_mutex_unlock(&mu);
-    nap(50);
+    nap(400);
+    CHECK(calls == 1);                            /* the first was never asked for */
+    /* one chosen while another is being counted is counted after it */
+    slow = 1;
+    rdir_count_click("22222222-0601-11e8-ae97-52543be04c81");
+    for (int i = 0; i < 300 && calls < 2; i++) nap(10);
+    CHECK(calls == 2);
+    rdir_count_click("33333333-0601-11e8-ae97-52543be04c81");
+    slow = 0;
+    for (int i = 0; i < 500 && calls < 3; i++) nap(10);
+    pthread_mutex_lock(&mu);
+    CHECK(calls == 3 && strstr(last_url, "/json/url/33333333-0601-11e8-ae97-52543be04c81"));
+    pthread_mutex_unlock(&mu);
+    nap(400);
+    rdir_test_click_wait(-1);
 
     if (!fails) printf("radiodir: ok\n");
     return fails != 0;

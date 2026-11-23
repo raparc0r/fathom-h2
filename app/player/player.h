@@ -47,6 +47,12 @@ typedef struct {
      * .album the show; pos_ms/len_ms its own. */
     int         podcast;
     int         podcast_stream;   /* ...streamed (not downloaded): no seeking */
+    /* A song that couldn't be played and was passed over: +1 each time */
+    unsigned    fail_seq;
+    int64_t     fail_track;   /* ...the last one */
+    int         fail_output;  /* ...because the output can't take its format */
+    int         fail_all;     /* ...and nothing in the queue could play: stopped */
+    int         fail_end;     /* ...the last in the queue (others played): stopped there */
 } player_now_t;
 
 player_t *player_new(library_t *lib, engine_t *eng);
@@ -59,6 +65,9 @@ void player_play(player_t *p, const int64_t *ids, int n, int start);
 void player_cue(player_t *p, const int64_t *ids, int n, int start);
 /* Shuffle every song in the library. */
 void player_shuffle_all(player_t *p);
+/* (tests) Shuffle all starts on one song and builds the order at the next tick
+ * from this many songs up (0: the usual 5,000) */
+void player_test_shuffle_soon(int min_songs);
 /* Shuffle `ids` (an album's or an artist's songs; a copy is kept) and play,
  * with shuffle on. Asked for by name, so audiobooks and podcasts aren't left
  * out, nor short interludes when they're all there is; songs: shuffle the
@@ -103,6 +112,12 @@ void    player_queue_remove(player_t *p, int i);
 void    player_queue_clear(player_t *p);                  /* everything after the current track */
 void    player_queue_jump(player_t *p, int i);            /* play upcoming track i now */
 
+/* For tests: called for each file the player asks the kernel to read ahead
+ * (the next track's: its path and how many bytes from its start), whether or
+ * not the system can (macOS has no posix_fadvise: there it is all that
+ * happens). NULL: none. */
+void player_set_warm_hook(void (*hook)(const char *file, long bytes));
+
 /* The queue, modes and position, kept across restarts. Restoring cues the
  * track paused at its position: Play continues from there. */
 int  player_save(player_t *p, const char *path);
@@ -116,6 +131,14 @@ void player_radio_play(player_t *p, const radio_station_t *st, int n, int i);
 int  player_radio(const player_t *p);
 const radio_station_t *player_radio_station(const player_t *p);   /* NULL off the radio */
 const radio_station_t *player_radio_at(const player_t *p, int i);  /* station i of those playing (NULL: none) */
+/* The network is there (up) or gone, told by whoever can see it (the player
+ * can't); taken as there until told. Gone: a station that's wanted waits for
+ * it, shown as connecting, with no tries used up (given up after ten minutes,
+ * so the player can count as idle). Back: it connects at once with its tries
+ * afresh, and so does one that was given up for want of the network; one
+ * stopped by hand, or given up with the network there, stays as it is. */
+void player_radio_net(player_t *p, int up);
+void player_radio_test_pace(int times);   /* tests: the radio's waits so many times shorter */
 /* What's playing, from somewhere other than the stream (radio_station_t.info):
  * used over what the stream says until the station changes; NULL = clear.
  * art_url: its cover ("" or NULL = none). */

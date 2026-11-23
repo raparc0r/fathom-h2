@@ -143,6 +143,20 @@ symbols, Back deletes, and **Join** at the end of the letters joins. Saved netwo
 joined by themselves next time; Menu on one forgets it. If you use something that needs
 Wi-Fi while it's off, the H2 offers to turn it on.
 
+Or type it on a computer instead: with the card in the computer (USB drive mode works),
+make a text file `wifi.txt` in the card's `fathom` folder, with your network's name and
+password:
+
+```
+network = My home network
+password = my password
+```
+
+(More networks: another `network =` line, then its `password =`; an open network needs no
+password line.) At its next start the H2 turns Wi-Fi on, saves the networks as if you'd
+typed them, says so, and deletes the file, so the password isn't left there. A network
+that isn't in range is saved all the same, and joined when it is.
+
 The H2 sets its clock over Wi-Fi when it connects, since it has no clock that keeps
 running while it's off.
 
@@ -153,6 +167,9 @@ searches a directory of thousands: by name, by genre or country, the most popula
 random one. Menu on a station adds it to your stations. Play stops and starts the stream;
 Prev and Next change station.
 
+A station added from Find stations shows its logo beside its name when the directory has
+one (a PNG or JPEG picture), and on Now Playing when the song has no cover of its own.
+
 Your stations are kept in the card's `fathom/radio.txt`, one per line, which you can also
 edit on a computer:
 
@@ -161,7 +178,8 @@ Radio Paradise = https://stream.radioparadise.com/flacm
 ```
 
 The address can be the stream itself (MP3, AAC, FLAC, Ogg, over http or https) or the
-station's playlist link (`.m3u`, `.pls`, `.m3u8`).
+station's playlist link (`.m3u`, `.pls`, `.m3u8`). To give a station a logo yourself, end
+its line with ` | icon: ` and the address of a PNG or JPEG picture.
 
 ## Podcasts
 
@@ -170,7 +188,8 @@ searches Apple's podcast directory), then Play on a show to add it. Or bring you
 from another podcast app: export them as an OPML file, put it at the top of the card, in
 `Music` or in `fathom/podcasts`, and choose **Import NAME.opml** at the bottom of the list.
 Shows are kept in `fathom/podcasts/shows.txt`, one `Title = feed address` per line, which
-you can also edit on a computer.
+you can also edit on a computer. Each show has its picture beside its name, a moment after
+you add it (unless Settings → Interface → Covers in lists is Off).
 
 A show's episodes are newest first. Each says how it stands: **New**, **12 min left**,
 **Played**, or its length, and one on the card has a small arrow onto a line beside that.
@@ -203,10 +222,12 @@ the one on the H2's screen, then trust it.
   certificate (Show Certificate → "Always trust" spares you the question next time), then
   choose Registered User, change the name Finder fills in (your Mac's) to `fathom`, and
   enter the password. The music folder opens like a disk.
-- **Windows:** Windows only connects to a certificate it already trusts. Open
-  `https://fathom-h2.local` in a browser, save the certificate and install it under
-  "Trusted Root Certification Authorities" (Local Machine). Then File Explorer → This PC
-  → Map network drive, folder `https://fathom-h2.local`, with the user and password.
+- **Windows:** USB drive mode is the simpler way from Windows (above). The network drive
+  can work too, but it hasn't been tried yet: Windows only connects to a certificate it
+  already trusts, so open `https://fathom-h2.local` in a browser, save the certificate and
+  install it under "Trusted Root Certification Authorities" (Local Machine); then File
+  Explorer → This PC → Map network drive, folder `https://fathom-h2.local`, with the user
+  and password.
 
 New music appears in the library about 10 seconds after the copying stops. Copies run at
 about 1 to 2 MB/s, so for a whole library USB drive mode is faster.
@@ -249,9 +270,10 @@ drive mode works). Each release's notes say if anything else is needed.
 HiBy's own firmware is still on the H2: hold **Play** while turning it on to start it, any
 time. To go back to it for good, its bootloader included, Fathom can do it from the H2:
 
-1. Download the firmware for the H2 from HiFi Walker's website: the version your H2 came
-   with, or a newer one (an older one can leave the screen blank). HiBy's firmware shows
-   its version in System Settings → About.
+1. Download the firmware for the H2 from HiFi Walker's website (their
+   [H2 firmware guide](https://hifiwalker.com/blogs/hifi-walker-h2/h2-firmware-update-guide)
+   leads to it): the version your H2 came with, or a newer one (an older one can leave
+   the screen blank). HiBy's firmware shows its version in System Settings → About.
 2. Put its `.upt` file at the top of the card, or in the `Music` folder (where the network
    drive puts files, from a phone too). There's no need to rename it.
 3. Settings → About → **Uninstall Fathom**. Fathom checks the file (a few seconds) and
@@ -274,7 +296,8 @@ Update** as in [INSTALL.md](INSTALL.md). Your settings and library are where you
 
 Fathom keeps its settings, library and cover cache in the card's `fathom` folder, and
 that's where you add things of your own: `radio.txt`, `eq/`, `themes/` and `lang/` (all
-above). `podcasts/` holds your shows, their episodes' downloads and where you left each. Wi-Fi passwords and the network drive's password are kept there too, so anyone
+above). `podcasts/` holds your shows, their episodes' downloads and where you left each;
+`radio-icons/` your stations' logos, fetched again if you delete them. Wi-Fi passwords and the network drive's password are kept there too, so anyone
 holding the card can read them.
 
 More for the technically minded (SSH, logs, recovery): [ADVANCED.md](ADVANCED.md).

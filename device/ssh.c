@@ -46,6 +46,7 @@ static int apply(int on, const char *password)
 static void *worker(void *arg)
 {
     (void)arg;
+    sh_wait_home(3000);                          /* (Home first: shell.h) */
     for (;;) {
         pthread_mutex_lock(&S.mu);
         while (!S.pending) pthread_cond_wait(&S.cv, &S.mu);

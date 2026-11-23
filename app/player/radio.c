@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 #include "radio.h"
+#include "core/fsafe.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -18,6 +19,15 @@ static void trim_copy(char *dst, size_t cap, const char *a, const char *b)
     dst[n] = '\0';
 }
 
+int radio_icon_ok(const char *url)
+{
+    if (!url || (strncmp(url, "http://", 7) && strncmp(url, "https://", 8))) return 0;
+    size_t n = 0;
+    for (const char *c = url; *c; c++, n++)
+        if ((unsigned char)*c <= ' ' || *c == '|') return 0;
+    return n < sizeof ((radio_station_t *)0)->icon;
+}
+
 int radio_parse(const char *text, radio_station_t *out, int max)
 {
     int n = 0;
@@ -28,8 +38,8 @@ int radio_parse(const char *text, radio_station_t *out, int max)
         const char *s = line;
         while (s < stop && isspace((unsigned char)*s)) s++;
         if (s < stop && *s != '#') {
-            /* Name = URL [| info: SOURCE]; the name is up to the first '=' that
-             * is followed by a URL (names may hold '='; URLs do too). */
+            /* Name = URL [| info: SOURCE] [| icon: URL]; the name is up to the first
+             * '=' that is followed by a URL (names may hold '='; URLs do too). */
             const char *eq = NULL;
             for (const char *q = s; q < stop; q++) {
                 if (*q != '=') continue;
@@ -47,10 +57,18 @@ int radio_parse(const char *text, radio_station_t *out, int max)
                 trim_copy(r->url, sizeof r->url, u, bar ? bar : stop);
                 for (char *c = r->url; *c; c++)
                     if (isspace((unsigned char)*c)) { *c = '\0'; break; }   /* a URL has no spaces */
-                if (bar) {
-                    const char *i = bar + 1;
-                    while (i < stop && isspace((unsigned char)*i)) i++;
-                    if (!strncmp(i, "info:", 5)) trim_copy(r->info, sizeof r->info, i + 5, stop);
+                while (bar) {                      /* what follows the stream, each part up to the next '|' */
+                    const char *i = bar + 1, *next = memchr(i, '|', (size_t)(stop - i));
+                    const char *e = next ? next : stop;
+                    while (i < e && isspace((unsigned char)*i)) i++;
+                    if (!strncmp(i, "info:", 5)) {
+                        trim_copy(r->info, sizeof r->info, i + 5, e);
+                    } else if (!strncmp(i, "icon:", 5)) {
+                        char icon[sizeof r->icon + 8];   /* (room to see one that's too long: left out, not cut) */
+                        trim_copy(icon, sizeof icon, i + 5, e);
+                        if (radio_icon_ok(icon)) memcpy(r->icon, icon, strlen(icon) + 1);
+                    }
+                    bar = next;
                 }
                 if (!r->name[0]) snprintf(r->name, sizeof r->name, "Station %d", n + 1);
                 n++;
@@ -79,6 +97,21 @@ int radio_load(const char *path, radio_station_t *out, int max)
     return r;
 }
 
+int radio_load_list(const char *path, const char *example, radio_station_t *out, int max)
+{
+    int n = radio_load(path, out, max);
+    if (n < 0) return example ? radio_load(example, out, max) : -1;
+    int missing = 0;
+    for (int i = 0; i < n; i++) missing |= !out[i].icon[0];
+    radio_station_t *ex = missing && example ? malloc(RADIO_MAX * sizeof *ex) : NULL;
+    int nex = ex ? radio_load(example, ex, RADIO_MAX) : 0;
+    for (int i = 0; i < n; i++)
+        for (int k = 0; k < nex && !out[i].icon[0]; k++)
+            if (ex[k].icon[0] && !strcmp(ex[k].url, out[i].url)) memcpy(out[i].icon, ex[k].icon, sizeof out[i].icon);
+    free(ex);
+    return n;
+}
+
 /* ---------- changing the list ---------- */
 
 #define LIST_MAX 65536
@@ -101,7 +134,7 @@ static char *read_text(const char *path)
 /* The station on one line of the list (a, up to b), if it is one. */
 static int line_station(const char *a, const char *b, radio_station_t *st)
 {
-    char line[1024];
+    char line[1280];                 /* (a full line is under 920: radio_line) */
     size_t n = (size_t)(b - a);
     if (n >= sizeof line) n = sizeof line - 1;
     memcpy(line, a, n);
@@ -153,7 +186,7 @@ static int write_text(const char *path, const char *text)
     ok = fflush(f) == 0 && ok;
     ok = fsync(fileno(f)) == 0 && ok;
     ok = fclose(f) == 0 && ok;
-    if (!ok || rename(tmp, path)) { unlink(tmp); return -1; }
+    if (!ok || file_replace(tmp, path)) { unlink(tmp); return -1; }
     return 0;
 }
 
@@ -169,8 +202,11 @@ void radio_line(const radio_station_t *st, char *out, size_t cap)
     while (*s == '#' || isspace((unsigned char)*s)) s++;
     for (char *e = s + strlen(s); e > s && isspace((unsigned char)e[-1]);) *--e = '\0';
     if (!*s) s = "Station";
-    if (st->info[0]) snprintf(out, cap, "%s = %s | info: %s", s, st->url, st->info);
-    else snprintf(out, cap, "%s = %s", s, st->url);
+    /* (the info before the icon: a build from before icons reads the info to
+     * the line's end, and takes "radiofrance:7 | icon: ..." for station 7 still) */
+    int len = snprintf(out, cap, "%s = %s", s, st->url);
+    if (st->info[0] && len >= 0 && (size_t)len < cap) len += snprintf(out + len, cap - (size_t)len, " | info: %s", st->info);
+    if (radio_icon_ok(st->icon) && len >= 0 && (size_t)len < cap) snprintf(out + len, cap - (size_t)len, " | icon: %s", st->icon);
 }
 
 int radio_add(const char *path, const char *example, const radio_station_t *st)
@@ -188,7 +224,7 @@ int radio_add(const char *path, const char *example, const radio_station_t *st)
         if (!end) break;
         line = end + 1;
     }
-    char add[700];
+    char add[1024];
     radio_line(st, add, sizeof add);
     size_t n = strlen(t), k = strlen(add);
     int r;

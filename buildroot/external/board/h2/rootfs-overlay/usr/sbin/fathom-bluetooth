@@ -15,21 +15,36 @@
 DRV=/sys/bus/serial/drivers/hci_uart_bcm
 DEV=serial0-0
 FW=/mnt/sd/fathom/firmware/brcm/BCM43430A1.hcd
+HCI=/sys/class/bluetooth/hci0
+HCIWAIT=100                             # hci0 is given this many tenths of a second to appear
 
 say() { echo "bluetooth: $1"; }
 
 case "$1" in
 on)
+    # (start-up's "off" still under way, S35bluetooth: 3 s at most)
+    i=0
+    while [ -d /var/run/fathom-bluetooth.off ] && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
     [ -d $DRV ] || { say "no driver"; exit 1; }
     [ -f $FW ] || say "no firmware patch at $FW: starting without it"
     [ -e $DRV/$DEV ] && echo $DEV > $DRV/unbind
     echo $DEV > $DRV/bind || { say "cannot start"; exit 1; }
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        [ -e /sys/class/bluetooth/hci0 ] && break
-        sleep 1
+    # hci0 looked for every tenth of a second, for 10 s (it was once a second:
+    # most of a second lost at every start)
+    i=0
+    while [ $i -lt $HCIWAIT ]; do
+        [ -e $HCI ] && break
+        sleep 0.1
+        i=$((i + 1))
     done
-    [ -e /sys/class/bluetooth/hci0 ] || { say "no hci0"; exit 1; }
-    sleep 2                              # the firmware patch loads (about 1 s)
+    [ -e $HCI ] || { say "no hci0"; exit 1; }
+    # No wait here for the firmware patch (it was a fixed 2 s). hci0 is there
+    # as soon as the driver registers it; the kernel then loads the patch
+    # (about 1 s) and only tells BlueZ of the controller once that's done
+    # (while a controller is being set up it's on no list bluetoothd can ask
+    # for, and "index added" comes after: net/bluetooth/mgmt.c, hci_core.c).
+    # fathom-bt start waits for exactly that, the controller in bluetoothctl's
+    # "show", so D-Bus and bluetoothd start while the patch loads.
     say "on (hci0)"
     ;;
 off)
@@ -37,7 +52,7 @@ off)
     say "off"
     ;;
 status)
-    [ -e /sys/class/bluetooth/hci0 ] && echo on || echo off
+    [ -e $HCI ] && echo on || echo off
     ;;
 *)
     echo "usage: $0 on|off|status" >&2

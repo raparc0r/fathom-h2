@@ -11,6 +11,7 @@
  * extended key usage, and at most 825 days. It's renewed a month before it
  * ends (when the clock is set; the H2 has no battery-backed clock). */
 #include "tlscert.h"
+#include "core/fsafe.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -86,7 +87,7 @@ static int put(const char *path, const unsigned char *buf, size_t n)
     ok = fflush(f) == 0 && ok;
     fsync(fileno(f));
     ok = fclose(f) == 0 && ok;
-    if (!ok || rename(tmp, path)) { unlink(tmp); return -1; }
+    if (!ok || file_replace(tmp, path)) { unlink(tmp); return -1; }
     return 0;
 }
 

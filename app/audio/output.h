@@ -39,6 +39,15 @@ typedef struct {
      * skip waits for the write under way (at most a chunk) rather than cut it
      * with flush() from another thread. NULL: flush(). */
     void (*flush_soft)(void *ctx);
+    /* Optional: an output that queues more than it has to (the H2's DAC:
+     * about a second of a file, so that a card busy with something else, or
+     * a page of the player read back from it, doesn't run the output dry)
+     * says how many frames are enough. The engine lets the queue play down
+     * to that where more would be noticed: before a track that follows
+     * gaplessly becomes the one that's on (that is told from what's decoded,
+     * and would run a second ahead of what's heard), during a fade, and for
+     * a few seconds after a sound setting changes. NULL or 0: as it comes. */
+    long (*join_depth)(void *ctx);
 } audio_output_t;
 
 int  out_sdl_create(audio_output_t *out);

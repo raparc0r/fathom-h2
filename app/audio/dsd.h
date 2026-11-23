@@ -64,6 +64,10 @@ void dsd_close(dsd_dec_t *d);
 #define DSD_CHUNK 256        /* frames per dsd2pcm_run, at most: small, to leave the cache to the tables */
 typedef struct dsd2pcm dsd2pcm_t;
 dsd2pcm_t *dsd2pcm_new(unsigned ratio, unsigned channels);
+/* The filter tables are designed once for a ratio and kept for later
+ * converters (dsd.c). 0: design them afresh for each dsd2pcm_new from now on,
+ * as if none were kept (tests: the samples must be the same either way). */
+void      dsd2pcm_keep_tables(int on);
 void      dsd2pcm_free(dsd2pcm_t *c);
 void      dsd2pcm_reset(dsd2pcm_t *c);                 /* as after silence */
 /* Where channel ch's bytes for the next run go (DSD_CHUNK * ratio / 8 of room). */

@@ -2,7 +2,7 @@
 
 # Fathom
 
-Latest version: [0.15.1](https://github.com/raparc0r/fathom-h2/releases/tag/v0.15.1) released November 22nd 2026
+Latest version: [0.16.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.16.0) released November 23rd 2026
 
 [Features](#features) · [Compatibility](#compatibility) · [Installing](#installing) · [Navigation](#navigation) · [Licence](#licence) · [How it was made](#how-it-was-made)
 
@@ -34,9 +34,10 @@ I recommend you check it out: [rockbox.org](https://www.rockbox.org).
 - **Gapless playback**, so live albums and mixes play without breaks.
 - **Most formats**: FLAC, MP3, AAC, ALAC, WAV, AIFF, WavPack, APE, TTA, Opus, Ogg Vorbis
   and DSD, and albums ripped as one file with a CUE sheet.
-- **Internet radio.** You can search and browse thousands of stations on the H2 itself.
-- **Podcasts.** Find shows on the H2, or import them from another app; new episodes
-  download while it charges.
+- **Internet radio.** You can search and browse thousands of stations on the H2 itself,
+  with their logos.
+- **Podcasts.** Find shows on the H2, or import them from another app, each with its
+  picture; new episodes download while it charges.
 - **Smart playlists.** Never played, On repeat, Not heard in a while, Forgotten favourites,
   Often skipped.
 - **A network drive**, so you can copy music to the H2 over Wi-Fi while it plays.

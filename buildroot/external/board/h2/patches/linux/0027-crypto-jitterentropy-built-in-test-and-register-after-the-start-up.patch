@@ -1,0 +1,70 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] crypto: jitterentropy: built in, test and register after the start-up
+
+Built in (Bluetooth's ECDH selects the DRBG, which selects this), the Jitter
+RNG's start-up test runs as an initcall and everything after it waits: on the
+H2's single 1 GHz MIPS core, 0.47 s of every start (initcall_debug:
+jent_mod_init, the longest by far). It now runs from a kernel thread of the
+lowest priority, ten seconds after the start. A DRBG instantiated before the
+Jitter RNG is registered carries on without it, as it already does when this
+test fails; the kernel's own generator is seeded by then (the SoC's RNG).
+As a module, nothing changes.
+---
+--- a/crypto/jitterentropy-kcapi.c
++++ b/crypto/jitterentropy-kcapi.c
+@@ -39,8 +39,10 @@
+ 
+ #include <crypto/hash.h>
+ #include <crypto/sha3.h>
++#include <linux/delay.h>
+ #include <linux/fips.h>
+ #include <linux/kernel.h>
++#include <linux/kthread.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/slab.h>
+@@ -332,7 +334,8 @@
+ 	}
+ };
+ 
+-static int __init jent_mod_init(void)
++/* (not __init: built in, it runs from a thread after the start-up: jent_mod_init) */
++static int jent_start(void)
+ {
+ 	SHASH_DESC_ON_STACK(desc, tfm);
+ 	struct crypto_shash *tfm;
+@@ -363,6 +366,34 @@
+ 	return crypto_register_rng(&jent_alg);
+ }
+ 
++#ifndef MODULE
++static int jent_late(void *unused)
++{
++	set_user_nice(current, MAX_NICE);
++	msleep(10000);
++	jent_start();
++	return 0;
++}
++#endif
++
++static int __init jent_mod_init(void)
++{
++#ifndef MODULE
++	/*
++	 * Built in, the start-up test above held up everything after it: on a
++	 * single 1 GHz MIPS core, 0.47 s of every start. It is run from a
++	 * thread of the lowest priority ten seconds in instead. Until it has
++	 * registered, a DRBG that is set up carries on without the Jitter RNG,
++	 * as it does when this test fails (drbg_prepare_hrng).
++	 */
++	struct task_struct *t = kthread_run(jent_late, NULL, "jent_init");
++
++	if (!IS_ERR(t))
++		return 0;
++#endif
++	return jent_start();
++}
++
+ static void __exit jent_mod_exit(void)
+ {
+ 	jent_testing_exit();

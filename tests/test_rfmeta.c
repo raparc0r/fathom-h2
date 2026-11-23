@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Additional terms under GPLv3 section 7: see LICENSE. */
-/* Radio France's live API answer: the step on now (levels[0].position). */
+/* Radio France's live API answer: the step on now (levels[0].position), its
+ * times, and when to ask again. */
 #include "player/rfmeta.h"
 
 #include <stdio.h>
@@ -46,6 +47,38 @@ int main(void)
         CHECK(rf_parse(c, a, sizeof a, t, sizeof t, NULL, 0) != 0);
         free(c);
     }
+
+    /* the step's times: of the one on now (b_7 above has none; a_7's aren't asked for) */
+    int64_t s = -1, e = -1;
+    CHECK(rf_step_times(j, &s, &e) != 0 && s == 0 && e == 0);
+    const char *live =
+        "{\"steps\":{"
+        "\"p_7\":{\"title\":\"Before\",\"start\":1763900000,\"end\":1763900180},"
+        "\"q_7\":{\"title\":\"Now\",\"authors\":\"Them\",\"start\": 1763900180 ,\"end\":1763900420,\"depth\":1}},"
+        "\"levels\":[{\"items\":[\"p_7\",\"q_7\"],\"position\":1}]}";
+    CHECK(rf_parse(live, a, sizeof a, t, sizeof t, v, sizeof v) == 0 && !strcmp(t, "Now"));
+    CHECK(rf_step_times(live, &s, &e) == 0 && s == 1763900180 && e == 1763900420);
+    CHECK(rf_step_times("{\"steps\":{\"x\":{\"title\":\"T\",\"start\":\"soon\",\"end\":null}},"
+                        "\"levels\":[{\"items\":[\"x\"],\"position\":0}]}", &s, &e) != 0 && s == 0 && e == 0);
+    CHECK(rf_step_times("{\"steps\":{\"x\":{\"title\":\"T\",\"start\":5}},"
+                        "\"levels\":[{\"items\":[\"x\"],\"position\":0}]}", &s, &e) != 0);
+    CHECK(rf_step_times("not json", &s, &e) != 0);
+
+    /* when to ask again: 3 s after the song ends... */
+    CHECK(rf_next_fetch_s(1763900200, 1763900180, 1763900420) == RF_POLL_MAX_S);   /* (223 s away: a look meanwhile) */
+    CHECK(rf_next_fetch_s(1763900300, 1763900180, 1763900420) == 123);
+    CHECK(rf_next_fetch_s(1763900180, 1763900180, 1763900420) == RF_POLL_MAX_S);   /* a long song: a look meanwhile */
+    CHECK(rf_next_fetch_s(1763900410, 1763900180, 1763900420) == RF_POLL_S);       /* about to end: not sooner than before */
+    CHECK(rf_next_fetch_s(1763900405, 1763900180, 1763900420) == 18);
+    /* ...and every 15 s as before when that can't be told */
+    CHECK(rf_next_fetch_s(1763900420, 1763900180, 1763900420) == RF_POLL_S);       /* over: the next one isn't out yet */
+    CHECK(rf_next_fetch_s(1763990000, 1763900180, 1763900420) == RF_POLL_S);
+    CHECK(rf_next_fetch_s(0, 1763900180, 1763900420) == RF_POLL_S);                /* the clock unset */
+    CHECK(rf_next_fetch_s(1763800000, 1763900180, 1763900420) == RF_POLL_S);       /* ...or a day behind */
+    CHECK(rf_next_fetch_s(1763900160, 1763900180, 1763900420) == RF_POLL_MAX_S);   /* 20 s behind: near enough */
+    CHECK(rf_next_fetch_s(1763900200, 0, 0) == RF_POLL_S);                         /* no times given */
+    CHECK(rf_next_fetch_s(1763900200, 1763900420, 1763900180) == RF_POLL_S);       /* nonsense */
+    CHECK(rf_next_fetch_s(1763900200, 1763900180, 1763900180 + 5 * 3600) == RF_POLL_S);
 
     CHECK(rf_station("radiofrance:7") == 7);
     CHECK(rf_station("radiofrance:") == -1);

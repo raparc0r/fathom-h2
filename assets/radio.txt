@@ -9,9 +9,13 @@
 # Icecast/Shoutcast streams do). For stations that don't, add after the URL
 #   | info: radiofrance:N     Radio France's live API, station N (FIP is 7)
 #
+# A station's logo, shown beside its name, is the address of a PNG or JPEG
+# picture, last on the line (Find stations adds it when the directory has one):
+#   | icon: https://example.com/logo.png
+#
 # Streams can be MP3, AAC, Ogg FLAC, Ogg Vorbis... over http or https.
 
-FIP = https://icecast.radiofrance.fr/fip-hifi.aac?id=radiofrance | info: radiofrance:7
-Radio Paradise = https://stream.radioparadise.com/flacm
+FIP = https://icecast.radiofrance.fr/fip-hifi.aac?id=radiofrance | info: radiofrance:7 | icon: https://www.fip.fr/dist/favicons/logo-120.png
+Radio Paradise = https://stream.radioparadise.com/flacm | icon: https://radioparadise.com/apple-touch-icon.png
 Djam Radio = https://stream10.xdevel.com/audio15s976748-2280/stream/icecast.audio
 EHFM = https://ehfm.out.airtime.pro/ehfm_a

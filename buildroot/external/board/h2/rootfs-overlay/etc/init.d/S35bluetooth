@@ -8,7 +8,11 @@
 
 case "$1" in
 start)
-    fathom-bluetooth off > /dev/null 2>&1
+    # Beside the scripts that follow (the chip's driver takes 0.2 s to let go
+    # of it, all waiting). A mark while it's under way: fathom-bluetooth on
+    # waits for it to go, so this "off" can't land on a start asked for after.
+    mkdir /var/run/fathom-bluetooth.off 2>/dev/null
+    ( fathom-bluetooth off > /dev/null 2>&1; rmdir /var/run/fathom-bluetooth.off 2>/dev/null ) &
     ;;
 stop)
     fathom-bt stop > /dev/null 2>&1

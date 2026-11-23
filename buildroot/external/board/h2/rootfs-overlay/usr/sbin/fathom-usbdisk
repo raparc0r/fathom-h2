@@ -25,6 +25,7 @@ say() { echo "usbdisk: $1"; }
 [ -d $LUN ] || { say "no USB drive function"; echo "USB drive mode isn't available" > $MSG; exit 1; }
 [ "$(cat $STATE 2>/dev/null)" = configured ] || { say "not connected"; exit 0; }
 
+card_report_done                  # (in the first seconds after start-up: the boot report has the card open)
 sync
 fathom-bt stop > /dev/null 2>&1   # Bluetooth runs from the card
 fathom-share off > /dev/null 2>&1 # the network drive (it has the card open)
@@ -53,11 +54,17 @@ echo 8388608 > $VM/dirty_bytes
 # Until it's ejected (the file goes empty) or the cable stays unplugged for 3 s.
 # A computer resets the USB link when the drive appears (macOS does), and the
 # link is "suspended" while it sleeps: neither ends drive mode.
+# Looked at five times a second (once a second before: up to a second between
+# Eject on the computer and the music coming back), with the shell's own read:
+# nothing is run for it but the sleep. Unplugged is still 3 s of it: 15 looks.
 gone=0
-while [ -n "$(cat $LUN/file)" ]; do
-    if [ "$(cat $STATE 2>/dev/null)" = "not attached" ]; then gone=$((gone + 1)); else gone=0; fi
-    [ $gone -ge 3 ] && break
-    sleep 1
+while :; do
+    file=; read -r file 2>/dev/null < $LUN/file
+    [ -n "$file" ] || break
+    state=; read -r state 2>/dev/null < $STATE
+    if [ "$state" = "not attached" ]; then gone=$((gone + 1)); else gone=0; fi
+    [ $gone -ge 15 ] && break
+    sleep 0.2
 done
 echo 1 > $LUN/forced_eject 2>/dev/null
 sync

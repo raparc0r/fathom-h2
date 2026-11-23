@@ -119,8 +119,20 @@ static void opml_search_chapters(void)
     if (n == 2) {
         CHECK(!strcmp(s[0].title, "Radiolab") && !strcmp(s[0].author, "WNYC Studios") && s[0].episodes == 575, "search 1");
         CHECK(!strcmp(s[1].title, "Caf\xc3\xa9 Talk") && s[1].episodes == 12, "search 2 [%s]", s[1].title);
+        /* its picture: the 600 px one when there is one */
+        CHECK(!strcmp(s[0].image, "https://is1.example/600x600bb.jpg"), "search 1's picture [%s]", s[0].image);
+        CHECK(!strcmp(s[1].image, "https://is2.example/100x100bb.jpg"), "search 2's picture [%s]", s[1].image);
     }
     CHECK(pod_parse_search("{}", 2, s, 8) == -1, "not an answer");
+    static const char odd[] = "{\"results\":[{\"feedUrl\":\"https://a.example/f\",\"artworkUrl600\":\"\","
+                              "\"artworkUrl100\":\"https://a.example/100.jpg\"},"
+                              "{\"feedUrl\":\"https://b.example/f\",\"artworkUrl600\":\"file:///etc/passwd\"}]}";
+    n = pod_parse_search(odd, sizeof odd - 1, s, 8);
+    CHECK(n == 2 && !strcmp(s[0].image, "https://a.example/100.jpg") && !s[1].image[0], "an empty or odd 600: the 100, or none");
+    char p1[700], p2[700];
+    pod_cover_path("/d", "0123456789ab", p1, sizeof p1);
+    pod_thumb_path("/d", "0123456789ab", p2, sizeof p2);
+    CHECK(!strcmp(p1, "/d/0123456789ab/cover.565") && !strcmp(p2, "/d/0123456789ab/thumb.565"), "cover and thumbnail paths");
     free(x);
     char url[512];
     pod_search_url(url, sizeof url, "slow & steady");

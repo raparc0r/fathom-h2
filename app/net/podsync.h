@@ -4,7 +4,8 @@
  * Podcasts over the network (net/podcast.h for the files): one worker thread
  * does one job at a time, in the order asked:
  *
- *   - reading a show's feed (or every show's), keeping its newest episodes;
+ *   - reading a show's feed (or every show's), keeping its newest episodes
+ *     and its picture, small (ID/cover.565, ID/thumb.565);
  *   - subscribing to a show (shows.txt), then reading its feed;
  *   - searching Apple's directory (a new search replaces one still running);
  *   - downloading an episode to the card (ID/KEY.ext.part, renamed when whole).

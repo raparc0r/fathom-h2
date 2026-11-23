@@ -16,6 +16,7 @@
  */
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,8 +37,9 @@ static int failures;
 static char g_tmp[512];
 
 /* The H2's limits (device/CMakeLists.txt) */
-static const art_limits_t H2 = {4194304L, 1200000LL, 4194304L};
-static const art_limits_t BIG = {1L << 30, 1LL << 30, 1L << 30};
+static const art_limits_t H2 = {4194304L, 1200000LL, 4194304L, 0};
+static const art_limits_t BIG = {1L << 30, 1LL << 30, 1L << 30, 0};
+static const art_limits_t MATTE = {4194304L, 1200000LL, 4194304L, 1};   /* transparency over white (a station's logo) */
 
 /* A picture with detail everywhere: gradients and a pattern */
 static unsigned char *picture(int w, int h)
@@ -383,6 +385,170 @@ static void test_png(void)
     free(src), free(expect), free(want);
 }
 
+/* ---------- transparency, and logos fitted whole ---------- */
+
+/* A PNG as it is given: colour type ct (3: a palette of n entries with their
+ * transparency in trns; else 4 or 6, 8 bits), rows unfiltered, `raw` its
+ * w * h * channels bytes */
+static void write_png_raw(const char *path, const unsigned char *raw, int w, int h, int ct, int interlace,
+                          const unsigned char *pal, const unsigned char *trns, int n)
+{
+    int ch = ct == 6 ? 4 : ct == 4 ? 2 : ct == 2 ? 3 : 1;
+    size_t rowbytes = (size_t)w * ch;
+    unsigned char *data = malloc((rowbytes + 1) * h);
+    for (int y = 0; y < h; y++) {
+        data[(size_t)y * (rowbytes + 1)] = 0;
+        memcpy(data + (size_t)y * (rowbytes + 1) + 1, raw + (size_t)y * rowbytes, rowbytes);
+    }
+    uLongf zn = compressBound((uLong)((rowbytes + 1) * h));
+    unsigned char *z = malloc(zn);
+    compress2(z, &zn, data, (uLong)((rowbytes + 1) * h), 6);
+    FILE *f = fopen(path, "wb");
+    fwrite("\x89PNG\r\n\x1a\n", 1, 8, f);
+    unsigned char hd[13];
+    put32(hd, (uint32_t)w), put32(hd + 4, (uint32_t)h);
+    hd[8] = 8, hd[9] = (unsigned char)ct, hd[10] = hd[11] = 0, hd[12] = (unsigned char)interlace;
+    chunk(f, "IHDR", hd, 13);
+    if (ct == 3) chunk(f, "PLTE", pal, (uint32_t)n * 3);
+    if (ct == 3 && trns) chunk(f, "tRNS", trns, (uint32_t)n);
+    chunk(f, "IDAT", z, (uint32_t)zn);
+    chunk(f, "IEND", NULL, 0);
+    fclose(f);
+    free(data), free(z);
+}
+
+static int decode_file(const char *path, const art_limits_t *lim, unsigned char **img, int *w, int *h)
+{
+    FILE *f = fopen(path, "rb");
+    int r = f ? art_decode(f, 0, -1, 204, lim, img, w, h) : -1;
+    if (f) fclose(f);
+    return r;
+}
+
+#define PX(img, w, x, y) ((img) + 3 * ((size_t)(y) * (w) + (x)))
+static int is_rgb(const unsigned char *p, int r, int g, int b) { return p[0] == r && p[1] == g && p[2] == b; }
+#define RGB565(r, g, b) ((uint16_t)((((r) >> 3) << 11) | (((g) >> 2) << 5) | ((b) >> 3)))
+
+static unsigned char *slurp(const char *path, long *n);
+
+static void test_logo(void)
+{
+    char path[600];
+    unsigned char *img = NULL;
+    int w = 0, h = 0;
+    /* RGBA: a transparent corner (black underneath, as editors leave it), a half-clear band, the rest red */
+    enum { W = 64, H = 48 };
+    unsigned char *rgba = calloc(W * H, 4);
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            unsigned char *p = rgba + 4 * (y * W + x);
+            if (x < 16 && y < 16) continue;                       /* 0, 0, 0, 0 */
+            if (y >= 40) { p[0] = 0, p[1] = 0, p[2] = 200, p[3] = 128; continue; }
+            p[0] = 200, p[1] = 10, p[2] = 20, p[3] = 255;
+        }
+    snprintf(path, sizeof path, "%s/logo-rgba.png", g_tmp);
+    write_png_raw(path, rgba, W, H, 6, 0, NULL, NULL, 0);
+    CHECK(decode_file(path, &MATTE, &img, &w, &h) == 0 && w == W && h == H);
+    if (img) {
+        CHECK(is_rgb(PX(img, w, 3, 3), 255, 255, 255));           /* the corner: white */
+        CHECK(is_rgb(PX(img, w, 40, 20), 200, 10, 20));           /* opaque: as it is */
+        CHECK(is_rgb(PX(img, w, 30, 44), 127, 127, 227));         /* half clear: half way to white */
+    }
+    free(img);
+    img = NULL;
+    CHECK(decode_file(path, &H2, &img, &w, &h) == 0);             /* without the matte: its colours as they are */
+    if (img) CHECK(is_rgb(PX(img, w, 3, 3), 0, 0, 0) && is_rgb(PX(img, w, 30, 44), 0, 0, 200));
+    free(img);
+    img = NULL;
+
+    /* grey with alpha */
+    unsigned char *ga = calloc(W * H, 2);
+    for (int i = 0; i < W * H; i++) ga[2 * i] = 60, ga[2 * i + 1] = (unsigned char)(i % W < 8 ? 0 : 255);
+    snprintf(path, sizeof path, "%s/logo-ga.png", g_tmp);
+    write_png_raw(path, ga, W, H, 4, 0, NULL, NULL, 0);
+    CHECK(decode_file(path, &MATTE, &img, &w, &h) == 0);
+    if (img) CHECK(is_rgb(PX(img, w, 2, 10), 255, 255, 255) && is_rgb(PX(img, w, 20, 10), 60, 60, 60));
+    free(img);
+    img = NULL;
+    free(ga);
+
+    /* a palette with a transparent entry (tRNS) */
+    static const unsigned char pal[6] = {9, 9, 9, 0, 120, 240}, trns[2] = {0, 255};
+    unsigned char *idx = calloc(W * H, 1);
+    for (int i = 0; i < W * H; i++) idx[i] = (unsigned char)(i % W >= 32);
+    snprintf(path, sizeof path, "%s/logo-pal.png", g_tmp);
+    write_png_raw(path, idx, W, H, 3, 0, pal, trns, 2);
+    CHECK(decode_file(path, &MATTE, &img, &w, &h) == 0);
+    if (img) CHECK(is_rgb(PX(img, w, 5, 5), 255, 255, 255) && is_rgb(PX(img, w, 50, 5), 0, 120, 240));
+    free(img);
+    img = NULL;
+    CHECK(decode_file(path, &H2, &img, &w, &h) == 0);
+    if (img) CHECK(is_rgb(PX(img, w, 5, 5), 9, 9, 9));
+    free(img);
+    img = NULL;
+    free(idx);
+
+    /* decoded whole (an interlaced PNG, through stb_image): the same. One
+     * pixel, which is laid out the same interlaced or not. */
+    static const unsigned char clear[4] = {0, 0, 0, 0}, solid[4] = {10, 20, 30, 255};
+    snprintf(path, sizeof path, "%s/logo-1.png", g_tmp);
+    write_png_raw(path, clear, 1, 1, 6, 1, NULL, NULL, 0);
+    CHECK(decode_file(path, &MATTE, &img, &w, &h) == 0 && w == 1 && h == 1);
+    if (img) CHECK(is_rgb(img, 255, 255, 255));
+    free(img);
+    img = NULL;
+    CHECK(decode_file(path, &H2, &img, &w, &h) == 0);
+    if (img) CHECK(is_rgb(img, 0, 0, 0));
+    free(img);
+    img = NULL;
+    write_png_raw(path, solid, 1, 1, 6, 1, NULL, NULL, 0);
+    CHECK(decode_file(path, &MATTE, &img, &w, &h) == 0);
+    if (img) CHECK(is_rgb(img, 10, 20, 30));
+    free(img);
+    img = NULL;
+
+    /* a station's logo: the RGBA one above, whole inside each square (64x48:
+     * 136x102 and 34x25, white above and below), its clear corner white */
+    static uint16_t large[LIB_ART_LARGE * LIB_ART_LARGE], small[LIB_ART_SMALL * LIB_ART_SMALL];
+    long n = 0;
+    snprintf(path, sizeof path, "%s/logo-rgba.png", g_tmp);
+    unsigned char *enc = slurp(path, &n);
+    int side = 0;
+    CHECK(enc && library_logo_decode(enc, (size_t)n, large, small, &side) == 0 && side == 48);
+    const uint16_t white = 0xFFFF, red = RGB565(200, 10, 20);
+    CHECK(large[0] == white && large[10 * LIB_ART_LARGE + 60] == white);              /* above the picture */
+    CHECK(large[(LIB_ART_LARGE - 5) * LIB_ART_LARGE + 60] == white);                 /* below it */
+    CHECK(large[20 * LIB_ART_LARGE + 5] == white);                                   /* its clear corner */
+    uint16_t mid = large[60 * LIB_ART_LARGE + 100];                                  /* red (dithered: within a step) */
+    CHECK(abs((mid >> 11) - (red >> 11)) <= 1 && abs(((mid >> 5) & 63) - ((red >> 5) & 63)) <= 1 && abs((mid & 31) - (red & 31)) <= 1);
+    CHECK(large[60 * LIB_ART_LARGE] != white && large[60 * LIB_ART_LARGE + LIB_ART_LARGE - 1] != white);   /* edge to edge across */
+    CHECK(small[0] == white && small[33 * LIB_ART_SMALL + 17] == white && small[17 * LIB_ART_SMALL + 20] != white);
+    memset(small, 0, sizeof small);
+    CHECK(enc && library_logo_decode(enc, (size_t)n, NULL, small, NULL) == 0 && small[0] == white);   /* the small one alone */
+    free(enc);
+    /* a tall one: white at its sides */
+    unsigned char *tall = malloc(40 * 160 * 3);
+    for (int i = 0; i < 40 * 160; i++) tall[3 * i] = 0, tall[3 * i + 1] = 90, tall[3 * i + 2] = 0;
+    snprintf(path, sizeof path, "%s/logo-tall.png", g_tmp);
+    write_png_raw(path, tall, 40, 160, 2, 0, NULL, NULL, 0);
+    enc = slurp(path, &n);
+    CHECK(enc && library_logo_decode(enc, (size_t)n, large, small, &side) == 0 && side == 40);
+    CHECK(large[68 * LIB_ART_LARGE + 10] == white && large[68 * LIB_ART_LARGE + 125] == white && large[68 * LIB_ART_LARGE + 68] != white);
+    CHECK(large[68] != white && large[135 * LIB_ART_LARGE + 68] != white);           /* top to bottom */
+    free(enc);
+    free(tall);
+    /* not a picture; and one over a logo's limits (400,000 pixels decoded) */
+    CHECK(library_logo_decode((const unsigned char *)"<svg xmlns='http://www.w3.org/2000/svg'/>", 41, large, small, &side) == -1);
+    unsigned char *wide = calloc(2000 * 201, 3);
+    snprintf(path, sizeof path, "%s/logo-wide.png", g_tmp);
+    write_png_raw(path, wide, 2000, 201, 2, 0, NULL, NULL, 0);
+    enc = slurp(path, &n);
+    CHECK(enc && library_logo_decode(enc, (size_t)n, large, small, &side) == -1);
+    free(enc);
+    free(wide);
+    free(rgba);
+}
+
 /* ---------- FLAC pictures and the library ---------- */
 
 static void put24(unsigned char *p, uint32_t v) { p[0] = (unsigned char)(v >> 16), p[1] = (unsigned char)(v >> 8), p[2] = (unsigned char)v; }
@@ -653,6 +819,72 @@ static void test_library(void)
         CHECK(album_art(db, "Album D") == 2);
         free(pxa), free(pxb), free(flat), free(flat_expect);
     }
+    /* The covers' store (large.pack, small.pack): no file per album; a cover
+     * from before it (a file per album and size) is read where it is, then
+     * moved in by a scan and its file removed; a slot a power cut left half
+     * written reads as no cover. */
+    {
+        int64_t aa = album_id_of(db, "Album A");
+        size_t ns = (size_t)LIB_ART_SMALL * LIB_ART_SMALL * 2, nl = (size_t)LIB_ART_LARGE * LIB_ART_LARGE * 2;
+        uint16_t *s0 = malloc(ns), *l0 = malloc(nl), *s1 = malloc(ns), *l1 = malloc(nl);
+        char small[700], large[700], olds[700], oldl[700];
+        snprintf(small, sizeof small, "%s/small.pack", art);
+        snprintf(large, sizeof large, "%s/large.pack", art);
+        snprintf(olds, sizeof olds, "%s/%lld-%d.rgb565", art, (long long)aa, LIB_ART_SMALL);
+        snprintf(oldl, sizeof oldl, "%s/%lld-%d.rgb565", art, (long long)aa, LIB_ART_LARGE);
+        lib = library_open(db, art);
+        CHECK(lib && s0 && l0 && s1 && l1 && !library_art_legacy(lib));
+        CHECK(library_art(lib, aa, LIB_ART_SMALL, s0) == 0 && library_art(lib, aa, LIB_ART_LARGE, l0) == 0);
+        CHECK(library_art(lib, 0, LIB_ART_SMALL, s1) == -1 && library_art(lib, aa + 1000, LIB_ART_SMALL, s1) == -1);
+        CHECK(library_art(lib, aa, 77, s1) == -1);                   /* (no such size) */
+        library_close(lib);
+        struct stat pst;
+        CHECK(stat(small, &pst) == 0 && pst.st_size > 0 && stat(large, &pst) == 0 && pst.st_size > 0);
+        CHECK(access(olds, F_OK) != 0);
+        /* as 0.15.1 left it: the files, an empty store */
+        FILE *of = fopen(olds, "wb");
+        CHECK(of && fwrite(s0, 1, ns, of) == ns);
+        if (of) fclose(of);
+        of = fopen(oldl, "wb");
+        CHECK(of && fwrite(l0, 1, nl, of) == nl);
+        if (of) fclose(of);
+        CHECK(truncate(small, 0) == 0 && truncate(large, 0) == 0);
+        lib = library_open(db, art);
+        CHECK(lib && library_art_legacy(lib));
+        CHECK(library_art(lib, aa, LIB_ART_SMALL, s1) == 0 && !memcmp(s0, s1, ns));   /* read where it is */
+        CHECK(library_art(lib, aa, LIB_ART_LARGE, l1) == 0 && !memcmp(l0, l1, nl));
+        CHECK(access(olds, F_OK) == 0);                                              /* (not moved by a look) */
+        CHECK(library_scan(lib, music, NULL, NULL) == 6);                            /* moved in */
+        CHECK(!library_art_legacy(lib) && access(olds, F_OK) != 0 && access(oldl, F_OK) != 0);
+        memset(s1, 0, ns);
+        memset(l1, 0, nl);
+        CHECK(library_art(lib, aa, LIB_ART_SMALL, s1) == 0 && !memcmp(s0, s1, ns));
+        CHECK(library_art(lib, aa, LIB_ART_LARGE, l1) == 0 && !memcmp(l0, l1, nl));
+        library_close(lib);
+        /* a slot cut half way: its last bytes never written */
+        int fd = open(large, O_RDWR);
+        off_t at = (off_t)aa * (off_t)(8 + nl) + 8 + (off_t)nl - 64;
+        char zeros[64] = {0};
+        l0[nl / 2 - 1] ^= 0x5555;                                    /* (so they weren't zeros already) */
+        CHECK(fd >= 0 && pwrite(fd, &l0[nl / 2 - 32], 64, at) == 64 && pwrite(fd, zeros, 32, at) == 32);
+        if (fd >= 0) close(fd);
+        lib = library_open(db, art);
+        CHECK(lib && library_art(lib, aa, LIB_ART_LARGE, l1) == -1);
+        CHECK(library_art(lib, aa, LIB_ART_SMALL, s1) == 0);         /* (the other is whole) */
+        library_close(lib);
+        /* ...put right for the tests that follow: the album looked at again */
+        {
+            sqlite3 *rdb = NULL;
+            CHECK(sqlite3_open(db, &rdb) == SQLITE_OK &&
+                  sqlite3_exec(rdb, "UPDATE albums SET art=0, art_sig=0 WHERE title='Album A'", NULL, NULL, NULL) == SQLITE_OK);
+            sqlite3_close(rdb);
+        }
+        lib = library_open(db, art);
+        CHECK(lib && library_needs_art(lib) && library_scan(lib, music, NULL, NULL) == 6);
+        CHECK(library_art(lib, aa, LIB_ART_LARGE, l1) == 0);
+        library_close(lib);
+        free(s0), free(l0), free(s1), free(l1);
+    }
     /* D removed, then a coverless E: E takes D's id (the highest), and mustn't
      * show D's cover (its thumbnails go with it) */
     int64_t did = album_id_of(db, "Album D");
@@ -796,6 +1028,7 @@ int main(void)
     (void)BIG;
     test_jpeg();
     test_png();
+    test_logo();
     test_library();
     rm_tree(g_tmp);
     if (failures) { fprintf(stderr, "%d failures\n", failures); return 1; }

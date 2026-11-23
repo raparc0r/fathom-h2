@@ -77,6 +77,24 @@ int main(void)
     CHECK(unit[1] && unit[1] == unit[2] && unit[2] == unit[3]);   /* the suite, together */
     CHECK(unit[4] == 0);                                          /* a lone prefix */
     CHECK(unit[5] == 0 && unit[6] == 0 && unit[7] == 0);          /* split by another track */
+    /* the same songs asked for by id, in another order (a playlist shuffled
+     * without reading the whole library): the same rows, the same works; one
+     * that's gone comes back as its id alone */
+    int64_t ids[N + 1];
+    shuf_track_t by[N + 1];
+    for (int i = 0; i < n; i++) ids[i] = t[n - 1 - i].id;
+    ids[n] = 99999;
+    CHECK(library_shuffle_tracks_for(lib, ids, n + 1, by) == n + 1);
+    for (int i = 0; i < n; i++) CHECK(!memcmp(&by[i], &t[n - 1 - i], sizeof by[i]));
+    CHECK(by[n].id == 99999 && by[n].album == 0 && by[n].duration_ms == 0 && by[n].unit == 0);
+    /* a few of them only: works among those asked for (two parts of the suite still go together) */
+    int64_t two[2] = {0, 0};
+    for (int i = 0; i < n; i++) {
+        if (t[i].track == 1) two[0] = t[i].id;
+        if (t[i].track == 3) two[1] = t[i].id;
+    }
+    CHECK(library_shuffle_tracks_for(lib, two, 2, by) == 2 && by[0].unit && by[0].unit == by[1].unit);
+    CHECK(library_top_track(lib) >= N);
     free(t);
     library_close(lib);
 

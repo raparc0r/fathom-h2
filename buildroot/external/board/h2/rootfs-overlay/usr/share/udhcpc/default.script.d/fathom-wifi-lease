@@ -12,11 +12,26 @@
 # instead (SIGUSR2: released, no timer at all); fathom-wifi status wakes it
 # (SIGUSR1) once a network is joined. (udhcpc reads the signal once this script
 # is done.)
+#
+# And name lookups that give up sooner and ask more often: the C library waits
+# 5 s in all for an answer, asking again only once, after 2.5 s. With this
+# line it asks every second and gives up after 3: one lost packet costs a
+# second, not two and a half, and a name server that doesn't answer half of a
+# question (some never answer for IPv6 addresses) costs 3 s, not 5. udhcpc's
+# own script rewrites only the lines it marks "# wlan0" (the name servers), so
+# the line is put in once and stays.
 [ "$interface" = wlan0 ] || exit 0
 RUN=/var/run/fathom-wifi
 CARRIER=/sys/class/net/wlan0/carrier       # 1 while a network is joined
+RESOLV=/etc/resolv.conf
+OPTIONS="options timeout:3 attempts:3"
 case "$1" in
-bound|renew) s=$(/usr/sbin/fathom-wifi ssid); [ -n "$s" ] && printf '%s\n' "$s" > $RUN/lease-ssid ;;
+bound|renew)
+    s=$(/usr/sbin/fathom-wifi ssid); [ -n "$s" ] && printf '%s\n' "$s" > $RUN/lease-ssid
+    have=
+    while IFS= read -r l; do [ "$l" = "$OPTIONS" ] && have=1; done 2>/dev/null < $RESOLV
+    [ -n "$have" ] || echo "$OPTIONS" >> $RESOLV
+    ;;
 deconfig|nak) rm -f $RUN/lease-ssid ;;
 leasefail)
     rm -f $RUN/lease-ssid

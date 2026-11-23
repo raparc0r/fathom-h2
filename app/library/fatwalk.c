@@ -101,6 +101,17 @@ static void short_name(const uint8_t *e, char *out, size_t cap)
 
 static void walk_dir(fw_t *f, uint32_t cluster, const char *path, int depth);
 
+#define DIR_PIECE 4096
+
+static fatwalk_entry_fn g_entry_fn;
+static void *g_entry_ctx;
+
+void fatwalk_set_entry_hook(fatwalk_entry_fn fn, void *ctx)
+{
+    g_entry_fn = fn;
+    g_entry_ctx = ctx;
+}
+
 /* Read a directory (all its clusters) into memory; caller frees. */
 static uint8_t *read_dir(fw_t *f, uint32_t cluster, size_t *len)
 {
@@ -111,12 +122,41 @@ static uint8_t *read_dir(fw_t *f, uint32_t cluster, size_t *len)
         uint8_t *nb = realloc(buf, n + f->cluster_bytes);
         if (!nb) break;
         buf = nb;
-        if (rd(f, (uint64_t)(f->data_start + (cluster - 2) * f->spc) * f->bps, buf + n, f->cluster_bytes)) break;
+        /* A piece at a time, up to the entry that ends the folder: an album's
+         * dozen files take a kilobyte or two of a 32 KB cluster, and reading
+         * all of it, for each of thousands of folders, was most of a walk. */
+        uint64_t at = (uint64_t)(f->data_start + (cluster - 2) * f->spc) * f->bps;
+        uint32_t got = 0;
+        int ended = 0, bad = 0;
+        while (got < f->cluster_bytes && !ended) {
+            uint32_t piece = f->cluster_bytes - got < DIR_PIECE ? f->cluster_bytes - got : DIR_PIECE;
+            if (rd(f, at + got, buf + n + got, piece)) { bad = 1; break; }
+            for (uint32_t o = 0; o + 32 <= piece; o += 32)
+                if (buf[n + got + o] == 0x00) { ended = 1; break; }
+            got += piece;
+        }
+        if (bad) break;
+        if (got < f->cluster_bytes) memset(buf + n + got, 0, f->cluster_bytes - got);   /* (past its end: none) */
         n += f->cluster_bytes;
+        if (ended) break;
         cluster = next_cluster(f, cluster);
     }
     *len = n;
     return buf;
+}
+
+/* A folder's subfolders, gone into once its own files are given, in name
+ * order: files then reach the caller in nearly the order of their paths
+ * whatever order the folders were made in (the library keeps the names it's
+ * given in blocks and lets a block go once the scan is past it: with folders
+ * in the card's own order, a block held names from all over the alphabet and
+ * none could go before the end). And the folder's own entries (a cluster,
+ * 32 KB) aren't held while its subfolders are read. */
+typedef struct { char *name; uint32_t cluster; } subdir_t;
+
+static int cmp_subdir(const void *a, const void *b)
+{
+    return strcmp(((const subdir_t *)a)->name, ((const subdir_t *)b)->name);
 }
 
 static void walk_dir(fw_t *f, uint32_t cluster, const char *path, int depth)
@@ -125,6 +165,8 @@ static void walk_dir(fw_t *f, uint32_t cluster, const char *path, int depth)
     size_t len;
     uint8_t *d = read_dir(f, cluster, &len);
     if (!d) return;
+    subdir_t *sub = NULL;
+    int nsub = 0, capsub = 0;
     uint16_t lfn[20 * 13 + 1];
     int lfn_n = -1;               /* pieces expected; -1 = none collected */
     uint8_t lfn_sum = 0;
@@ -165,15 +207,34 @@ static void walk_dir(fw_t *f, uint32_t cluster, const char *path, int depth)
         snprintf(p, sizeof p, "%s/%s", path, name);
         uint32_t c = (uint32_t)(e[20] | e[21] << 8) << 16 | (uint32_t)(e[26] | e[27] << 8);
         if (e[11] & 0x10) {
-            walk_dir(f, c, p, depth + 1);
+            if (nsub == capsub) {
+                int nc = capsub ? capsub * 2 : 32;
+                subdir_t *ns = realloc(sub, (size_t)nc * sizeof *ns);
+                if (!ns) { walk_dir(f, c, p, depth + 1); continue; }   /* (no memory to note it: gone into now) */
+                sub = ns;
+                capsub = nc;
+            }
+            if ((sub[nsub].name = strdup(name))) sub[nsub++].cluster = c;
+            else walk_dir(f, c, p, depth + 1);
         } else {
             uint32_t size;
             memcpy(&size, e + 28, 4);
             int64_t mt = fat_time((uint16_t)(e[24] | e[25] << 8), (uint16_t)(e[22] | e[23] << 8));
+            if (g_entry_fn) g_entry_fn(p, c, c >= 2 && c - 2 < f->nclusters ? next_cluster(f, c) : 0xFFFFFFFFu, size, g_entry_ctx);
             if (f->cb(p, mt, size, f->ctx)) f->stop = 1;
         }
     }
     free(d);
+    if (nsub > 1) qsort(sub, (size_t)nsub, sizeof *sub, cmp_subdir);
+    for (int i = 0; i < nsub; i++) {
+        if (!f->stop) {
+            char p[2048];
+            snprintf(p, sizeof p, "%s/%s", path, sub[i].name);
+            walk_dir(f, sub[i].cluster, p, depth + 1);
+        }
+        free(sub[i].name);
+    }
+    free(sub);
 }
 
 /* The first cluster of `name` in the directory at `cluster`, or 0. */
@@ -219,6 +280,9 @@ int fatwalk(const char *dev, const char *mount, const char *rel, fatwalk_cb cb, 
 {
     fw_t f = {.fd = open(dev, O_RDONLY | O_CLOEXEC), .fat_sec_no = -1, .cb = cb, .ctx = ctx};
     if (f.fd < 0) return -1;
+#ifdef POSIX_FADV_RANDOM
+    posix_fadvise(f.fd, 0, 0, POSIX_FADV_RANDOM);   /* (folders lie all over the card: nothing read ahead) */
+#endif
     uint8_t bs[512];
     int rc = -1;
     if (rd(&f, 0, bs, sizeof bs) || bs[510] != 0x55 || bs[511] != 0xaa || memcmp(bs + 82, "FAT32", 5)) goto out;

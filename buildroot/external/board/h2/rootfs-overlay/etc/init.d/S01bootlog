@@ -2,16 +2,79 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Additional terms under GPLv3 section 7: see LICENSE.
 #
-# Fathom bring-up: write a boot report to the microSD card, then turn the blue
-# LED solid. LED heartbeat = kernel running; solid = report saved.
+# Fathom bring-up: mount the microSD card, and write a boot report to it, then
+# turn the blue LED solid for 5 s, then off. LED heartbeat = kernel running;
+# solid = report saved; off after that = all as it should be.
 # Writes only to /fathom/ on the card.
+#
+# The start-up waits for the card, its mount and the reason for the start
+# only. The report (five files moved along, 60 to 80 KB written, a sync) is
+# written in the background at nice 19, 8 s later, when the player is up: it
+# was 0.3 to 0.5 s of every start-up before the player could begin.
+#   S01bootlog start          at start-up (rcS)
+#   S01bootlog report RSR     the report, started by the above
 
 case "$1" in
-    start) ;;
+    start|report) ;;
     *) exit 0 ;;
 esac
 
-. /usr/lib/fathom/card.sh               # (card_disk, card_mount)
+. /usr/lib/fathom/card.sh               # (card_disk, card_mount, card_mounted, now_cs, BOOTLOG_BUSY)
+
+# The report. It mustn't keep the card busy for whoever unmounts it (USB drive
+# mode): while it's written a mark says so, and fathom-usbdisk waits for the
+# mark to go (card_report_done). With the card gone when its time comes (lent,
+# taken out, the H2 switching off) there's no report: nothing is ever written
+# to the RAM under the mount point (the folder is only made at start-up, on
+# the card).
+if [ "$1" = report ]; then
+    rsr=$2
+    saved=
+    sleep 8
+    : > $BOOTLOG_BUSY
+    if card_mounted && [ -d /mnt/sd/fathom ]; then
+        # The last five start-ups: boot-1.log is this one, boot-5.log the oldest
+        for f in /mnt/sd/fathom/boot-*.log; do
+            n=${f##*/boot-}; n=${n%.log}
+            [ "$n" -ge 5 ] 2>/dev/null && rm -f "$f"
+        done
+        for n in 4 3 2 1; do
+            [ -e "/mnt/sd/fathom/boot-$n.log" ] && mv "/mnt/sd/fathom/boot-$n.log" "/mnt/sd/fathom/boot-$((n + 1)).log"
+        done
+        log=/mnt/sd/fathom/boot-1.log
+        {
+            echo "== Fathom start-up log (boot-1.log is the newest)"
+            uname -a
+            echo "cmdline: $(cat /proc/cmdline)"
+            echo "start: $(cat /tmp/fathom-reset) (RSR ${rsr:-?})"
+            # (the figures below are from then, with the player running: not from before it began)
+            echo "written: $(cut -d' ' -f1 /proc/uptime) s after the kernel started"
+            echo; echo "== dmesg"; dmesg
+            echo; echo "== cpuinfo"; cat /proc/cpuinfo
+            echo; echo "== meminfo"; cat /proc/meminfo
+            echo; echo "== interrupts"; cat /proc/interrupts
+            echo; echo "== platform devices"; ls /sys/bus/platform/devices
+            # (no clocks or GPIO: they need debugfs, out of the kernel since
+            # 2026-11-18 for its memory; a kernel built with it again would need
+            # it mounted on /sys/kernel/debug first)
+            for f in /sys/fs/pstore/*; do [ -f "$f" ] && { echo; echo "== pstore: $f"; cat "$f"; }; done
+        } > "$log" 2>&1
+        sync
+        saved=1
+    fi
+    rm -f $BOOTLOG_BUSY
+    # The report saved: the LED solid for 5 s, then off. (It used to stay on
+    # for as long as the H2 did: a lit LED, for nothing, all day.) No report:
+    # left as the kernel has it, the heartbeat.
+    if [ -n "$saved" ]; then
+        echo none > /sys/class/leds/blue/trigger
+        echo 1 > /sys/class/leds/blue/brightness
+        sleep 5
+        echo 0 > /sys/class/leds/blue/brightness
+    fi
+    exit 0
+fi
+
 mkdir -p /mnt/sd
 mount -t pstore pstore /sys/fs/pstore 2>/dev/null
 
@@ -25,41 +88,63 @@ if [ $(( ${rsr:-0} & 3 )) -eq 2 ]; then echo restart; else echo power-on; fi > /
 
 # The card in the microSD slot, by its slot (card_disk: before the device tree
 # numbered the slots, now and then Wi-Fi's came first and the card was mmcblk1,
-# and this waited 10 s for mmcblk0 and gave up)
-for i in 1 2 3 4 5 6 7 8 9 10; do
+# and this waited 10 s for mmcblk0 and gave up). Looked for every 0.05 s: the
+# disk is there about 90 ms after init starts, and looking once a second lost
+# a whole second whenever the first look came just before it. A card slow to
+# answer still has its 10 s; an empty slot is given up on after 3 s, so
+# "No card" is said in 3 s, not 11. Empty: nothing has answered on the slot's
+# bus (a card shows there as mmc0:xxxx before its disk does). The slot's host
+# is mmc0 since the device tree numbers them; if it isn't, 10 s as before.
+# The 3 and the 10 s are by the clock (each look costs a sleep run, some
+# milliseconds more than the 0.05 s asked), and by the number of looks should
+# the clock not be readable.
+slot=/sys/class/mmc_host/mmc0
+case "$(readlink -f $slot 2>/dev/null)" in */13450000.mmc/*) ;; *) slot= ;; esac
+slot_empty() {
+    [ -n "$slot" ] || return 1
+    for c in $slot/mmc0:*; do [ -e "$c" ] && return 1; done
+    return 0
+}
+now_cs; t0=$cs
+i=0
+while [ $i -lt 200 ]; do
     disk=$(card_disk) && [ -b /dev/$disk ] && break
-    sleep 1
+    now_cs; t=$((cs - t0))
+    [ $t -ge 1000 ] && break
+    { [ $t -ge 300 ] || [ $i -ge 60 ]; } && slot_empty && break
+    sleep 0.05
+    i=$((i + 1))
 done
-[ -b /dev/${disk}p1 ] || sleep 1     # (the partition shows up just after the disk)
+# (the partition shows up just after the disk: 0.3 s for it, and a card with
+# no partition table, which never has one, costs no more than that)
+if [ -n "$disk" ]; then
+    for i in 1 2 3 4 5 6; do
+        [ -b /dev/${disk}p1 ] && break
+        sleep 0.05
+    done
+fi
 
+# The card stays mounted: the player runs from /mnt/sd/fathom (S90fathom).
 if card_mount "$disk" > /dev/null; then
-    mkdir -p /mnt/sd/fathom
-    # The last five start-ups: boot-1.log is this one, boot-5.log the oldest
-    for f in /mnt/sd/fathom/boot-*.log; do
-        n=${f##*/boot-}; n=${n%.log}
-        [ "$n" -ge 5 ] 2>/dev/null && rm -f "$f"
-    done
-    for n in 4 3 2 1; do
-        [ -e "/mnt/sd/fathom/boot-$n.log" ] && mv "/mnt/sd/fathom/boot-$n.log" "/mnt/sd/fathom/boot-$((n + 1)).log"
-    done
-    log=/mnt/sd/fathom/boot-1.log
-    {
-        echo "== Fathom start-up log (boot-1.log is the newest)"
-        uname -a
-        echo "cmdline: $(cat /proc/cmdline)"
-        echo "start: $(cat /tmp/fathom-reset) (RSR ${rsr:-?})"
-        echo; echo "== dmesg"; dmesg
-        echo; echo "== cpuinfo"; cat /proc/cpuinfo
-        echo; echo "== meminfo"; cat /proc/meminfo
-        echo; echo "== interrupts"; cat /proc/interrupts
-        echo; echo "== platform devices"; ls /sys/bus/platform/devices
-        # (no clocks or GPIO: they need debugfs, out of the kernel since
-        # 2026-11-18 for its memory; a kernel built with it again would need
-        # it mounted on /sys/kernel/debug first)
-        for f in /sys/fs/pstore/*; do [ -f "$f" ] && { echo; echo "== pstore: $f"; cat "$f"; }; done
-    } > "$log" 2>&1
-    sync
-    # The card stays mounted: the player runs from /mnt/sd/fathom (S90fathom).
-    echo none > /sys/class/leds/blue/trigger
-    echo 1 > /sys/class/leds/blue/brightness
+    [ -d /mnt/sd/fathom ] || mkdir -p /mnt/sd/fathom
+    # The player and what its first screen is drawn with, read ahead while
+    # the scripts after this one run (about a second, mostly waiting on
+    # nothing the card does): the player then starts from memory. It read
+    # them itself as it went, a piece at each page it first touched: 50
+    # waits on the card, 0.2 s of a start to Home measured at 0.7 s. One
+    # pass in order here, in the background; not there, nothing is read.
+    # Also what it reads and looks for first: its settings and queue, the
+    # start of its library, and the folders it looks in to see whether Wi-Fi,
+    # the network drive and Bluetooth are on the card (0.15 s of its start
+    # was those three looks, each a folder or three read from the card).
+    (
+        F=/mnt/sd/fathom
+        cat $F/bin/fathom-player $F/assets/logo.png $F/assets/themes/*.theme $F/assets/fonts/*.ttf \
+            $F/settings.ini $F/queue.txt $F/queue.txt.pos > /dev/null 2>&1
+        [ -x $F/wifi/usr/sbin/wpa_supplicant ]
+        [ -x $F/share/usr/sbin/lighttpd ]
+        [ -d $F/bt ]
+        head -c 262144 $F/library.db > /dev/null 2>&1
+    ) &
+    nice -n 19 sh "$0" report "$rsr" > /dev/null 2>&1 &
 fi

@@ -33,6 +33,8 @@ static int back_down;            /* Back held: long-press pending */
 static uint32_t back_since;
 static int back_long_fired;
 static int power_down, power_off_fired;
+static int screen_on = 1;        /* as the caller last said (input_set_screen) */
+static int power_woke;           /* Power went down with the screen off: said on the press, not the release */
 static int menu_down, menu_long_fired, menu_chord;   /* Menu held; quick settings sent; wheel turned */
 static uint32_t menu_since;
 static int track_key;             /* Prev/Next held: UI_KEY_PREV or UI_KEY_NEXT, -1 if none */
@@ -101,6 +103,8 @@ void input_jacks(int *hp, int *lo)
     *hp = jack_hp;
     *lo = jack_lo;
 }
+
+void input_set_screen(int on) { screen_on = on; }
 
 /* Opens /dev/input/<node> unless it's open already. BlueZ makes one device per
  * pair of headphones, "<name> (AVRCP)", for the buttons on them. */
@@ -191,11 +195,20 @@ static void on_key(int code, int value, uint32_t now)
         }
         break;
     }
-    case KEY_POWER:     /* short press: screen on/off; held 2 s: power off */
-        if (press) { power_down = 1; power_since = now; power_off_fired = 0; }
-        else if (power_down) {
+    case KEY_POWER:
+        /* Short press: screen on/off; held 2 s: power off. Off is said on
+         * the release, so that holding it for power-off doesn't blank the
+         * screen first. On is said on the press: nothing to wait for with
+         * the screen dark, and the release came 80 to 200 ms later, all of it
+         * added to every wake. That press's release then says nothing. */
+        if (press) {
+            power_down = 1; power_since = now; power_off_fired = 0;
+            power_woke = !screen_on;
+            if (power_woke) push(IN_POWER, 0);
+        } else if (power_down) {
             power_down = 0;
-            if (!power_off_fired) push(IN_POWER, 0);
+            if (!power_off_fired && !power_woke) push(IN_POWER, 0);
+            power_woke = 0;
         }
         break;
     case KEY_BACK:

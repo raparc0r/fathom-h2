@@ -21,6 +21,7 @@
 #include "library/playlist.h"
 #include "core/rng.h"
 #include "net/radiodir.h"
+#include "net/radioicon.h"
 #include "net/podcast.h"
 #include "net/podsync.h"
 #include "net/coverfind.h"
@@ -81,8 +82,18 @@ static const char *const HOME_ID[] = {"nowplaying", "shuffle", "search", "albums
 enum { H_NOWPLAYING, H_SHUFFLE, H_SEARCH, H_ALBUMS, H_ARTISTS, H_ALBUM_ARTISTS, H_SONGS, H_PLAYLISTS,
        H_FAVOURITES, H_RECENT_ADDED, H_HISTORY, H_RADIO, H_SETTINGS, H_GENRES, H_COMPOSERS, H_YEARS, H_FOLDERS,
        H_PODCASTS, H_N };
-/* Hidden until shown in Settings > Home (fewer people tag them) */
-static int home_hidden_by_default(int h) { return h == H_COMPOSERS || h == H_YEARS; }
+/* Hidden until shown in Settings > Home (fewer people tag them); on a fresh
+ * install also Genres and Folders, for a shorter Home (ui_set_new_install) */
+static int g_new_install;
+static int home_hidden_by_default(int h)
+{
+    return h == H_COMPOSERS || h == H_YEARS || (g_new_install && (h == H_GENRES || h == H_FOLDERS));
+}
+
+void ui_set_new_install(int on) { g_new_install = on; }
+static int g_music_missing;
+void ui_set_music_missing(int missing) { g_music_missing = missing; }
+static void home_save(void);
 /* Their icons: Tabler Icons code points (player-play, arrows-shuffle, search,
  * disc, microphone-2, users, music, playlist, heart, clock-plus, history,
  * radio, settings; then category, feather, calendar, folder), and Pixel Pastel's own, drawn on its 10 px grid (pixel_icons.h,
@@ -313,6 +324,7 @@ static struct {
     lv_obj_t *row_cov[SLOTS];       /* Albums: each album's cover, the library's 34 px thumbnail */
     lv_image_dsc_t cov_dsc[SLOTS];  /* (their pixels: g_cov, only while Albums is shown) */
     int64_t cov_id[SLOTS];          /* the album each slot shows (-1: to be read) */
+    unsigned char cov_has[SLOTS];   /* ...and whether it has a picture (Podcasts: a show without one shows an icon) */
     lv_obj_t *row_wheel[SLOTS], *row_ch[SLOTS][3];   /* the typing row: letter before, the wheel's (larger), after */
     int slot_item[SLOTS], slot_playing[SLOTS];
     int slot_accent[SLOTS];   /* drawn in the theme's accent colour (Home's Update available!) */
@@ -328,8 +340,9 @@ static struct {
     char about_lbl[ABOUT_MAX][32], about_val[ABOUT_MAX][48];
     dt_t clk;               /* About > Clock: the date and time being set */
     lv_obj_t *clk_ov;       /* ...on its own screen, over everything */
-    /* "Turn on Wi-Fi?" answered Turn on: what to do once it connects, if
-     * the screen it was asked from is still there (wifi_then_run) */
+    /* "Turn on Wi-Fi?" answered Turn on, or something asked for while Wi-Fi
+     * was still joining: what to do once it connects, if the screen it was
+     * asked from is still there (wifi_then_run) */
     struct {
         int what, armed, depth, sel, q_null;
         list_kind_t kind;
@@ -379,7 +392,11 @@ static struct {
     /* Radio: the stations on the card (-1: no fathom/radio.txt) */
     radio_station_t radio[RADIO_MAX];
     int radio_n;
+    int64_t radio_key[RADIO_MAX];   /* each one's picture in the list's cache (COV_RADIO | its icon's id; -1: no icon) */
     int radio_art;          /* art_px holds the radio's cover */
+    int radio_logo;         /* ...or, the song having none, the station's logo: */
+    char logo_id[13];       /* the icon read for it, or tried ("?": to be read again) */
+    unsigned logo_seq, ricon_seq;   /* the icons on the card as last looked at (ricon_seq), for it and for the list */
     /* Find stations (net/radiodir.h): the request running (RD_JOB_*) for the
      * level at rd_job_depth; the open list's stations (Results, Search) and its
      * query; the countries; how the last request for the list went; the
@@ -400,6 +417,10 @@ static struct {
      * one downloads, unpacks or installs (NULL: not shown) */
     ui_update_t upd;
     lv_obj_t *upd_ov, *upd_title, *upd_bar, *upd_detail, *upd_hint;
+    lv_obj_t *scan_ov, *scan_step, *scan_count, *scan_left, *scan_file;   /* Rescan's progress (ui_show_scan) */
+    lv_timer_t *scan_timer;
+    int scan_was;           /* the step shown (-1: none yet) */
+    uint32_t scan_t0, scan_left_at;
     lv_obj_t *wn_ov, *wn_body, *wn_hint;   /* What's new: the panel, its points, the hint */
     lv_obj_t *wn_row[16];     /* ...each point (the wheel moves through them a whole point at a time) */
     int wn_h[16], wn_n, wn_first, wn_last;
@@ -652,11 +673,13 @@ static void home_load(void)
         S.home_hidden[h] = home_hidden_by_default(h);
         n++;
     }
+    /* a fresh install's shorter Home, kept (from the next start it's no longer new) */
+    if (g_new_install && !settings_get("home.items", "")[0]) home_save();
     home_rebuild();
 }
 
-/* Settings > Home changed something: keep it, and keep Home's selection valid. */
-static void home_changed(void)
+/* home.items: Home's items in order, "-" before a hidden one */
+static void home_save(void)
 {
     char buf[512] = "";
     size_t w = 0;
@@ -664,8 +687,14 @@ static void home_changed(void)
         int h = S.home_order[i];
         w += (size_t)snprintf(buf + w, sizeof buf - w, "%s%s%s", i ? "," : "", S.home_hidden[h] ? "-" : "", HOME_ID[h]);
     }
-    int was = S.stack[0].sel < S.home_n ? S.home[S.stack[0].sel] : H_SETTINGS;
     settings_set("home.items", buf);
+}
+
+/* Settings > Home changed something: keep it, and keep Home's selection valid. */
+static void home_changed(void)
+{
+    int was = S.stack[0].sel < S.home_n ? S.home[S.stack[0].sel] : H_SETTINGS;
+    home_save();
     home_rebuild();
     int sel = 0;
     for (int i = 0; i < S.home_n; i++)
@@ -761,12 +790,13 @@ static void uninstall_look(void)
 
 /* About's rows: the device's, then Check for updates and Check automatically
  * (with updates), Uninstall Fathom (when it can), Reset all settings. */
-enum { AB_INFO, AB_WHATSNEW, AB_CHECK, AB_AUTO, AB_UNINSTALL, AB_RESET };
+enum { AB_INFO, AB_WHATSNEW, AB_TIPS, AB_CHECK, AB_AUTO, AB_UNINSTALL, AB_RESET };
 static int about_row(int i)
 {
     if (i < S.about_n) return AB_INFO;
     i -= S.about_n;
     if (S.wn_text[0] && i-- == 0) return AB_WHATSNEW;   /* (a release's: not in builds of my own) */
+    if (i-- == 0) return AB_TIPS;                       /* (the welcome's) */
     if (S.hooks.update_do) {
         if (i < 2) return i == 0 ? AB_CHECK : AB_AUTO;
         i -= 2;
@@ -859,7 +889,7 @@ static int list_count(const level_t *l)
     }
     case L_ABOUT:
         about_look();
-        return S.about_n + (S.wn_text[0] != 0) + 2 * (S.hooks.update_do != NULL) + (S.hooks.uninstall_do != NULL) + 1;   /* about_row */
+        return S.about_n + (S.wn_text[0] != 0) + 1 + 2 * (S.hooks.update_do != NULL) + (S.hooks.uninstall_do != NULL) + 1;   /* about_row */
     case L_UNINSTALL: uninstall_look(); return uninstall_rows();
     case L_UPDATE: update_look(); return S.upd.state == UI_UPD_AVAILABLE || S.upd.state == UI_UPD_FAILED ? 2 : 1;
     case L_BATTERY: return 3;                      /* the graph's range, since full charge, history */
@@ -1060,10 +1090,24 @@ static void push_as(list_kind_t kind, const char *title, int64_t parent, int ui)
 /* A level titled with a name (an album, an artist, a device) */
 static void push(list_kind_t kind, const char *title, int64_t parent) { push_as(kind, title, parent, 0); }
 /* A level titled with the UI's own words ("Albums", "Settings"): translated */
+/* Settings > Library's counts: read as it opens, and again when the library
+ * changes under it (a rescan's end shows it) */
+static void lib_counts_load(void)
+{
+    static const lib_view_t v[4] = {LIB_SONGS, LIB_ALBUMS, LIB_ARTISTS, LIB_PLAYLISTS};
+    for (int i = 0; S.lib && i < 4; i++) {
+        lib_list_t tmp;
+        S.lib_counts[i] = library_list(S.lib, v[i], 0, &tmp);
+        library_list_free(&tmp);
+    }
+}
+
 static void push_ui(list_kind_t kind, const char *title, int64_t parent) { push_as(kind, title, parent, 1); }
 static void about_look(void);
-enum { WT_NONE, WT_OK, WT_RDIR };   /* once Wi-Fi connects: nothing, OK again, ask the directory again */
+/* once Wi-Fi connects: nothing, OK again, ask the directory again, search for the podcast typed */
+enum { WT_NONE, WT_OK, WT_RDIR, WT_POD_SEARCH };
 static int wifi_ask_if_off(int then);
+static void pod_search_run(void);
 static void open_selected(void);
 
 /* Opens the editor on a profile; it plays while it's being edited. */
@@ -1277,7 +1321,21 @@ static void setting_row(setting_t st, int editing, char *main, size_t mn, char *
         snprintf(main, mn, "%s", tr("Speed"));
         pod_speed_text(S.player ? player_speed(S.player) : settings_get_int("podcasts.speed", 100), meta, tn);
         break;
-    case ST_RESCAN: snprintf(main, mn, "%s", tr("Rescan the music folder")); break;
+    case ST_RESCAN: {
+        snprintf(main, mn, "%s", tr("Rescan the music folder"));
+        ui_scan_t p;   /* (one running: how far, every second) */
+        if (S.hooks.scan_progress && S.hooks.scan_progress(&p)) {
+            char d[16], t[16];
+            snprintf(d, sizeof d, "%d", p.done);
+            snprintf(t, sizeof t, "%d", p.total);
+            int covers = p.step == UI_SCAN_COVERS;
+            if (covers && p.total > 0 && p.done <= p.total) tr_fill(meta, tn, "Covers %s of %s", d, t);
+            else if (covers) snprintf(meta, tn, "%s", tr("Covers"));
+            else if (p.step == UI_SCAN_SONGS && p.total > 0 && p.done < p.total) tr_fill(meta, tn, "%s of %s", d, t);
+            else snprintf(meta, tn, "%s", tr("Working"));
+        }
+        break;
+    }
     case ST_FIND_COVERS: {
         cf_batch_t b;
         cf_batch_status(&b);
@@ -1433,6 +1491,27 @@ static void search_run(void)
 }
 
 /* ---------- the station directory: what the lists show ---------- */
+
+/* Your stations as the card has them now (-1: none can be read), and their
+ * icons: each one's place in the list's cache, and those not on the card yet
+ * fetched meanwhile if the network's up (never a directory list's: only
+ * stations of yours). */
+#define COV_RADIO (1LL << 61)   /* (with COV_POD, below) */
+#define COV_KEY_BITS 0xFFFFFFFFFFFFLL
+static void thumbs_reset(int64_t tag);
+static void radio_read(void)
+{
+    S.radio_n = S.hooks.radio_stations ? S.hooks.radio_stations(S.radio, RADIO_MAX) : -1;
+    for (int i = 0; i < S.radio_n && i < RADIO_MAX; i++) {
+        char id[13];
+        ricon_id(S.radio[i].icon, id);
+        S.radio_key[i] = id[0] ? COV_RADIO | (int64_t)(strtoull(id, NULL, 16) & COV_KEY_BITS) : -1;
+    }
+    char why[96];
+    int net = !S.hooks.radio_ready || S.hooks.radio_ready(why, sizeof why) == 0;
+    ricon_sync(S.radio, S.radio_n, net);
+    thumbs_reset(COV_RADIO);
+}
 
 /* This station is the one playing (or connecting). */
 static int rd_on_air(const radio_station_t *st)
@@ -1617,7 +1696,7 @@ static void battery_row(list_kind_t k, int i, char *main, size_t mn, char *meta,
     if (k == L_BATTERY) {
         if (i == 0) {
             snprintf(main, mn, "%s", S.bat_days == 7 ? "Last 7 days" : "Last 24 hours");
-            snprintf(meta, tn, "%s", S.bat_days == 7 ? "Play: 24 hours" : "Play: 7 days");
+            snprintf(meta, tn, "%s", S.bat_days == 7 ? "<Play>: 24 hours" : "<Play>: 7 days");
         } else if (i == 1) {
             snprintf(main, mn, "Since full charge");
             fmt_dur(d, sizeof d, S.bat.since.on_s);
@@ -2114,7 +2193,7 @@ static void pod_episode_row(int i, char *main, size_t mn, char *meta, size_t tn,
         podsync_status_t st;
         podsync_status(&st);
         snprintf(main, mn, "%s", tr(st.refreshing ? "Reading its episodes\xE2\x80\xA6"
-                                    : s->refreshed ? "No episodes" : "Menu: Check for new episodes"));
+                                    : s->refreshed ? "No episodes" : "<Menu>: Check for new episodes"));
         return;
     }
     const pod_episode_t *e = &S.pod_eps[i];
@@ -2488,6 +2567,7 @@ static void battery_load(void)
 }
 
 static int covers_in(list_kind_t k);
+static int thumbs_in(list_kind_t k);
 
 static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta, size_t tn, int *playing)
 {
@@ -2701,6 +2781,7 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
             snprintf(main, mn, "%s", tr("What's new"));
             snprintf(meta, tn, "%s", S.wn_ver);
             break;
+        case AB_TIPS: snprintf(main, mn, "%s", tr("Tips")); break;
         case AB_UNINSTALL: snprintf(main, mn, "Uninstall Fathom"); break;
         case AB_AUTO:
             snprintf(main, mn, "Check automatically");
@@ -3242,10 +3323,22 @@ static int covers_in(list_kind_t k)
     return (is_album_list(k) && (v & 1)) || ((is_track_list(k) || k == L_QUEUE) && (v & 2));
 }
 
+/* Podcasts and Radio: each show's or station's picture before its name, the
+ * size of an album's cover in a list (one without: the list's icon in its
+ * place). Not with Covers in lists off. */
+static int thumbs_in(list_kind_t k)
+{
+    return (k == L_PODCASTS || k == L_RADIO) && settings_get_int("display.covers", UI_COVERS_DEFAULT) != 0;
+}
+
 /* Albums' covers: the last COV_CACHE read, so scrolling a row reads one, not a
  * screenful (2.3 KB each from the card's art cache, no decoding), and each
  * visible row's pixels. Taken when Albums is drawn, given back when it goes
- * or the screen turns off: about 45 KB, and nothing elsewhere. */
+ * or the screen turns off: about 45 KB, and nothing elsewhere. The same cache
+ * holds the pictures of Podcasts' shows and Radio's stations, under keys of
+ * their own: COV_POD | a show's id (12 hex digits) as a number, for its
+ * ID/thumb.565; COV_RADIO | a station's icon's id, the same way (radio_read). */
+#define COV_POD (1LL << 60)
 #define COV_CACHE 12
 static struct covers {
     struct cov { int64_t id; uint32_t used; int ok; uint16_t px[LIB_ART_SMALL * LIB_ART_SMALL]; } cache[COV_CACHE];
@@ -3279,6 +3372,31 @@ static void covers_free(void)
     memset(&S.fill_sig, 0, sizeof S.fill_sig);   /* (the rows filled again when they're shown) */
 }
 
+/* A show's or a station's picture for the list (2.3 KB read from the card): 1 if it has one */
+static int thumb_read(int64_t key, uint16_t *px)
+{
+    char id[13], p[800];
+    snprintf(id, sizeof id, "%012llx", (unsigned long long)(key & COV_KEY_BITS));
+    if (key & COV_RADIO) return ricon_read(id, LIB_ART_SMALL, px);
+    if (!(key & COV_POD) || !podsync_dir()[0]) return 0;
+    pod_thumb_path(podsync_dir(), id, p, sizeof p);
+    FILE *f = fopen(p, "rbe");
+    size_t want = sizeof(uint16_t) * LIB_ART_SMALL * LIB_ART_SMALL;
+    int ok = f && fread(px, 1, want, f) == want;
+    if (f) fclose(f);
+    return ok;
+}
+
+/* The picture a row of Podcasts or Radio shows: its key, or -1 for a row that
+ * isn't a show or a station, or a station with no icon */
+static int64_t thumb_key(const level_t *l, int i)
+{
+    if (l->kind == L_RADIO) return i >= 1 && i - 1 < S.radio_n ? S.radio_key[i - 1] : -1;
+    if (l->kind == L_PODCASTS && i >= 1 && i - 1 < S.pod_n)
+        return COV_POD | (int64_t)(strtoull(S.pod_shows[i - 1].id, NULL, 16) & COV_KEY_BITS);
+    return -1;
+}
+
 static const uint16_t *cover_px(int64_t id)
 {
     struct cov *e = &g_cov->cache[0];
@@ -3289,8 +3407,17 @@ static const uint16_t *cover_px(int64_t id)
     }
     e->id = id;
     e->used = ++g_cov->tick;
-    e->ok = library_art(S.lib, id, LIB_ART_SMALL, e->px) == 0;
+    e->ok = id >= COV_POD ? thumb_read(id, e->px) : S.lib && library_art(S.lib, id, LIB_ART_SMALL, e->px) == 0;
     return e->ok ? e->px : NULL;
+}
+
+/* Shows' or stations' pictures changed on the card (tag: COV_POD, COV_RADIO): read again, the albums' left as they are */
+static void thumbs_reset(int64_t tag)
+{
+    for (int j = 0; j < SLOTS; j++)
+        if (S.cov_id[j] >= 0 && (S.cov_id[j] & tag)) S.cov_id[j] = -1;
+    for (int k = 0; g_cov && k < COV_CACHE; k++)
+        if (g_cov->cache[k].id >= 0 && (g_cov->cache[k].id & tag)) g_cov->cache[k].used = 0;
 }
 
 /* (the theme changed, or the library: each row's cover drawn again; a new
@@ -3412,25 +3539,38 @@ static void fill_slots(const level_t *l, int n)
         int eq = playing && T()->playing_equalizer;
 
         /* Albums: the cover first, in a straight column; the playing marker after it */
-        int cover = covers_in(l->kind) && S.lib && covers_take();   /* the album's cover (none: a plain square) */
-        show(S.row_cov[j], cover);
-        if (cover) {
+        int thumbs = thumbs_in(l->kind) && covers_take();           /* Podcasts, Radio: the show's or station's picture in that column */
+        int cover = !thumbs && covers_in(l->kind) && S.lib && covers_take();   /* the album's cover (none: a plain square) */
+        int64_t id = -1;
+        if (thumbs) {
+            id = thumb_key(l, i);
+        } else if (cover) {
             int64_t tid = l->kind == L_QUEUE ? (S.player ? player_queue_at(S.player, i) : -1)   /* (the queue: the player's) */
                         : l->items.ids[i];
-            int64_t id = is_album_list(l->kind) ? tid : tid >= 0 ? library_track_album(S.lib, tid) : -1;
+            id = is_album_list(l->kind) ? tid : tid >= 0 ? library_track_album(S.lib, tid) : -1;
+        }
+        int blank = thumbs;                        /* a row of theirs with no picture: an icon in its place, below */
+        if (cover || (thumbs && id >= 0)) {
             if (S.cov_id[j] != id) {
                 const uint16_t *px = cover_px(id);
                 uint16_t *to = g_cov->slot[j];
                 if (px) memcpy(to, px, sizeof g_cov->slot[j]);
-                else {
+                else if (cover) {
                     uint16_t c = (uint16_t)theme_rgb565(T()->surface);
                     for (size_t k = 0; k < sizeof g_cov->slot[j] / 2; k++) to[k] = c;
                 }
                 S.cov_id[j] = id;
-                lv_image_cache_drop(&S.cov_dsc[j]);
-                lv_image_set_src(S.row_cov[j], &S.cov_dsc[j]);
-                lv_obj_invalidate(S.row_cov[j]);
+                S.cov_has[j] = px != NULL;
+                if (px || cover) {
+                    lv_image_cache_drop(&S.cov_dsc[j]);
+                    lv_image_set_src(S.row_cov[j], &S.cov_dsc[j]);
+                    lv_obj_invalidate(S.row_cov[j]);
+                }
             }
+            if (thumbs) blank = !S.cov_has[j];
+        }
+        show(S.row_cov[j], cover || (thumbs && !blank));
+        if (cover || (thumbs && !blank)) {
             if (lv_obj_get_style_x(S.row_cov[j], 0) != x) lv_obj_set_x(S.row_cov[j], x);
             x += LIB_ART_SMALL + ICON_GAP;
         }
@@ -3446,29 +3586,35 @@ static void fill_slots(const level_t *l, int n)
             cp = smart ? SMART_ICON : HOME_ICON[H_PLAYLISTS];
             pic = smart ? PIXEL_SMART : H_PLAYLISTS;
         }
+        if (blank) {                               /* Podcasts, Radio: a row without a picture: Search's icon to find some, else the list's own */
+            pic = i == 0 ? H_SEARCH : l->kind == L_RADIO ? H_RADIO : H_PODCASTS;
+            cp = HOME_ICON[pic];
+        }
         int pix = pic >= 0 && T()->icons_pixel;
         int glyph = pic >= 0 && !pix && S.f->icon;
-        int col = pix || glyph;
+        int col = pix || glyph || blank;
+        int colw = blank ? LIB_ART_SMALL : ICON_W; /* (the pictures' column: the icon in its middle) */
         for (int k = 0; k < 3; k++) {          /* three bars, 11 px across */
             show(S.row_eq[j][k], eq);
-            lv_obj_set_x(S.row_eq[j][k], x + (col ? (ICON_W - 11) / 2 : 0) + k * 4);
+            lv_obj_set_x(S.row_eq[j][k], x + (col ? (colw - 11) / 2 : 0) + k * 4);
         }
-        lv_obj_set_x(S.row_dot[j], x + (col ? (ICON_W - 8) / 2 : 0));
+        lv_obj_set_x(S.row_dot[j], x + (col ? (colw - 8) / 2 : 0));
         show(S.row_icon[j], glyph && !playing);
         show(S.row_picon[j], pix && !playing);
         if (glyph && !playing) {
             char u[5];
             utf8_of(cp, u);
             set_text(S.row_icon[j], u);
-            if (lv_obj_get_style_x(S.row_icon[j], 0) != x) lv_obj_set_x(S.row_icon[j], x);
+            int gx = x + (colw - ICON_W) / 2;
+            if (lv_obj_get_style_x(S.row_icon[j], 0) != gx) lv_obj_set_x(S.row_icon[j], gx);
         }
         if (pix && !playing) {
             const lv_image_dsc_t *img = pixel_icon(pic);
             if (lv_image_get_src(S.row_picon[j]) != img) lv_image_set_src(S.row_picon[j], img);
-            int px = x + (ICON_W - PIXEL_ICON_GRID * PIXEL_ICON_SCALE) / 2;
+            int px = x + (colw - PIXEL_ICON_GRID * PIXEL_ICON_SCALE) / 2;
             if (lv_obj_get_style_x(S.row_picon[j], 0) != px) lv_obj_set_x(S.row_picon[j], px);
         }
-        if (col) x += ICON_W + ICON_GAP;
+        if (col) x += colw + ICON_GAP;
         else if (eq) x += 18;
         else if (playing) x += 14;
         int swatch = (l->kind == L_THEMES && i < S.n_themes) || l->kind == L_THEME_COLOURS;
@@ -3607,13 +3753,17 @@ static void render_list(render_mode_t mode)
                         : l->kind == L_PLAYLISTS ? "No playlists in the music folder"
                         : l->kind == L_PLAYLIST_TRACKS ? "None of these songs are on the card"
                         : l->kind == L_SMART_TRACKS ? "Nothing here now"
-                        : l->kind == L_FAVOURITES ? "No favourites yet: Menu on a song"
+                        : l->kind == L_FAVOURITES ? "No favourites yet: <Menu> on a song"
                         : l->kind == L_RECENT_PLAYED || l->kind == L_MOST_PLAYED ? "Nothing played yet"
                         : l->kind == L_BAT_HISTORY ? "No time on battery yet"
                         : l->kind == L_RDIR_RESULTS || l->kind == L_RDIR_COUNTRIES
                             ? (S.rd_job == RD_JOB_LIST ? "Searching\xE2\x80\xA6" : S.rd_state == RD_FAILED ? S.rd_msg
                                : l->kind == L_RDIR_COUNTRIES ? "No countries found" : "No stations found")
-                        : library_backed(l->kind) ? "No music found" : "Nothing here";
+                        : !library_backed(l->kind) ? "Nothing here"
+                        /* the whole library empty: what to do about it */
+                        : g_music_missing ? "No Music folder on the card: make one at the top of the card and copy music into it"
+                        : S.lib && library_empty(S.lib) ? "No music yet. Plug the H2 into a computer, choose Use as a USB drive and copy music into the Music folder"
+                        : "No music found";
         set_text(S.empty, tr(msg));
     }
 
@@ -3624,7 +3774,7 @@ static void render_list(render_mode_t mode)
         S.pill_y = S.pill_target = target;
         S.rows_off = 0;
         graphs_place(l->kind);
-        if (!covers_in(l->kind)) covers_free();     /* (a list without covers: their memory back) */
+        if (!covers_in(l->kind) && !thumbs_in(l->kind)) covers_free();   /* (a list without covers: their memory back) */
         lv_obj_set_y(S.pill, S.list_y0 + target);
         rows_box_place();
         color_slots(l->sel - l->top + 1);
@@ -3667,12 +3817,42 @@ static void fmt_rate(char *b, size_t n, uint32_t rate)
     else snprintf(b, n, "%u.%u", rate / 1000, (rate % 1000) / 100);
 }
 
+/* The station's logo is no longer what art_px holds: read again when it's wanted */
+static void logo_forget(void)
+{
+    S.radio_logo = 0;
+    snprintf(S.logo_id, sizeof S.logo_id, "?");
+}
+
+/* On the radio with no cover for the song: the station's own logo, if it's on
+ * the card at Now Playing's size (a station of yours whose icon was fetched).
+ * Read once for a station, and again when the icons on the card change. 1 if
+ * art_px holds it. */
+static int radio_logo(void)
+{
+    const radio_station_t *st = S.player ? player_radio_station(S.player) : NULL;
+    char id[13] = "";
+    unsigned seq = ricon_seq();
+    if (st) ricon_id(st->icon, id);
+    if (strcmp(id, S.logo_id) || seq != S.logo_seq) {
+        snprintf(S.logo_id, sizeof S.logo_id, "%s", id);
+        S.logo_seq = seq;
+        S.radio_logo = id[0] && ricon_read(id, LIB_ART_LARGE, S.art_px);
+        if (S.radio_logo) {
+            lv_image_cache_drop(&S.art_dsc);   /* same descriptor, new pixels */
+            lv_obj_invalidate(S.np_img);
+        }
+    }
+    return S.radio_logo;
+}
+
 /* Cover art for the current track, from the library's RGB565 cache. */
 static void load_art(void)
 {
     S.np_seq = S.player ? player_seq(S.player) : 0;
     if (S.now.radio) return;           /* the radio's cover comes by ui_set_radio_art */
     S.radio_art = 0;
+    logo_forget();                     /* (art_px is about to hold something else) */
     if (S.now.podcast) {               /* the show's, kept small on the card */
         const player_episode_t *e = S.player ? player_episode(S.player, NULL, NULL) : NULL;
         char p[800];
@@ -3724,7 +3904,7 @@ static void np_icon(int h)
 static void render_np_radio(void)
 {
     const lib_track_t *t = &S.now.track;
-    int art = S.radio_art;
+    int art = S.radio_art || radio_logo();   /* the song's cover, else the station's logo, else the radio's icon */
     if (art) {
         if (lv_image_get_src(S.np_img) != &S.art_dsc) lv_image_set_src(S.np_img, &S.art_dsc);
         show(S.np_img, 1);
@@ -4089,7 +4269,7 @@ static void update_overlay(void)
         lv_obj_t *col = box(S.upd_ov, 0, 0, UI_W, UI_H - 36);
         lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_row(col, 16, 0);
+        lv_obj_set_style_pad_row(col, 12, 0);
         S.upd_title = lv_label_create(col);
         style_label(S.upd_title, S.f->title, t->text);
         lv_obj_set_width(S.upd_title, UI_W - 32);
@@ -4119,7 +4299,7 @@ static void update_overlay(void)
         lv_obj_move_background(S.upd_ov);            /* toasts and the volume bar stay over it */
     }
     char title[96], detail[96], a[24], b[24];
-    const char *hint = "Back cancels";
+    const char *hint = "<Back> cancels";
     int permille = u->total ? (int)(u->done * 1000 / u->total) : 0;
     detail[0] = '\0';
     fmt_mb(a, sizeof a, u->done);
@@ -4139,7 +4319,7 @@ static void update_overlay(void)
     case UI_UPD_READY:
         subst(title, sizeof title, tr("Ready to install %s"), u->latest, NULL);
         snprintf(detail, sizeof detail, "%s", tr("The H2 restarts to finish. Your settings and music stay."));
-        hint = "Play installs, Back cancels";
+        hint = "<Play> installs, <Back> cancels";
         permille = 1000;
         break;
     case UI_UPD_INSTALLING:
@@ -4158,7 +4338,146 @@ static void update_overlay(void)
     lv_label_set_text(S.upd_detail, detail);
     show(S.upd_detail, detail[0] != '\0');
     lv_label_set_text(S.upd_hint, tr(hint));
+    /* on one line: at the lists' size where it fits, else the smaller one (a
+     * wide font: Pixel Pastel); the column centred in the room above it */
+    lv_obj_set_style_text_font(S.upd_hint, S.f->body, 0);
+    lv_obj_update_layout(S.upd_hint);
+    if (lv_obj_get_height(S.upd_hint) > lv_font_get_line_height(S.f->body) * 3 / 2)
+        lv_obj_set_style_text_font(S.upd_hint, S.f->meta, 0);
+    lv_obj_update_layout(S.upd_hint);
+    lv_obj_set_height(lv_obj_get_parent(S.upd_title), UI_H - 12 - lv_obj_get_height(S.upd_hint) - 4);
     lv_bar_set_value(S.upd_bar, permille, LV_ANIM_OFF);
+}
+
+/* ---------- Rescan's progress ----------
+ * Settings > Library > Rescan the music folder: the scan (the player's
+ * background one) shown as the first scan is, over everything: each step
+ * named, how far, about how long it has left, the song it's reading. The
+ * music plays on (Play, Prev, Next, the volume work); Back puts it away and
+ * the scan carries on (the Rescan row says how far). It goes when the scan
+ * ends ("Library updated", or that nothing changed). */
+
+static void scan_overlay_close(void)
+{
+    if (S.scan_timer) lv_timer_delete(S.scan_timer);
+    if (S.scan_ov) lv_obj_delete(S.scan_ov);
+    S.scan_timer = NULL;
+    S.scan_ov = S.scan_step = S.scan_count = S.scan_left = S.scan_file = NULL;
+}
+
+/* a row of the column: one line (cut with "...", its place kept when empty),
+ * or wrapped (the title) */
+static lv_obj_t *scan_overlay_label(lv_obj_t *col, const lv_font_t *f, uint32_t colour, int wrap)
+{
+    lv_obj_t *l = lv_label_create(col);
+    style_label(l, f, colour);
+    lv_obj_set_width(l, UI_W - 32);
+    lv_label_set_long_mode(l, wrap ? LV_LABEL_LONG_WRAP : LV_LABEL_LONG_DOT);
+    if (!wrap) lv_obj_set_height(l, lv_font_get_line_height(f));
+    lv_label_set_text(l, "");
+    return l;
+}
+
+/* "Less than a minute left"... (as the first scan's) */
+static void scan_left_words(uint32_t left_s, char *t, size_t n)
+{
+    char m[16];
+    if (left_s < 45) snprintf(t, n, "%s", tr("Less than a minute left"));
+    else if (left_s < 90) snprintf(t, n, "%s", tr("About a minute left"));
+    else {
+        snprintf(m, sizeof m, "%u", (left_s + 30) / 60);
+        tr_fill(t, n, "About %s minutes left", m, NULL);
+    }
+}
+
+static void scan_overlay_update(void)
+{
+    ui_scan_t p;
+    if (!S.scan_ov) return;
+    if (!S.hooks.scan_progress || !S.hooks.scan_progress(&p)) { scan_overlay_close(); return; }
+    uint32_t now = lv_tick_get();
+    if (p.step != S.scan_was) {                      /* the next step: its own clock */
+        S.scan_was = p.step;
+        S.scan_t0 = now;
+        S.scan_left_at = 0;
+        static const char *const SCAN_STEP[] = {"Looking for music", "Reading songs", "Sorting albums and artists", "Finding covers"};
+        lv_label_set_text(S.scan_step, tr(SCAN_STEP[p.step >= 0 && p.step <= UI_SCAN_COVERS ? p.step : 0]));
+        lv_label_set_text(S.scan_left, "");
+    }
+    char a[16], b[16], t[64] = "";
+    snprintf(a, sizeof a, "%d", p.done);
+    snprintf(b, sizeof b, "%d", p.total);
+    int counted = (p.step == UI_SCAN_SONGS || p.step == UI_SCAN_COVERS) && p.total > 0 && p.done <= p.total;
+    if (counted) tr_fill(t, sizeof t, p.step == UI_SCAN_COVERS ? "%s of %s albums" : "%s of %s songs", a, b);
+    lv_label_set_text(S.scan_count, t);
+    /* about how long this step has left, once it can tell (10 s in, 2 % done) */
+    uint32_t el = now - S.scan_t0;
+    if (!counted || p.done <= 0 || el < 10000 || p.done * 50 < p.total) lv_label_set_text(S.scan_left, "");
+    else if (!S.scan_left_at || now - S.scan_left_at >= 2000) {   /* (steadier: every 2 s) */
+        S.scan_left_at = now;
+        scan_left_words((uint32_t)((uint64_t)el * (uint32_t)(p.total - p.done) / (uint32_t)p.done / 1000), t, sizeof t);
+        lv_label_set_text(S.scan_left, t);
+    }
+    lv_label_set_text(S.scan_file, p.step == UI_SCAN_SONGS ? p.file : "");
+}
+
+static void scan_overlay_tick(lv_timer_t *t)
+{
+    (void)t;
+    scan_overlay_update();
+}
+
+void ui_show_scan(void)
+{
+    ui_scan_t p;
+    if (!S.hooks.scan_progress || !S.hooks.scan_progress(&p)) { scan_overlay_close(); return; }
+    if (S.scan_ov) { scan_overlay_update(); return; }
+    const theme_t *t = T();
+    S.scan_ov = box(lv_layer_top(), 0, 0, UI_W, UI_H);
+    fill(S.scan_ov, t->bg);
+    /* as the first scan's screen: a column (a title that wraps pushes the rest down) */
+    lv_obj_t *col = box(S.scan_ov, 0, 0, UI_W, UI_H - 44);
+    lv_obj_set_style_pad_hor(col, 16, 0);
+    lv_obj_set_style_pad_top(col, 16, 0);
+    lv_obj_set_style_pad_row(col, 6, 0);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_label_set_text(scan_overlay_label(col, S.f->title, t->text, 1), tr("Reading your library"));
+    S.scan_step = scan_overlay_label(col, S.f->body, t->text, 0);
+    S.scan_count = scan_overlay_label(col, S.f->body, t->signal, 0);
+    S.scan_left = scan_overlay_label(col, S.f->meta, t->text_muted, 0);
+    S.scan_file = scan_overlay_label(col, S.f->meta, t->text_muted, 0);
+    lv_obj_t *hint = lv_label_create(S.scan_ov);
+    style_label(hint, S.f->meta, t->text_muted);   /* (where the first scan's note is) */
+    lv_obj_set_width(hint, UI_W - 32);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_LEFT, 16, -14);
+    lv_label_set_text(hint, tr("<Back> hides this"));   /* (and says the scan carries on) */
+    lv_obj_update_layout(hint);                    /* (the column down to it: whole rows only) */
+    lv_obj_set_height(col, UI_H - 14 - lv_obj_get_height(hint) - 6);
+    lv_obj_update_layout(col);
+    for (uint32_t i = 0; i < lv_obj_get_child_count(col); i++) {
+        lv_obj_t *r = lv_obj_get_child(col, (int32_t)i);
+        if (lv_obj_get_y(r) + lv_obj_get_height(r) > lv_obj_get_height(col)) lv_obj_add_flag(r, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_move_background(S.scan_ov);             /* toasts and the volume bar stay over it */
+    S.scan_was = -1;
+    S.scan_timer = lv_timer_create(scan_overlay_tick, 250, NULL);
+    scan_overlay_update();
+}
+
+static int scan_overlay_key(ui_key_t k)
+{
+    switch (k) {
+    case UI_KEY_PLAY: case UI_KEY_PREV: case UI_KEY_NEXT: case UI_KEY_SEEK_BACK: case UI_KEY_SEEK_FWD:
+    case UI_KEY_BRIGHTER: case UI_KEY_DIMMER:
+        return 0;                                   /* the music's and the screen's, as anywhere */
+    case UI_KEY_BACK:
+        scan_overlay_close();
+        ui_toast("The rescan carries on", 1500);
+        return 1;
+    default:
+        return 1;
+    }
 }
 
 /* ---------- What's new ----------
@@ -4190,12 +4509,25 @@ static void whats_new_show(void)
         show(S.wn_row[i], on);
     }
     if (S.wn_hint)
-        lv_label_set_text(S.wn_hint, tr(S.wn_last < S.wn_n - 1 ? "Turn for more, Play: done" : "Play or Back: done"));
+        lv_label_set_text(S.wn_hint, tr(S.wn_last < S.wn_n - 1 ? "Turn for more, <Play>: done" : "<Play> or <Back>: done"));
 }
 
-static void whats_new_open(void)
+/* The welcome, once after a fresh install's first scan (ui_show_welcome) and
+ * from Settings > About > Tips: the keys nobody would guess, one per point */
+static const char WELCOME[] =
+    "Hold <Back>: Now Playing, and back\n"
+    "Hold <Menu>: quick settings, like brightness and EQ\n"
+    "<Menu> on a song, album or artist: what you can do with it\n"
+    "<Menu> on a setting: what it does\n"
+    "Screen off: <Play>, <Prev>, <Next> and volume still work";
+
+static void points_open(int welcome);
+static void whats_new_open(void) { points_open(0); }
+
+static void points_open(int welcome)
 {
-    if (!S.wn_text[0]) return;
+    const char *text = welcome ? WELCOME : S.wn_text;
+    if (!text[0]) return;
     whats_new_close();
     const theme_t *t = T();
     S.wn_ov = box(lv_layer_top(), 0, 0, UI_W, UI_H);
@@ -4211,7 +4543,8 @@ static void whats_new_open(void)
     lv_obj_set_width(title, LV_PCT(100));
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
     char tt[96];
-    subst(tt, sizeof tt, tr("What's new in %s"), S.wn_ver, NULL);
+    if (welcome) snprintf(tt, sizeof tt, "%s", tr("Welcome to Fathom"));
+    else subst(tt, sizeof tt, tr("What's new in %s"), S.wn_ver, NULL);
     lv_label_set_text(title, tt);
     S.wn_body = box(col, 0, 0, LV_PCT(100), 10);
     lv_obj_set_flex_grow(S.wn_body, 1);
@@ -4220,7 +4553,7 @@ static void whats_new_open(void)
     S.wn_n = S.wn_first = 0;
     const lv_font_t *pf = S.f->body;              /* (the lists' 20 px: easy to read; the wheel scrolls the rest) */
     int lh = lv_font_get_line_height(pf), dot = 7;
-    for (const char *p = S.wn_text; *p;) {
+    for (const char *p = text; *p;) {
         const char *e = strchr(p, '\n');
         size_t n = e ? (size_t)(e - p) : strlen(p);
         char line[300];
@@ -4269,6 +4602,8 @@ static int whats_new_key(ui_key_t k)
         return 0;
     }
 }
+
+void ui_show_welcome(void) { points_open(1); }
 
 void ui_set_whats_new(const char *version, const char *text, int show)
 {
@@ -4368,7 +4703,7 @@ static void uninstall_overlay(void)
     lv_obj_set_width(hint, UI_W - 32);
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(hint, tr(pending ? "Play restarts, Back cancels" : "Play looks again"));
+    lv_label_set_text(hint, tr(pending ? "<Play> restarts, <Back> cancels" : "<Play> looks again"));
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -12);
     /* the text centred in the room above the hint (two lines of it in a wide font) */
     lv_obj_update_layout(hint);
@@ -4460,6 +4795,7 @@ void ui_set_radio_art(const uint16_t *px)
         lv_obj_invalidate(S.np_img);
     }
     S.radio_art = px != NULL;
+    logo_forget();                         /* (art_px holds the song's cover, or did: the station's logo read again when it's its turn) */
     if (S.now_playing_view && S.now.radio) render(R_CONTENT);
 }
 
@@ -4514,15 +4850,15 @@ static const char *setting_help(setting_t st)
     case ST_THEME: return "Pick how Fathom looks. More themes can go in fathom/themes.";
     case ST_COVERS: return "Show album covers in lists of albums and of songs.";
     case ST_ALBUM_ARTISTS: return "Display artist name when browsing albums.";
-    case ST_BRIGHTNESS: return "How bright the screen is. Press Play, then turn the wheel.";
+    case ST_BRIGHTNESS: return "How bright the screen is. Press <Play>, then turn the wheel.";
     case ST_TIMEOUT: return "How long the screen stays on. Saves battery.";
     case ST_DIM: return "Dims the screen 5 seconds before it turns off.";
     case ST_ON_CHARGING: return "Keeps the screen on while the H2 is plugged in.";
     case ST_LANGUAGE: return "Interface language. More in fathom/lang.";
-    case ST_OUTPUT: return "Where the sound goes. Play shows each step in the path.";
+    case ST_OUTPUT: return "Where the sound goes. <Play> shows each step in the path.";
     case ST_PURE: return "Skips EQ, balance and levelling, for bit-perfect sound.";
     case ST_EQ: return "Shape the sound with an equaliser. Each output keeps its own.";
-    case ST_BALANCE: return "Left/right balance. Press Play, then turn the wheel.";
+    case ST_BALANCE: return "Left/right balance. Press <Play>, then turn the wheel.";
     case ST_CROSSFEED: return "Each ear hears a little of the other side, as with speakers.";
     case ST_VOL_LIMIT: return "Caps the volume, to protect your ears. Per output.";
     case ST_LEVELLING: return "Plays songs at the same loudness, or albums as mastered.";
@@ -4537,14 +4873,14 @@ static const char *setting_help(setting_t st)
     case ST_SHUF_SPOKEN: return "Leaves out tracks whose genre is audiobook, podcast or spoken.";
     case ST_REPEAT: return "Repeat all, or one song.";
     case ST_PAUSE_UNPLUG: return "Pauses when wired headphones are unplugged.";
-    case ST_BATTERY: return "Charge and time left. Play shows the battery history.";
+    case ST_BATTERY: return "Charge and time left. <Play> shows the battery history.";
     case ST_AUTO_OFF: return "Turns the H2 off when it's not in use.";
     case ST_POD_AUTO: return "Your shows' new episodes download by themselves, while charging on Wi-Fi.";
     case ST_POD_KEEP: return "How many of each show's newest unplayed episodes are downloaded.";
     case ST_POD_CLEAN: return "A played episode's download is deleted after this long.";
     case ST_POD_SPEED: return "Episodes faster, without the voices going up. Music always plays as it is.";
     case ST_SLEEP: return "Stops the music after a set time or at the end of the album.";
-    case ST_RESCAN: return "Force a library rescan.";
+    case ST_RESCAN: return "Read the music folder again, showing how far it has got. <Back> lets it carry on while you listen.";
     case ST_FIND_COVERS: return "Finds covers online for albums without one. Keeps only sure matches.";
     case ST_N_SONGS: case ST_N_ALBUMS: case ST_N_ARTISTS: case ST_N_PLAYLISTS: return "Library counts.";
     case ST_USB_COMPUTER: return "What to do when plugged into a computer.";
@@ -4587,7 +4923,7 @@ static const char *row_help(const level_t *l)
     case L_WIFI:
         switch (wifi_row(i, &w)) {
         case WR_TOGGLE: return "Turns Wi-Fi on or off. Off saves battery.";
-        case WR_LINK: return "The network you're on. Play shows its address and signal.";
+        case WR_LINK: return "The network you're on. <Play> shows its address and signal.";
         case WR_SEARCH: return "Refresh the list of networks.";
         default: return NULL;
         }
@@ -4610,14 +4946,16 @@ static const char *row_help(const level_t *l)
     case L_ABOUT:
         if (i >= n) return NULL;
         switch (about_row(i)) {
-        case AB_RESET: return "Reset all settings to defaults. Press Play twice.";
+        case AB_RESET: return "Reset all settings to defaults. Press <Play> twice.";
         case AB_UNINSTALL: return "Put the H2 back on HiBy's own firmware.";
         case AB_AUTO: return "Check for updates once a day over Wi-Fi.";
         case AB_CHECK: return "Check for a newer version of Fathom.";
+        case AB_TIPS: return "The keys worth knowing, as shown after installing.";
+        case AB_WHATSNEW: return NULL;
         default:
             if (!strcmp(S.about_lbl[i], UI_ABOUT_CREDIT)) return UI_ABOUT_NOTICE;
             if (!strcmp(S.about_lbl[i], "Clock"))
-                return S.hooks.clock_set ? "Set from the internet over Wi-Fi, or by hand: press Play. Your time zone is there too."
+                return S.hooks.clock_set ? "Set from the internet over Wi-Fi, or by hand: press <Play>. Your time zone is there too."
                                          : "Set from the internet over Wi-Fi. In UTC.";
             if (!strcmp(S.about_lbl[i], "Charge cycles")) return "Battery wear, in full charges used.";
             return NULL;
@@ -4630,7 +4968,7 @@ static const char *row_help(const level_t *l)
         switch (uninstall_row(i)) {
         case UR_LOOK: return "Put HiBy's update file for the H2 at the top of the card or in Music.";
         case UR_VERSION: return "Use your H2's version of HiBy's firmware, or a newer one.";
-        case UR_GO: return "Press Play twice. Your music stays on the card.";
+        case UR_GO: return "Press <Play> twice. Your music stays on the card.";
         default: return NULL;
         }
     default:
@@ -4762,22 +5100,49 @@ static void render_cf(void)
         subst(src, sizeof src, tr("Source: %s"), m.source == CF_APPLE ? "Apple" : "MusicBrainz", NULL);
         set_text(S.cf_note, pic == -2 ? tr("Couldn't fetch it") : src);
         snprintf(hint, sizeof hint, "%d / %d  %s", S.cf_k + 1, n,
-                 tr(pic == 1 ? "Play: use this cover" : pic == 0 ? "Fetching its picture\xE2\x80\xA6"
-                    : pic == -2 ? "Play: try again" : "No picture"));
+                 tr(pic == 1 ? "<Play>: use this cover" : pic == 0 ? "Fetching its picture\xE2\x80\xA6"
+                    : pic == -2 ? "<Play>: try again" : "No picture"));
         set_text(S.cf_hint, hint);
     } else {
         set_text(S.cf_title, st == 0 ? tr("Looking\xE2\x80\xA6") : st == -2 ? tr("Couldn't look it up") : tr("Nothing found"));
         set_text(S.cf_artist, "");
         set_text(S.cf_meta, "");
         set_text(S.cf_note, st == -2 ? tr("No network, or no answer") : "");
-        set_text(S.cf_hint, st == 0 ? "" : tr("Back: done"));
+        set_text(S.cf_hint, st == 0 ? "" : tr("<Back>: done"));
     }
+}
+
+/* A song the player couldn't play and passed over: said (once the screen is
+ * on, if it was off), with why when it's the output, or when none could play */
+static unsigned g_fail_seen;
+static void say_failed(void)
+{
+    if (S.now.fail_seq == g_fail_seen || S.asleep) return;
+    g_fail_seen = S.now.fail_seq;
+    int bt = S.bt_link == UI_BT_LINK_CONNECTED;   /* (the music goes to the headphones) */
+    char msg[192], title[96] = "";
+    lib_track_t t;
+    if (S.lib && library_track(S.lib, S.now.fail_track, &t) == 0) snprintf(title, sizeof title, "%s", t.title);
+    if (S.now.fail_all && S.now.fail_output)
+        snprintf(msg, sizeof msg, "%s", tr(bt ? "Bluetooth can't play these songs' format" : "This output can't play these songs' format"));
+    else if (S.now.fail_all)
+        snprintf(msg, sizeof msg, "%s", tr("None of these songs could be played"));
+    else if (S.now.fail_output && S.now.fail_end)   /* (the last: nothing after it to skip to) */
+        tr_fill(msg, sizeof msg, bt ? "Bluetooth can't play \u201C%s\u201D" : "This output can't play \u201C%s\u201D", title, NULL);
+    else if (S.now.fail_output)
+        tr_fill(msg, sizeof msg, bt ? "Bluetooth can't play \u201C%s\u201D: skipped" : "This output can't play \u201C%s\u201D: skipped", title, NULL);
+    else if (S.now.fail_end)
+        tr_fill(msg, sizeof msg, "Couldn't play \u201C%s\u201D", title, NULL);
+    else
+        tr_fill(msg, sizeof msg, "Couldn't play \u201C%s\u201D: skipped", title, NULL);
+    ui_toast(msg, 3000);
 }
 
 static void render(render_mode_t mode)
 {
     int np_changed = S.now_playing_view != S.last_np;
     if (S.player) player_now(S.player, &S.now);
+    if (S.player) say_failed();
     if (S.asleep) {                 /* drawn when the screen comes on (no animations meanwhile) */
         if (mode != R_CONTENT) S.wake_mode = R_SNAP;
         pending_free();
@@ -4855,16 +5220,9 @@ static void push_as(list_kind_t kind, const char *title, int64_t parent, int ui)
         S.eq_n = S.hooks.eq_list ? S.hooks.eq_list(S.eq_names, 64) : 0;
         for (int i = 0; i < S.eq_n; i++)
             if (!strcmp(S.eq_names[i], S.eq_name)) l->sel = i + 1;
-        ui_toast(S.eq_n ? "Menu on an EQ: edit it" : "AutoEQ files go in fathom/eq. Or: New EQ", 2500);
+        ui_toast(S.eq_n ? "<Menu> on an EQ: edit it" : "AutoEQ files go in fathom/eq. Or: New EQ", 2500);
     }
-    if (kind == L_LIBRARY && S.lib) {
-        static const lib_view_t v[4] = {LIB_SONGS, LIB_ALBUMS, LIB_ARTISTS, LIB_PLAYLISTS};
-        for (int i = 0; i < 4; i++) {
-            lib_list_t tmp;
-            S.lib_counts[i] = library_list(S.lib, v[i], 0, &tmp);
-            library_list_free(&tmp);
-        }
-    }
+    if (kind == L_LIBRARY) lib_counts_load();
 }
 
 /* An artist's songs on one album (Artists > artist > album). */
@@ -4932,7 +5290,7 @@ static int rd_ready(char *why, size_t cap)
     return 0;
 }
 
-#define RD_UNREACHABLE "Couldn't reach the station directory. Play tries again"
+#define RD_UNREACHABLE "Couldn't reach the station directory. <Play> tries again"
 /* (an HTTPS request that failed: the clock, while it isn't set, netclock.h) */
 #define RD_FAILED_WHY() netclock_why(RD_UNREACHABLE)
 
@@ -4943,8 +5301,9 @@ static void rd_ask(const rdir_query_t *q)
     S.rd_state = RD_IDLE;
     if (!rd_ready(S.rd_msg, sizeof S.rd_msg)) {
         S.rd_state = RD_FAILED;
-        if (wifi_ask_if_off(WT_RDIR)) {
-            snprintf(S.rd_msg, sizeof S.rd_msg, "%s", tr("Wi-Fi is off"));
+        int asked = wifi_ask_if_off(WT_RDIR);
+        if (asked) {
+            snprintf(S.rd_msg, sizeof S.rd_msg, "%s", tr(asked == 2 ? "Waiting for Wi-Fi" : "Wi-Fi is off"));
             S.wifi_then.q_null = !q;
             if (q) S.wifi_then.q = *q;
         }
@@ -5019,7 +5378,7 @@ static void rd_random_done(rdir_result_t *r)
     }
     if (r->n == 0) { ui_toast("No stations found", 2000); return; }
     /* the directory didn't answer (Wi-Fi is on: it was asked): one of your own stations, at random */
-    S.radio_n = S.hooks.radio_stations ? S.hooks.radio_stations(S.radio, RADIO_MAX) : -1;
+    radio_read();
     radio_station_t *mix = S.radio_n > 0 ? malloc((size_t)S.radio_n * sizeof *mix) : NULL;
     if (!mix) { ui_toast(netclock_why("Couldn't reach the station directory"), 2500); return; }
     static rng_t rng;
@@ -5118,14 +5477,32 @@ static void push_from_here(list_kind_t kind, const char *title, int64_t parent, 
 }
 
 /* Something that needs Wi-Fi, with Wi-Fi off: ask to turn it on (1), and
- * once it has connected do `then` (WT_*) where it was asked. On, but not
- * connected yet (or no Wi-Fi at all), the caller says why as before (0). */
+ * once it has connected do `then` (WT_*) where it was asked. On or starting
+ * but not connected yet (the 10-20 s after a start, mostly): `then` is kept
+ * for when it connects, as after "Turn on", and Wi-Fi is told to look for a
+ * network now (2): what was pressed isn't thrown away. With nothing to do
+ * then, from Now Playing (wifi_then_run does nothing there), or with no Wi-Fi
+ * at all, the caller says why as before (0). */
 static int wifi_ask_if_off(int then)
 {
     if (!S.hooks.wifi_state || !S.hooks.wifi_do) return 0;
-    char busy[32];
-    ui_wifi_status_t st;
-    if (S.hooks.wifi_state(busy, sizeof busy, &st) || busy[0]) return 0;
+    char busy[32] = "";
+    ui_wifi_status_t st = {0};
+    if (S.hooks.wifi_state(busy, sizeof busy, &st) || busy[0]) {
+        char why[96];
+        if (then == WT_NONE || S.now_playing_view || st.state == UI_WIFI_CONNECTED || !strcmp(busy, "Stopping")) return 0;
+        if (S.hooks.radio_ready && S.hooks.radio_ready(why, sizeof why) == 0) return 0;   /* (usable as it is: a proxy) */
+        level_t *l = &S.stack[S.depth - 1];
+        S.wifi_then.what = then;
+        S.wifi_then.armed = 1;
+        S.wifi_then.depth = S.depth;
+        S.wifi_then.kind = l->kind;
+        S.wifi_then.sel = l->sel;
+        S.wifi_then.at = lv_tick_get();
+        if (S.hooks.wifi_wake) S.hooks.wifi_wake();
+        if (then != WT_RDIR) ui_toast("Waiting for Wi-Fi", 2500);   /* (the directory's lists say it on a line) */
+        return 2;
+    }
     if (S.stack[S.depth - 1].kind == L_WIFI_ASK) return 1;
     S.wifi_then.what = then;
     S.wifi_then.armed = 0;
@@ -5140,12 +5517,18 @@ static void wifi_then_run(int connected)
     S.wifi_then.armed = 0;
     level_t *l = &S.stack[S.depth - 1];
     if (!connected) {
-        if (S.depth == S.wifi_then.depth && l->kind == S.wifi_then.kind)
+        if (S.depth == S.wifi_then.depth && l->kind == S.wifi_then.kind) {
+            if (S.wifi_then.what == WT_RDIR && S.rd_state == RD_FAILED && !S.rd_job) {   /* (its line said Waiting) */
+                snprintf(S.rd_msg, sizeof S.rd_msg, "%s", "Couldn't connect: Settings > Wi-Fi");
+                render(R_CONTENT);
+            }
             ui_toast("Couldn't connect: Settings > Wi-Fi", 2500);
+        }
         return;
     }
     if (S.now_playing_view || S.depth != S.wifi_then.depth || l->kind != S.wifi_then.kind) return;   /* moved on */
     if (S.wifi_then.what == WT_RDIR) rd_ask(S.wifi_then.q_null ? NULL : &S.wifi_then.q);
+    else if (S.wifi_then.what == WT_POD_SEARCH) pod_search_run();
     else if (S.wifi_then.what == WT_OK && l->sel == S.wifi_then.sel) open_selected();
     render(R_ANIMATE);
 }
@@ -5425,12 +5808,13 @@ static void the_ok(level_t *l)
 
 /* ---------- Podcasts: what Play and Menu do ---------- */
 
-/* The network can be used now; else say why (or offer to turn on Wi-Fi): 0 */
-static int pod_net(void)
+/* The network can be used now; else say why, offer to turn on Wi-Fi, or wait
+ * for it to connect (then: what to do once it has, WT_*): 0 */
+static int pod_net(int then)
 {
     char why[96] = "";
     if (!S.hooks.radio_ready || S.hooks.radio_ready(why, sizeof why) == 0) return 1;
-    if (!wifi_ask_if_off(WT_OK)) ui_toast(why[0] ? why : "Podcasts need Wi-Fi for this", 2500);
+    if (!wifi_ask_if_off(then)) ui_toast(why[0] ? why : "Podcasts need Wi-Fi for this", 2500);
     return 0;
 }
 
@@ -5511,7 +5895,7 @@ static void pod_play_episode(int i)
         pod_episode_path(pod_dir(), s->id, e, pe.path, sizeof pe.path);
         pe.start_ms = st.played ? 0 : st.pos_ms;
     } else {
-        if (!pod_net()) return;
+        if (!pod_net(WT_OK)) return;
         snprintf(pe.path, sizeof pe.path, "%s", e->url);
         if (st.pos_ms >= 60000) {
             char at[16], msg[96];
@@ -5569,7 +5953,7 @@ static void pod_open_show(int i)
 static void pod_search_run(void)
 {
     if (!S.entry[0]) { ui_toast("Type a name first", 1500); return; }
-    if (!pod_net()) return;
+    if (!pod_net(WT_POD_SEARCH)) return;
     if (podsync_search(S.entry)) { S.pod_search = -2; return; }
     S.pod_search = 0;
     S.pod_nf = 0;
@@ -5654,6 +6038,8 @@ static void pod_second(void)
     }
     if (st.changed != S.pod_changed) {
         S.pod_changed = st.changed;
+        thumbs_reset(COV_POD);                    /* a show's picture may have arrived: the list's read again */
+        if (S.now.podcast && !S.pod_cover) load_art();   /* ...and the one playing's */
         list_kind_t k = S.stack[S.depth - 1].kind;
         if (S.pod_shows && (k == L_PODCASTS || k == L_POD_SHOW || k == L_POD_SEARCH || S.pod_ci >= 0)) pod_reload();
     }
@@ -5766,7 +6152,7 @@ static int open_context(void)
         S.rd_ctx = *rs;
         int yours = l->kind == L_RADIO && !on_np;
         if (!yours) {                            /* is it in your list? (as the card has it now) */
-            S.radio_n = S.hooks.radio_stations ? S.hooks.radio_stations(S.radio, RADIO_MAX) : -1;
+            radio_read();
             for (int i = 0; i < S.radio_n && !yours; i++) yours = !strcmp(S.radio[i].url, rs->url);
         }
         if (S.rd_ctx_i >= 0) CTX_ADD(CTX_RADIO_PLAY);
@@ -6112,7 +6498,7 @@ static void run_context(ctx_action_t a)
         int r = S.hooks.radio_add ? S.hooks.radio_add(&S.rd_ctx) : -1;
         ui_toast(r == 1 ? "Added to your stations" : r == 0 ? "Already in your stations"
                  : r == -2 ? "Your stations are full: remove one first" : "Couldn't save fathom/radio.txt", 2000);
-        S.radio_n = S.hooks.radio_stations ? S.hooks.radio_stations(S.radio, RADIO_MAX) : -1;
+        radio_read();
         break;
     }
     case CTX_RADIO_REMOVE: {
@@ -6126,7 +6512,7 @@ static void run_context(ctx_action_t a)
         pop_level(0);
         int r = S.hooks.radio_remove ? S.hooks.radio_remove(S.rd_ctx.url) : -1;
         ui_toast(r == 0 ? "Removed from your stations" : r == 1 ? "Not in your stations" : "Couldn't save fathom/radio.txt", 2000);
-        S.radio_n = S.hooks.radio_stations ? S.hooks.radio_stations(S.radio, RADIO_MAX) : -1;
+        radio_read();
         level_t *l = &S.stack[S.depth - 1];
         if (l->kind == L_RADIO && !S.now_playing_view) {
             int n = list_count(l);
@@ -6161,7 +6547,7 @@ static void run_context(ctx_action_t a)
         char u[512];
         snprintf(u, sizeof u, "%s", url);
         pop_level(1);
-        if (!pod_net()) break;
+        if (!pod_net(WT_NONE)) break;   /* (OK on the row under the menu is something else: nothing kept) */
         podsync_refresh(u);
         ui_toast("Checking for new episodes", 1500);
         break;
@@ -6191,7 +6577,7 @@ static void run_context(ctx_action_t a)
         const char *id = S.pod_shows[S.pod_ci].id;
         const pod_episode_t *e = &S.pod_eps[S.pod_ctx];
         if (a == CTX_POD_DOWNLOAD) {
-            if (!pod_net()) break;
+            if (!pod_net(WT_NONE)) break;
             if (podsync_download(id, e) == 0) ui_toast("Downloading", 1500);
         } else if (a == CTX_POD_CANCEL) {
             podsync_cancel_download(id, e->key);
@@ -6388,7 +6774,7 @@ static void setting_ok(setting_t st)
         settings_set_int("podcasts.speed", SPEEDS[(k + 1) % 5]);
         break;
     }
-    case ST_RESCAN: if (S.hooks.rescan) S.hooks.rescan(); break;
+    case ST_RESCAN: if (S.hooks.rescan) S.hooks.rescan(); ui_show_scan(); break;
     case ST_FIND_COVERS: covers_find_all(); break;
     case ST_USB_DRIVE: if (S.hooks.usb_drive) S.hooks.usb_drive(); break;
     case ST_USB_COMPUTER: {      /* Ask, USB drive, USB DAC, Just charge */
@@ -6481,7 +6867,7 @@ static void clock_update(void)
         lv_obj_align_to(CK.up, b, LV_ALIGN_OUT_TOP_MID, 0, -2);
         lv_obj_align_to(CK.down, b, LV_ALIGN_OUT_BOTTOM_MID, 0, 2);
     }
-    lv_label_set_text(CK.hint, tr(CK.editing ? "Turn to change, Play to keep it" : "Turn to choose, Play to change. Back when done"));
+    lv_label_set_text(CK.hint, tr(CK.editing ? "Turn to change, <Play> to keep it" : "Turn to choose, <Play> to change. <Back> when done"));
 }
 
 static void clock_open(void)
@@ -6655,7 +7041,7 @@ static void open_selected(void)
         case H_RECENT_ADDED: push_ui(L_RECENT_ADDED, "Recently added", 0); break;
         case H_HISTORY: push_ui(L_HISTORY, "History", 0); break;
         case H_RADIO:   /* the station playing selected, else your first */
-            S.radio_n = S.hooks.radio_stations ? S.hooks.radio_stations(S.radio, RADIO_MAX) : -1;
+            radio_read();
             push_ui(L_RADIO, "Radio", 0);
             S.stack[S.depth - 1].sel = S.radio_n > 0 ? 1 : 0;
             for (int i = 0; i < S.radio_n; i++)
@@ -6873,7 +7259,7 @@ static void open_selected(void)
                 char t[80];
                 subst(t, sizeof t, tr("Password for %s"), w->ssid, NULL);
                 push(L_WIFI_PASS, t, 0);
-                ui_toast("Play adds a letter, Menu: a A 0 !", 2500);
+                ui_toast("<Play> adds a letter, <Menu>: a A 0 !", 2500);
             }
         }
         break;
@@ -6927,7 +7313,7 @@ static void open_selected(void)
         static const list_kind_t sub[] = {L_INTERFACE, L_HOME_EDIT, L_DISPLAY, L_SOUND, L_BLUETOOTH, L_WIFI, L_SHARE, L_SSH,
                                           L_USB, L_PLAYBACK, L_POD_SETTINGS, L_POWER, L_LIBRARY, L_ABOUT};
         push_ui(sub[l->sel], SETTINGS[l->sel], 0);
-        if (sub[l->sel] == L_HOME_EDIT) ui_toast("Play shows or hides. Menu: Move", 2500);
+        if (sub[l->sel] == L_HOME_EDIT) ui_toast("<Play> shows or hides. <Menu>: Move", 2500);
         if (sub[l->sel] == L_WIFI && S.hooks.wifi_do) S.hooks.wifi_do(UI_WIFI_SCAN, NULL, NULL);   /* fresh networks */
         break;
     }
@@ -6936,6 +7322,8 @@ static void open_selected(void)
             clock_open();
         } else if (about_row(l->sel) == AB_WHATSNEW) {
             whats_new_open();
+        } else if (about_row(l->sel) == AB_TIPS) {
+            points_open(1);
         } else if (about_row(l->sel) == AB_CHECK) {    /* Check for updates: from here, or */
             if (wifi_ask_if_off(WT_OK)) break;
             S.hooks.update_do(UI_UPD_CHECK);
@@ -7267,6 +7655,16 @@ static void marquee_arm(void)
     lv_timer_resume(S.marquee_timer);
 }
 
+void ui_covers_changed(void)
+{
+    /* covers made since they were asked for (a scan finding them in the
+     * background): the lists' thumbnails forgotten and drawn again, and Now
+     * Playing's cover, if it had none */
+    covers_reset(1);
+    if (S.now_playing_view && S.player && !S.now.radio && !S.now.podcast) load_art();
+    render(R_CONTENT);
+}
+
 void ui_library_changed(void)
 {
     /* Refreshed in place (a background scan may finish while you listen or
@@ -7291,6 +7689,8 @@ void ui_library_changed(void)
         if (l->top > sel) l->top = sel;
     }
     if (S.stack[S.depth - 1].kind == L_SEARCH) search_run();
+    for (int d = 0; d < S.depth; d++)
+        if (S.stack[d].kind == L_LIBRARY) { lib_counts_load(); break; }
     render(R_SNAP);
 }
 
@@ -7394,6 +7794,7 @@ void ui_key(ui_key_t k)
     level_t *l = &S.stack[S.depth - 1];
     player_t *pl = S.player;
     if (S.upd_ov && update_overlay_key(k)) return;
+    if (S.scan_ov && scan_overlay_key(k)) return;
     if (S.wn_ov && whats_new_key(k)) return;
     if (S.uni_ov && uninstall_overlay_key(k)) return;
     if (S.clk_ov && clock_key(k)) return;
@@ -7624,7 +8025,7 @@ void ui_key(ui_key_t k)
         uint32_t now = lv_tick_get();
         if (!(S.the_back_armed && now - S.the_back_armed < 3000)) {
             S.the_back_armed = now;
-            ui_toast("Not saved: press Back again to leave it", 3000);
+            ui_toast("Not saved: press <Back> again to leave it", 3000);
             render(R_CONTENT);
             return;
         }
@@ -7698,6 +8099,11 @@ void ui_tick_1s(void)
     list_kind_t k = S.stack[S.depth - 1].kind;
     if ((k == L_BATTERY || k == L_BAT_SPAN || k == L_BAT_HISTORY) && lv_tick_elaps(S.bat_at) >= 60000) battery_load();
     pod_second();
+    unsigned icons = ricon_seq();          /* a station's icon arrived: Radio's list reads its pictures again */
+    if (icons != S.ricon_seq) {
+        S.ricon_seq = icons;
+        thumbs_reset(COV_RADIO);
+    }
     S.ticking = 1;
     render(R_CONTENT);
     S.ticking = 0;
@@ -7971,12 +8377,12 @@ void ui_show(const char *what)
         if (!strcmp(what, "batteryhistory")) { S.stack[S.depth - 1].sel = 2; push_ui(L_BAT_HISTORY, "History", 0); }
     } else if (!strcmp(what, "radio")) {
         S.stack[0].sel = home_index(H_RADIO);
-        S.radio_n = S.hooks.radio_stations ? S.hooks.radio_stations(S.radio, RADIO_MAX) : -1;
+        radio_read();
         push_ui(L_RADIO, "Radio", 0);
         if (S.radio_n > 1) S.stack[S.depth - 1].sel = 2;
     } else if (!strncmp(what, "rdir", 4)) {         /* Radio > Find stations, from saved answers */
         S.stack[0].sel = home_index(H_RADIO);
-        S.radio_n = S.hooks.radio_stations ? S.hooks.radio_stations(S.radio, RADIO_MAX) : -1;
+        radio_read();
         push_ui(L_RADIO, "Radio", 0);
         push_ui(L_RDIR, "Find stations", 0);
         level_t *m = &S.stack[S.depth - 1];

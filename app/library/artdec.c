@@ -33,8 +33,16 @@ static int whole(FILE *f, long off, long len, const art_limits_t *lim, unsigned 
     int ch, r = -1;
     if (enc && fread(enc, 1, (size_t)len, f) == (size_t)len &&
         stbi_info_from_memory(enc, (int)len, w, h, &ch) && (long long)*w * *h <= lim->max_pixels) {
-        *rgb = stbi_load_from_memory(enc, (int)len, w, h, &ch, 3);
+        int alpha = lim->matte && (ch == 2 || ch == 4);    /* (with transparency: over white) */
+        *rgb = stbi_load_from_memory(enc, (int)len, w, h, &ch, alpha ? 4 : 3);
         r = *rgb ? 0 : -1;
+        if (*rgb && alpha) {                               /* RGBA to RGB where it is (each pixel read before it's written over) */
+            unsigned char *p = *rgb;
+            for (size_t i = 0, n = (size_t)*w * (size_t)*h; i < n; i++) {
+                unsigned a = p[4 * i + 3];
+                for (int c = 0; c < 3; c++) p[3 * i + c] = (unsigned char)((p[4 * i + c] * a + 255 * (255 - a) + 127) / 255);
+            }
+        }
     }
     free(enc);
     return r;
@@ -49,6 +57,8 @@ typedef struct {
     int depth, ctype, channels;
     size_t rowbytes, bpp;            /* bytes a row; bytes a pixel for the filters (at least 1) */
     unsigned char pal[256 * 3];
+    int matte;                       /* transparency over white: */
+    unsigned char pal_a[256];        /* each palette entry's (tRNS), 255 = opaque */
     int k, ow, oh;                   /* shrunk by k: ow x oh */
     unsigned char *cur, *prev;       /* this row and the one above, each after its filter byte */
     uint32_t *sum;                   /* k rows' pixels added up, ow * 3 */
@@ -90,16 +100,23 @@ static void png_row(png_t *p, int filter)
     if (oy < (uint32_t)p->oh) {
         for (uint32_t x = 0; x < (uint32_t)(p->ow * p->k); x++) {
             uint32_t *s = p->sum + 3 * (x / (uint32_t)p->k);
+            uint32_t v[3], a = 255;
             if (p->ctype == 3) {
-                const unsigned char *e = p->pal + 3 * png_sample(p, c, x, 0);
-                s[0] += e[0], s[1] += e[1], s[2] += e[2];
+                int idx = png_sample(p, c, x, 0);
+                const unsigned char *e = p->pal + 3 * idx;
+                v[0] = e[0], v[1] = e[1], v[2] = e[2];
+                a = p->pal_a[idx];
             } else if (p->ctype == 2 || p->ctype == 6) {
-                s[0] += (uint32_t)png_sample(p, c, x, 0), s[1] += (uint32_t)png_sample(p, c, x, 1);
-                s[2] += (uint32_t)png_sample(p, c, x, 2);
+                v[0] = (uint32_t)png_sample(p, c, x, 0), v[1] = (uint32_t)png_sample(p, c, x, 1);
+                v[2] = (uint32_t)png_sample(p, c, x, 2);
+                if (p->ctype == 6) a = (uint32_t)png_sample(p, c, x, 3);
             } else {                                  /* gray, with or without alpha */
-                uint32_t g = (uint32_t)png_sample(p, c, x, 0);
-                s[0] += g, s[1] += g, s[2] += g;
+                v[0] = v[1] = v[2] = (uint32_t)png_sample(p, c, x, 0);
+                if (p->ctype == 4) a = (uint32_t)png_sample(p, c, x, 1);
             }
+            if (p->matte && a != 255)                 /* over white */
+                for (int q = 0; q < 3; q++) v[q] = (v[q] * a + 255 * (255 - a) + 127) / 255;
+            s[0] += v[0], s[1] += v[1], s[2] += v[2];
         }
         if ((p->y + 1) % (uint32_t)p->k == 0) {
             uint32_t kk = (uint32_t)(p->k * p->k);
@@ -119,6 +136,8 @@ static int png_stream(FILE *f, long off, int min_side, const art_limits_t *lim, 
 {
     png_t p;
     memset(&p, 0, sizeof p);
+    p.matte = lim->matte;
+    memset(p.pal_a, 255, sizeof p.pal_a);
     unsigned char hd[8], *row = NULL, *in = NULL;
     z_stream z;
     memset(&z, 0, sizeof z);
@@ -159,6 +178,10 @@ static int png_stream(FILE *f, long off, int min_side, const art_limits_t *lim, 
         if (!have_hdr) goto out;                      /* IHDR comes first */
         if (!memcmp(hd + 4, "PLTE", 4) && len <= sizeof p.pal) {
             if (fread(p.pal, 1, len, f) != len || fseek(f, 4, SEEK_CUR)) goto out;
+            continue;
+        }
+        if (p.matte && p.ctype == 3 && !memcmp(hd + 4, "tRNS", 4) && len <= sizeof p.pal_a) {   /* the palette's transparency */
+            if (fread(p.pal_a, 1, len, f) != len || fseek(f, 4, SEEK_CUR)) goto out;
             continue;
         }
         if (!memcmp(hd + 4, "IDAT", 4)) {

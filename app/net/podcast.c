@@ -3,6 +3,7 @@
 /* Podcasts: feeds, OPML, Apple's search and the files on the card (podcast.h). */
 #define _GNU_SOURCE   /* memmem */
 #include "net/podcast.h"
+#include "core/fsafe.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -470,6 +471,8 @@ void pod_search_url(char *out, size_t cap, const char *term)
     snprintf(out, cap, "https://itunes.apple.com/search?media=podcast&entity=podcast&limit=%d&term=%s", POD_SEARCH_MAX, q);
 }
 
+static int is_http(const char *s) { return !strncmp(s, "http://", 7) || !strncmp(s, "https://", 8); }
+
 int pod_parse_search(const char *json, size_t len, pod_show_t *out, int max)
 {
     json_t root = json_root(json, len), res, r, v;
@@ -482,7 +485,13 @@ int pod_parse_search(const char *json, size_t len, pod_show_t *out, int max)
         if (!json_member(r, "feedUrl", &v) || json_string(v, s.url, sizeof s.url) <= 0) continue;
         if (json_member(r, "collectionName", &v)) json_string(v, s.title, sizeof s.title);
         if (json_member(r, "artistName", &v)) json_string(v, s.author, sizeof s.author);
-        if (json_member(r, "artworkUrl100", &v)) json_string(v, s.image, sizeof s.image);
+        /* its picture, for the list until its feed is read: the 600 px one
+         * when Apple gives it (the 100 px one is smaller than Now Playing's) */
+        long il = json_member(r, "artworkUrl600", &v) ? json_string(v, s.image, sizeof s.image) : 0;
+        if (il <= 0 || il >= (long)sizeof s.image - 1 || !is_http(s.image)) {   /* (none, or cut short) */
+            s.image[0] = '\0';
+            if (json_member(r, "artworkUrl100", &v)) json_string(v, s.image, sizeof s.image);
+        }
         if (json_member(r, "trackCount", &v)) s.episodes = (int)json_int(v, 0);
         if (!s.title[0]) snprintf(s.title, sizeof s.title, "%s", s.url);
         pod_hash(s.url, s.id);
@@ -549,7 +558,7 @@ static int write_file(const char *path, const char *text, size_t len)
     int ok = fwrite(text, 1, len, f) == len && fflush(f) == 0;
     ok &= fsync(fileno(f)) == 0;
     ok &= fclose(f) == 0;
-    if (!ok || rename(tmp, path) != 0) { unlink(tmp); return -1; }
+    if (!ok || file_replace(tmp, path) != 0) { unlink(tmp); return -1; }
     return 0;
 }
 
@@ -606,8 +615,6 @@ static void show_details(const char *dir, pod_show_t *s)
     }
     free(t);
 }
-
-static int is_http(const char *s) { return !strncmp(s, "http://", 7) || !strncmp(s, "https://", 8); }
 
 int pod_shows_load(const char *dir, pod_show_t *out, int max)
 {
@@ -924,6 +931,11 @@ void pod_chapters_path(const char *dir, const char *id, const char *key, char *o
 void pod_cover_path(const char *dir, const char *id, char *out, size_t cap)
 {
     snprintf(out, cap, "%s/%s/cover.565", dir, id);
+}
+
+void pod_thumb_path(const char *dir, const char *id, char *out, size_t cap)
+{
+    snprintf(out, cap, "%s/%s/thumb.565", dir, id);
 }
 
 int pod_chapters(const char *dir, const char *id, const pod_episode_t *e, pod_chapter_t *out, int max)

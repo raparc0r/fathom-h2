@@ -214,3 +214,10 @@ CONFIG_LOG_BUF_SHIFT=16
 # 2026-11-18 and left out: playback with network-drive downloads running,
 # with and without 1.5 MB less memory, gave no underruns and no measurable
 # difference in page faults either way, and it costs 16 KB.
+
+# No helper program run for every kernel event: the base config names
+# /sbin/hotplug, which isn't in the system, so each event (several hundred
+# while starting, and more at every Wi-Fi or Bluetooth start) forked a thread
+# that failed to run it. The card's and the radios' events are read from the
+# netlink socket (busybox uevent in S10sdcard), which this doesn't touch.
+# CONFIG_UEVENT_HELPER is not set

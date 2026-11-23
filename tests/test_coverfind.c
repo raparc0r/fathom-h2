@@ -93,7 +93,7 @@ static void test_parse(void)
     cf_album_t okc = album(1, "Radiohead", "OK Computer", 1997);
     int n = j ? cf_parse_mb(j, len, &okc, m, 16) : 0;
     CHECK(n >= 1 && !strcmp(m[0].title, "OK Computer") && !strcmp(m[0].artist, "Radiohead") && m[0].year == 1997 &&
-          m[0].sure && strstr(m[0].image, "coverartarchive.org/release-group/b1392450-e666-3926-a536-22c65f834433/front-500"),
+          m[0].sure && strstr(m[0].image, "coverartarchive.org/release-group/b1392450-e666-3926-a536-22c65f834433/front-250"),
           "MusicBrainz: OK Computer (%d: %s / %s %d)", n, n ? m[0].title : "", n ? m[0].artist : "", n ? m[0].year : 0);
     CHECK(cf_pick(&okc, m, n) == 0, "picked");
     cf_album_t remaster = album(1, "Radiohead", "OK Computer (Remastered)", 0);
@@ -106,7 +106,7 @@ static void test_parse(void)
 
     j = slurp("tests/data/covers/apple_okcomputer.json", &len);
     n = j ? cf_parse_apple(j, len, &okc, m, 16) : 0;
-    CHECK(n == 5 && !strcmp(m[0].title, "OK Computer") && m[0].sure && strstr(m[0].image, "/600x600bb.jpg"),
+    CHECK(n == 5 && !strcmp(m[0].title, "OK Computer") && m[0].sure && strstr(m[0].image, "/300x300bb.jpg"),
           "Apple: OK Computer first, at 600 px (%d)", n);
     int sure = 0;
     for (int i = 0; i < n; i++) sure += m[i].sure;
@@ -144,10 +144,14 @@ static int net_down;
 
 static volatile int gate, gated;   /* gate: the next question waits (gated: one is waiting) */
 
+static int mb_asked, apple_asked;   /* questions put to each */
+
 static long fake_fetch(const char *url, char *buf, size_t cap, const volatile int *abort)
 {
     (void)abort;
     while (gate) { gated = 1; usleep(1000); }
+    if (strstr(url, "musicbrainz.org")) mb_asked++;
+    else apple_asked++;
     if (net_down) return -2;                           /* (-2: no retries, so the test doesn't wait) */
     const char *file = NULL;
     if (strstr(url, "musicbrainz.org")) {
@@ -167,12 +171,19 @@ static long fake_fetch(const char *url, char *buf, size_t cap, const volatile in
 }
 
 static int downloads, flaky, net_fails;
+static int card_full, full_tries;   /* the card nearly full: how often the first picture asked for was tried */
+static char full_url[512];
 
 static int64_t fake_download(const char *url, const char *path, http_progress_fn progress, void *ctx,
                              const volatile int *abort)
 {
     (void)progress; (void)ctx; (void)abort;
     downloads++;
+    if (card_full) {
+        if (!full_url[0]) snprintf(full_url, sizeof full_url, "%s", url);
+        if (!strcmp(url, full_url)) full_tries++;
+        return HTTP_ERR_FULL;
+    }
     if (strstr(url, "coverartarchive.org") && strstr(url, "/release-group/1a5ae023")) return -3;   /* (no picture) */
     if (net_fails) { net_fails--; return -1; }       /* (a name that didn't resolve) */
     if (flaky) return -1;
@@ -241,6 +252,14 @@ static void test_worker(void)
     CHECK(r == 1, "then here (%d)", r);
     CHECK(cf_find_retry(0) < 0, "(one that's here isn't asked again)");
     cf_find_close();
+    /* the card nearly full: the picture isn't here, and wasn't tried three times */
+    card_full = 1;
+    cf_find(&okc);
+    for (int i = 0; i < 500 && (st = cf_find_state(&n)) == 0; i++) usleep(10000);
+    for (int i = 0; i < 500 && (r = cf_find_show(0, &m, large)) == 0; i++) usleep(10000);
+    CHECK(r == -2 && full_tries == 1, "card full: %d, tried %d times", r, full_tries);
+    cf_find_close();
+    card_full = 0;
 
     /* every album without a cover, once */
     cf_album_t list[4] = {album(1, "Radiohead", "OK Computer", 1997), album(2, "Weezer", "Weezer", 0),
@@ -250,6 +269,7 @@ static void test_worker(void)
     if (f) fclose(f);
     library_found_cover_path(list[0].key, "jpg", p, sizeof p);
     remove(p);                                         /* (the one kept above: as if it had none) */
+    mb_asked = apple_asked = 0;
     CHECK(cf_batch(list, 4) == 0, "batch");
     cf_batch_t b;
     int taken = 0;
@@ -264,6 +284,8 @@ static void test_worker(void)
     CHECK(!b.running && b.total == 3 && b.done == 3, "done (%d of %d)", b.done, b.total);
     CHECK(b.found == 1 && b.unsure == 1 && b.none == 1 && !b.failed, "found %d, unsure %d, none %d", b.found, b.unsure, b.none);
     CHECK(taken == 1 && id == 1, "OK Computer's to store (%d, %lld)", taken, (long long)id);
+    /* Apple asked only for the two MusicBrainz had no sure picture for */
+    CHECK(mb_asked == 3 && apple_asked == 2, "asked MusicBrainz %d times, Apple %d", mb_asked, apple_asked);
     library_found_cover_path(list[1].key, "jpg", p, sizeof p);
     CHECK(!exists(p), "Weezer's: not taken");
 

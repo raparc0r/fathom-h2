@@ -4,7 +4,12 @@
 # Hardware watchdog: busybox feeds it every 2 s; if userspace stops running
 # for 8 s (a kernel hang), the X1000 resets. RAM survives a watchdog reset, so
 # pstore still has the console log. Stopping the daemon disarms it.
+# Killed for want of memory, it leaves the watchdog armed and unfed, and the
+# H2 resets 8 s later (2026-11-22, a test that ran out of RAM): the OOM killer
+# passes it by (-1000), it takes a few hundred KB.
 case "$1" in
-    start) [ -c /dev/watchdog ] && watchdog -t 2 -T 8 /dev/watchdog ;;
+    # (beside the scripts that follow, not before them: 0.1 s of the start)
+    start) [ -c /dev/watchdog ] && ( watchdog -t 2 -T 8 /dev/watchdog &&
+           for p in $(pidof watchdog); do echo -1000 > /proc/$p/oom_score_adj; done ) > /dev/null 2>&1 & ;;
     stop)  killall watchdog 2>/dev/null ;;
 esac

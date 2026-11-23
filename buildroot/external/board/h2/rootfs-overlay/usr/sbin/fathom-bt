@@ -6,6 +6,10 @@
 # (fathom/bt), the chip through fathom-bluetooth. The player calls this:
 #
 #   fathom-bt start | stop | status       the stack (and the chip) on or off
+#   fathom-bt health                      is all of it still there? exit 0: yes; 3: no,
+#                                         and what's gone (dbus bluetoothd bluealsa avrcp
+#                                         hci0, or "stopped")
+#   fathom-bt avrcp                       the AVRCP helper started again, if it's gone
 #   fathom-bt scan SECONDS                audio devices nearby: ADDR|NAME|ICON|PAIRED
 #   fathom-bt paired                      paired devices: ADDR|NAME|ICON|CONNECTED
 #   fathom-bt pair ADDR                   pair, trust and connect
@@ -21,6 +25,7 @@ BT=/mnt/sd/fathom/bt
 STATE=/mnt/sd/fathom/bluetooth-pairings.tar
 RUN=/var/run/fathom-bt
 SETTINGS=/mnt/sd/fathom/settings.ini
+HCI=/sys/class/bluetooth/hci0
 nl='
 '
 setting() { sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" $SETTINGS 2>/dev/null | tail -1 | tr -d '\r' | sed 's/[[:space:]]*$//'; }
@@ -28,11 +33,44 @@ export LD_LIBRARY_PATH=$BT/usr/lib:$BT/lib
 export DBUS_SYSTEM_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket
 
 # --timeout makes bluetoothctl wait that long even when it's done: only for
-# what must take time (a scan); D-Bus bounds the rest (25 s)
-ctl() { $BT/usr/bin/bluetoothctl ${T:+--timeout $T} "$@" 2>/dev/null; }
+# what must take time (a scan); D-Bus bounds the rest (25 s). And bounded from
+# outside: bluetoothctl waits for ever for a bluetoothd that never came onto
+# the bus (it died as it started), which left the player "Starting" for good.
+ctl() { timeout -s KILL $(( ${T:-25} + 10 )) $BT/usr/bin/bluetoothctl ${T:+--timeout $T} "$@" 2>/dev/null; }
 say() { echo "bt: $1" >&2; }
 running() { [ -f $RUN/bluetoothd.pid ] && kill -0 "$(cat $RUN/bluetoothd.pid)" 2>/dev/null; }
-save() { [ -d /var/lib/bluetooth ] && tar -cf $STATE.new -C /var/lib bluetooth 2>/dev/null && mv $STATE.new $STATE && sync; }
+# pid $1 is running, and is $2 (a pid kept in a file is only believed when the
+# process is what it should be: numbers get used again)
+is_proc() {
+    [ -n "$1" ] && kill -0 "$1" 2>/dev/null || return 1
+    [ -r /proc/$1/cmdline ] || return 0
+    c=; IFS= read -r c 2>/dev/null < /proc/$1/cmdline
+    case "$c" in *"$2"*) return 0 ;; esac
+    return 1
+}
+# the player as the headphones see it (AVRCP: state, track; their buttons)
+avrcp_start() {
+    [ -x /mnt/sd/fathom/bin/fathom-avrcp ] || return 0
+    p=; read -r p 2>/dev/null < $RUN/avrcp.pid
+    is_proc "$p" fathom-avrcp && return 0
+    /mnt/sd/fathom/bin/fathom-avrcp >> /tmp/fathom-avrcp.log 2>&1 &
+    echo $! > $RUN/avrcp.pid
+}
+# The pairings, kept on the card: written whole and on the card before they take
+# the old archive's place, and the one before kept (a power cut in that moment
+# left an archive that didn't open: every pairing gone)
+save() {
+    [ -d /var/lib/bluetooth ] && tar -cf $STATE.new -C /var/lib bluetooth 2>/dev/null && sync || return
+    [ -s $STATE ] && tar -tf $STATE >/dev/null 2>&1 && cp $STATE $STATE.bak && sync
+    mv $STATE.new $STATE && sync
+}
+restore() {
+    [ -f $STATE ] && tar -xf $STATE -C /var/lib 2>/dev/null && return
+    [ -f $STATE ] && logger -t fathom-bt "the pairings' archive doesn't open: the one before used"
+    rm -rf /var/lib/bluetooth; mkdir -p /var/lib/bluetooth
+    [ -f $STATE.bak ] && tar -xf $STATE.bak -C /var/lib 2>/dev/null
+    return 0
+}
 # AAC: a bluez-alsa with Fraunhofer's FDK AAC, built by the user for their own H2
 # (tools/bluetooth-aac), in fathom/bt-aac; never part of a release
 AAC=/mnt/sd/fathom/bt-aac
@@ -41,6 +79,27 @@ bluealsa() {
     elif [ -x $BT/usr/bin/bluealsad ]; then echo $BT/usr/bin/bluealsad
     else echo $BT/usr/bin/bluealsa; fi
 }
+# What this bluealsa ($ba) can do, read from its --help into $caps (words:
+# sbc-quality, aac-bitrate, aptx, io-rt-priority). Asked once and kept in RAM
+# ($RUN/bluealsa.caps) with what the program was then (its `ls -ln` line: size
+# and date), so every later start is spared running it from the card just to
+# read its help; another build in its place (the AAC add-on put on the card)
+# is asked again. An answer that isn't its help (it couldn't run) isn't kept.
+ba_caps() {
+    key=$(ls -ln "${ba##* }" 2>/dev/null)
+    k= caps=
+    { IFS= read -r k; IFS= read -r caps; } 2>/dev/null < $RUN/bluealsa.caps
+    [ -n "$key" ] && [ "$k" = "$key" ] && return 0
+    help=$($ba -h 2>&1)
+    caps=
+    case "$help" in *--sbc-quality*) caps="$caps sbc-quality" ;; esac
+    case "$help" in *--aac-bitrate*) caps="$caps aac-bitrate" ;; esac
+    echo "$help" | grep -q "a2dp-source:.*aptX" && caps="$caps aptx"
+    case "$help" in *--io-rt-priority*) caps="$caps io-rt-priority" ;; esac
+    case "$help" in *a2dp-source*) [ -n "$key" ] && printf '%s\n%s\n' "$key" "$caps" > $RUN/bluealsa.caps ;; esac
+    return 0
+}
+can() { case " $caps " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # bluetoothctl's "info" (one device or several) read: ADDR|NAME|ICON|PAIRED|CONNECTED
 # for each device that plays audio, ADDR| for each that doesn't. (Fed on its
@@ -86,10 +145,20 @@ case "$1" in
 start)
     running && { echo on; exit 0; }
     [ -x $BT/usr/libexec/bluetooth/bluetoothd ] || { say "not on the card ($BT)"; exit 1; }
-    # (just after a stop the chip may still be going down: one more try)
-    fathom-bluetooth on >/dev/null || { sleep 2; fathom-bluetooth on >/dev/null; } || exit 1
+    # What an earlier start left without its bluetoothd (it died; the player
+    # started again): gone first, or a second bus, bluealsa and AVRCP would run
+    # beside them
+    for d in avrcp bluealsa bluetoothd dbus; do
+        [ -f $RUN/$d.pid ] && kill "$(cat $RUN/$d.pid)" 2>/dev/null
+        rm -f $RUN/$d.pid
+    done
+    rm -f /var/run/dbus/system_bus_socket
+    # (just after a stop the chip may still be going down: one more try; a chip
+    # that won't start isn't left powered)
+    fathom-bluetooth on >/dev/null || { sleep 2; fathom-bluetooth on >/dev/null; } ||
+        { fathom-bluetooth off >/dev/null 2>&1; exit 1; }
     mkdir -p $RUN /var/run/dbus /var/lib/bluetooth
-    [ -f $STATE ] && tar -xf $STATE -C /var/lib 2>/dev/null
+    restore
     cd /
     $BT/usr/bin/dbus-daemon --config-file=/etc/fathom/dbus-system.conf --fork --print-pid > $RUN/dbus.pid || exit 1
     # only what audio needs: no input, network, SIM access, MIDI, admin policy,
@@ -98,7 +167,17 @@ start)
         -P sap,input,hog,network,midi,neard,wiimote,bap,bass,vcp,mcp,ccp,csip,micp,tmap,gmap,asha,battery,deviceinfo,gap,scanparam,sixaxis,health,admin \
         >> /tmp/bluetoothd.log 2>&1 &
     echo $! > $RUN/bluetoothd.pid
-    for i in 1 2 3 4 5 6 7 8 9 10; do ctl show | grep -q "Controller" && break; sleep 0.5; done
+    # Until bluetoothd has its controller: that is once the chip's firmware
+    # patch has loaded (fathom-bluetooth no longer waits 2 s for it; four more
+    # looks here make up for those 2 s when it's slow). What "show" says of the
+    # controller is kept for below.
+    show=
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+        running || { say "bluetoothd didn't stay up"; "$0" stop >/dev/null 2>&1; exit 1; }
+        show=$(T=3 ctl show)
+        case "$show" in *Controller*) break ;; esac
+        sleep 0.5
+    done
     # 44.1 kHz for the whole link (most music; the player converts the rest:
     # changing the rate mid-link drops many headphones), and the headphones'
     # own volume (AVRCP absolute volume) where they have one. aptX is off unless
@@ -111,24 +190,24 @@ start)
     # away: SBC at medium quality, AAC at 128 kb/s, and no aptX (fixed at
     # 352 kb/s). The chip already transmits at its maximum (12 dBm).
     ba=$(bluealsa)
-    help=$($ba -h 2>&1)
+    ba_caps
     codecs= rt= range=
     if [ "$(setting bluetooth.range)" = 1 ]; then
-        echo "$help" | grep -q -- "--sbc-quality" && range="--sbc-quality=medium"
-        echo "$help" | grep -q -- "--aac-bitrate" && range="$range --aac-bitrate=128000"
+        can sbc-quality && range="--sbc-quality=medium"
+        can aac-bitrate && range="$range --aac-bitrate=128000"
     else
-        echo "$help" | grep -q "a2dp-source:.*aptX" && codecs="-c aptX"
+        can aptx && codecs="-c aptX"
     fi
-    echo "$help" | grep -q -- "--io-rt-priority" && rt="--io-rt-priority=10"
+    can io-rt-priority && rt="--io-rt-priority=10"
     $ba -p a2dp-source $codecs $rt $range --a2dp-force-audio-cd --a2dp-volume >> /tmp/bluealsa.log 2>&1 &
     echo $! > $RUN/bluealsa.pid
-    ctl power on > /dev/null
-    ctl pairable on > /dev/null              # bonding: pairings keep their keys
-    # the player as the headphones see it (AVRCP: state, track; their buttons)
-    if [ -x /mnt/sd/fathom/bin/fathom-avrcp ]; then
-        /mnt/sd/fathom/bin/fathom-avrcp >> /tmp/fathom-avrcp.log 2>&1 &
-        echo $! > $RUN/avrcp.pid
-    fi
+    # On, and bonding (pairings keep their keys): bluetoothd does both by
+    # itself as it takes the controller (AutoEnable and AlwaysPairable in
+    # /etc/fathom/bluetooth.conf), so each is only asked for here if "show"
+    # didn't already say so: a bluetoothctl from the card spared, or two.
+    case "$show" in *"Powered: yes"*) ;; *) ctl power on > /dev/null ;; esac
+    case "$show" in *"Pairable: yes"*) ;; *) ctl pairable on > /dev/null ;; esac
+    avrcp_start
     echo on
     ;;
 stop)
@@ -143,6 +222,32 @@ stop)
     ;;
 status)
     running && echo on || echo off
+    ;;
+health)
+    # Each daemon by its pid, and the chip: looked at, nothing asked of them (a
+    # question on D-Bus would wake bluetoothd and bluez-alsa for it, and hang
+    # on a bus that's gone). The player asks once a minute while Bluetooth is
+    # on, and stops and starts it when something is gone: a daemon killed for
+    # memory, or one that crashed, left Bluetooth "on" and silent until it was
+    # turned off and on by hand. Stopped altogether (by hand) counts as gone.
+    [ -f $RUN/bluetoothd.pid ] || { echo stopped; exit 3; }
+    gone=
+    for d in dbus bluetoothd bluealsa avrcp; do
+        [ $d = avrcp ] && [ ! -f $RUN/avrcp.pid ] && continue   # (no helper on the card: none was started)
+        case $d in dbus) name=dbus-daemon ;; avrcp) name=fathom-avrcp ;; *) name=$d ;; esac
+        p=; read -r p 2>/dev/null < $RUN/$d.pid
+        is_proc "$p" $name || gone="$gone $d"
+    done
+    [ -e $HCI ] || gone="$gone hci0"
+    [ -z "$gone" ] && exit 0
+    echo ${gone# }
+    exit 3
+    ;;
+avrcp)
+    # (only the helper gone: started again by itself, the music not interrupted for it)
+    running || exit 1
+    cd /
+    avrcp_start
     ;;
 scan)
     running || exit 1
@@ -184,7 +289,7 @@ codec)
     $BT/usr/bin/bluealsa-cli info "$p" 2>/dev/null | sed -n 's/^Selected codec: \([^:]*\).*/\1/p'
     ;;
 *)
-    echo "usage: $0 start|stop|status|scan [s]|paired|pair|connect|disconnect|forget ADDR|pcm" >&2
+    echo "usage: $0 start|stop|status|health|avrcp|scan [s]|paired|pair|connect|disconnect|forget ADDR|pcm" >&2
     exit 2
     ;;
 esac

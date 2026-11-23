@@ -54,8 +54,10 @@ add_executable(fathom-player
   main.c input.c uac_relay.c bt.c wifi.c share.c ssh.c shell.c tlscert.c radiometa.c out_router.c ff_trim.c jpeg_trim.c updater.c uninstaller.c ${ROOT}/app/audio/out_bt.c ${FATHOM_BOARD_SOURCES}
   ${ROOT}/app/core/rng.c
   ${ROOT}/app/core/settings.c
+  ${ROOT}/app/core/fsafe.c
   ${ROOT}/app/core/lang.c
   ${ROOT}/app/core/batlog.c
+  ${ROOT}/app/core/wifitxt.c
   ${ROOT}/app/core/datetime.c
   ${ROOT}/app/core/tz.c
   ${ROOT}/app/core/intern.c
@@ -76,6 +78,7 @@ add_executable(fathom-player
   ${ROOT}/app/net/http.c
   ${ROOT}/app/net/json.c
   ${ROOT}/app/net/radiodir.c
+  ${ROOT}/app/net/radioicon.c
   ${ROOT}/app/net/podcast.c
   ${ROOT}/app/net/podsync.c
   ${ROOT}/app/net/coverfind.c
@@ -118,7 +121,8 @@ target_compile_definitions(fathom-player PRIVATE
   FATHOM_ART_MAX_PIXELS=1200000LL
   FATHOM_JPEG_MAX_MEMORY=4194304L
   FATHOM_ART_MAX_FILE=4194304L
-  "FATHOM_SQLITE_CACHE=\"-512\"")
+  "FATHOM_SQLITE_CACHE=\"-512\""
+  FATHOM_SQLITE_NO_TRACE)   # (its SQLite is built without tracing: external.mk)
 target_compile_options(fathom-player PRIVATE -Wall -Wextra -Wno-unused-parameter -ffunction-sections -fdata-sections ${FATHOM_EXE_CODE})
 set_source_files_properties(${ROOT}/app/library/stb_impl.c PROPERTIES COMPILE_OPTIONS "-w")
 # The player's cold code built for size: start-up, settings, the network, the
@@ -131,7 +135,7 @@ set_property(SOURCE main.c bt.c wifi.c share.c ssh.c shell.c tlscert.c radiometa
   ${ROOT}/app/core/settings.c ${ROOT}/app/core/lang.c
   ${ROOT}/app/library/tags.c ${ROOT}/app/library/cue.c ${ROOT}/app/library/playlist.c
   ${ROOT}/app/shuffle/shuffle.c
-  ${ROOT}/app/net/http.c ${ROOT}/app/net/json.c ${ROOT}/app/net/radiodir.c
+  ${ROOT}/app/net/http.c ${ROOT}/app/net/json.c ${ROOT}/app/net/radiodir.c ${ROOT}/app/net/radioicon.c
   ${ROOT}/app/net/podcast.c ${ROOT}/app/net/podsync.c ${ROOT}/app/net/coverfind.c ${ROOT}/app/net/netclock.c
   ${ROOT}/app/net/unzip.c ${ROOT}/app/net/update.c
   ${ROOT}/app/player/player.c ${ROOT}/app/player/radio.c ${ROOT}/app/player/rfmeta.c
@@ -170,6 +174,7 @@ add_executable(fathom-bitperfect
   ${ROOT}/app/audio/streamlist.c
   ${ROOT}/app/audio/ff_util.c
   ${ROOT}/app/net/http.c
+  ${ROOT}/app/core/fsafe.c
   ${ROOT}/app/net/json.c
   ${ROOT}/app/audio/engine.c
   ${ROOT}/app/audio/eq.c
@@ -195,6 +200,7 @@ add_executable(fathom-scan
   ${ROOT}/app/library/tags.c
   ${ROOT}/app/library/cue.c
   ${ROOT}/app/library/library.c
+  ${ROOT}/app/core/fsafe.c
   ${ROOT}/app/library/artdec.c
   ${ROOT}/app/library/fatwalk.c
   ${ROOT}/app/library/playlist.c
@@ -209,7 +215,7 @@ add_executable(fathom-scan
 target_include_directories(fathom-scan PRIVATE ${ROOT}/app ${ROOT}/third_party ${DEPS_STATIC_INCLUDE_DIRS})
 # (the player's cover limits: what it measures is what the player does)
 target_compile_definitions(fathom-scan PRIVATE FATHOM_HAVE_FFMPEG FATHOM_HAVE_LIBJPEG FATHOM_HAVE_VORBIS FATHOM_VORBIS_TREMOR
-  FATHOM_ART_MAX_PIXELS=1200000LL FATHOM_JPEG_MAX_MEMORY=4194304L FATHOM_ART_MAX_FILE=4194304L)
+  FATHOM_ART_MAX_PIXELS=1200000LL FATHOM_JPEG_MAX_MEMORY=4194304L FATHOM_ART_MAX_FILE=4194304L FATHOM_SQLITE_NO_TRACE)
 target_link_options(fathom-scan PRIVATE -static)
 target_link_libraries(fathom-scan PRIVATE ${DEPS_STATIC_LDFLAGS} pthread m)
 
@@ -227,12 +233,26 @@ add_executable(fathom-rg-bench
   ${ROOT}/app/audio/streamlist.c
   ${ROOT}/app/audio/ff_util.c
   ${ROOT}/app/net/http.c
+  ${ROOT}/app/core/fsafe.c
   ${ROOT}/app/net/json.c)
 target_include_directories(fathom-rg-bench PRIVATE ${ROOT}/app ${DEPS_STATIC_INCLUDE_DIRS})
 target_compile_options(fathom-rg-bench PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_compile_definitions(fathom-rg-bench PRIVATE FATHOM_HAVE_FFMPEG FATHOM_HAVE_VORBIS FATHOM_VORBIS_TREMOR)
 target_link_options(fathom-rg-bench PRIVATE -static)
 target_link_libraries(fathom-rg-bench PRIVATE ${DEPS_STATIC_LDFLAGS} pthread m)
+
+# Request timing (tools/httptime): a URL fetched a few times through the
+# player's HTTP client, each a new connection. Not installed; copied by hand.
+add_executable(fathom-httptime
+  ${ROOT}/tools/httptime/main.c
+  ${ROOT}/app/audio/ff_util.c
+  ${ROOT}/app/net/http.c
+  ${ROOT}/app/core/fsafe.c)
+target_include_directories(fathom-httptime PRIVATE ${ROOT}/app ${DEPS_STATIC_INCLUDE_DIRS})
+target_compile_options(fathom-httptime PRIVATE -Wall -Wextra -Wno-unused-parameter)
+target_compile_definitions(fathom-httptime PRIVATE FATHOM_HAVE_FFMPEG)
+target_link_options(fathom-httptime PRIVATE -static)
+target_link_libraries(fathom-httptime PRIVATE ${DEPS_STATIC_LDFLAGS} pthread m)
 
 # fatwalk check (tools/fatcheck): lists a folder by reading the FAT directly and
 # through the kernel, and compares. Not installed; copied by hand.

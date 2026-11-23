@@ -34,11 +34,26 @@ DEV=13460000.mmc
 FW=/mnt/sd/fathom/firmware/brcm/brcmfmac43430-sdio.bin
 JOIN=40                                 # connect waits up to this many half seconds
 UPTIME=/proc/uptime
+LOCK=/var/run/fathom-wifi.lock          # one of on, off, connect, forget at a time: its pid in $LOCK/pid
+LOCKWAIT=300                            # another run is waited for this many fifths of a second
+NTPLOCK=/var/run/fathom-ntp.lock        # the clock hook's loop (fathom-ntp): its pid in $NTPLOCK/pid
+NET=/sys/class/net/wlan0                # there once the chip has started
+VM=/proc/sys/vm
+BUDDY=/proc/buddyinfo
+CHIPWAIT=450                            # the chip is given this many tenths of a second to start (45 s)
+ROOM=16                                 # free 64 KB pieces that make tidying memory unnecessary (see roomy)
 export LD_LIBRARY_PATH=$W/usr/lib:$W/lib:$BT/usr/lib:$BT/lib
 nl='
 '
 
 say() { echo "wifi: $1" >&2; }
+# mods: the kernel modules loaded, " name name ... " (read by the shell: a grep
+# of /proc/modules for each one asked about was a program started each time,
+# a dozen at every start of Wi-Fi and four at every off, start-up's included)
+loaded() {
+    mods=" "
+    while read -r lm lrest; do mods="$mods$lm "; done < /proc/modules 2>/dev/null
+}
 cli() { $W/usr/sbin/wpa_cli -p $CTRL -i wlan0 "$@" 2>/dev/null; }
 running() { [ -f $RUN/wpa.pid ] && read -r wpid < $RUN/wpa.pid && kill -0 "$wpid" 2>/dev/null; }
 hex() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
@@ -46,6 +61,54 @@ hex() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
 # v: KEY's value in wpa_cli's KEY=VALUE lines ($2), "" without one
 val() { v="$nl$2"; case "$v" in *"$nl$1="*) v=${v#*"$nl$1="}; v=${v%%"$nl"*} ;; *) v= ;; esac; }
 up() { read -r up _ < $UPTIME; up=${up%.*}; }
+# pid $1 is running, and is $2 (a pid kept in a file is only believed when the
+# process is what it should be: numbers get used again)
+is_proc() {
+    [ -n "$1" ] && kill -0 "$1" 2>/dev/null || return 1
+    [ -r /proc/$1/cmdline ] || return 0
+    c=; IFS= read -r c 2>/dev/null < /proc/$1/cmdline
+    case "$c" in *"$2"*) return 0 ;; esac
+    return 1
+}
+
+# One run at a time of what changes Wi-Fi (on, off, connect, forget). The
+# player's worker runs them one after another, but a player started again
+# after a crash can ask for "on" while the "on" its predecessor started is
+# still loading the driver, and a boot script's "off" can meet either: two
+# runs then loaded modules, bound the chip and started wpa_supplicant across
+# each other. A directory as the lock (mkdir either makes it or doesn't), as
+# fathom-ntp's: not flock on a descriptor, which wpa_supplicant and udhcpc
+# would inherit and hold for as long as Wi-Fi is on. A lock whose owner is
+# gone (stopped at the player's deadline) is cleared away; one still held
+# after a minute is no longer waited for, and a lock that can't be made at all
+# isn't insisted on: the command then runs as it always did, without.
+lock() {
+    n=0 gone=0 miss=0
+    until mkdir $LOCK 2>/dev/null; do
+        if [ ! -d $LOCK ]; then                 # (it can't be made, or was cleared this instant)
+            miss=$((miss + 1))
+            [ $miss -lt 3 ] && continue
+            return 0
+        fi
+        p=; read -r p 2>/dev/null < $LOCK/pid
+        if is_proc "$p" fathom-wifi; then
+            gone=0
+        else
+            # (seen ownerless twice running, not once: a run that has just
+            # made it is about to write its pid)
+            gone=$((gone + 1))
+            [ $gone -ge 2 ] && { rm -rf $LOCK; gone=0; }
+        fi
+        n=$((n + 1))
+        if [ $n -ge $LOCKWAIT ]; then
+            logger -t fathom-wifi "$1: another run ($p) still going: not waited for any longer"
+            return 0
+        fi
+        sleep 0.2
+    done
+    echo $$ > $LOCK/pid
+    trap 'rm -rf $LOCK' EXIT
+}
 
 # wpa_cli prints a network's name with its bytes escaped (printf_encode):
 # \" \\ \e \n \r \t, and \xHH for each byte outside printable ASCII, so
@@ -97,6 +160,37 @@ unesc() {
     esac
 }
 
+# Where a start's 10 to 20 s go: with /tmp/fathom-lat there (or the card's
+# fathom/test/fathom-lat: the player's own timing switch, core/lat.h), a line
+# in the system log (/tmp/messages) at each step of "on", stamped as the
+# player's lat lines are (ms since the kernel started), so the two read as one.
+# Not on stderr: the player reads that for why a start failed. Without the
+# file, two looks for it and nothing more.
+lat() {
+    [ -e /tmp/fathom-lat ] || [ -e /mnt/sd/fathom/test/fathom-lat ] || return 0
+    read -r t _ < $UPTIME
+    logger -t fathom-wifi "lat ${t%.*}${t#*.}0: $1"
+}
+
+# Is there room for the driver in memory as it stands? What fails when there
+# isn't is the firmware's download: brcmfmac sends it in 32 KB pieces from one
+# buffer that, with its header, needs a free 64 KB block (16 pages in a row),
+# asked for in a way that can't wait for memory to be tidied; its scan buffer
+# is another 64 KB. /proc/buddyinfo counts the free blocks of each size (4 KB,
+# 8, 16, ... 4 MB) per zone: here, those of 64 KB and more, as 64 KB pieces
+# ($big). $ROOM of them (1 MB) is room: eight times what's needed at once,
+# since the player is reading the library at the same moment. Anything not as
+# expected (no file, a line that isn't numbers) is "no room": memory is tidied
+# as it always was.
+roomy() {
+    big=0
+    while read -r _ _ _ _ _ _ _ _ o4 o5 o6 o7 o8 o9 o10 _; do
+        case "$o4$o5$o6$o7$o8$o9$o10" in ''|*[!0-9]*) big=0; return 1 ;; esac
+        big=$((big + ${o4:-0} + 2 * ${o5:-0} + 4 * ${o6:-0} + 8 * ${o7:-0} + 16 * ${o8:-0} + 32 * ${o9:-0} + 64 * ${o10:-0}))
+    done 2>/dev/null < $BUDDY
+    [ $big -ge $ROOM ]
+}
+
 # The chip's settings: the stock file (from the H2's flash), and for this board
 # a copy with Cypress's Bluetooth coexistence parameters, as the Raspberry Pi
 # ships for the same chip; brcmfmac loads brcmfmac43430-sdio.<board>.txt in the
@@ -116,7 +210,71 @@ nvram() {
 # Saved with every network enabled. Picking one makes wpa_supplicant disable all
 # the others, which is meant for now only: saved as it is, the H2 would never
 # rejoin them by itself (home, after a hotspot elsewhere).
-save() { cli save_config > /dev/null; sed -i '/^[[:space:]]*disabled=1$/d' $CONF; sync; }
+# Written to a file of its own, on the card, then moved over the old one (never
+# rewritten where it lies: a power cut in that moment left networks.conf empty or
+# half written, and Wi-Fi then never started again). What's saved and sound is
+# also kept as networks.conf.bak, for `on` to go back to.
+conf_ok() { [ -s "$1" ] && grep -q '^ctrl_interface=' "$1" && grep -q '^update_config=1' "$1"; }
+save() {
+    cli save_config > /dev/null
+    if grep -q '^[[:space:]]*disabled=1$' $CONF; then
+        sed '/^[[:space:]]*disabled=1$/d' $CONF > $CONF.new && sync && mv $CONF.new $CONF
+    fi
+    sync
+    conf_ok $CONF && cp $CONF $CONF.bak.new && sync && mv $CONF.bak.new $CONF.bak
+    sync
+}
+
+# The DHCP client (see `on`): started, and by status again if it has died
+dhcp_start() {
+    [ -f $RUN/udhcpc.pid ] && kill "$(cat $RUN/udhcpc.pid)" 2>/dev/null   # (one left by a start before this)
+    rm -f $RUN/asked $RUN/udhcpc.pid
+    (cd / && exec udhcpc -f -i wlan0 -S -A 3 -T 1 -x hostname:fathom-h2 -p $RUN/udhcpc.pid) < /dev/null > /dev/null 2>&1 &
+}
+dhcp_alive() { [ -f $RUN/udhcpc.pid ] && kill -0 "$(cat $RUN/udhcpc.pid)" 2>/dev/null; }
+# Joined to $ssid, with the address $ip ("" for none): DHCP made to follow.
+# By status at every look while joined, and by connect at the join itself (the
+# address then comes without waiting for the player's next look). It may empty
+# $ip (an address that was another network's).
+dhcp_follow() {
+    # Joined a different network from the one the address came from
+    # (wpa_supplicant moved on; udhcpc keeps its lease until it's due):
+    # let that address go and ask this network for one
+    up
+    lease=
+    [ -f $RUN/lease-ssid ] && IFS= read -r lease < $RUN/lease-ssid
+    if [ -f $RUN/lease-ssid ] && [ "$lease" != "$ssid" ] && [ -f $RUN/udhcpc.pid ]; then
+        read -r p < $RUN/udhcpc.pid
+        rm -f $RUN/lease-ssid
+        # release, then a fresh discover: apart, as two signals pending at once
+        # arrive lowest first (USR1, renew, would come before the release)
+        kill -USR2 "$p" 2>/dev/null; sleep 0.3; kill -USR1 "$p" 2>/dev/null
+        echo $up > $RUN/asked              # (asked: not again just below)
+        logger -t fathom-wifi "joined another network: a new address"
+        ip=
+    fi
+    # Joined, no address yet: DHCP woken (udhcpc rests while no network is
+    # joined: its lease hook), and again every 10 s until there's one. (A
+    # wake while it's already asking changes nothing: udhcpc lets a search
+    # in progress be.)
+    if [ -z "$ip" ] && [ -f $RUN/udhcpc.pid ]; then
+        asked=
+        [ -f $RUN/asked ] && read -r asked < $RUN/asked
+        if [ -z "$asked" ] || [ $((up - asked)) -ge 10 ]; then
+            read -r p < $RUN/udhcpc.pid
+            kill -USR1 "$p" 2>/dev/null
+            echo $up > $RUN/asked
+        fi
+    fi
+    echo $up > $RUN/seen
+}
+
+wpa_start() {
+    rm -f $CTRL/wlan0 $RUN/wpa.pid                     # a socket left by an earlier one
+    $W/usr/sbin/wpa_supplicant -B -i wlan0 -c $CONF -P $RUN/wpa.pid >/dev/null 2>&1
+    for i in $(seq 1 20); do running && return 0; sleep 0.1; done   # (it writes its pid once in the background)
+    return 1
+}
 
 # The ids of the networks saved as SSID (its real name), oldest first
 net_ids() {
@@ -127,49 +285,93 @@ net_ids() {
 case "$1" in
 on)
     running && { echo on; exit 0; }
+    lock on
+    running && { echo on; exit 0; }                    # (the run waited for has started it)
     [ -f $FW ] || { say "no firmware at $FW (extract-firmware.py --wifi)"; exit 1; }
+    lat "on"
     nvram
     # brcmfmac-wcc: the BCM43430's vendor code, which brcmfmac would ask modprobe
     # for (there's none): loaded first, it's found registered
     # cfg80211 keeps up to 1000 networks heard in scans, in memory the kernel
     # can't give back: 40 is plenty here (the one joined is never dropped)
+    loaded
     for m in cfg80211 brcmutil brcmfmac brcmfmac-wcc; do
         opt=; [ $m = cfg80211 ] && opt=bss_entries_limit=40
-        grep -q "^$(echo $m | tr - _) " /proc/modules || insmod $W/modules/$m.ko $opt || { say "can't load $m"; exit 1; }
+        case $m in brcmfmac-wcc) mm=brcmfmac_wcc ;; *) mm=$m ;; esac   # (as the kernel names it)
+        case "$mods" in *" $mm "*) continue ;; esac
+        insmod $W/modules/$m.ko $opt || { say "can't load $m"; exit 1; }
     done
-    # The firmware goes to the chip in 32 KB pieces, each needing 32 KB of
-    # contiguous memory: with the player running that can be missing until the
-    # page cache is dropped and memory compacted. A start takes 10-20 s. Only
-    # when the driver says it failed is the chip unpowered for a second try:
-    # unbinding MSC1 while brcmfmac is still starting deadlocks the two.
+    lat "modules loaded"
+    # The firmware goes to the chip in 32 KB pieces, from a buffer that needs
+    # 64 KB of contiguous memory: with the player running that can be missing
+    # until the page cache is dropped and memory compacted. That was done
+    # before every start, which also threw away every page of the library the
+    # player had just read, right as Home appears. Now the first try goes
+    # ahead as memory is when there's plainly room (roomy); a first try that
+    # fails for memory after all is the second try, which always tidies first,
+    # as before. A start takes 10-20 s. Only when the driver says it failed is
+    # the chip unpowered for a second try: unbinding MSC1 while brcmfmac is
+    # still starting deadlocks the two.
     for try in 1 2; do
-        sync
-        echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
-        [ -w /proc/sys/vm/compact_memory ] && echo 1 > /proc/sys/vm/compact_memory
+        if [ $try = 1 ] && roomy; then
+            lat "try 1: room in memory ($big free pieces of 64 KB): nothing dropped"
+        else
+            sync
+            echo 3 > $VM/drop_caches 2>/dev/null
+            [ -w $VM/compact_memory ] && echo 1 > $VM/compact_memory
+            lat "try $try: caches dropped, memory compacted (it had $big free pieces of 64 KB)"
+        fi
         mark=$(dmesg | wc -l)
         [ -e $MMC/$DEV ] || echo $DEV > $MMC/bind || { say "can't power the chip"; exit 1; }
-        failed=
-        for i in $(seq 1 90); do
-            [ -e /sys/class/net/wlan0 ] && break
-            dmesg | tail -n +$((mark + 1)) | grep -q -E "download failed|brcmf_attach failed|firmware_callback" && { failed=1; break; }
-            sleep 0.5
+        # wlan0 looked for every tenth of a second (a test of a file); the
+        # kernel's log, for the driver saying it failed, every half second as
+        # before (three programs each time). It was both every half second:
+        # up to that long lost at every start.
+        failed= i=0
+        while [ $i -lt $CHIPWAIT ]; do
+            [ -e $NET ] && break
+            if [ $((i % 5)) = 4 ]; then
+                dmesg | tail -n +$((mark + 1)) | grep -q -E "download failed|brcmf_attach failed|firmware_callback" && { failed=1; break; }
+            fi
+            sleep 0.1
+            i=$((i + 1))
         done
-        [ -e /sys/class/net/wlan0 ] && break
+        [ -e $NET ] && break
         [ -n "$failed" ] || { say "the chip didn't start in 45 s"; exit 1; }
+        lat "try $try: the driver says it failed"
         echo $DEV > $MMC/unbind
     done
-    [ -e /sys/class/net/wlan0 ] || { say "no wlan0 (firmware?)"; exit 1; }
+    [ -e $NET ] || { say "no wlan0 (firmware?)"; exit 1; }
+    lat "wlan0 (try $try)"
     mkdir -p $RUN $CTRL
-    [ -f $CONF ] || printf 'ctrl_interface=%s\nupdate_config=1\n' $CTRL > $CONF
+    # Saved networks a power cut left empty or cut short: the copy from the last
+    # good save, else none (the damaged file kept as networks.conf.bad)
+    if [ -f $CONF ] && ! conf_ok $CONF; then
+        logger -t fathom-wifi "networks.conf is damaged"
+        if conf_ok $CONF.bak; then cp $CONF.bak $CONF; else mv $CONF $CONF.bad; fi
+        sync
+    fi
+    [ -f $CONF ] || { printf 'ctrl_interface=%s\nupdate_config=1\n' $CTRL > $CONF; sync; }
+    # (networks saved before there was a copy: one made now)
+    [ -f $CONF.bak ] || { cp $CONF $CONF.bak.new && sync && mv $CONF.bak.new $CONF.bak; }
     # (cards saved by 0.8.4 and earlier: every network the H2 last left disabled)
-    grep -q '^[[:space:]]*disabled=1$' $CONF && sed -i '/^[[:space:]]*disabled=1$/d' $CONF
+    if grep -q '^[[:space:]]*disabled=1$' $CONF; then
+        sed '/^[[:space:]]*disabled=1$/d' $CONF > $CONF.new && sync && mv $CONF.new $CONF
+    fi
     rm -f $RUN/lease-ssid $RUN/seen
     ifconfig wlan0 up
-    rm -f $CTRL/wlan0 $RUN/wpa.pid                     # a socket left by an earlier one
-    $W/usr/sbin/wpa_supplicant -B -i wlan0 -c $CONF -P $RUN/wpa.pid >/dev/null 2>&1
-    for i in $(seq 1 20); do running && break; sleep 0.1; done   # (it writes its pid once in the background)
-    running || { say "wpa_supplicant didn't start"; exit 1; }
+    if ! wpa_start; then
+        # it won't read the file (damaged past its first lines): the copy, else afresh
+        logger -t fathom-wifi "wpa_supplicant didn't start: networks.conf set aside"
+        cp $CONF $CONF.bad 2>/dev/null
+        if conf_ok $CONF.bak && ! cmp -s $CONF.bak $CONF; then cp $CONF.bak $CONF
+        else printf 'ctrl_interface=%s\nupdate_config=1\n' $CTRL > $CONF; fi
+        sync
+        wpa_start || { say "wpa_supplicant didn't start"; exit 1; }
+    fi
+    lat "wpa_supplicant started"
     for i in $(seq 1 20); do [ -S $CTRL/wlan0 ] && break; sleep 0.2; done
+    lat "its control socket"
     cli set ap_scan 1 > /dev/null
     # wpa_supplicant's own list of networks heard: 40, not 200 (saved ones are kept first)
     cli set bss_max_count 40 > /dev/null
@@ -185,12 +387,18 @@ on)
     # an answer (-T 1), not 3: the first goes out before the network is joined
     # and is lost, and the owner's router answers the next about 1.8 s after
     # the join; with 3 s the address came 6-12 s after "on", with 1 s 2.5 s.
-    rm -f $RUN/asked
-    (cd / && exec udhcpc -f -i wlan0 -S -A 3 -T 1 -x hostname:fathom-h2 -p $RUN/udhcpc.pid) < /dev/null > /dev/null 2>&1 &
+    dhcp_start
+    lat "udhcpc started: on"
     echo on
     ;;
 off)
+    lock off
     [ -f $RUN/udhcpc.pid ] && kill "$(cat $RUN/udhcpc.pid)" 2>/dev/null
+    # The clock hook's loop, asleep until its next try at NTP (up to half an
+    # hour): it ends by itself only when it next wakes and finds no network.
+    # (udhcpc, ended, doesn't run its hooks: nothing else tells it.)
+    np=; read -r np 2>/dev/null < $NTPLOCK/pid
+    is_proc "$np" fathom-ntp && kill "$np" 2>/dev/null
     # wpa_supplicant ended at once: asked to, it spends a second winding down
     # with the chip, which is about to lose power (it writes the networks only
     # when told to: nothing is lost). The interface goes down with the driver.
@@ -203,12 +411,16 @@ off)
     # The driver out first, while the chip still answers (0.6 s); then the chip
     # unpowered. The other way round, brcmfmac detached from a chip already
     # gone and waited 5 s for it, at every shutdown.
-    for m in brcmfmac_wcc brcmfmac brcmutil cfg80211; do grep -q "^$m " /proc/modules && rmmod $m 2>/dev/null; done
+    loaded
+    for m in brcmfmac_wcc brcmfmac brcmutil cfg80211; do
+        case "$mods" in *" $m "*) rmmod $m 2>/dev/null ;; esac
+    done
     [ -e $MMC/$DEV ] && echo $DEV > $MMC/unbind
     echo off
     ;;
 status)
     running || { echo "off|||"; exit 0; }
+    dhcp_alive || { logger -t fathom-wifi "udhcpc was gone: started again"; dhcp_start; }
     # (asked every few seconds while Wi-Fi is on: two or three wpa_cli, little else)
     st=$(cli status)
     val wpa_state "$st"; state=$v
@@ -218,36 +430,7 @@ status)
     if [ "$state" = COMPLETED ]; then
         [ -z "$ip" ] && ip=$(ifconfig wlan0 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p')
         val RSSI "$(cli signal_poll)"; sig=$v
-        # Joined a different network from the one the address came from
-        # (wpa_supplicant moved on; udhcpc keeps its lease until it's due):
-        # let that address go and ask this network for one
-        up
-        lease=
-        [ -f $RUN/lease-ssid ] && IFS= read -r lease < $RUN/lease-ssid
-        if [ -f $RUN/lease-ssid ] && [ "$lease" != "$ssid" ] && [ -f $RUN/udhcpc.pid ]; then
-            read -r p < $RUN/udhcpc.pid
-            rm -f $RUN/lease-ssid
-            # release, then a fresh discover: apart, as two signals pending at once
-            # arrive lowest first (USR1, renew, would come before the release)
-            kill -USR2 "$p" 2>/dev/null; sleep 0.3; kill -USR1 "$p" 2>/dev/null
-            echo $up > $RUN/asked              # (asked: not again just below)
-            logger -t fathom-wifi "joined another network: a new address"
-            ip=
-        fi
-        # Joined, no address yet: DHCP woken (udhcpc rests while no network is
-        # joined: its lease hook), and again every 10 s until there's one. (A
-        # wake while it's already asking changes nothing: udhcpc lets a search
-        # in progress be.)
-        if [ -z "$ip" ] && [ -f $RUN/udhcpc.pid ]; then
-            asked=
-            [ -f $RUN/asked ] && read -r asked < $RUN/asked
-            if [ -z "$asked" ] || [ $((up - asked)) -ge 10 ]; then
-                read -r p < $RUN/udhcpc.pid
-                kill -USR1 "$p" 2>/dev/null
-                echo $up > $RUN/asked
-            fi
-        fi
-        echo $up > $RUN/seen
+        dhcp_follow
     else
         rm -f $RUN/asked
         case "$(cli list_networks)" in
@@ -296,6 +479,7 @@ saved)
 connect)
     running || exit 1
     [ -n "$2" ] || exit 2
+    lock connect
     old=$(net_ids "$2")
     id=${old%%"$nl"*} new=
     if [ -z "$id" ] || [ -n "$3" ]; then
@@ -334,6 +518,17 @@ connect)
         fi
         sleep 0.5; i=$((i + 1))
     done
+    # Joined: DHCP woken now, as status does when it sees a network joined (an
+    # address that was another network's let go, a resting udhcpc set asking),
+    # before the networks are saved to the card below. Left to the player's
+    # next status, the address came a second or more later for nothing.
+    if [ "$r" = joined ]; then
+        dhcp_alive || { logger -t fathom-wifi "udhcpc was gone: started again"; dhcp_start; }
+        val ssid "$st"; unesc "$v"; ssid=$u
+        val ip_address "$st"; ip=$v
+        [ -z "$ip" ] && ip=$(ifconfig wlan0 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p')
+        dhcp_follow
+    fi
     if [ -n "$r" ] && [ "$r" != joined ]; then
         # Not kept (wpa_supplicant would try it again and again, silently): a
         # new one goes; a saved one whose password is wrong too, so choosing
@@ -349,11 +544,17 @@ connect)
     if [ "$r" = joined ] && [ -n "$new" ]; then
         for o in $old; do cli remove_network "$o" > /dev/null; done
     fi
+    # Not joined in the wait: the other saved networks on again at once. They
+    # stayed off for a minute more (until status's own minute was up): choosing
+    # a network out of range dropped a working connection for that long.
+    [ "$r" = joined ] || cli enable_network all > /dev/null
     save
+    [ "$r" = joined ] || { say "not joined yet"; exit 6; }
     echo "$id"
     ;;
 forget)
     running || exit 1
+    lock forget
     ids=$(net_ids "$2")
     [ -n "$ids" ] || exit 0
     for id in $ids; do cli remove_network "$id" > /dev/null; done

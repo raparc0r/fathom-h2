@@ -7,9 +7,16 @@
  * the lookup fails after its 5 s timeout ("Try again"). A station's start, a
  * station change, a reconnect, FIP's song info every 15 s and each HLS
  * segment asked again each time. Here a result is given again for 2 minutes
- * without asking, and for up to an hour when asking fails for the moment (the
- * address is still the station's; were it not, the connection fails as it
- * would have, and the next lookup asks again).
+ * without asking. An older one (up to an hour) is given at once as well, and
+ * asked again in the background: a reconnect after a few minutes' listening
+ * doesn't wait for the router first. (The address is still the station's;
+ * were it not, the connection fails as it would have, and by the next try the
+ * background's answer is here.)
+ *
+ * The H2's kernel has no IPv6, and a lookup for "either" asks for both
+ * addresses: musl fails all of it after 5 s when the IPv6 half isn't answered
+ * (some routers don't), though the IPv4 half came at once. With
+ * dnscache_ipv4_only() such lookups ask for IPv4 alone.
  *
  * A result handed out is a copy in one block of ours, recorded until it's
  * freed (freeaddrinfo() tells ours from musl's by that record). */
@@ -32,6 +39,7 @@
 #define ADDRS 8           /* addresses kept per name */
 #define OUTSTANDING 32    /* results handed out and not yet freed */
 #define PREFETCH_Q 8
+#define REASK_GAP_MS 10000   /* an old entry in use: asked again in the background this often at most */
 
 typedef struct {
     char host[256];
@@ -39,6 +47,7 @@ typedef struct {
     int n;
     struct { int family, socktype, protocol; socklen_t len; struct sockaddr_storage sa; } a[ADDRS];
     uint32_t at;          /* when it was looked up (0: empty) */
+    uint32_t asked_at;    /* when the background was last asked to look it up again (0: not) */
 } entry_t;
 
 typedef struct {          /* what's handed out: n of these in one block */
@@ -50,8 +59,23 @@ static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static entry_t cache[ENTRIES];
 static void *out[OUTSTANDING];
 static uint32_t (*clock_fn)(void);
+static int q_n, q_running;            /* (the background's queue, below) */
 static dns_resolve_fn g_resolve;      /* (for the prefetch: the last ones used) */
 static dns_free_fn g_free;
+static int g_v4;                      /* dnscache_ipv4_only */
+
+void dnscache_ipv4_only(int on) { g_v4 = on; }
+
+/* The hints a lookup is made (and kept) with: the caller's, or with IPv4
+ * asked for where either family would have done (dnscache_ipv4_only). */
+static const struct addrinfo *hints_for(const struct addrinfo *h, struct addrinfo *copy)
+{
+    if (!g_v4 || (h && h->ai_family != AF_UNSPEC)) return h;
+    if (h) *copy = *h;
+    else memset(copy, 0, sizeof *copy);
+    copy->ai_family = AF_INET;
+    return copy;
+}
 
 static uint32_t now_ms(void)
 {
@@ -69,6 +93,14 @@ void dnscache_test_reset(void)
     pthread_mutex_lock(&mu);
     memset(cache, 0, sizeof cache);
     pthread_mutex_unlock(&mu);
+}
+
+int dnscache_test_idle(void)
+{
+    pthread_mutex_lock(&mu);
+    int idle = !q_running;
+    pthread_mutex_unlock(&mu);
+    return idle;
 }
 
 /* A port number in service ("443"), or -1 */
@@ -162,9 +194,13 @@ static void keep(const char *node, const struct addrinfo *h, const struct addrin
     *e = n;
 }
 
+static int ask_behind(const char *host, int port, const struct addrinfo *h);
+
 int dnscache_getaddrinfo(const char *node, const char *service, const struct addrinfo *hints,
                          struct addrinfo **res, dns_resolve_fn resolve, dns_free_fn real_free)
 {
+    struct addrinfo v4;
+    hints = hints_for(hints, &v4);
     if (!cacheable(node, service, hints)) return resolve(node, service, hints, res);
     int port = numeric_port(service);
     uint32_t t0 = now_ms();
@@ -172,11 +208,17 @@ int dnscache_getaddrinfo(const char *node, const char *service, const struct add
     g_resolve = resolve;
     g_free = real_free;
     entry_t *e = find(node, hints);
-    if (e && (uint32_t)(t0 - e->at) < DNSCACHE_FRESH_MS) {
+    uint32_t age = e ? (uint32_t)(t0 - e->at) : 0;
+    if (e && age < DNSCACHE_STALE_MS) {
         struct addrinfo *r = hand_out(e, port);
+        /* an old one: good enough to connect with now, and asked again behind
+         * the connection (once, not for each of a burst of connections) */
+        int old = r && age >= DNSCACHE_FRESH_MS;
+        if (old && (!e->asked_at || (uint32_t)(t0 - e->asked_at) >= REASK_GAP_MS) && ask_behind(node, port, hints))
+            e->asked_at = t0 ? t0 : 1;
         pthread_mutex_unlock(&mu);
         if (r) {
-            LAT("dns: %s from the cache", node);
+            LAT("dns: %s from the cache%s", node, old ? " (old: asked again behind)" : "");
             *res = r;
             return 0;
         }
@@ -222,30 +264,70 @@ void dnscache_freeaddrinfo(struct addrinfo *ai, dns_free_fn real_free)
     real_free(ai);
 }
 
-/* ---- prefetch ---- */
+/* ---- lookups in the background: a host about to be wanted, an old entry in use ---- */
 
-static char queue[PREFETCH_Q][256 + 8];   /* "host port" */
-static int q_n, q_running;
+typedef struct { char host[256]; int port, family, socktype, protocol, flags; } want_t;
+static want_t queue[PREFETCH_Q];
 
 static void *prefetch_run(void *arg)
 {
     (void)arg;
     for (;;) {
-        char item[sizeof queue[0]];
         pthread_mutex_lock(&mu);
         if (!q_n || !g_resolve) { q_n = 0; q_running = 0; pthread_mutex_unlock(&mu); return NULL; }
-        memcpy(item, queue[0], sizeof item);
-        memmove(queue[0], queue[1], (size_t)(q_n - 1) * sizeof queue[0]);
+        want_t w = queue[0];
+        memmove(&queue[0], &queue[1], (size_t)(q_n - 1) * sizeof queue[0]);
         q_n--;
         dns_resolve_fn resolve = g_resolve;
         dns_free_fn real_free = g_free;
         pthread_mutex_unlock(&mu);
-        char *sp = strchr(item, ' ');
-        if (!sp) continue;
-        *sp = '\0';
-        struct addrinfo h = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM}, *r = NULL;   /* (FFmpeg's) */
-        if (dnscache_getaddrinfo(item, sp + 1, &h, &r, resolve, real_free) == 0) dnscache_freeaddrinfo(r, real_free);
+        /* Asked whatever is kept (who queued it saw to that): the answer
+         * replaces it. A name that's gone for good loses its old address;
+         * one that just wasn't answered keeps it. */
+        struct addrinfo h = {.ai_family = w.family, .ai_socktype = w.socktype, .ai_protocol = w.protocol,
+                             .ai_flags = w.flags}, *got = NULL;
+        char ps[8];
+        snprintf(ps, sizeof ps, "%d", w.port);
+        uint32_t t0 = now_ms();
+        int rc = resolve(w.host, ps, &h, &got);
+        LAT("dns: %s looked up behind (%d) in %u ms", w.host, rc, now_ms() - t0);
+        pthread_mutex_lock(&mu);
+        if (rc == 0) keep(w.host, &h, got);
+        else if (rc != EAI_AGAIN) {
+            entry_t *e = find(w.host, &h);
+            if (e) e->at = 0;
+        }
+        pthread_mutex_unlock(&mu);
+        if (rc) fprintf(stderr, "dns: %s not looked up in the background (%d)\n", w.host, rc);
+        if (rc == 0 && got && real_free) real_free(got);
     }
+}
+
+/* Queue a lookup of host (with hints h) for the background thread, started if
+ * it isn't running: 1, or 0 when it's queued already, the queue is full or
+ * there's no resolver or thread to be had. (under mu) */
+static int ask_behind(const char *host, int port, const struct addrinfo *h)
+{
+    want_t w = {.port = port, .family = h ? h->ai_family : AF_UNSPEC, .socktype = h ? h->ai_socktype : 0,
+                .protocol = h ? h->ai_protocol : 0, .flags = h ? h->ai_flags : 0};
+    snprintf(w.host, sizeof w.host, "%s", host);
+    for (int i = 0; i < q_n; i++)
+        if (queue[i].family == w.family && queue[i].socktype == w.socktype && queue[i].protocol == w.protocol &&
+            queue[i].flags == w.flags && !strcasecmp(queue[i].host, w.host))
+            return 0;
+    if (q_n == PREFETCH_Q || !g_resolve) return 0;
+    queue[q_n++] = w;
+    if (!q_running) {
+        pthread_attr_t a;
+        pthread_t t;
+        pthread_attr_init(&a);
+        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        pthread_attr_setstacksize(&a, 64 * 1024);
+        q_running = pthread_create(&t, &a, prefetch_run, NULL) == 0;
+        pthread_attr_destroy(&a);
+        if (!q_running) { q_n = 0; return 0; }
+    }
+    return 1;
 }
 
 void dnscache_prefetch_url(const char *url)
@@ -266,30 +348,15 @@ void dnscache_prefetch_url(const char *url)
     host[n] = '\0';
     if (p[n] == ':') port = atoi(p + n + 1);
     if (port <= 0 || port > 65535) return;
-    struct addrinfo h = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
+    struct addrinfo either = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM}, v4;   /* (FFmpeg's) */
+    const struct addrinfo *h = hints_for(&either, &v4);
     char ps[8];
     snprintf(ps, sizeof ps, "%d", port);
-    if (!cacheable(host, ps, &h)) return;
+    if (!cacheable(host, ps, h)) return;
     pthread_mutex_lock(&mu);
-    entry_t *e = find(host, &h);
+    entry_t *e = find(host, h);
     int fresh = e && (uint32_t)(now_ms() - e->at) < DNSCACHE_FRESH_MS / 2;
-    int queued = 0;
-    for (int i = 0; i < q_n && !queued; i++) {
-        size_t hl = strlen(host);
-        queued = !strncasecmp(queue[i], host, hl) && queue[i][hl] == ' ';
-    }
-    if (fresh || queued || q_n == PREFETCH_Q || !g_resolve) { pthread_mutex_unlock(&mu); return; }
-    snprintf(queue[q_n++], sizeof queue[0], "%s %d", host, port);
-    if (!q_running) {
-        pthread_attr_t a;
-        pthread_t t;
-        pthread_attr_init(&a);
-        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-        pthread_attr_setstacksize(&a, 64 * 1024);
-        q_running = pthread_create(&t, &a, prefetch_run, NULL) == 0;
-        pthread_attr_destroy(&a);
-        if (!q_running) q_n = 0;
-    }
+    if (!fresh) ask_behind(host, port, h);
     pthread_mutex_unlock(&mu);
 }
 
@@ -320,5 +387,6 @@ void __wrap_freeaddrinfo(struct addrinfo *ai)
 __attribute__((constructor)) static void dnscache_wrap_init(void)
 {
     dnscache_use(__real_getaddrinfo, __real_freeaddrinfo);
+    dnscache_ipv4_only(1);              /* (the H2's kernel is built without IPv6) */
 }
 #endif

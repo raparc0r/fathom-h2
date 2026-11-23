@@ -22,6 +22,7 @@
 #include <libavutil/opt.h>
 #include "audio/ff_util.h"
 #include "audio/streamlist.h"
+#include "net/netclock.h"
 #endif
 #include "library/cue.h"
 
@@ -190,8 +191,13 @@ static int open_mp3(decoder_t *d, const char *path)
     if (!mp3_ready) { mpg123_init(); mp3_ready = 1; }   /* no-op on recent mpg123, needed on old ones */
     d->mp3 = mpg123_new(NULL, NULL);
     if (!d->mp3) return -1;
-    /* ADD_FLAGS keeps mpg123's defaults; MPG123_FLAGS would replace them */
-    mpg123_param(d->mp3, MPG123_ADD_FLAGS, MPG123_QUIET | MPG123_GAPLESS, 0);
+    /* ADD_FLAGS keeps mpg123's defaults; MPG123_FLAGS would replace them.
+     * SKIP_ID3V2: the tag at the front is passed over, not read into memory
+     * and parsed (all of it, a cover of a megabyte or more included, at every
+     * open: on the playback thread at a gapless join). Nothing here asks
+     * mpg123 for tags (the library reads them: library/tags.c); the encoder's
+     * delay and padding are in the first audio frame (LAME/Info), not the tag. */
+    mpg123_param(d->mp3, MPG123_ADD_FLAGS, MPG123_QUIET | MPG123_GAPLESS | MPG123_SKIP_ID3V2, 0);
     /* damaged files: keep searching for the next valid frame instead of giving up after 1 KiB */
     mpg123_param(d->mp3, MPG123_RESYNC_LIMIT, -1, 0);
     /* 32-bit output if this mpg123 build has it, else 16-bit; we widen to int32 ourselves */
@@ -264,7 +270,10 @@ static int ff_interrupted(void *opaque)
 }
 
 #define NET_UA "Fathom (HiFi Walker H2)"
-#define NET_TIMEOUT "15000000"          /* µs: a read that waits this long gives up */
+/* µs: a read that waits this long gives up, and the stream reconnects. 8 s
+ * (it was 15): a live stream that has sent nothing for that long isn't coming
+ * back on that connection, and the silence is heard for all of it. */
+#define NET_TIMEOUT "8000000"
 
 /* The hls demuxer's own fetches (the playlist, its reloads, segments, keys):
  * with the certificates checked as for every other fetch (it passes on only
@@ -627,6 +636,9 @@ static int open_net(decoder_t *d, const char *path)
     }
 out:
     free(buf);
+    /* (not opened: a clock days behind may be why, a newer certificate
+     * refused; the time is asked for, and the radio's next try finds it set) */
+    if (r && !(d->abort && *d->abort) && netclock_net_failed) netclock_net_failed(path);
     return r;
 }
 #endif

@@ -20,9 +20,11 @@ set(FATHOM_WARNINGS -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototy
 add_library(fathom_core STATIC
   app/core/rng.c
   app/core/settings.c
+  app/core/fsafe.c
   app/core/intern.c
   app/core/lang.c
   app/core/batlog.c
+  app/core/wifitxt.c
   app/core/datetime.c
   app/core/tz.c
   app/library/keys.c
@@ -39,6 +41,7 @@ add_library(fathom_player STATIC
   app/net/http.c
   app/net/json.c
   app/net/radiodir.c
+  app/net/radioicon.c
   app/net/podcast.c
   app/net/podsync.c
   app/net/coverfind.c
@@ -213,6 +216,11 @@ add_executable(test_rfmeta tests/test_rfmeta.c)
 target_link_libraries(test_rfmeta PRIVATE fathom_player)
 target_compile_options(test_rfmeta PRIVATE ${FATHOM_WARNINGS})
 add_test(NAME rfmeta COMMAND test_rfmeta)
+# profile-library: the calls behind what's slow on a big library, timed (tools/profile-library)
+add_executable(profile-library tools/profile-library/main.c)
+target_link_libraries(profile-library PRIVATE fathom_player)
+target_compile_options(profile-library PRIVATE ${FATHOM_WARNINGS})
+
 add_executable(test_player tests/test_player.c)
 target_link_libraries(test_player PRIVATE fathom_player)
 target_compile_options(test_player PRIVATE ${FATHOM_WARNINGS})
@@ -253,6 +261,10 @@ add_executable(test_dsd tests/test_dsd.c)
 target_link_libraries(test_dsd PRIVATE fathom_player)
 target_compile_options(test_dsd PRIVATE ${FATHOM_WARNINGS})
 add_test(NAME dsd COMMAND test_dsd)
+add_executable(test_mp3 tests/test_mp3.c)
+target_link_libraries(test_mp3 PRIVATE fathom_player)
+target_compile_options(test_mp3 PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME mp3 COMMAND test_mp3)
 # Ogg Vorbis, on files made with libvorbisenc (when there's a Vorbis library and the encoder)
 pkg_check_modules(VORBISENC IMPORTED_TARGET vorbisenc vorbis ogg)
 if((TREMOR_FOUND OR VORBISFILE_FOUND) AND VORBISENC_FOUND)
@@ -269,6 +281,11 @@ add_executable(test_radiodir tests/test_radiodir.c)
 target_link_libraries(test_radiodir PRIVATE fathom_player)
 target_compile_options(test_radiodir PRIVATE ${FATHOM_WARNINGS})
 add_test(NAME radiodir COMMAND test_radiodir WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_executable(test_radioicon tests/test_radioicon.c)
+target_link_libraries(test_radioicon PRIVATE fathom_player pthread)
+target_include_directories(test_radioicon PRIVATE tests)
+target_compile_options(test_radioicon PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME radioicon COMMAND test_radioicon WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_executable(test_update tests/test_update.c)
 target_link_libraries(test_update PRIVATE fathom_player)
 target_compile_options(test_update PRIVATE ${FATHOM_WARNINGS})
@@ -297,6 +314,11 @@ add_executable(test_batlog tests/test_batlog.c)
 target_link_libraries(test_batlog PRIVATE fathom_core)
 target_compile_options(test_batlog PRIVATE ${FATHOM_WARNINGS})
 add_test(NAME batlog COMMAND test_batlog)
+
+add_executable(test_wifitxt tests/test_wifitxt.c)
+target_link_libraries(test_wifitxt PRIVATE fathom_core)
+target_compile_options(test_wifitxt PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME wifitxt COMMAND test_wifitxt)
 add_executable(test_settings tests/test_settings.c)
 target_link_libraries(test_settings PRIVATE fathom_core)
 target_compile_options(test_settings PRIVATE ${FATHOM_WARNINGS})
@@ -343,6 +365,23 @@ target_compile_options(test_tz PRIVATE ${FATHOM_WARNINGS})
 add_test(NAME tz COMMAND test_tz)
 # The udhcpc hook that sets the clock by NTP, trying again while it gets no answer
 add_test(NAME fathom_ntp COMMAND sh tests/test_fathom_ntp.sh WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# The start-up scripts, against a root made for the test: the wait for the card and the
+# boot report (S01bootlog); the USB network and the player's start (S40usbnet, S90fathom)
+add_test(NAME bootlog COMMAND sh tests/test_bootlog.sh WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME startup COMMAND sh tests/test_startup.sh WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# USB drive mode: the card lent, its end seen (ejected, unplugged), the card back
+add_test(NAME fathom_usbdisk COMMAND sh tests/test_fathom_usbdisk.sh WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# fathom-ssh: the password's hash, SSH as the settings say, two calls at once
+add_test(NAME fathom_ssh COMMAND sh tests/test_fathom_ssh.sh WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# device/shell.c on the host: commands run for the workers (output, status, deadline, no
+# fork), and what the Wi-Fi worker reads of wpa_supplicant's answers
+add_executable(test_shell tests/test_shell.c)
+target_link_libraries(test_shell PRIVATE pthread)
+target_compile_options(test_shell PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME shell COMMAND test_shell)
+# fathom-wifi and fathom-bt against stand-ins for wpa_cli, udhcpc and bluetoothctl
+add_test(NAME fathom_wifi COMMAND sh tests/test_fathom_wifi.sh WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME fathom_bt COMMAND sh tests/test_fathom_bt.sh WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 # HiBy's update files, for Uninstall Fathom: read, check, mark the bootloader, undo
 add_executable(test_hibyupt tests/test_hibyupt.c app/sys/hibyupt.c app/sys/md5.c app/sys/uninstall.c)
 target_include_directories(test_hibyupt PRIVATE app)

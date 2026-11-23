@@ -149,19 +149,25 @@ static const char *element(const char *p, int i)
     }
 }
 
-int rf_parse(const char *json, char *artist, size_t an, char *title, size_t tn, char *visual, size_t vn)
+/* The step on now (levels[0]'s position among its items), or NULL. */
+static const char *step_now(const char *json)
 {
-    if (visual && vn) visual[0] = '\0';
     const char *lv = element(member(json, "levels") ? member(json, "levels") : "", 0);
-    if (!lv) return -1;
+    if (!lv) return NULL;
     const char *pos = member(lv, "position"), *items = member(lv, "items");
-    if (!pos || !items) return -1;
+    if (!pos || !items) return NULL;
     int i = atoi(pos);
     const char *it = element(items, i);
     char uid[128];
-    if (!it || read_string(it, uid, sizeof uid)) return -1;
+    if (!it || read_string(it, uid, sizeof uid)) return NULL;
     const char *steps = member(json, "steps");
-    const char *step = steps ? member(steps, uid) : NULL;
+    return steps ? member(steps, uid) : NULL;
+}
+
+int rf_parse(const char *json, char *artist, size_t an, char *title, size_t tn, char *visual, size_t vn)
+{
+    if (visual && vn) visual[0] = '\0';
+    const char *step = step_now(json);
     if (!step) return -1;
     const char *t = member(step, "title");
     if (!t || read_string(t, title, tn) || !title[0]) return -1;
@@ -175,4 +181,35 @@ int rf_parse(const char *json, char *artist, size_t an, char *title, size_t tn, 
     const char *v = member(step, "visual");
     if (visual && vn && (!v || read_string(v, visual, vn))) visual[0] = '\0';
     return 0;
+}
+
+/* A whole number of seconds at p (a time): 0 if it isn't one. */
+static int64_t read_time(const char *p)
+{
+    if (!p) return 0;
+    p = ws(p);
+    if (*p < '0' || *p > '9') return 0;
+    char *end;
+    long long v = strtoll(p, &end, 10);
+    return v > 0 && v < 100000000000LL ? (int64_t)v : 0;
+}
+
+int rf_step_times(const char *json, int64_t *start, int64_t *end)
+{
+    *start = *end = 0;
+    const char *step = step_now(json);
+    if (!step) return -1;
+    int64_t s = read_time(member(step, "start")), e = read_time(member(step, "end"));
+    if (!s || !e) return -1;
+    *start = s;
+    *end = e;
+    return 0;
+}
+
+int rf_next_fetch_s(int64_t now, int64_t start, int64_t end)
+{
+    /* believable by this clock: begun (give or take), not over, and no longer than a long programme */
+    if (start <= 0 || end <= start || end - start > 4 * 3600 || now < start - 30 || now >= end) return RF_POLL_S;
+    int64_t in = end + 3 - now;
+    return in < RF_POLL_S ? RF_POLL_S : in > RF_POLL_MAX_S ? RF_POLL_MAX_S : (int)in;
 }

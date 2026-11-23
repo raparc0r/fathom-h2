@@ -53,8 +53,31 @@ static double now(void)
     return t.tv_sec + t.tv_nsec / 1e9;
 }
 
+/* --dangling: entries whose first cluster the FAT says is free, or that isn't
+ * one: what a rename over a file leaves on the card for up to 30 s (and a power
+ * cut then for good), unless the card is mounted dirsync or the file is fsynced
+ * after (core/fsafe.h). Reads the card only. */
+static int dangling;
+static void on_entry(const char *path, uint32_t start, uint32_t fat, uint32_t size, void *ctx)
+{
+    (void)ctx;
+    if (!size) return;                                 /* (an empty file has no cluster) */
+    if (start < 2 || fat == 0 || fat == 0xFFFFFFFFu) {
+        printf("DANGLING %s: %u bytes, first cluster %u, FAT says %s\n", path, size, start,
+               fat == 0 ? "free" : "no such cluster");
+        dangling++;
+    }
+}
+static int no_file(const char *p, int64_t mt, int64_t sz, void *ctx) { (void)p; (void)mt; (void)sz; (void)ctx; return 0; }
+
 int main(int argc, char **argv)
 {
+    if (argc == 5 && !strcmp(argv[1], "--dangling")) {
+        fatwalk_set_entry_hook(on_entry, NULL);
+        if (fatwalk(argv[2], argv[3], argv[4], no_file, NULL)) { fprintf(stderr, "can't read %s\n", argv[2]); return 2; }
+        printf("%d dangling\n", dangling);
+        return dangling ? 1 : 0;
+    }
     if (argc != 4) { fprintf(stderr, "usage: %s DEV MOUNT FOLDER\n", argv[0]); return 2; }
     list_t a = {0}, b = {0};
     char root[1024];

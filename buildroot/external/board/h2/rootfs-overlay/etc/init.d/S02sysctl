@@ -1,0 +1,31 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
+#
+# The kernel settings in /etc/sysctl.d/*.conf ("a.b.c = value" lines), written
+# to /proc/sys by the shell itself. Buildroot's script does the same with find,
+# xargs, readlink, sysctl and two loggers: nine programs started for four
+# values, an eighth of a second of every start on the H2.
+case "$1" in
+start|restart|reload)
+    for f in /etc/sysctl.d/*.conf; do
+        [ -r "$f" ] || continue
+        while IFS= read -r line; do
+            case "$line" in ''|'#'*|';'*) continue ;; *=*) ;; *) continue ;; esac
+            k=${line%%=*}
+            v=${line#*=}
+            k=${k%"${k##*[! ]}"}        # (the spaces around the "=")
+            v=${v#"${v%%[! ]*}"}
+            p=/proc/sys
+            while :; do
+                case "$k" in
+                *.*) p=$p/${k%%.*}; k=${k#*.} ;;
+                *)   p=$p/$k; break ;;
+                esac
+            done
+            [ -w "$p" ] && echo "$v" > "$p"
+        done < "$f"
+    done
+    ;;
+esac
+exit 0

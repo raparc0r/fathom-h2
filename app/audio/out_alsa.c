@@ -100,6 +100,17 @@ static int format_bytes(int f)
  * aside at boot (the kernel's dmaengine PCM), so that costs it nothing up to
  * there; a USB DAC's buffer is allocated as it opens, so less there. */
 #define STREAM_BUFFER_MS 1000
+/* Files on the H2's own DAC queue about a second too, in the same 25 ms
+ * periods (so a start, a skip and a seek are as quick as with 8 of them):
+ * with 200 ms, music dropped out while anything wrote to the card steadily
+ * (a copy over the network or SSH: 6 of 21 bursts of 15 MB, measured
+ * 2026-11-23), the decoder's reads and the player's own pages waiting behind
+ * the writes for longer than that. The engine lets the queue play down to the
+ * 8 periods where a second would be noticed (join_depth, output.h). Not on a
+ * USB DAC: its volume may be the engine's gain, heard a queue later.
+ * FATHOM_FILE_QUEUE_MS in the environment: another length (tests on the H2). */
+#define FILE_BUFFER_MS 1000
+#define FILE_PERIODS 8                  /* what a file needs queued, in periods */
 #define OWN_DAC "/dev/snd/pcmC0D0p"
 #define OWN_DAC_BYTES (448 * 1024)
 #define OTHER_BYTES (192 * 1024)
@@ -113,6 +124,20 @@ static unsigned period_frames(const alsa_out_t *a, const audio_format_t *fmt, in
     unsigned want = fmt->rate * STREAM_BUFFER_MS / 1000;
     unsigned p = (want < cap ? want : cap) / 8 & ~31u;
     return p > small ? p : small;
+}
+
+/* How many of a file's periods the H2's own DAC queues (elsewhere, and where
+ * the DMA memory holds no more: FILE_PERIODS). */
+static unsigned file_periods(const alsa_out_t *a, const audio_format_t *fmt, int format, unsigned period)
+{
+    if (strcmp(a->dev, OWN_DAC) || !period) return FILE_PERIODS;
+    const char *env = getenv("FATHOM_FILE_QUEUE_MS");
+    unsigned ms = env && atoi(env) > 0 ? (unsigned)atoi(env) : FILE_BUFFER_MS;
+    unsigned frame = (unsigned)fmt->channels * (unsigned)format_bytes(format);
+    unsigned cap = OWN_DAC_BYTES / frame;
+    unsigned long long want = (unsigned long long)fmt->rate * ms / 1000;
+    unsigned n = (unsigned)(want < cap ? want : cap) / period;
+    return n > FILE_PERIODS ? n : FILE_PERIODS;
 }
 
 static void a_close(void *ctx)
@@ -148,12 +173,17 @@ static int a_open(void *ctx, const audio_format_t *fmt)
     const int *try = fmt->bits && fmt->bits <= 16 ? shallow : fmt->bits > 24 ? full : deep;
     struct snd_pcm_hw_params hp;
     int ok = 0, err = 0;
-    /* a stream: the deep buffer, else (a device that won't) the usual one */
+    /* a stream: the deep buffer; a file on the H2's DAC: more of its periods;
+     * else (and for a device that won't) the usual 8 short ones */
+    int longer = !fmt->stream && !strcmp(a->dev, OWN_DAC);
     for (int k = 0; k < 8 && !ok; k++) {
-        int i = k % 4, deep = fmt->stream && k < 4;
-        if (k >= 4 && !fmt->stream) break;
+        /* (a file's format comes first: each with more periods, then with 8) */
+        int i = longer ? k / 2 : k % 4, deep = fmt->stream && k < 4, more = longer && k % 2 == 0;
+        if (k >= 4 && !fmt->stream && !longer) break;
         if (fmt->dop && try[i] == SNDRV_PCM_FORMAT_S16_LE) continue;   /* DoP needs 24 bits */
         unsigned period = period_frames(a, fmt, try[i], deep);
+        unsigned periods = more ? file_periods(a, fmt, try[i], period) : FILE_PERIODS;
+        if (more && periods == FILE_PERIODS) continue;                 /* (no more than 8 fit: the next try) */
         hp_any(&hp);
         hp_mask_set(&hp, SNDRV_PCM_HW_PARAM_ACCESS, SNDRV_PCM_ACCESS_RW_INTERLEAVED);
         hp_mask_set(&hp, SNDRV_PCM_HW_PARAM_FORMAT, (unsigned)try[i]);
@@ -161,7 +191,7 @@ static int a_open(void *ctx, const audio_format_t *fmt)
         hp_int_set(&hp, SNDRV_PCM_HW_PARAM_CHANNELS, fmt->channels);
         hp_int_set(&hp, SNDRV_PCM_HW_PARAM_RATE, rate);
         hp_int_set(&hp, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, period);
-        hp_int_set(&hp, SNDRV_PCM_HW_PARAM_PERIODS, 8);
+        hp_int_set(&hp, SNDRV_PCM_HW_PARAM_PERIODS, periods);
         if (ioctl(a->fd, SNDRV_PCM_IOCTL_HW_PARAMS, &hp) == 0) {
             ok = 1;
             a->format = try[i];
@@ -179,7 +209,10 @@ static int a_open(void *ctx, const audio_format_t *fmt)
     a->buffer = hp_int(&hp, SNDRV_PCM_HW_PARAM_BUFFER_SIZE)->min;
     {   /* a copy of what's queued, for a flush that fades instead of clicking */
         unsigned fb = (unsigned)fmt->channels * (unsigned)format_bytes(a->format);
-        unsigned cap = a->buffer < HIST_MAX_BYTES / fb ? a->buffer : HIST_MAX_BYTES / fb;
+        /* (a file's: all of it, so a skip takes back the whole queue; a stream's
+         * is capped, and a station left is heard for a moment more) */
+        unsigned max = (fmt->stream ? HIST_MAX_BYTES : OWN_DAC_BYTES) / fb;
+        unsigned cap = a->buffer < max ? a->buffer : max;
         pcmring_free(&a->hist);
         if (!fmt->dop) pcmring_init(&a->hist, cap, fb);   /* (DoP: never faded, its markers would go) */
         a->soft_tail = 0;
@@ -420,6 +453,13 @@ void out_alsa_set_device(void *ctx, void *device)
 
 static int a_can_cut(void *ctx) { (void)ctx; return 1; }
 
+static long a_join_depth(void *ctx)
+{
+    alsa_out_t *a = ctx;
+    if (a->fd < 0 || a->fmt.stream || a->buffer <= a->period * FILE_PERIODS) return 0;
+    return (long)(a->period * FILE_PERIODS);
+}
+
 int out_alsa_create(audio_output_t *out, const char *device)
 {
     alsa_out_t *a = calloc(1, sizeof *a);
@@ -428,7 +468,7 @@ int out_alsa_create(audio_output_t *out, const char *device)
     a->fd = -1;
     if (access(a->dev, W_OK)) { free(a); return -1; }
     *out = (audio_output_t){a_open, a_write, a_delay, a_drain, a_flush, a_pause, a_close, a_describe, a, NULL, a_can_cut,
-                            a_flush_soft};
+                            a_flush_soft, a_join_depth};
     return 0;
 }
 

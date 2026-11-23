@@ -6,7 +6,7 @@
 # root with a password, and SFTP (/usr/libexec/sftp-server).
 #   echo PASSWORD | fathom-ssh on    root's password is PASSWORD; SSH started
 #   echo PASSWORD | fathom-ssh off   root's password is PASSWORD; SSH stopped
-#   fathom-ssh boot                  as the settings say (S90fathom, before the player)
+#   fathom-ssh boot                  as the settings say (S90fathom, at start-up)
 #   fathom-ssh status                on or off
 #
 # The build locks root (no password works) until one is set here, so neither
@@ -19,20 +19,58 @@
 # on it runs from a copy in RAM, so logins stay quick when memory is short and
 # USB drive mode can still lend the card. It runs at nice 10, and so does
 # everything started from a login (SFTP included): audio comes first.
+#
+# The password is hashed with MD5 (chpasswd -c md5), not the build's SHA-512:
+# 5,000 rounds of that are 0.15 to 0.4 s of this CPU, twice at every start-up
+# ("boot" here, then the player's own "on" or "off"), and protect nothing: the
+# password is in the clear in settings.ini on the card, and /etc/shadow is in
+# RAM, gone at power-off. dropbear (musl's crypt) and the serial console's
+# login (busybox's own) both take MD5 hashes ($1$).
 
 K=/mnt/sd/fathom/keys
 DB=/mnt/sd/fathom/ssh/dropbearmulti
 RUN=/var/run/fathom-ssh
 SETTINGS=/mnt/sd/fathom/settings.ini
 PID=/var/run/dropbear.pid
+LOCK=/var/run/fathom-ssh.lock
 
 say() { echo "ssh: $1" >&2; }
 alive() { [ -f $PID ] && kill -0 "$(cat $PID)" 2>/dev/null; }
 setting() { sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" $SETTINGS 2>/dev/null | tail -1 | tr -d '\r' | sed 's/[[:space:]]*$//'; }
 
+# One call at a time (a folder as the lock: mkdir makes it or doesn't). At
+# start-up S90fathom's "boot" and the player's own "on" come close together,
+# and each would start a dropbear: alive says no to both until the first one's
+# is up. A lock left behind never keeps SSH from starting: it's taken over
+# once the call that held it is gone, or after 20 s; and where no lock can be
+# made, the call goes ahead without one, as every call did before.
+lock() {
+    n=0
+    until mkdir $LOCK 2>/dev/null; do
+        if [ ! -d $LOCK ]; then             # (let go of meanwhile, or none can be made)
+            mkdir $LOCK 2>/dev/null || return 0
+            break
+        fi
+        p=$(cat $LOCK/pid 2>/dev/null)
+        if { [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; } || [ $n -ge 200 ]; then
+            rm -rf $LOCK
+            mkdir $LOCK 2>/dev/null || return 0
+            break
+        fi
+        sleep 0.1
+        n=$((n + 1))
+    done
+    echo $$ > $LOCK/pid
+    trap unlock EXIT
+    trap 'exit 1' HUP INT TERM
+}
+unlock() { [ "$(cat $LOCK/pid 2>/dev/null)" = $$ ] && rm -rf $LOCK; }
+
+# (a chpasswd that won't take -c md5: the build's own hash, as before)
 password() {
     [ -n "$1" ] || { say "no password"; return 2; }
-    printf 'root:%s\n' "$1" | chpasswd > /dev/null 2>&1 || { say "couldn't set the password"; return 1; }
+    printf 'root:%s\n' "$1" | chpasswd -c md5 > /dev/null 2>&1 ||
+        printf 'root:%s\n' "$1" | chpasswd > /dev/null 2>&1 || { say "couldn't set the password"; return 1; }
 }
 
 start() {
@@ -82,11 +120,13 @@ stop() {
 case "$1" in
 on|off)
     read -r pass
+    lock
     password "$pass" || exit $?
     if [ "$1" = on ]; then start || exit 1; else stop; fi
     echo "$1"
     ;;
 boot)
+    lock
     pass=$(setting ssh.password)
     [ -n "$pass" ] || exit 0          # (the player makes one up)
     password "$pass" || exit $?

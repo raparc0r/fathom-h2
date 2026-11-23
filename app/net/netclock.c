@@ -21,6 +21,12 @@ void netclock_set_now(int64_t (*now)(void)) { g_now = now; }
 
 int netclock_unset(void) { return netclock_unset_at(g_now ? g_now() : (int64_t)time(NULL)); }
 
+static volatile int g_confirmed;
+
+void netclock_set_confirmed(int yes) { g_confirmed = yes; }
+int netclock_confirmed(void) { return g_confirmed; }
+int netclock_doubtful(void) { return netclock_unset() || !g_confirmed; }
+
 static pthread_mutex_t g_fetching = PTHREAD_MUTEX_INITIALIZER;
 static int (*g_fetch)(void);
 static int64_t g_failed_at;              /* (monotonic s: settimeofday doesn't move it) */
@@ -78,9 +84,14 @@ int netclock_wanted(void)
 
 const char *netclock_why(const char *otherwise)
 {
-    if (!netclock_unset()) return otherwise;
-    netclock_want();                         /* (the time, now) */
-    return netclock_unset_text();
+    if (netclock_doubtful()) netclock_want();   /* (the time, now) */
+    return netclock_unset() ? netclock_unset_text() : otherwise;
+}
+
+void netclock_net_failed(const char *url)
+{
+    if (!url || (strncasecmp(url, "https://", 8) && strncasecmp(url, "http://", 7))) return;
+    if (netclock_doubtful()) netclock_want();
 }
 
 int netclock_take(int64_t got, int64_t now, int64_t back)

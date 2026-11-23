@@ -1,22 +1,27 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 #include "radiometa.h"
+#include "shell.h"
 
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <libavformat/avio.h>
 #include <libavutil/dict.h>
 #include <libavutil/error.h>
 
 #include "audio/ff_util.h"
+#include "core/lat.h"
 #include "library/library.h"
+#include "net/netclock.h"
 #include "player/rfmeta.h"
 
-#define REFRESH_S 15
 #define MAX_ANSWER (256 * 1024)
 #define MAX_IMAGE (1024 * 1024)
 #define ART LIB_ART_LARGE
@@ -64,6 +69,7 @@ static unsigned char *fetch(const char *url, job_t *job, size_t max, size_t *len
     ff_tls_options(&opt);
     int r = avio_open2(&pb, url, AVIO_FLAG_READ, &icb, &opt);
     av_dict_free(&opt);
+    if (r < 0 && !interrupted(job)) netclock_net_failed(url);   /* (the clock may be why: netclock.h) */
     if (r < 0) return NULL;
     unsigned char *buf = malloc(max + 1);
     size_t n = 0;
@@ -116,19 +122,26 @@ static void do_info(void)
 
     char artist[256] = "", title[256] = "", visual[512] = "";
     int ok = -1, n = rf_station(info);
+    int64_t step_start = 0, step_end = 0;
     if (n >= 0) {
         char url[128];
         rf_url(n, url, sizeof url);
         char *json = (char *)fetch(url, &job, MAX_ANSWER, NULL);
         if (json) {
             ok = rf_parse(json, artist, sizeof artist, title, sizeof title, visual, sizeof visual);
+            if (ok == 0) rf_step_times(json, &step_start, &step_end);
             free(json);
         }
     }
+    /* Asked again when the song on now ends, not every 15 s (a new TLS
+     * connection each time, for as long as the station plays); every 15 s
+     * still when its end can't be told by this clock (rf_next_fetch_s). */
+    int again = ok == 0 ? rf_next_fetch_s((int64_t)time(NULL), step_start, step_end) : 5;
+    LAT("radiometa: info %s, asked again in %d s", ok == 0 ? "read" : "not read", again);
 
     pthread_mutex_lock(&mu);
     if (job.mine != info_gen) return;   /* the station changed meanwhile: fetch again at once */
-    info_next = mono_s() + (ok == 0 ? REFRESH_S : 5);
+    info_next = mono_s() + again;
     if (ok == 0 && (strcmp(artist, got_artist) || strcmp(title, got_title) || strcmp(visual, got_visual))) {
         snprintf(got_artist, sizeof got_artist, "%s", artist);
         snprintf(got_title, sizeof got_title, "%s", title);
@@ -140,15 +153,17 @@ static void do_info(void)
 static void *run(void *arg)
 {
     (void)arg;
+    /* Song info and covers are extras: their TLS handshakes and picture
+     * decoding give way to the stream's own connection, the UI and the music
+     * on the one core (nice 10, this thread only: behind them, but not
+     * starved into a timeout the way nice 19 can be). */
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
     pthread_mutex_lock(&mu);
     for (;;) {
         if (art_done != art_gen) { do_art(); continue; }        /* a new cover first: it's quick */
         if (want_info[0] && mono_s() >= info_next) { do_info(); continue; }
         if (want_info[0]) {
-            struct timespec until;
-            clock_gettime(CLOCK_REALTIME, &until);
-            until.tv_sec += info_next - mono_s() + 1;
-            pthread_cond_timedwait(&cv, &mu, &until);
+            mono_cond_wait_ms(&cv, &mu, (int)(info_next - mono_s() + 1) * 1000);
         } else {
             pthread_cond_wait(&cv, &mu);
         }
@@ -163,6 +178,7 @@ static void start(void)   /* under mu */
     pthread_attr_t a;
     pthread_attr_init(&a);
     pthread_attr_setstacksize(&a, 128 * 1024);
+    mono_cond_init(&cv);
     if (pthread_create(&t, &a, run, NULL) == 0) {
         pthread_detach(t);
         started = 1;

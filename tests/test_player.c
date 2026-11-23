@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -250,6 +251,29 @@ static int only44_open(void *ctx, const audio_format_t *f)
     return f->rate == 44100 ? g_inner.open(ctx, f) : -1;
 }
 
+/* The clock output, its frames counted as they're written (has anything
+ * played?). */
+static audio_output_t g_clock_out;
+static unsigned long long g_written;
+static long counting_write(void *ctx, const int32_t *x, long n)
+{
+    __atomic_add_fetch(&g_written, (unsigned long long)n, __ATOMIC_SEQ_CST);
+    return g_clock_out.write(ctx, x, n);
+}
+static unsigned long long written(void) { return __atomic_load_n(&g_written, __ATOMIC_SEQ_CST); }
+
+/* ...and its writes held up while g_gate is set: the engine's thread stays in
+ * its write, and a play command asked meanwhile stays "starting". */
+static int g_gate;
+static long gated_write(void *ctx, const int32_t *x, long n)
+{
+    while (__atomic_load_n(&g_gate, __ATOMIC_SEQ_CST)) {
+        struct timespec ts = {0, 1000000};
+        nanosleep(&ts, NULL);
+    }
+    return counting_write(ctx, x, n);
+}
+
 /* Tracks the output can't take are skipped, as they start or gapless; a
  * queue of nothing but those stops after one pass, even with repeat on. */
 static void test_unplayable(const char *dir)
@@ -385,6 +409,417 @@ static void test_long_cued(const char *dir)
     library_close(lib);
 }
 
+/* A song's plays and early skips, as the library has them (read beside it). */
+static void counts(const char *db, int64_t id, int *plays, int *skips)
+{
+    sqlite3 *raw = NULL;
+    sqlite3_stmt *q = NULL;
+    *plays = *skips = -1;
+    if (sqlite3_open_v2(db, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK &&
+        sqlite3_prepare_v2(raw, "SELECT play_count, skip_count FROM tracks WHERE id=?", -1, &q, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(q, 1, id);
+        if (sqlite3_step(q) == SQLITE_ROW) {
+            *plays = sqlite3_column_int(q, 0);
+            *skips = sqlite3_column_int(q, 1);
+        }
+    }
+    sqlite3_finalize(q);
+    sqlite3_close(raw);
+}
+
+static int counted(const char *db, int64_t id, int plays, int skips)
+{
+    int pl, sk;
+    counts(db, id, &pl, &sk);
+    if (pl != plays || sk != skips) fprintf(stderr, "track %lld: %d plays, %d skips (want %d, %d)\n", (long long)id, pl, sk, plays, skips);
+    return pl == plays && sk == skips;
+}
+
+/* Next counts a play or an early skip only for a track that was on: not for
+ * one only cued (after "stop after this track", after a restart), nor again
+ * for the last of the queue once it has ended. Each made a play or a skip of
+ * a song never heard (the position looked at was the track before's). */
+static void test_phantom_plays(const char *dir)
+{
+    char music[300], path[400], db[300], art[300], queue[300];
+    snprintf(music, sizeof music, "%s/phantom", dir);
+    snprintf(db, sizeof db, "%s/phantom.db", dir);
+    snprintf(art, sizeof art, "%s/phantom-art", dir);
+    snprintf(queue, sizeof queue, "%s/phantom-queue.txt", dir);
+    mkdir(music, 0755);
+    for (int i = 0; i < 5; i++) {                    /* 2 s each: time to press a key in */
+        snprintf(path, sizeof path, "%s/%02d.flac", music, i + 1);
+        CHECK(write_flac_long(path, 2) == 0);
+    }
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 5);
+    lib_list_t tr;
+    CHECK(library_list(lib, LIB_SONGS, 0, &tr) == 5);
+    int64_t *t = tr.ids;
+    audio_output_t out;
+    out_clock_create(&out);
+    engine_t *eng = engine_new(&out);
+    player_t *p = player_new(lib, eng);
+    eng_status_t es;
+
+    /* a skip of a track that plays is an early skip, as before */
+    player_play(p, t, 5, 0);
+    WAIT_FOR(p, (engine_status(eng, &es), es.state == ENG_PLAYING && !es.starting && es.track_id == t[0]), SLOW);
+    player_next(p);
+    CHECK(cur_id(p) == t[1] && counted(db, t[0], 0, 1));
+
+    /* stop after this track: the next one is cued, and Next past it counts nothing */
+    player_set_stop_after(p, 1);
+    WAIT_FOR(p, !playing(p) && cur_id(p) == t[2], SLOW);
+    CHECK(cur_id(p) == t[2] && counted(db, t[1], 1, 0) && counted(db, t[2], 0, 0));
+    player_next(p);
+    CHECK(cur_id(p) == t[3] && !playing(p) && counted(db, t[2], 0, 0));
+    player_next(p);
+    CHECK(cur_id(p) == t[4] && counted(db, t[3], 0, 0));
+
+    /* after a restart, the queue cued: the same */
+    CHECK(player_save(p, queue) == 0);
+    player_free(p);
+    engine_stop(eng);
+    p = player_new(lib, eng);
+    CHECK(player_restore(p, queue) == 0 && cur_id(p) == t[4] && !playing(p));
+    player_prev(p);
+    CHECK(cur_id(p) == t[3]);
+    player_next(p);
+    CHECK(cur_id(p) == t[4] && counted(db, t[3], 0, 0) && counted(db, t[4], 0, 0));
+
+    /* the end of the queue, repeat off: Next goes nowhere and counts nothing,
+     * while the last track plays (its play comes at its end) and after */
+    player_toggle_pause(p);
+    WAIT_FOR(p, (engine_status(eng, &es), es.state == ENG_PLAYING && !es.starting && es.track_id == t[4]), SLOW);
+    player_next(p);
+    CHECK(cur_id(p) == t[4] && counted(db, t[4], 0, 0));
+    WAIT_FOR(p, !playing(p), SLOW);
+    WAIT_FOR(p, 0, 100);
+    CHECK(counted(db, t[4], 1, 0));
+    player_next(p);
+    player_next(p);
+    CHECK(cur_id(p) == t[4] && counted(db, t[4], 1, 0));
+
+    player_free(p);
+    engine_free(eng);
+    library_list_free(&tr);
+    library_close(lib);
+    unlink(queue);
+}
+
+/* PATH.pos written as the player writes it: 64 bytes, the text and spaces. */
+static void put_pos(const char *queue, const char *text)
+{
+    char posf[340], rec[64];
+    snprintf(posf, sizeof posf, "%s.pos", queue);
+    memset(rec, ' ', sizeof rec);
+    memcpy(rec, text, strlen(text) < 62 ? strlen(text) : 62);
+    rec[63] = '\n';
+    FILE *f = fopen(posf, "w");
+    CHECK(f && fwrite(rec, 1, sizeof rec, f) == sizeof rec);
+    if (f) fclose(f);
+}
+
+/* A small file's contents (NUL-ended; "" if it can't be read), and back. */
+static void slurp(const char *path, char *buf, size_t cap)
+{
+    FILE *f = fopen(path, "r");
+    size_t n = f ? fread(buf, 1, cap - 1, f) : 0;
+    buf[n] = '\0';
+    if (f) fclose(f);
+}
+
+static void spit(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "w");
+    CHECK(f && fputs(text, f) >= 0);
+    if (f) fclose(f);
+}
+
+/* What PATH.pos says: the track and the position (-1: no record). */
+static long long pos_record(const char *queue, unsigned *ms)
+{
+    char posf[340];
+    long long id = -1;
+    snprintf(posf, sizeof posf, "%s.pos", queue);
+    FILE *f = fopen(posf, "r");
+    *ms = 0;
+    if (f && fscanf(f, "fathom-pos %lld %u", &id, ms) != 2) id = -1;
+    if (f) fclose(f);
+    return id;
+}
+
+/* The queue saved while the engine still starts the next track (Next, and
+ * the 10 s save or a power-off right behind it): the new track's id goes with
+ * its own position (the start), not the old track's, which the engine still
+ * reports until it has taken the command. */
+static void test_save_starting(const char *dir)
+{
+    char music[300], path[400], db[300], art[300], queue[300];
+    snprintf(music, sizeof music, "%s/starting", dir);
+    snprintf(db, sizeof db, "%s/starting.db", dir);
+    snprintf(art, sizeof art, "%s/starting-art", dir);
+    snprintf(queue, sizeof queue, "%s/starting-queue.txt", dir);
+    mkdir(music, 0755);
+    for (int i = 0; i < 2; i++) {
+        snprintf(path, sizeof path, "%s/%02d.flac", music, i + 1);
+        CHECK(write_flac_long(path, 5) == 0);
+    }
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 2);
+    lib_list_t tr;
+    CHECK(library_list(lib, LIB_SONGS, 0, &tr) == 2);
+    int64_t *t = tr.ids;
+    audio_output_t out;
+    out_clock_create(&out);
+    g_clock_out = out;
+    out.write = gated_write;
+    engine_t *eng = engine_new(&out);
+    player_t *p = player_new(lib, eng);
+    eng_status_t es;
+    unsigned ms = 0;
+
+    player_play(p, t, 2, 0);
+    WAIT_FOR(p, now_pos(p) >= 400, SLOW);
+    CHECK(player_save(p, queue) == 0);
+    CHECK(pos_record(queue, &ms) == t[0] && ms >= 400);          /* playing: where it is */
+    __atomic_store_n(&g_gate, 1, __ATOMIC_SEQ_CST);              /* the thread held in its write */
+    sleep_ms(100);
+    player_next(p);
+    engine_status(eng, &es);
+    CHECK(es.starting && es.track_id == t[0] && es.pos_ms >= 400);   /* (still the old track's figures) */
+    CHECK(cur_id(p) == t[1] && now_pos(p) == 0);
+    CHECK(player_save(p, queue) == 0);
+    CHECK(pos_record(queue, &ms) == t[1] && ms == 0);
+    if (ms) fprintf(stderr, "saved while starting: the new track at %u ms\n", ms);
+    player_set_repeat(p, REPEAT_ALL);                            /* (the queue changed: queue.txt written whole) */
+    CHECK(player_save(p, queue) == 0);
+    {   /* ...and in queue.txt itself (read with no record beside it) */
+        char posf[340];
+        snprintf(posf, sizeof posf, "%s.pos", queue);
+        unlink(posf);
+        audio_output_t out2;
+        out_null_stats_t st2;
+        out_null_create(&out2, &st2);
+        engine_t *eng2 = engine_new(&out2);
+        player_t *q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[1] && now_pos(q) == 0);
+        player_free(q);
+        engine_free(eng2);
+    }
+    __atomic_store_n(&g_gate, 0, __ATOMIC_SEQ_CST);
+    WAIT_FOR(p, (engine_status(eng, &es), !es.starting && es.track_id == t[1] && es.pos_ms >= 200), SLOW);
+    CHECK(player_save(p, queue) == 0);
+    CHECK(pos_record(queue, &ms) == t[1] && ms >= 200 && ms < 4000);   /* on it: its own position again */
+
+    player_free(p);
+    engine_free(eng);
+    library_list_free(&tr);
+    library_close(lib);
+    unlink(queue);
+}
+
+/* The next track's file is asked for ahead of its turn: 128 KB as a track
+ * starts (Next starts from memory), 512 KB once it has under 10 s left (the
+ * gapless join), each once for a track and its successor; nothing with no
+ * successor, nor while the radio plays. (Counted through the hook: on a Mac
+ * the call itself doesn't exist.) */
+static int g_warm_n;
+static long g_warm_bytes;
+static char g_warm_path[1024];
+static void warm_counted(const char *file, long bytes)
+{
+    g_warm_n++;
+    g_warm_bytes = bytes;
+    snprintf(g_warm_path, sizeof g_warm_path, "%s", file);
+}
+
+static void test_warm_next(const char *dir)
+{
+    char music[300], path[400], db[300], art[300];
+    snprintf(music, sizeof music, "%s/warm", dir);
+    snprintf(db, sizeof db, "%s/warm.db", dir);
+    snprintf(art, sizeof art, "%s/warm-art", dir);
+    mkdir(music, 0755);
+    for (int i = 0; i < 3; i++) {
+        snprintf(path, sizeof path, "%s/%02d.flac", music, i + 1);
+        CHECK(write_flac_long(path, i < 2 ? 13 : 2) == 0);
+    }
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 3);
+    lib_list_t tr;
+    CHECK(library_list(lib, LIB_SONGS, 0, &tr) == 3);
+    int64_t t[3];
+    lib_track_t lt[3];
+    for (int i = 0; i < 3; i++) {                    /* by length: the two long ones, then the short one */
+        snprintf(path, sizeof path, "%s/%02d.flac", music, i + 1);
+        for (int k = 0; k < 3; k++)
+            if (library_track(lib, tr.ids[k], &lt[i]) == 0 && !strcmp(lt[i].path, path)) { t[i] = tr.ids[k]; break; }
+        CHECK(!strcmp(lt[i].path, path));
+    }
+    audio_output_t out;
+    out_clock_create(&out);
+    engine_t *eng = engine_new(&out);
+    player_t *p = player_new(lib, eng);
+    g_warm_n = 0;
+    player_set_warm_hook(warm_counted);
+
+    player_play(p, t, 3, 0);                          /* a track starts: 128 KB of the next, once */
+    WAIT_FOR(p, g_warm_n >= 1, SLOW);
+    WAIT_FOR(p, 0, 300);
+    CHECK(g_warm_n == 1 && g_warm_bytes == 128 * 1024 && !strcmp(g_warm_path, lt[1].path));
+    player_seek_by(p, 5000);                          /* under 10 s left: 512 KB, once */
+    WAIT_FOR(p, g_warm_n >= 2, SLOW);
+    WAIT_FOR(p, 0, 300);
+    CHECK(g_warm_n == 2 && g_warm_bytes == 512 * 1024 && !strcmp(g_warm_path, lt[1].path));
+    player_seek_by(p, -4000);                         /* back, and near the end again: not asked again */
+    WAIT_FOR(p, 0, 200);
+    player_seek_by(p, 4000);
+    WAIT_FOR(p, 0, 200);
+    CHECK(g_warm_n == 2);
+    player_next(p);                                   /* Next: the one after it */
+    WAIT_FOR(p, g_warm_n >= 3, SLOW);
+    WAIT_FOR(p, 0, 200);
+    CHECK(g_warm_n == 3 && g_warm_bytes == 128 * 1024 && !strcmp(g_warm_path, lt[2].path));
+    player_pause(p, 1);                               /* paused: nothing asked, even near the end */
+    player_seek_by(p, 11000);
+    WAIT_FOR(p, 0, 200);
+    CHECK(g_warm_n == 3);
+    player_pause(p, 0);                               /* ...playing: asked, before the join */
+    WAIT_FOR(p, g_warm_n >= 4, SLOW);
+    CHECK(g_warm_n == 4 && g_warm_bytes == 512 * 1024 && !strcmp(g_warm_path, lt[2].path) && cur_id(p) == t[1]);
+    WAIT_FOR(p, cur_id(p) == t[2], SLOW);             /* the last track: no successor, nothing asked */
+    WAIT_FOR(p, !playing(p), SLOW);
+    CHECK(cur_id(p) == t[2] && g_warm_n == 4);
+    player_set_repeat(p, REPEAT_ONE);                 /* repeat one: its successor is itself, in memory already */
+    player_play(p, t, 3, 2);
+    WAIT_FOR(p, playing(p), SLOW);
+    WAIT_FOR(p, 0, 300);
+    CHECK(g_warm_n == 4);
+    player_set_repeat(p, REPEAT_OFF);
+    radio_station_t rs = {.name = "A station", .url = "http://127.0.0.1:9/none"};
+    player_play(p, t, 3, 0);
+    player_radio_play(p, &rs, 1, 0);                  /* the radio: the queue waits, nothing asked */
+    int n0 = g_warm_n;
+    WAIT_FOR(p, 0, 300);
+    CHECK(g_warm_n == n0 && n0 <= 5);
+
+    player_set_warm_hook(NULL);
+    player_free(p);
+    engine_free(eng);
+    library_list_free(&tr);
+    library_close(lib);
+}
+
+/* The radio and the network (player_radio_net). The station's address is one
+ * nothing answers at, so every connection fails at once, as with the network
+ * gone. Connections are counted by player_seq: one more for each connection
+ * begun, and one for giving up. */
+static void test_radio_net(player_t *p)
+{
+    radio_station_t rs = {.name = "A station", .url = "http://127.0.0.1:9/none"};
+    player_now_t n;
+    uint32_t a;
+    #define SEQ(from) ((int)(player_seq(p) - (from)))
+
+    /* the network there: the first connection and six more tries, then given
+     * up, as before (the waits 50 times shorter: 1.2 s in all, not a minute) */
+    player_radio_test_pace(50);
+    player_radio_net(p, 1);
+    a = player_seq(p);
+    player_radio_play(p, &rs, 1, 0);
+    WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
+    CHECK(n.radio_failed && !n.playing && !n.connecting);
+    CHECK(SEQ(a) == 7 + 1);
+    /* ...and so it stays when the network goes and comes back some time later */
+    player_radio_test_pace(2000);                 /* ("some time": over 60 ms) */
+    sleep_ms(150);
+    player_radio_net(p, 0);
+    WAIT_FOR(p, 0, 50);
+    player_radio_net(p, 1);
+    WAIT_FOR(p, 0, 200);
+    player_now(p, &n);
+    CHECK(n.radio_failed && !n.playing && SEQ(a) == 7 + 1);
+
+    /* the network gone: the station waits, and no tries are used up */
+    player_radio_test_pace(50);
+    a = player_seq(p);
+    player_toggle_pause(p);                       /* Play: again */
+    player_radio_net(p, 0);
+    WAIT_FOR(p, 0, 1500);                         /* (longer than giving up takes) */
+    player_now(p, &n);
+    CHECK(!n.radio_failed && n.playing && n.connecting);
+    CHECK(SEQ(a) == 1);                           /* the one on its way when it went, and no more */
+    /* back: connected at once, and with all its tries */
+    player_radio_net(p, 1);
+    CHECK(SEQ(a) == 2);
+    WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
+    CHECK(n.radio_failed && SEQ(a) == 1 + 7 + 1);
+
+    /* given up, and the network seen to go just after: it was the network
+     * (noticed late), so the station comes back with it */
+    player_radio_net(p, 0);
+    WAIT_FOR(p, 0, 50);
+    player_now(p, &n);
+    CHECK(n.radio_failed && !n.playing);
+    a = player_seq(p);
+    player_radio_net(p, 1);
+    player_now(p, &n);
+    CHECK(!n.radio_failed && n.playing && n.connecting && SEQ(a) == 1);
+    WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
+    CHECK(n.radio_failed && SEQ(a) == 7 + 1);
+
+    /* waiting isn't for ever: given up after a while (0.3 s here, ten minutes
+     * really), so the player can count as idle; back with the network still */
+    player_radio_test_pace(2000);
+    sleep_ms(150);                                /* (not "just after" this time) */
+    a = player_seq(p);
+    player_toggle_pause(p);
+    player_radio_net(p, 0);
+    WAIT_FOR(p, 0, 100);
+    player_now(p, &n);
+    CHECK(!n.radio_failed && n.playing);
+    WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
+    CHECK(n.radio_failed && !n.playing && SEQ(a) == 1 + 1);
+    CHECK(player_idle(p));
+    player_radio_net(p, 1);
+    player_now(p, &n);
+    CHECK(!n.radio_failed && n.playing && SEQ(a) == 3);
+    WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
+    CHECK(n.radio_failed);
+
+    /* stopped by hand while it waited: it stays stopped when the network is back */
+    player_radio_test_pace(50);
+    player_toggle_pause(p);
+    player_radio_net(p, 0);
+    WAIT_FOR(p, 0, 100);
+    player_now(p, &n);
+    CHECK(n.playing && n.connecting);
+    player_pause(p, 1);
+    a = player_seq(p);
+    player_radio_net(p, 1);
+    WAIT_FOR(p, 0, 200);
+    player_now(p, &n);
+    CHECK(!n.playing && !n.radio_failed && SEQ(a) == 0);
+
+    /* Next while the network is gone: the other station waits too, and has its tries when it's back */
+    radio_station_t two[2] = {rs, {.name = "Another", .url = "http://127.0.0.1:9/other"}};
+    player_radio_play(p, two, 2, 0);
+    player_radio_net(p, 0);
+    player_next(p);
+    a = player_seq(p);
+    WAIT_FOR(p, 0, 1500);
+    player_now(p, &n);
+    CHECK(!n.radio_failed && n.playing && n.connecting && n.index == 1 && SEQ(a) == 0);
+    player_radio_net(p, 1);
+    WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
+    CHECK(n.radio_failed && n.index == 1 && SEQ(a) == 7 + 1);
+
+    player_radio_test_pace(1);
+    #undef SEQ
+}
+
 int main(void)
 {
     char dir[200];
@@ -402,6 +837,9 @@ int main(void)
     test_unplayable(dir);
     test_removed(dir);
     test_long_cued(dir);
+    test_phantom_plays(dir);
+    test_save_starting(dir);
+    test_warm_next(dir);
     char db[300], art[300], queue[300];
     snprintf(db, sizeof db, "%s/lib.db", dir);
     snprintf(art, sizeof art, "%s/art", dir);
@@ -570,6 +1008,8 @@ int main(void)
 
     audio_output_t out;
     out_clock_create(&out);
+    g_clock_out = out;
+    out.write = counting_write;
     engine_t *eng = engine_new(&out);
     player_t *p = player_new(lib, eng);
 
@@ -735,13 +1175,15 @@ int main(void)
         player_set_speed(p, 100);
         /* the radio leaves an episode too, and an episode the radio */
         player_episode_play(p, &ep);
-        radio_station_t rs = {"A station", "http://127.0.0.1:9/none", ""};
+        radio_station_t rs = {"A station", "http://127.0.0.1:9/none", "", ""};
         player_radio_play(p, &rs, 1, 0);
         CHECK(!player_episode(p, NULL, NULL) && player_radio(p));
         player_episode_play(p, &ep);
         CHECK(player_episode(p, NULL, NULL) && !player_radio(p));
         player_play(p, t, N, 0);
     }
+
+    test_radio_net(p);
 
     /* very short tracks and no tick from the UI meanwhile (busy): the engine
      * goes on through all of them by itself, gapless, and stops once, at the
@@ -778,9 +1220,32 @@ int main(void)
         CHECK(f && fwrite("not a flac file", 1, 15, f) == 15);
         if (f) fclose(f);
         player_set_repeat(p, REPEAT_OFF);
+        player_now_t n0, n1;
+        player_now(p, &n0);
         player_play(p, t, N, 2);                          /* 03, then 04 (damaged), 05 */
         WAIT_FOR(p, idx_of(p, t, N) >= 4, SLOW);          /* (05, or 06 after it) */
         CHECK(idx_of(p, t, N) >= 4);
+        player_now(p, &n1);                               /* passed over, and said which (for the screen) */
+        CHECK(n1.fail_seq == n0.fail_seq + 1 && n1.fail_track == t[3] && !n1.fail_output && !n1.fail_all);
+        /* nothing in the queue playable (repeat on: it would go round for ever): stopped, and said so */
+        player_set_repeat(p, REPEAT_ALL);
+        player_play(p, &t[3], 1, 0);
+        WAIT_FOR(p, (player_now(p, &n1), n1.fail_all), SLOW);
+        CHECK(n1.fail_all && !playing(p));
+        player_set_repeat(p, REPEAT_OFF);
+        /* repeat off: a queue none of which plays is said as that too (its last
+         * one was said as "skipped"), and a last one that fails after others
+         * played is said as stopping there */
+        unsigned seq = n1.fail_seq;
+        player_play(p, &t[3], 1, 0);
+        WAIT_FOR(p, (player_now(p, &n1), n1.fail_seq != seq), SLOW);
+        CHECK(n1.fail_all && !n1.fail_end && !playing(p));
+        seq = n1.fail_seq;
+        player_play(p, &t[2], 2, 0);                      /* 03 plays, then 04 (damaged), the end */
+        WAIT_FOR(p, (player_now(p, &n1), n1.fail_seq != seq), SLOW);
+        WAIT_FOR(p, !playing(p), SLOW);
+        player_now(p, &n1);
+        CHECK(!n1.fail_all && n1.fail_end && n1.fail_track == t[3]);
         CHECK(write_flac(bad, 4) == 0);                   /* (as it was, for what follows) */
     }
 
@@ -798,6 +1263,240 @@ int main(void)
         fprintf(stderr, "queue: restored %d, saved %d\n", player_queue_len(q), player_queue_len(p));
     CHECK(player_queue_at(q, 0) == t[5]);
     player_free(q);
+    /* saved again with the queue as it was: queue.txt isn't written again (no
+     * file replaced every 10 s for a power cut to catch half way); the position
+     * goes to queue.txt.pos, written in place, and a restore takes it from
+     * there when it's for the same track */
+    {
+        char posf[340], qtmp[340];
+        struct stat q0, q1;
+        audio_output_t out2;                         /* (an engine of its own: nothing playing on it) */
+        out_null_stats_t st2;
+        out_null_create(&out2, &st2);
+        engine_t *eng2 = engine_new(&out2);
+        snprintf(posf, sizeof posf, "%s.pos", queue);
+        snprintf(qtmp, sizeof qtmp, "%s.tmp", queue);
+        struct timeval was[2] = {{1000000000, 0}, {1000000000, 0}};
+        CHECK(utimes(queue, was) == 0 && stat(queue, &q0) == 0 && access(posf, F_OK) == 0);
+        CHECK(player_save(p, queue) == 0 && stat(queue, &q1) == 0);
+        CHECK(q0.st_mtime == q1.st_mtime && q0.st_ino == q1.st_ino && access(qtmp, F_OK) != 0);
+        FILE *pf = fopen(posf, "r+");
+        char rec[64];
+        memset(rec, ' ', sizeof rec);
+        int k = snprintf(rec, sizeof rec, "fathom-pos %lld %u", (long long)t[1], 4321u);
+        rec[k] = ' ';
+        rec[63] = '\n';
+        CHECK(pf && fwrite(rec, 1, sizeof rec, pf) == sizeof rec);
+        if (pf) fclose(pf);
+        player_now_t rn;
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[1]);
+        player_now(q, &rn);
+        CHECK(rn.pos_ms == 4321);
+        player_free(q);
+        /* ...another track's position is not this one's */
+        pf = fopen(posf, "r+");
+        k = snprintf(rec, sizeof rec, "fathom-pos %lld %u", (long long)t[4], 9999u);
+        rec[k] = ' ';
+        CHECK(pf && fwrite(rec, 1, sizeof rec, pf) == sizeof rec);
+        if (pf) fclose(pf);
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0);
+        player_now(q, &rn);
+        CHECK(rn.pos_ms != 9999);
+        player_free(q);
+        engine_free(eng2);
+        /* the queue changed: written again */
+        player_queue_clear(p);
+        CHECK(player_save(p, queue) == 0 && stat(queue, &q1) == 0 && q1.st_mtime != q0.st_mtime);
+    }
+    /* The place in the queue is in the record too (fathom-pos ID MS POS
+     * USER_END), so a track change writes 64 bytes in place, not queue.txt
+     * again (600 KB for a shuffle of 50,000, at every track). */
+    {
+        char posf[340], qtmp[340], text[2048], rec[80], keep_q[2048], keep_pos[80];
+        struct stat q0, q1;
+        struct timeval was[2] = {{1000000000, 0}, {1000000000, 0}};
+        audio_output_t out2;
+        out_null_stats_t st2;
+        out_null_create(&out2, &st2);
+        engine_t *eng2 = engine_new(&out2);
+        player_now_t rn;
+        unsigned ms = 0;
+        snprintf(posf, sizeof posf, "%s.pos", queue);
+        snprintf(qtmp, sizeof qtmp, "%s.tmp", queue);
+        player_set_shuffle(p, 0);
+        player_set_repeat(p, REPEAT_OFF);
+
+        /* an album from its fourth track: written whole, its order (the
+         * context's own) as a word, not six numbers */
+        player_play(p, t, N, 3);
+        player_pause(p, 1);
+        CHECK(player_save(p, queue) == 0);
+        slurp(queue, text, sizeof text);
+        CHECK(strstr(text, "\npos 3\nuser_end 4\n") && strstr(text, "\norder identity\n"));
+        CHECK(pos_record(queue, &ms) == t[3]);
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[3] && player_queue_len(q) == 2 && player_queue_at(q, 0) == t[4]);
+        player_free(q);
+
+        /* the same album from the top: the same queue, so only the record is
+         * written; a restore takes the track, the position and where the
+         * hand-queued part ends from it (queue.txt still says the fourth) */
+        CHECK(utimes(queue, was) == 0 && stat(queue, &q0) == 0);
+        player_play(p, t, N, 0);
+        player_pause(p, 1);
+        CHECK(player_save(p, queue) == 0 && stat(queue, &q1) == 0);
+        CHECK(q0.st_mtime == q1.st_mtime && q0.st_ino == q1.st_ino && access(qtmp, F_OK) != 0);
+        slurp(posf, rec, sizeof rec);
+        int rpos = -1, rend = -1;
+        long long rid = -1;
+        CHECK(sscanf(rec, "fathom-pos %lld %u %d %d", &rid, &ms, &rpos, &rend) == 4 && rid == t[0] && rpos == 0 && rend == 1);
+        CHECK(strlen(rec) == 64);
+        snprintf(rec, sizeof rec, "fathom-pos %lld 2500 0 1", (long long)t[0]);
+        put_pos(queue, rec);
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[0] && player_queue_len(q) == 5);
+        player_now(q, &rn);
+        CHECK(rn.pos_ms == 2500 && rn.index == 0);
+        player_add_to_queue(q, &t[5], 1);                 /* (right after it: nothing was queued by hand) */
+        CHECK(player_queue_at(q, 0) == t[5]);
+        player_free(q);
+        /* Next twice (paused): the same again, and restored on the third track */
+        player_next(p);
+        player_next(p);
+        CHECK(cur_id(p) == t[2]);
+        CHECK(player_save(p, queue) == 0 && stat(queue, &q1) == 0);
+        CHECK(q0.st_mtime == q1.st_mtime && q0.st_ino == q1.st_ino && access(qtmp, F_OK) != 0);
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[2] && player_queue_len(q) == 3 && player_queue_at(q, 0) == t[3]);
+        /* ...and saved from there, the restored player writes only the record too */
+        CHECK(player_save(q, queue) == 0 && stat(queue, &q1) == 0 && q0.st_mtime == q1.st_mtime && q0.st_ino == q1.st_ino);
+        player_free(q);
+
+        /* a record naming a track that isn't at that place in this queue (another
+         * queue's, or damaged): left alone, the place and position are queue.txt's */
+        static const char *const stray[] = {
+            "fathom-pos %lld 9999 1 2",       /* the fifth track isn't second */
+            "fathom-pos %lld 9999 99 100",    /* past the end */
+            "fathom-pos %lld 9999 -1 0",
+        };
+        for (int k = 0; k < 3; k++) {
+            snprintf(rec, sizeof rec, stray[k], (long long)t[4]);
+            put_pos(queue, rec);
+            q = player_new(lib, eng2);
+            CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[3]);
+            player_now(q, &rn);
+            CHECK(rn.pos_ms != 9999 && rn.index == 3);
+            player_free(q);
+        }
+        snprintf(rec, sizeof rec, "fathom-pos %lld 9999 1 2", (long long)t[3]);   /* queue.txt's track, at a place it isn't */
+        put_pos(queue, rec);
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[3]);
+        player_now(q, &rn);
+        CHECK(rn.pos_ms != 9999);
+        player_free(q);
+        /* a record whose hand-queued end is past the queue's: held to its end */
+        snprintf(rec, sizeof rec, "fathom-pos %lld 100 2 999", (long long)t[2]);
+        put_pos(queue, rec);
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[2]);
+        player_add_to_queue(q, &t[0], 1);
+        CHECK(player_queue_len(q) == 4 && player_queue_at(q, 3) == t[0]);
+        player_free(q);
+
+        /* files from before: queue.txt with its order as numbers and no
+         * record; then with a record of the old kind (the position only) */
+        slurp(queue, keep_q, sizeof keep_q);
+        slurp(posf, keep_pos, sizeof keep_pos);
+        int k = snprintf(text, sizeof text, "fathom-queue 1\nshuffle 0\nrepeat 2\npos 2\nuser_end 4\nposition_ms 1234\nctx %d", N);
+        for (int i = 0; i < N; i++) k += snprintf(text + k, sizeof text - (size_t)k, " %lld", (long long)t[i]);
+        snprintf(text + k, sizeof text - (size_t)k, "\norder 6 0 1 5 2 3 4\n");   /* T1 T2 | T6 T3 T4 T5 */
+        spit(queue, text);
+        unlink(posf);
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[5] && player_repeat(q) == REPEAT_ONE);
+        player_now(q, &rn);
+        CHECK(rn.pos_ms == 1234 && rn.index == 2 && player_queue_len(q) == 3 && player_queue_at(q, 0) == t[2]);
+        player_add_to_queue(q, &t[0], 1);                 /* (after the one queued by hand: user_end 4) */
+        CHECK(player_queue_at(q, 1) == t[0]);
+        player_free(q);
+        snprintf(rec, sizeof rec, "fathom-pos %lld 777", (long long)t[5]);
+        put_pos(queue, rec);
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[5]);
+        player_now(q, &rn);
+        CHECK(rn.pos_ms == 777 && rn.index == 2);
+        player_free(q);
+        snprintf(rec, sizeof rec, "fathom-pos %lld 777", (long long)t[1]);   /* another track's */
+        put_pos(queue, rec);
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[5]);
+        player_now(q, &rn);
+        CHECK(rn.pos_ms == 1234);
+        /* ...and a save from there leaves the old queue.txt as it is: the record only */
+        CHECK(utimes(queue, was) == 0 && stat(queue, &q0) == 0);
+        player_next(q);
+        CHECK(cur_id(q) == t[2] && player_save(q, queue) == 0 && stat(queue, &q1) == 0);
+        CHECK(q0.st_mtime == q1.st_mtime && q0.st_ino == q1.st_ino);
+        player_free(q);
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[2] && player_queue_len(q) == 2);
+        player_free(q);
+        /* a queue.txt that isn't one: nothing restored, as before */
+        spit(queue, "fathom-queue 1\nshuffle 0\nrepeat 0\npos 0\nuser_end 1\nposition_ms 0\nctx 2 1 2\norder some\n");
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) != 0);
+        player_free(q);
+        spit(queue, keep_q);
+        spit(posf, keep_pos);
+
+        /* A cut between the two writes of a save that changes the queue.
+         * queue.txt new, the record still the old queue's: its place isn't
+         * in the new queue (or isn't that track there), so the new queue
+         * is restored where queue.txt says */
+        player_play(p, t, N, 4);                          /* the old queue: the album, on its fifth track */
+        player_pause(p, 1);
+        CHECK(player_save(p, queue) == 0);
+        slurp(queue, keep_q, sizeof keep_q);
+        slurp(posf, keep_pos, sizeof keep_pos);
+        int64_t rev[3] = {t[3], t[2], t[1]};
+        player_play(p, rev, 3, 1);                        /* the new one: three tracks, on its second */
+        player_pause(p, 1);
+        CHECK(player_save(p, queue) == 0);
+        spit(posf, keep_pos);                             /* (the record's write never happened) */
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[2] && player_queue_len(q) == 1 && player_queue_at(q, 0) == t[1]);
+        player_free(q);
+        /* ...an old record that does fit the new queue (the same track at the
+         * same place): there, a place that exists */
+        snprintf(rec, sizeof rec, "fathom-pos %lld 3000 0 1", (long long)t[3]);
+        put_pos(queue, rec);
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[3] && player_queue_len(q) == 2);
+        player_free(q);
+        /* the other way round (the record new, queue.txt still the old
+         * queue): the old queue, where it was when queue.txt was last
+         * written whole (on its fourth track: going to the fifth wrote the
+         * record only) */
+        CHECK(player_save(p, queue) == 0);                /* (the record: the new queue's second track) */
+        spit(queue, keep_q);
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[3] && player_queue_len(q) == 2);
+        player_free(q);
+        /* no record at all (lost, or a first save cut before it): queue.txt alone */
+        unlink(posf);
+        q = player_new(lib, eng2);
+        CHECK(player_restore(q, queue) == 0 && cur_id(q) == t[3]);
+        player_free(q);
+        engine_free(eng2);
+        player_play(p, t, N, 0);                          /* (and a queue.txt that is p's again) */
+        player_pause(p, 1);
+        player_set_repeat(p, REPEAT_ALL);
+        CHECK(player_save(p, queue) == 0);
+        player_set_repeat(p, REPEAT_OFF);
+    }
 
     /* your own playlists: written relative to their folder, read back, kept by a rescan */
     char pldir[300], plfile[400];
@@ -859,6 +1558,48 @@ int main(void)
     CHECK(in_order < 8);                                  /* (all 8 in order: 1 in 720^8) */
     CHECK(player_shuffle_these(p, t, N, 0) == N && cur_id(p) == t[0] && player_queue_at(p, 0) == t[1]);
     CHECK(player_shuffle_these(p, t, 0, 1) == 0);
+    /* Shuffle all on a big library (here: any): one song at once, the whole
+     * order at the next tick, around it; a key before that tick finds the
+     * whole queue; something else started meanwhile isn't overwritten */
+    {
+        player_shuffle_prefs_t all = {.albums = 0, .freshness = 1};
+        player_set_shuffle_prefs(p, &all);
+        player_test_shuffle_soon(1);
+        for (int k = 0; k < 6; k++) {
+            player_shuffle_all(p);
+            int64_t first = cur_id(p);
+            CHECK(player_shuffle(p) && first > 0 && player_queue_len(p) == 0);     /* (the one song) */
+            player_tick(p);
+            CHECK(cur_id(p) == first && player_queue_len(p) == N - 1);
+            int each = idx_of_id(t, N, first) >= 0;
+            for (int i = 0; i < N - 1; i++) {
+                int64_t qi = player_queue_at(p, i);
+                each &= idx_of_id(t, N, qi) >= 0 && qi != first;
+                for (int j = 0; j < i; j++) each &= player_queue_at(p, j) != qi;
+            }
+            CHECK(each);                                                           /* every song once */
+        }
+        player_shuffle_all(p);
+        int64_t first = cur_id(p);
+        player_next(p);                                   /* (before any tick) */
+        CHECK(cur_id(p) != first && idx_of_id(t, N, cur_id(p)) >= 0 && player_queue_len(p) == N - 2);
+        player_shuffle_all(p);
+        player_set_shuffle(p, 0);                         /* shuffle off at once: all the songs, in order */
+        CHECK(!player_shuffle(p) && player_queue_len(p) > 0);
+        player_shuffle_all(p);
+        player_play(p, t, 3, 0);                          /* an album started instead: it stays */
+        player_tick(p);
+        CHECK(cur_id(p) == t[0] && player_queue_len(p) == 2);
+        all.albums = 1;                                   /* whole albums: from the album's first track */
+        player_set_shuffle_prefs(p, &all);
+        player_shuffle_all(p);
+        CHECK(cur_id(p) == t[0]);
+        player_tick(p);
+        CHECK(cur_id(p) == t[0] && player_queue_len(p) == N - 1 && player_queue_at(p, 0) == t[1]);
+        player_test_shuffle_soon(0);
+        player_shuffle_all(p);                            /* (a small library: all at once, as before) */
+        CHECK(player_queue_len(p) == N - 1);
+    }
     sp.albums = 0;
     player_set_shuffle_prefs(p, &sp);
     CHECK(player_shuffle_these(p, t, N, 1) == N);           /* songs: all interludes, all played */
@@ -886,12 +1627,31 @@ int main(void)
         player_set_repeat(p, REPEAT_OFF);
         player_play(p, t, N, 1);
         player_pause(p, 1);
+        eng_status_t ps;
+        WAIT_FOR(p, (engine_status(eng, &ps), ps.state == ENG_PAUSED && !ps.starting), SLOW);
+        unsigned long long w0 = written();
         player_next(p);
         WAIT_FOR(p, 0, 600);                              /* (two 0.3 s tracks' time) */
         CHECK(cur_id(p) == t[2] && !playing(p));
         player_prev(p);
         WAIT_FOR(p, 0, 600);
         CHECK(cur_id(p) == t[1] && !playing(p));
+        /* ...and nothing of either was played meanwhile (the new track
+         * sounded for a moment at each press), nor counted as heard */
+        for (int k = 0; k < 6; k++) {
+            player_next(p);
+            WAIT_FOR(p, 0, 30);
+            player_prev(p);
+            WAIT_FOR(p, 0, 30);
+        }
+        CHECK(written() == w0 && cur_id(p) == t[1] && !playing(p));
+        if (written() != w0) fprintf(stderr, "skips while paused: %llu frames played\n", written() - w0);
+        player_pause(p, 0);                               /* the resume: now it plays */
+        WAIT_FOR(p, written() > w0, SLOW);
+        CHECK(written() > w0);
+        player_play(p, t, N, 1);                          /* (the second track, paused, for what follows) */
+        player_pause(p, 1);
+        WAIT_FOR(p, (engine_status(eng, &ps), ps.state == ENG_PAUSED && !ps.starting), SLOW);
         CHECK(player_save(p, queue) == 0);
         engine_stop(eng);
         player_t *c = player_new(lib, eng);

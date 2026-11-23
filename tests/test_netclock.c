@@ -368,9 +368,38 @@ int main(void)
     CHECK(!netclock_wanted());
     netclock_want();
     CHECK(netclock_wanted() && !netclock_wanted());
+    /* The clock set, but not by the network since the start (the last
+     * shutdown's time: perhaps days behind): a request that failed says its
+     * own reason, and the time is asked for all the same; once the network
+     * has given it, not any more. */
     if (!netclock_unset()) {
+        CHECK(!netclock_confirmed() && netclock_doubtful());
+        CHECK(!strcmp(netclock_why("other"), "other") && netclock_wanted());
+        netclock_net_failed("https://example.org/a");
+        CHECK(netclock_wanted());
+        netclock_net_failed("http://example.org/a");   /* (it may lead to https) */
+        CHECK(netclock_wanted());
+        netclock_net_failed("/mnt/sd/Music/a.flac");   /* not the network's */
+        netclock_net_failed(NULL);
+        CHECK(!netclock_wanted());
+        netclock_set_confirmed(1);
+        CHECK(netclock_confirmed() && !netclock_doubtful());
         CHECK(!strcmp(netclock_why("other"), "other") && !netclock_wanted());
+        netclock_net_failed("https://example.org/a");
+        CHECK(!netclock_wanted());
+        netclock_set_confirmed(0);                     /* set by hand since */
+        netclock_net_failed("https://example.org/a");
+        CHECK(netclock_wanted());
+        netclock_set_confirmed(1);
     }
+    /* unset: doubtful whatever was confirmed before (it went back) */
+    netclock_set_now(fake_now);
+    fake_t = 86400;
+    CHECK(netclock_doubtful());
+    netclock_net_failed("https://example.org/a");
+    CHECK(netclock_wanted());
+    CHECK(!strcmp(netclock_why("other"), netclock_unset_text()) && netclock_wanted());
+    netclock_set_now(NULL);
 
     parse_tests();
     year_tests();

@@ -29,6 +29,7 @@ typedef struct {
     int            ended;        /* playback ran out (no successor), or the track failed */
     int            error;        /* the track couldn't be played (unreadable, or the output can't
                                   * take its format); track_id is that track's */
+    int            error_output; /* ...because the output can't take its format (not the file) */
     unsigned       stop_seq;     /* +1 each time playback stops by itself (ended or error) */
     int            output_lost;  /* a write or open failed (device gone); the engine paused */
     int            starting;     /* a track is about to start (engine_play not yet taken up) */
@@ -63,8 +64,12 @@ void engine_queue_next(engine_t *e, const char *path, int64_t id);  /* gapless s
 void engine_play_gain(engine_t *e, const char *path, int64_t id, float gain);
 /* The same from start_ms in (a podcast episode, or a long file, where it was
  * left): nothing before it is ever heard, which a play and then a seek can't
- * promise (an idle engine starts on the play before the seek comes). */
-void engine_play_at(engine_t *e, const char *path, int64_t id, float gain, uint32_t start_ms);
+ * promise (an idle engine starts on the play before the seek comes).
+ * paused: it starts paused, with nothing of it written until the resume (Next
+ * while paused); a play and then a pause can't promise that either (the
+ * playback thread, first in line for the CPU, takes the play up before the
+ * pause comes, and the new track sounds for a moment). */
+void engine_play_at(engine_t *e, const char *path, int64_t id, float gain, uint32_t start_ms, int paused);
 void engine_queue_next_gain(engine_t *e, const char *path, int64_t id, float gain);
 /* Lines up what follows the current track, in order (replacing what was lined
  * up; n = 0: nothing), at most ENGINE_AHEAD: the engine goes on to each by

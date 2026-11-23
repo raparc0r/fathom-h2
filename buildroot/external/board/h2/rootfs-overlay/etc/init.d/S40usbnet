@@ -2,15 +2,31 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Additional terms under GPLv3 section 7: see LICENSE.
 # USB network to the computer: the H2 is 10.42.0.1, the computer gets 10.42.0.2.
+#
+# usb0 is there as soon as S30usbgadget has made the gadget, and then all of
+# this is done before the next script, as it always was. When it isn't (a
+# gadget that failed), the 10 s it's waited for, and what's tried after them
+# all the same, happen in the background: the scripts after this one (the
+# player's among them) used to stand still for those 10 s.
+up() {
+    ip link set usb0 up
+    ip addr add 10.42.0.1/24 dev usb0
+    touch /tmp/udhcpd.leases
+    udhcpd /etc/udhcpd.conf
+}
+
 case "$1" in
     start)
-        for i in 1 2 3 4 5 6 7 8 9 10; do
-            [ -e /sys/class/net/usb0 ] && break
-            sleep 1
-        done
-        ip link set usb0 up
-        ip addr add 10.42.0.1/24 dev usb0
-        touch /tmp/udhcpd.leases
-        udhcpd /etc/udhcpd.conf
+        if [ -e /sys/class/net/usb0 ]; then
+            up
+        else
+            (
+                for i in $(seq 1 50); do
+                    [ -e /sys/class/net/usb0 ] && break
+                    sleep 0.2
+                done
+                up
+            ) &
+        fi
         ;;
 esac

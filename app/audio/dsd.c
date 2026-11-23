@@ -2,7 +2,8 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * DSD to PCM in two stages, both linear-phase FIRs (Kaiser-windowed sinc,
- * designed when a file opens; integers from there on: Fathom is built soft-float).
+ * designed the first time a file of a DSD rate opens and kept for the next;
+ * integers from there on: Fathom is built soft-float).
  *
  *  1. At the DSD rate, decimating to twice the output rate (352.8 kHz): a
  *     6 x ratio tap filter evaluated a byte at a time from tables of the sums
@@ -24,6 +25,7 @@
 #include "dsd.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -43,7 +45,8 @@ struct dsd2pcm {
     unsigned ratio, ch, group;   /* group: bytes per channel per output frame (ratio / 8) */
     unsigned l1;                 /* stage 1's length in bytes */
     unsigned delay, span;
-    int32_t *t1;                 /* l1 / 2 tables of 256: byte j back from the newest */
+    const int32_t *t1;           /* l1 / 2 tables of 256: byte j back from the newest */
+    int t1_own;                  /* ...this converter's own (else the kept ones: not freed with it) */
     int32_t h2[(S2_TAPS + 1) / 2];
     uint8_t *b[2];               /* l1 - 1 bytes of history, then the run's input */
     uint8_t *r[2];               /* the same bytes bit-reversed (the older half's index) */
@@ -75,6 +78,96 @@ static void kaiser_lowpass(double *h, int n, double fc, double beta)
     for (int i = 0; i < n; i++) h[i] /= sum;
 }
 
+/* Stage 1's tables (l1 / 2 of 256, allocated) and stage 2's taps for a ratio,
+ * designed: NULL if there's no memory. */
+static int32_t *design_tables(unsigned ratio, unsigned l1, int32_t *h2q)
+{
+    unsigned taps = 8 * l1;
+    double *h = malloc(taps * sizeof *h);
+    int32_t *t1 = malloc((size_t)l1 / 2 * 256 * sizeof *t1);
+    if (!h || !t1) { free(h); free(t1); return NULL; }
+    /* stage 1: keep what stage 2 keeps, stop what would fold onto it */
+    kaiser_lowpass(h, (int)taps, (PASS + 2 - STOP) / 2 / ratio, S1_BETA);
+    for (unsigned j = 0; j < l1 / 2; j++)
+        for (unsigned v = 0; v < 256; v++) {
+            double a = 0;
+            for (unsigned i = 0; i < 8; i++)          /* bit 0 is the newest: tap 8j + i */
+                a += (v >> i & 1) ? h[8 * j + i] : -h[8 * j + i];
+            t1[j * 256 + v] = (int32_t)lround(a * (1 << 28));
+        }
+    double h2[S2_TAPS];
+    kaiser_lowpass(h2, S2_TAPS, (PASS + STOP) / 4, S2_BETA);
+    for (unsigned i = 0; i < (S2_TAPS + 1) / 2; i++) h2q[i] = (int32_t)lround(h2[i] * (1 << 30));
+    free(h);
+    return t1;
+}
+
+/* The tables, kept once designed. Designing them is tens of thousands of
+ * soft-float operations: 20 to 65 ms on the H2 at every DSD file's open, on
+ * the playback thread, and inside the 200 ms the output has queued when the
+ * file is the next of a gapless album. They depend on the ratio alone, so
+ * the first open of a ratio designs them and later ones use the same tables
+ * (read only: converters share them; 6 KB at DSD64, 12 at DSD128, 24 at
+ * DSD256, for the rates played). Guarded: a file is opened by the playback
+ * thread, and by others (the loudness scan). The design itself runs without
+ * the lock (the playback thread never waits out another thread's): two
+ * designing the same at once get the same numbers, and the second uses the
+ * first's. */
+#define TABLES_KEPT 3            /* DSD64, DSD128, DSD256 */
+static struct {
+    unsigned ratio;              /* 0: free */
+    int32_t *t1;
+    int32_t h2[(S2_TAPS + 1) / 2];
+} kept[TABLES_KEPT];
+static pthread_mutex_t kept_mu = PTHREAD_MUTEX_INITIALIZER;
+static int keep_tables = 1;
+
+void dsd2pcm_keep_tables(int on)
+{
+    pthread_mutex_lock(&kept_mu);
+    keep_tables = on;
+    pthread_mutex_unlock(&kept_mu);
+}
+
+/* c's tables (c->l1 set): the kept ones, or designed now (and kept). 0, or -1. */
+static int take_tables(dsd2pcm_t *c)
+{
+    pthread_mutex_lock(&kept_mu);
+    int keep = keep_tables;
+    for (int i = 0; keep && i < TABLES_KEPT && !c->t1; i++)
+        if (kept[i].ratio == c->ratio) {
+            c->t1 = kept[i].t1;
+            memcpy(c->h2, kept[i].h2, sizeof c->h2);
+        }
+    pthread_mutex_unlock(&kept_mu);
+    if (c->t1) return 0;
+    int32_t *t1 = design_tables(c->ratio, c->l1, c->h2);
+    if (!t1) return -1;
+    c->t1 = t1;
+    c->t1_own = 1;
+    if (!keep) return 0;
+    pthread_mutex_lock(&kept_mu);
+    int at = -1;
+    for (int i = 0; i < TABLES_KEPT && at < 0; i++)
+        if (kept[i].ratio == c->ratio) at = i;        /* (another thread designed it meanwhile: its tables) */
+    if (at >= 0) {
+        free(t1);
+        c->t1 = kept[at].t1;
+        c->t1_own = 0;
+    } else {
+        for (int i = 0; i < TABLES_KEPT && at < 0; i++)
+            if (!kept[i].ratio) at = i;
+        if (at >= 0) {                                /* (none free, a ratio no file has: this converter's own) */
+            kept[at].ratio = c->ratio;
+            kept[at].t1 = t1;
+            memcpy(kept[at].h2, c->h2, sizeof c->h2);
+            c->t1_own = 0;
+        }
+    }
+    pthread_mutex_unlock(&kept_mu);
+    return 0;
+}
+
 dsd2pcm_t *dsd2pcm_new(unsigned ratio, unsigned channels)
 {
     if (ratio < 16 || ratio % 16 || ratio > 128 || channels < 1 || channels > 2) return NULL;
@@ -85,34 +178,18 @@ dsd2pcm_t *dsd2pcm_new(unsigned ratio, unsigned channels)
     c->group = ratio / 8;
     c->l1 = S1_BYTES_PER_16 * ratio / 16;
     unsigned taps = 8 * c->l1;
-    double *h = malloc(taps * sizeof *h);
-    c->t1 = malloc((size_t)c->l1 / 2 * 256 * sizeof *c->t1);
     for (unsigned k = 0; k < channels; k++) {
         c->b[k] = malloc(c->l1 - 1 + (size_t)DSD_CHUNK * c->group);
         c->r[k] = malloc(c->l1 - 1 + (size_t)DSD_CHUNK * c->group);
         c->s[k] = malloc((S2_TAPS - 1 + 2 * (size_t)DSD_CHUNK) * sizeof *c->s[k]);
-        if (!c->b[k] || !c->r[k] || !c->s[k]) { free(h); dsd2pcm_free(c); return NULL; }
+        if (!c->b[k] || !c->r[k] || !c->s[k]) { dsd2pcm_free(c); return NULL; }
     }
     for (unsigned v = 0; v < 256; v++) {
         unsigned x = 0;
         for (int i = 0; i < 8; i++) x |= (v >> i & 1) << (7 - i);
         c->rev[v] = (uint8_t)x;
     }
-    if (!h || !c->t1) { free(h); dsd2pcm_free(c); return NULL; }
-
-    /* stage 1: keep what stage 2 keeps, stop what would fold onto it */
-    kaiser_lowpass(h, (int)taps, (PASS + 2 - STOP) / 2 / ratio, S1_BETA);
-    for (unsigned j = 0; j < c->l1 / 2; j++)
-        for (unsigned v = 0; v < 256; v++) {
-            double a = 0;
-            for (unsigned i = 0; i < 8; i++)          /* bit 0 is the newest: tap 8j + i */
-                a += (v >> i & 1) ? h[8 * j + i] : -h[8 * j + i];
-            c->t1[j * 256 + v] = (int32_t)lround(a * (1 << 28));
-        }
-    double h2[S2_TAPS];
-    kaiser_lowpass(h2, S2_TAPS, (PASS + STOP) / 4, S2_BETA);
-    for (unsigned i = 0; i < (S2_TAPS + 1) / 2; i++) c->h2[i] = (int32_t)lround(h2[i] * (1 << 30));
-    free(h);
+    if (take_tables(c)) { dsd2pcm_free(c); return NULL; }
 
     /* Output k, made when group k is in, is centred on bit
      * (k + 1) * ratio - ratio * (S2_TAPS - 1) / 4 - 1 - (taps - 1) / 2,
@@ -129,7 +206,7 @@ void dsd2pcm_free(dsd2pcm_t *c)
 {
     if (!c) return;
     for (unsigned k = 0; k < 2; k++) { free(c->b[k]); free(c->r[k]); free(c->s[k]); }
-    free(c->t1);
+    if (c->t1_own) free((void *)c->t1);
     free(c);
 }
 

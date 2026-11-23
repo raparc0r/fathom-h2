@@ -1,0 +1,40 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] init: a tenth of a second, not one, after SIGTERM and before the reboot call
+
+At halt, power-off and reboot, init runs the shutdown actions (rcK, then
+"umount -a -r"), sends SIGTERM to everything, sleeps a second, sends SIGKILL,
+and sleeps a second more before the reboot() call, "for the last message to
+reach the serial console". On the H2 the stop scripts have by then stopped
+everything that has anything to save (the player, Bluetooth, Wi-Fi, SSH) and
+unmounted the card (S10sdcard), so the two seconds are pure waiting with the
+screen saying "Powering off". A tenth of a second each: enough for what's
+left (getty, udhcpd, shells) to take the signal, and for the console.
+
+Upstream-Status: Inappropriate [Fathom's stop scripts make it safe]
+
+--- a/init/init.c
++++ b/init/init.c
+@@ -735,8 +735,9 @@
+ {
+ 	pid_t pid;
+ 
+-	/* Allow time for last message to reach serial console, etc */
+-	sleep1();
++	/* Allow time for last message to reach serial console, etc.
++	 * Fathom: a tenth of a second, not one (see below) */
++	msleep(100);
+ 
+ 	/* We have to fork here, since the kernel calls do_exit(EXIT_SUCCESS)
+ 	 * in linux/kernel/sys.c, which can cause the machine to panic when
+@@ -768,7 +769,10 @@
+ 	kill(-1, SIGTERM);
+ 	message(L_CONSOLE, "Sent SIG%s to all processes", "TERM");
+ 	sync();
+-	sleep1();
++	/* Fathom: a tenth of a second, not one. The stop scripts have already
++	 * stopped everything that has anything to save and unmounted the card
++	 * (S90fathom ... S10sdcard), so nothing left needs a second to end. */
++	msleep(100);
+ 
+ 	kill(-1, SIGKILL);
+ 	message(L_CONSOLE, "Sent SIG%s to all processes", "KILL");

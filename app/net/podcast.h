@@ -17,6 +17,9 @@
  *       ID/episodes.txt    its episodes, as last read from the feed
  *       ID/state.txt       where each episode was left, and which are played
  *       ID/KEY.mp3 (...)   downloaded episodes (KEY.mp3.part while downloading)
+ *       ID/cover.565       its cover for Now Playing, ID/thumb.565 the same
+ *                          small for the list of shows, ID/cover.url the
+ *                          address of the image they were last made from
  *     ID is from the feed's address, KEY from the episode's guid (12 hex
  *     digits of their SHA-256), so a show or an episode keeps its files when
  *     its title changes. Files are written beside and moved over (a power cut
@@ -94,6 +97,8 @@ void pod_chapters_path(const char *dir, const char *id, const char *key, char *o
 /* A show's cover, kept small (ID/cover.565: RGB565, LIB_ART_LARGE square, made from
  * its image when its feed is read) */
 void pod_cover_path(const char *dir, const char *id, char *out, size_t cap);
+/* The same for the list of shows (ID/thumb.565: RGB565, LIB_ART_SMALL square) */
+void pod_thumb_path(const char *dir, const char *id, char *out, size_t cap);
 
 /* "Tue, 19 Nov 2026 05:00:00 +0000" (RFC 822, as feeds give it): seconds, or 0. */
 int64_t pod_parse_date(const char *s);

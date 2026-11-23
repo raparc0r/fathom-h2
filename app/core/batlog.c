@@ -2,6 +2,9 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Battery history: the log and what it says (batlog.h). */
 #include "core/batlog.h"
+#include "core/fsafe.h"
+
+#include <unistd.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -108,7 +111,8 @@ static void trim(const char *path, int64_t now)
     }
     ok = !ferror(f) && ok;
     fclose(f);
-    if (fclose(o) == 0 && ok) rename(tmp, path);
+    int flushed = fflush(o) == 0 && fsync(fileno(o)) == 0;
+    if (fclose(o) == 0 && flushed && ok) file_replace(tmp, path);
     else remove(tmp);
 }
 

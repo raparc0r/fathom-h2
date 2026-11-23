@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional terms under GPLv3 section 7: see LICENSE.
+#
+# Start the scripts in /etc/init.d in their order (as Buildroot's rcS does),
+# and note when each began, in seconds since the kernel started, in
+# /tmp/rcS.times: where a slow start-up's time went. (The shell's own read:
+# no process started for it.)
+for i in /etc/init.d/S??*; do
+    [ -f "$i" ] || continue
+    read -r t _ < /proc/uptime && echo "$t $i" >> /tmp/rcS.times
+    "$i" start
+done
+read -r t _ < /proc/uptime && echo "$t done" >> /tmp/rcS.times

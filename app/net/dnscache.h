@@ -17,8 +17,9 @@ typedef void (*dns_free_fn)(struct addrinfo *ai);
 
 /* A result younger than this is given without asking (ms) */
 #define DNSCACHE_FRESH_MS 120000
-/* An older one (up to this) only when asking fails for the moment (EAI_AGAIN):
- * the router didn't answer, the name is still the station's */
+/* An older one (up to this) is given at once too, and looked up again in the
+ * background for the next time: the name is still the station's, and a
+ * reconnect doesn't wait for the router. Past this it's asked for first. */
 #define DNSCACHE_STALE_MS 3600000
 
 /* getaddrinfo() through the cache: resolve does the real lookup. A name with a
@@ -38,9 +39,16 @@ void dnscache_prefetch_url(const char *url);
 /* The resolver the prefetch uses (the player: libc's own, under the wrap) */
 void dnscache_use(dns_resolve_fn resolve, dns_free_fn real_free);
 
+/* On: a lookup for either family (AF_UNSPEC, or no hints) asks for IPv4 only.
+ * For a kernel without IPv6 (the H2's): musl asks for both addresses and fails
+ * the whole lookup after 5 s when the IPv6 half isn't answered. The player
+ * turns it on (with the wrap). */
+void dnscache_ipv4_only(int on);
+
 /* tests: the clock (ms) instead of CLOCK_MONOTONIC (NULL: the real one), and
  * everything forgotten */
 void dnscache_test_clock(uint32_t (*now)(void));
 void dnscache_test_reset(void);
+int  dnscache_test_idle(void);   /* tests: nothing is being looked up in the background */
 
 #endif

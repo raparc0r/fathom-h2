@@ -9,12 +9,15 @@
 # Output goes to /tmp/fathom-player.log (RAM, not the card).
 #
 # Logs in RAM would grow for as long as the H2 runs: while the player runs,
-# this loop looks once a minute, and a log in /tmp over 256 KB keeps its last
-# 128 KB (cut in place: whoever writes it appends, so carries on at its end).
+# a loop beside it looks every 10 minutes (and this one each time the player
+# exits), and a log in /tmp over 256 KB keeps its last 128 KB (cut in place:
+# whoever writes it appends, so carries on at its end). Every minute, as it
+# was, woke the H2 sixty times an hour to find, nearly always, nothing to cut.
 
-. /usr/lib/fathom/card.sh               # (CARD_OUT, card_wait)
+. /usr/lib/fathom/card.sh               # (CARD_OUT, card_wait, card_mounted, now_cs)
 bin=/mnt/sd/fathom/bin/fathom-player
 pidfile=/var/run/fathom.pid
+trimpid=/var/run/fathom-trim.pid        # (the loop that looks at the logs, while the player runs)
 log=/tmp/fathom-player.log
 
 trim_logs() {
@@ -25,14 +28,34 @@ trim_logs() {
     done
 }
 
+# How long the player took to stop (stop, below), said in its log. Over a
+# second, or killed ($1) because it hadn't stopped in 5 s (its library is then
+# checked at the next start): on the card too, fathom/player-stop.log (its
+# last 4 KB kept), because at power-off the log in RAM goes with the RAM.
+stopped() {
+    now_cs
+    t=$((cs - t0))
+    [ $t -ge 0 ] || t=0
+    t="$((t / 100)).$((t % 100 / 10))$((t % 10)) s"
+    if [ -n "$1" ]; then m="fathom-player hadn't stopped after $t: killed"; else m="fathom-player stopped in $t"; fi
+    echo "$m" >> $log
+    case "$1:$t" in :0.*) return 0 ;; esac
+    card_mounted && [ -d /mnt/sd/fathom ] || return 0
+    f=/mnt/sd/fathom/player-stop.log
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $m" >> $f
+    [ "$(wc -c < $f)" -gt 8192 ] && tail -c 4096 $f > $f.cut && cat $f.cut > $f
+    rm -f $f.cut
+}
+
 case "$1" in
 start)
     # One loop only: a card put in during the start (fathom-sdcard's add) can
     # start it before rcS does, and two players would fight over everything
     [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null && exit 0
-    /usr/sbin/fathom-ssh boot           # root's password, and SSH if it's on (even if the player isn't there)
-    [ -x "$bin" ] || { echo "fathom: $bin not found"; exit 0; }
-    [ -e /mnt/sd/fathom/no-autostart ] && { echo "fathom: autostart disabled"; exit 0; }
+    # No player to start: root's password, and SSH if it's on, all the same
+    # (the way in to see why)
+    [ -x "$bin" ] || { /usr/sbin/fathom-ssh boot; echo "fathom: $bin not found"; exit 0; }
+    [ -e /mnt/sd/fathom/no-autostart ] && { /usr/sbin/fathom-ssh boot; echo "fathom: autostart disabled"; exit 0; }
     (
         cd /                            # not on the card: USB drive mode unmounts it
         while :; do
@@ -45,43 +68,96 @@ start)
                 card_wait
                 break
             fi
+            started=$(cut -d. -f1 /proc/uptime)
             "$bin" >> $log 2>&1 &
             p=$!
-            # Until it exits, a look at the logs each minute. The player's exit
-            # ends the minute's sleep at once (busybox's wait -n waits for the
-            # newest job only, so it can't be used for this).
-            s=
-            trap '[ -n "$s" ] && kill $s 2>/dev/null' CHLD
-            while kill -0 $p 2>/dev/null; do
-                sleep 60 &
-                s=$!
-                wait $s
-                kill -0 $p 2>/dev/null && trim_logs
-            done
-            trap - CHLD
+            # While it runs, a look at the logs every 10 minutes, by a loop of
+            # its own that is stopped when the player exits (here, or by stop).
+            # This loop only waits for the player. (It used to sleep the
+            # minutes itself, a CHLD trap ending the sleep when the player
+            # exited: an exit between its look at the player and the start of
+            # the sleep went unseen for the whole minute, with the screen
+            # frozen on the player's last picture.)
+            (
+                trap 'kill $s 2>/dev/null; exit 0' TERM
+                while :; do
+                    sleep 600 &
+                    s=$!
+                    wait $s
+                    trim_logs
+                done
+            ) &
+            t=$!
+            echo $t > $trimpid
             wait $p
             rc=$?
+            kill $t 2>/dev/null
+            wait $t 2>/dev/null             # (gone before trim_logs below: one at a time)
+            rm -f $trimpid
             if [ $rc = 42 ]; then           # USB drive mode: lend the card, then carry on
                 /usr/sbin/fathom-usbdisk >> $log 2>&1
                 continue
             fi
             echo "fathom-player exited ($rc), restarting" >> $log
             trim_logs
-            sleep 2
+            # It can't start (gone within 20 s, five times running): its log is
+            # kept on the card for whoever looks, once, and it's tried every
+            # half minute, not every 2 s for ever.
+            ran=$(( $(cut -d. -f1 /proc/uptime) - started ))
+            if [ $ran -lt 20 ]; then quick=$((${quick:-0} + 1)); else quick=0; fi
+            if [ $quick -ge 5 ]; then
+                [ $quick = 5 ] && tail -c 16384 $log > /mnt/sd/fathom/player-crash.log 2>/dev/null && sync
+                sleep 28
+            fi
+            # Started again at once after a run of any length (a crash, Reset
+            # all settings): the 2 s there used to be before every restart are
+            # only for one that went within 20 s of its start, so a player
+            # that can't start is still tried every 2 s, not all the time.
+            if [ $ran -lt 20 ]; then sleep 2; fi
         done
     ) &
     echo $! > "$pidfile"
+    # Root's password, and SSH if it's on: beside the player's start, not
+    # before it (it held the player up for as long as it took: a password
+    # hashed, dropbear copied to RAM and started). The player sets both itself
+    # once it's up (ssh_init; fathom-ssh's lock keeps the two calls apart):
+    # this one is for a player that never gets that far. What it says goes to
+    # the player's log.
+    # (...and a few seconds after it: on the one CPU it ran through the
+    # player's own start, which sets both itself moments later)
+    ( sleep 4; /usr/sbin/fathom-ssh boot >> $log 2>&1 ) &
     ;;
 stop)
     [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null   # the restart loop first
-    rm -f "$pidfile"
+    [ -f $trimpid ] && kill "$(cat $trimpid)" 2>/dev/null       # ...and the logs' loop it started
+    rm -f "$pidfile" $trimpid
     p=$(pidof fathom-player) || exit 0
+    now_cs; t0=$cs
     kill $p
-    for i in 1 2 3 4 5 6 7 8 9 10; do       # up to 5 s to close the library cleanly
-        pidof fathom-player >/dev/null || exit 0
-        sleep 0.5
+    # Up to 5 s to close the library cleanly, looked at every 0.1 s (every
+    # 0.5 s before: a quarter of a second of every power-off, on average,
+    # slept through after the player had gone), by its pid and the clock: no
+    # pidof run each time (the one CPU is the player's while it closes).
+    i=0
+    while [ $i -lt 50 ]; do
+        gone=1
+        # (exited but not yet collected still answers kill -0: with its loop
+        # killed first the player is init's to collect, and init looks once a
+        # second, so a stop by hand always read as a second long)
+        for q in $p; do
+            kill -0 $q 2>/dev/null || continue
+            st=
+            { read -r _ _ st _ < /proc/$q/stat; } 2>/dev/null   # (can't be read: taken for running)
+            [ "$st" = Z ] || gone=
+        done
+        [ -n "$gone" ] && { stopped; exit 0; }
+        now_cs
+        [ $((cs - t0)) -ge 500 ] && break
+        sleep 0.1
+        i=$((i + 1))
     done
     kill -9 $p 2>/dev/null
+    stopped killed
     ;;
 restart)
     "$0" stop; sleep 1; "$0" start

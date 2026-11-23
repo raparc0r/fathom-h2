@@ -47,6 +47,7 @@
 #include "core/tz.h"
 #include "core/lat.h"
 #include "net/dnscache.h"
+#include "core/fsafe.h"
 #include "net/netclock.h"
 #include "net/tls_wrap.h"
 #include "audio/mixer_alsa.h"
@@ -59,6 +60,7 @@
 #include "uninstaller.h"
 #include "sys/uninstall.h"
 #include "wifi.h"
+#include "shell.h"
 #include "radiometa.h"
 #include "out_router.h"
 #include "audio/out_bt.h"
@@ -75,6 +77,7 @@
 #include "net/update.h"
 #include "net/podsync.h"
 #include "net/coverfind.h"
+#include "net/radioicon.h"
 #include "audio/crossfeed.h"
 #include "audio/decoder.h"
 #include "audio/ff_util.h"
@@ -86,7 +89,22 @@
 #include "ui/ui.h"
 
 static volatile sig_atomic_t g_quit;
-static void on_signal(int s) { (void)s; g_quit = 1; }
+/* A stop asked for from outside (init's stop script, a restart): the signal
+ * may be handed to any of the player's threads, and the main loop, asleep in
+ * poll() for up to a second with nothing going on, only saw g_quit at its
+ * next timer: a second of every such stop. The handler writes to a pipe the
+ * main loop's poll() watches. */
+static int g_quit_pipe[2] = {-1, -1};
+static void on_signal(int s)
+{
+    (void)s;
+    g_quit = 1;
+    if (g_quit_pipe[1] >= 0) {
+        char c = 1;
+        ssize_t w = write(g_quit_pipe[1], &c, 1);
+        (void)w;
+    }
+}
 
 /* The boot logo as the player's last frame: on a crash too, so the screen shows
  * the logo (not a frozen or black screen) until S90fathom has it running again;
@@ -264,13 +282,13 @@ static void power_off(const char *why)
     if (g_powering_off) return;        /* (charging mode asks every second until init stops us) */
     fprintf(stderr, "power off: %s\n", why);
     g_powering_off = 1;
+    screen_set(1);                     /* the message must be visible */
+    ui_toast(why, 5000);
+    lv_refr_now(NULL);                 /* ...and at once: the saves below write to the card, and Power is still held */
     batlog_end();
     clock_save();
     settings_save();
     queue_save();
-    screen_set(1);                     /* the message must be visible */
-    ui_toast(why, 5000);
-    lv_refr_now(NULL);
     if (system("/sbin/poweroff") != 0) {
         fprintf(stderr, "poweroff failed\n");
         g_powering_off = 0;            /* (asked again later, as before) */
@@ -366,20 +384,90 @@ static void poll_battery(lv_timer_t *t)
 }
 /* The player followed 10 times a second while it has something to follow
  * (playing, starting, the sleep timer, a stream reconnecting); otherwise once a
- * second, until a key (fast_tick_now()). Paused, that's 9 wakeups a second fewer. */
-static lv_timer_t *g_fast;
-static uint32_t g_fast_ms = 100;
+ * second, until a key (fast_tick_now()). Paused, that's 9 wakeups a second fewer.
+ *
+ * With the screen off there's nobody to show it to, and a song playing along
+ * needs nothing from here for minutes: the engine has what follows lined up
+ * (8 tracks or 30 s ahead). Once a second then too (tick_can_wait), and the
+ * polls with it (polls_pace: they're 4 a second otherwise), which leaves two
+ * wakeups a second of the 14. Not while something that has to come on time
+ * is near, when it's 10 times a second as with the screen on:
+ *   - for 3 s after a key or a headphone button (what it started: a track,
+ *     a seek, one that can't be played and is passed over), and after the
+ *     track changed (the next ones lined up; one that fails);
+ *   - in a track's last 5 s, or when its length isn't known (the change to
+ *     the next, the end of the queue, a new shuffle cycle, "stop after");
+ *   - in the sleep timer's last 12 s (it fades over 10);
+ *   - the radio and a streamed episode (a stream that drops is reconnected
+ *     from here), and anything not plainly playing.
+ * Power's wake comes as a key, and screen_set() sets both paces back. */
+#define FAST_HOLD_MS 3000
+static lv_timer_t *g_fast, *g_polls;
+static uint32_t g_fast_ms = 100, g_polls_ms = 250;
+static uint32_t g_fast_until;         /* 10 times a second until then... */
+static int g_fast_hold;               /* ...while this says so (the clock wraps: not left to g_fast_until alone) */
+static player_t *g_player;            /* (below) */
+static uac_relay_t *g_relay;
+static int g_screen_on;
+
+static void fast_hold(void)
+{
+    g_fast_hold = 1;
+    g_fast_until = ms_now() + FAST_HOLD_MS;
+}
+
+static int fast_held(void)
+{
+    if (g_fast_hold && (int32_t)(ms_now() - g_fast_until) >= 0) g_fast_hold = 0;
+    return g_fast_hold;
+}
+
+/* The player needn't be looked at for a second: the screen off, a file
+ * playing, nothing near that has to come on time (above). */
+static int tick_can_wait(void)
+{
+    static uint32_t seq;
+    if (g_screen_on || !g_player) return 0;
+    uint32_t s = player_seq(g_player);
+    if (s != seq) { seq = s; fast_hold(); }
+    if (fast_held()) return 0;
+    player_now_t n;
+    player_now(g_player, &n);
+    if (!n.playing || n.radio || n.connecting || n.podcast_stream) return 0;
+    if (n.sleep_s >= 0 && n.sleep_s <= 12) return 0;
+    if (!n.len_ms || n.pos_ms + 5000 >= n.len_ms) return 0;
+    return 1;
+}
+
 static void every_100ms(lv_timer_t *t)
 {
-    uint32_t ms = ui_tick() ? 100 : 1000;
+    uint32_t ms = ui_tick() && !tick_can_wait() ? 100 : 1000;
     if (ms != g_fast_ms) lv_timer_set_period(t, g_fast_ms = ms);
 }
+
+/* The polls' pace (polls(), below): 4 a second; once a second with the
+ * screen off, where all they'd do sooner is notice a cable, a DAC or a pair
+ * of headphones 0.75 s earlier. Not in USB DAC mode, nor while fast_held()
+ * (a key; an output that just came or went: what follows it, its EQ, at the
+ * usual pace). Each poll keeps its period either way (polls() counts in
+ * quarters of a second). */
+static void polls_pace(void)
+{
+    if (!g_polls) return;
+    uint32_t ms = g_screen_on || g_relay || fast_held() ? 250 : 1000;
+    if (ms == g_polls_ms) return;
+    lv_timer_set_period(g_polls, g_polls_ms = ms);
+    if (ms == 250) lv_timer_ready(g_polls);       /* (back to it: a look at once) */
+}
+
 static void fast_tick_now(void)
 {
+    fast_hold();
     if (g_fast && g_fast_ms != 100) {
         lv_timer_set_period(g_fast, g_fast_ms = 100);
         lv_timer_ready(g_fast);
     }
+    polls_pace();
 }
 
 /* ---- volume and output routing ----
@@ -480,8 +568,9 @@ static void volume_step(int dir)
     if (v < 0) return;
     g_user_vol = v;
     volume_show(v);
-    FILE *f = fopen(g_vol_path, "we");
-    if (f) { fprintf(f, "%d\n", v); fclose(f); }
+    char rec[24];
+    snprintf(rec, sizeof rec, "%d", v);
+    file_put_small(g_vol_path, rec, 0);                 /* (in place: no entry for a cut to leave dangling) */
 }
 
 static void jacks_changed(int hp, int lo)
@@ -581,8 +670,9 @@ static void usb_volume_step(int dir)
     snprintf(t, sizeof t, "%s%ld.%ld dB%s", g_usb_cdb < 0 ? "-" : "", a / 100, (a % 100) / 10,
              vol_limit() && g_usb_cdb >= cap ? tr(" (limit)") : "");
     ui_level("Volume", (int)(g_usb_cdb - g_usb_lo), (int)(g_usb_hi - g_usb_lo), t);
-    FILE *f = fopen(g_usb_vol_path, "we");
-    if (f) { fprintf(f, "%ld\n", g_usb_cdb); fclose(f); }
+    char rec[24];
+    snprintf(rec, sizeof rec, "%ld", g_usb_cdb);
+    file_put_small(g_usb_vol_path, rec, 0);
 }
 
 /* ---- Transport mode ----
@@ -1177,8 +1267,8 @@ static int hook_eq_put(const char *name, const eq_profile_t *p)
     for (int i = 0; i < p->n; i++)
         fprintf(f, "Filter %d: ON %s Fc %.0f Hz Gain %.1f dB Q %.2f\n", i + 1, type[p->band[i].type],
                 p->band[i].fc, p->band[i].gain_db, p->band[i].q);
-    int bad = ferror(f);
-    if (fclose(f) || bad || rename(tmp, path)) { unlink(tmp); return -1; }
+    int bad = ferror(f) || fflush(f) || fsync(fileno(f));
+    if (fclose(f) || bad || file_replace(tmp, path)) { unlink(tmp); return -1; }
     char key[64], label[64];
     eq_output(key, sizeof key, label, sizeof label);
     if (!strcmp(settings_get(key, ""), name)) eq_apply();   /* this output's choice: from the saved file */
@@ -1203,6 +1293,15 @@ static int hook_eq_remove(const char *name)
     return 0;
 }
 
+/* The network as the radio sees it: a station that's wanted waits while
+ * Wi-Fi is gone by itself (out of range, the router restarting) and comes
+ * back with it (player_radio_net). A proxy counts as a network, as in
+ * hook_radio_ready. */
+static void radio_net_feed(void)
+{
+    if (g_player) player_radio_net(g_player, wifi_connected() || getenv("http_proxy") != NULL);
+}
+
 /* Every 250 ms: Wi-Fi's news (a network joined, an error) and its screens. */
 static void wifi_poll(lv_timer_t *t)
 {
@@ -1213,6 +1312,7 @@ static void wifi_poll(lv_timer_t *t)
     seen = s;
     char msg[96];
     if (wifi_take_message(msg, sizeof msg)) ui_toast(msg, 2500);
+    radio_net_feed();   /* (first: what the UI kept for the connection starts with the network known to be there) */
     ui_wifi_changed();
 }
 
@@ -1275,7 +1375,15 @@ static void hook_ssh_do(int what)
  * Once for each new count, so no more often than NTP is tried (1, 5, 15, then
  * every 30 minutes), until it has worked once. And at once when a secure
  * connection has just failed for want of the time (netclock_want: Find
- * stations, covers, the update check), at most every 30 s. */
+ * stations, covers, the update check), at most every 30 s.
+ *
+ * The clock at a start is the last shutdown's (clock_restore): set, to look
+ * at, and as many days behind as the H2 was off, so a server whose
+ * certificate is newer than that is refused until NTP answers. Until the
+ * network has given the time once since the player started
+ * (netclock_confirmed), a connection that couldn't be opened asks for it here
+ * as well (netclock_net_failed), set or not. The answer only ever moves the
+ * clock forward (netclock_take), as before. */
 #define CLOCK_HOST "api.github.com"          /* (UPDATE_API's) */
 #define NTP_FAILS "/var/run/fathom-ntp-fails"
 static volatile int g_https_clock_busy;     /* a worker is asking */
@@ -1298,12 +1406,14 @@ static int clock_from_https(void)
     if (netclock_take(t, now, g_clock_by_hand ? NETCLOCK_HAND_BACK : 0)) {
         struct timeval tv = {(time_t)t, 0};
         if (settimeofday(&tv, NULL)) { perror("settimeofday"); return -1; }
+        fprintf(stderr, "clock: %lld s behind %s's time\n", (long long)(t - now), CLOCK_HOST);
         g_https_clock_set = g_https_clock_done = 1;
         g_clock_by_hand = 0;
     } else {
         fprintf(stderr, "clock: %s's time (%lld) isn't later: kept\n", CLOCK_HOST, (long long)t);
         g_https_clock_done = 1;              /* (the clock is fine as it is) */
     }
+    netclock_set_confirmed(1);               /* (the network's time, taken or agreed with) */
     return netclock_unset() ? -1 : 0;
 }
 
@@ -1336,7 +1446,8 @@ static void https_clock_poll(void)
     if (!up) up_since = asked_up = 0;
     else if (!up_since) up_since = ms_now() | 1;
     int start = up && !asked_up && netclock_unset() && ms_now() - up_since >= 10000;
-    int want = netclock_wanted() && netclock_unset() &&
+    /* (doubtful: unset, or the last shutdown's time and nothing from the network yet) */
+    int want = netclock_wanted() && netclock_doubtful() &&
                (!asked_at || ms_now() - asked_at >= 30000);   /* (a network that blocks it too: not hammered) */
     int fails = 0;
     FILE *f = fopen(NTP_FAILS, "re");
@@ -1352,7 +1463,8 @@ static void https_clock_poll(void)
     asked_at = ms_now() | 1;
     if (ntp) fprintf(stderr, "clock: no answer from NTP (%d): asking %s\n", fails, CLOCK_HOST);
     else if (start) fprintf(stderr, "clock: unset 10 s after Wi-Fi joined: asking %s\n", CLOCK_HOST);
-    else fprintf(stderr, "clock: wanted for a secure connection: asking %s\n", CLOCK_HOST);
+    else fprintf(stderr, "clock: %s, and a connection failed: asking %s\n",
+                 netclock_unset() ? "unset" : "not confirmed by the network since the start", CLOCK_HOST);
     pthread_attr_t a;
     pthread_t t;
     pthread_attr_init(&a);
@@ -1376,6 +1488,7 @@ static int clock_set_by_hand(int64_t t)
     if (g_batlog_on) batlog_clock_set(&g_batlog, time(NULL), mono_s());
     g_clock_by_hand = 1;
     g_https_clock_done = 0;                  /* (an HTTPS answer may set it right again) */
+    netclock_set_confirmed(0);
     return 0;
 }
 
@@ -1410,6 +1523,7 @@ static void net_poll(lv_timer_t *t)
     if (!access("/var/run/fathom-clock", F_OK) || by_https) {
         unlink("/var/run/fathom-clock");
         fprintf(stderr, "clock: set by %s\n", by_https ? CLOCK_HOST "'s answer" : "NTP");
+        netclock_set_confirmed(1);
         clock_save();
         if (g_batlog_on) batlog_clock_set(&g_batlog, time(NULL), mono_s());   /* (how long it was off, known now) */
     }
@@ -1464,7 +1578,12 @@ static void update_announce(void)
 /* The player is up: an update's new kernel started (h2boot, bootloader/
  * fathom/bootpick.c, gives it two starts to get here before going back to the
  * one before); or it didn't, and the H2 went back: said once. */
-static void boot_markers(void)
+/* An update's kernel started: its markers go as soon as the screen is up, not
+ * after the library has opened. Bringing a big library up to date (a minute
+ * and more, once, after an update) or a first scan came before, and forcing
+ * the H2 off twice during it made the bootloader put the old kernel back
+ * under the new player. */
+static void boot_started(void)
 {
     static const char *const tried[] = {"boot-new", "boot-try1", "boot-try2"};
     char p[300];
@@ -1472,6 +1591,32 @@ static void boot_markers(void)
         snprintf(p, sizeof p, CARD_DIR "/fathom/%s", tried[i]);
         if (!unlink(p)) fprintf(stderr, "update: the new system started (%s)\n", tried[i]);
     }
+}
+
+/* The card can't be written (the kernel made it read-only after an error, or
+ * its lock switch is on): nothing is saved, which would otherwise go unsaid.
+ * Once a session. (/proc/mounts: statvfs would read the whole FAT first.) */
+static void card_writable_check(void)
+{
+    static int said;
+    if (said) return;
+    FILE *f = fopen("/proc/mounts", "re");
+    if (!f) return;
+    char dev[128], mnt[256], type[32], opts[256];
+    int ro = 0;
+    while (fscanf(f, "%127s %255s %31s %255s %*[^\n]", dev, mnt, type, opts) == 4)
+        if (!strcmp(mnt, CARD_DIR)) ro = !strncmp(opts, "ro", 2) && (opts[2] == ',' || !opts[2]);
+    fclose(f);
+    if (!ro) return;
+    said = 1;
+    fprintf(stderr, "card: mounted read-only: nothing can be saved\n");
+    ui_toast("The card can't be written, so nothing is saved. Check it on a computer.", 8000);
+}
+
+static void boot_markers(void)
+{
+    char p[300];
+    boot_started();
     snprintf(p, sizeof p, CARD_DIR "/fathom/boot-fell-back");
     if (!access(p, F_OK)) {
         fprintf(stderr, "update: the new system didn't start twice: h2boot went back to the one before\n");
@@ -1528,7 +1673,7 @@ static void hook_uninstall_do(int what)
         return;
     }
     if (uninstaller_ask_recovery()) {
-        power_off("Hold Vol+ as you turn the H2 on, then choose Boot select > HibyOS Recovery");
+        power_off("Hold <Vol+> as you turn the H2 on, then choose Boot select > HibyOS Recovery");
         return;
     }
     fprintf(stderr, "uninstall: restarting into HiBy's recovery\n");
@@ -1557,16 +1702,14 @@ static void uninstall_poll(void)
 /* ---- internet radio ---- */
 
 /* Home > Radio: the stations in fathom/radio.txt, or until there is one, the
- * example that comes with Fathom (fathom/assets/radio.txt, replaced by updates). */
+ * example that comes with Fathom (fathom/assets/radio.txt, replaced by updates;
+ * a station of yours that's in it too takes its icon from there if it has none). */
 static int hook_radio_stations(radio_station_t *out, int max)
 {
-    char path[600];
+    char path[600], example[600];
     snprintf(path, sizeof path, "%s/radio.txt", g_data_dir);
-    int n = radio_load(path, out, max);
-    if (n < 0) {
-        snprintf(path, sizeof path, "%s/assets/radio.txt", g_data_dir);
-        n = radio_load(path, out, max);
-    }
+    snprintf(example, sizeof example, "%s/assets/radio.txt", g_data_dir);
+    int n = radio_load_list(path, example, out, max);
     /* Your stations shown: their names looked up meanwhile, so the one chosen
      * doesn't wait for DNS (a few hundred ms on the H2, sometimes seconds) */
     if (wifi_connected()) {
@@ -1625,14 +1768,16 @@ static int hook_podcast_opml(char *path, size_t cap)
 static int hook_radio_ready(char *why, size_t cap)
 {
     if (wifi_connected() || getenv("http_proxy")) return 0;
+    char busy[32] = "";
+    int on = wifi_ui_state(busy, sizeof busy, NULL);   /* (starting: not on yet, but not off either) */
     if (!wifi_available()) snprintf(why, cap, "The radio needs Wi-Fi");
-    else if (!wifi_on()) snprintf(why, cap, "Wi-Fi is off: Settings > Wi-Fi");
+    else if (!on && !busy[0]) snprintf(why, cap, "Wi-Fi is off: Settings > Wi-Fi");
     else snprintf(why, cap, "Not connected yet: Settings > Wi-Fi");
     return -1;
 }
 
 /* Twice a second: the radio's live info (stations whose streams don't say);
- * Wi-Fi switched off stops the radio (rather than it retrying for a minute). */
+ * Wi-Fi switched off stops the radio (rather than it waiting for it). */
 static void radio_poll(lv_timer_t *t)
 {
     (void)t;
@@ -1644,7 +1789,12 @@ static void radio_poll(lv_timer_t *t)
         player_pause(g_player, 1);
         n.playing = 0;
     }
-    radiometa_want(s && n.playing ? s->info : NULL);
+    radio_net_feed();
+    /* The info is asked for once the station plays, not while it connects: a
+     * second TLS handshake then is CPU taken from the first on the one core.
+     * (While it connects there's none wanted: a station change drops the
+     * request for the last one's, in flight or not.) */
+    radiometa_want(s && n.playing && !n.connecting ? s->info : NULL);
     /* a station playing: the ones Next and Previous go to, looked up ahead */
     static const radio_station_t *ahead_of;
     if (s != ahead_of && wifi_connected()) {   /* (not connected yet: once it is) */
@@ -1773,8 +1923,12 @@ static void screen_set(int on)
 {
     if (on != g_screen_on) ui_set_awake(on);
     if (on && !g_screen_on) wifi_wake();                     /* (out and back: a saved network may be in range) */
+    wifi_screen(on);                                         /* (dark: the signal's strength isn't asked for) */
     if (!on && g_screen_on) library_release_memory(g_lib);   /* the database's cache: nothing browses meanwhile */
     g_screen_on = on;
+    input_set_screen(on);              /* (Power wakes on its press, and turns off on its release) */
+    if (on) fast_tick_now();           /* the player and the polls at their usual pace again... */
+    else polls_pace();                 /* ...or the polls once a second (the player's tick finds out by itself) */
     g_dimmed = 0;
     g_last_input = ms_now();
     screen_apply();
@@ -1850,7 +2004,7 @@ static void charge_screen_show(void)
     pct[strcspn(pct, "\r\n")] = '\0';
     char pc[40];
     snprintf(pc, sizeof pc, "%s%%", pct[0] ? pct : "-");
-    tr_fill(body, sizeof body, "%s\n\nPress Power to start", pc, NULL);
+    tr_fill(body, sizeof body, "%s\n\nPress <Power> to start", pc, NULL);
     if (g_charge_screen) lv_obj_delete(g_charge_screen);
     g_charge_screen = ui_message_screen("Charging", body);
     screen_set(1);
@@ -2202,11 +2356,73 @@ static void free_space_warm(void)
     pthread_attr_destroy(&a);
 }
 
+/* The background scan's progress, for Settings > Library and Rescan's screen
+ * (read on the UI's thread: copied under a lock, the file's name with it) */
+static pthread_mutex_t g_bg_mu = PTHREAD_MUTEX_INITIALIZER;
+static ui_scan_t g_bg;
+static int g_rescan_asked;   /* (Rescan: its end says so even when nothing changed) */
+static int g_scan_covers;    /* the background scan made covers: the screen shows them */
+static int g_scan_check;     /* the next background scan checks the database first (the last stop wasn't clean) */
+static volatile int g_db_damaged;   /* ...and found it damaged */
+static void bg_progress(int done, int total, const char *path, void *ctx)
+{
+    (void)ctx;
+    if (path && !strcmp(path, "done")) return;
+    pthread_mutex_lock(&g_bg_mu);
+    if (path && (!strcmp(path, "albums") || !strcmp(path, "indexes"))) {
+        g_bg.step = UI_SCAN_ALBUMS;
+        g_bg.done = g_bg.total = 0;
+        g_bg.file[0] = '\0';
+    } else if (total < 0) {
+        g_bg.step = UI_SCAN_COVERS;
+        g_bg.total = -total - 1;
+        g_bg.done = done;
+        g_bg.file[0] = '\0';
+    } else {
+        g_bg.step = UI_SCAN_SONGS;
+        g_bg.total = total;
+        g_bg.done = done;
+        const char *slash = path ? strrchr(path, '/') : NULL;
+        snprintf(g_bg.file, sizeof g_bg.file, "%s", slash ? slash + 1 : path ? path : "");
+    }
+    pthread_mutex_unlock(&g_bg_mu);
+}
+
+static int hook_scan_progress(ui_scan_t *p)
+{
+    if (g_scan_state != 1) return 0;
+    pthread_mutex_lock(&g_bg_mu);
+    *p = g_bg;
+    pthread_mutex_unlock(&g_bg_mu);
+    return 1;
+}
+
 static void *scan_thread(void *arg)
 {
     (void)arg;
     setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);   /* below the music and the UI, as levelling */
-    g_scan_result = g_scan_lib ? library_scan(g_scan_lib, g_music, NULL, NULL) : -1;
+    pthread_mutex_lock(&g_bg_mu);
+    memset(&g_bg, 0, sizeof g_bg);                   /* (UI_SCAN_LOOKING) */
+    pthread_mutex_unlock(&g_bg_mu);
+    /* After a stop that wasn't clean: the database read through first. Sound:
+     * this scan compares every file again. Damaged: said, and rebuilt at the
+     * next start (main: the marker), its play counts brought over. */
+    if (g_scan_lib && g_scan_check) {
+        g_scan_check = 0;
+        if (library_check(g_scan_lib) == 0) library_scan_distrust(g_scan_lib);
+        else {
+            char mark[600];
+            snprintf(mark, sizeof mark, "%s.rebuild", g_db_path);
+            FILE *f = fopen(mark, "we");
+            if (f) fclose(f);
+            g_db_damaged = 1;
+            g_scan_result = -1;
+            g_scan_changes = 0;
+            g_scan_state = 2;
+            return NULL;
+        }
+    }
+    g_scan_result = g_scan_lib ? library_scan(g_scan_lib, g_music, bg_progress, NULL) : -1;
     g_scan_changes = g_scan_lib && g_scan_result >= 0 ? library_scan_changes(g_scan_lib) : 0;
     g_scan_state = 2;
     return NULL;
@@ -2231,16 +2447,46 @@ static void scan_start(void)
 static void scan_poll(lv_timer_t *t)
 {
     (void)t;
+    if (g_scan_state == 1) {                         /* covers as they're made: shown every 10 s */
+        static uint32_t shown_at;
+        static int shown;
+        pthread_mutex_lock(&g_bg_mu);
+        int covers = g_bg.step == UI_SCAN_COVERS ? g_bg.done : 0;
+        pthread_mutex_unlock(&g_bg_mu);
+        if (covers < shown) shown = 0;               /* (another scan) */
+        if (covers > shown && ms_now() - shown_at >= 10000) {
+            shown = covers;
+            shown_at = ms_now();
+            g_scan_covers = 1;
+            ui_covers_changed();
+        }
+        return;
+    }
     if (g_scan_state != 2) return;
     pthread_join(g_scan_thread, NULL);
     library_close(g_scan_lib);
     g_scan_lib = NULL;
     g_scan_state = 0;
+    {
+        pthread_mutex_lock(&g_bg_mu);
+        if (g_bg.step == UI_SCAN_COVERS && g_bg.done > 0) g_scan_covers = 1;
+        pthread_mutex_unlock(&g_bg_mu);
+    }
     fprintf(stderr, "library: background scan: %d tracks, %d changes\n", g_scan_result, g_scan_changes);
+    ui_set_music_missing(g_music && access(g_music, F_OK) != 0);   /* (made since, or gone) */
+    if (g_lib) library_art_legacy(g_lib);            /* (its covers may be in the store now) */
     if (g_scan_result >= 0 && g_scan_changes > 0) {
         ui_library_changed();
         ui_toast("Library updated", 1500);
-    }
+    } else if (g_db_damaged) {
+        g_db_damaged = 0;
+        ui_toast("The library is damaged. It's rebuilt at the next start; your play counts are kept.", 8000);
+    } else if (g_scan_covers) ui_covers_changed();   /* (covers only: shown where they were missing) */
+    else if (g_rescan_asked && g_scan_result >= 0) ui_toast("No changes found", 1500);
+    else if (g_rescan_asked) ui_toast("Couldn't read the music folder", 2500);
+    g_rescan_asked = 0;
+    g_scan_covers = 0;
+    ui_show_scan();                                  /* (its screen goes) */
 }
 
 /* On the way out (and before lending the card): stop a scan and wait for it. */
@@ -2292,9 +2538,21 @@ static void *rg_thread(void *arg)
     int measured = 0, tagged = 0;
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    /* the song the player died measuring, last time: marked as one that couldn't
+     * be measured, or it would be the first tried at every start */
+    char died[32];
+    if (library_trying_left("level", died, sizeof died) && atoll(died) > 0) {
+        lib_rg_t none = {.state = 3};
+        fprintf(stderr, "levelling: the player stopped while measuring track %s: left unmeasured\n", died);
+        library_rg_store(g_rg_lib, atoll(died), &none);
+    }
+    int trying = -1;
     while (!g_rg_stop && library_rg_next(g_rg_lib, &id, path, sizeof path) == 0) {
         lib_rg_t rg = {0};
         tags_t t;
+        char note[32];
+        snprintf(note, sizeof note, "%lld", (long long)id);
+        library_trying("level", &trying, note);
         if (tags_read(path, &t) == 0 && t.has_rg_track) {    /* tagged since the last scan */
             rg = (lib_rg_t){1, t.rg_track_gain, t.rg_track_peak, t.has_rg_album, t.rg_album_gain, t.rg_album_peak};
             tagged++;
@@ -2311,6 +2569,7 @@ static void *rg_thread(void *arg)
                     (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
         }
     }
+    library_trying_done("level", &trying);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     fprintf(stderr, "levelling: %d measured, %d from tags in %.0f s\n", measured, tagged,
             (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
@@ -2366,12 +2625,19 @@ static void rg_poll(lv_timer_t *t)
     }
 }
 
+/* Settings > Library > Rescan: the background scan, which the UI then shows
+ * over everything (ui_show_scan); one already running is shown as it is */
+
 static void rescan(void)
 {
     if (!g_lib) return;
-    if (g_scan_state) { ui_toast("Already checking for new music", 1500); return; }
-    scan_start();
-    ui_toast("Checking for new music", 1500);
+    if (!g_scan_state) {
+        pthread_mutex_lock(&g_bg_mu);
+        memset(&g_bg, 0, sizeof g_bg);               /* (no last scan's numbers for a moment) */
+        pthread_mutex_unlock(&g_bg_mu);
+        scan_start();
+    }
+    g_rescan_asked = 1;
 }
 
 static int about(int i, char *label, size_t lc, char *value, size_t vc)
@@ -2435,7 +2701,7 @@ static int about(int i, char *label, size_t lc, char *value, size_t vc)
             snprintf(date, sizeof date, "%s %s", d, tr(MON[(t.mon + 11) % 12]));   /* (as the battery's days) */
             snprintf(value, vc, "%s %d, %02d:%02d%s", date, t.year, t.hour, t.min, z ? "" : " UTC");
         }
-        else snprintf(value, vc, "Not set: Play sets it");   /* (or Wi-Fi) */
+        else snprintf(value, vc, "Not set: <Play> sets it");   /* (or Wi-Fi) */
         return 0;
     }
     case 6: snprintf(label, lc, "Licence"); snprintf(value, vc, "GPL; fonts OFL"); return 0;
@@ -2476,6 +2742,7 @@ static void queue_timer(lv_timer_t *t)
     (void)t;
     static int ticks;
     if (++ticks % 30 == 0) clock_save();   /* every 5 min; written with the other settings */
+    if (ticks % 6 == 3) card_writable_check();   /* (a minute apart, from 30 s in) */
     if (!g_player) return;
     player_now_t n;
     player_now(g_player, &n);
@@ -2527,12 +2794,18 @@ static void battery_log_poll(void)
 /* ---- the polls: one timer ----
  * Everything the player polls, on one 250 ms timer: LVGL's timers drift apart,
  * so a dozen of them (250, 300, 500 ms, 1, 10, 30 s) woke the CPU 30 to 40 times
- * a second at rest. Each poll keeps its period (the EQ's: 250 ms, was 300). */
+ * a second at rest. Each poll keeps its period (the EQ's: 250 ms, was 300).
+ * With the screen off the timer is a 1 s one (polls_pace): k, which counts
+ * quarters of a second, then goes on to the next whole second each time, so
+ * the 10 s and 30 s polls keep their periods and those under a second come
+ * once a second. */
 static void polls(lv_timer_t *t)
 {
     (void)t;
     static unsigned k;
-    k++;
+    int usb = g_usb_card, bt = g_bt_routed[0] != '\0';
+    if (g_polls_ms == 1000) k = (k | 3) + 1;
+    else k++;
     screen_timer(NULL);
     usb_poll(NULL);            /* the prompt soon after plugging in */
     bt_poll(NULL);
@@ -2557,27 +2830,160 @@ static void polls(lv_timer_t *t)
     if (k % 40 == 0) { poll_battery(NULL); battery_log_poll(); }   /* 10 s */
     if (k % 40 == 20) queue_timer(NULL);   /* 10 s */
     if (k % 120 == 0) idle_timer(NULL);    /* 30 s */
+    /* a USB DAC or Bluetooth headphones just came or went: the usual pace for what follows (the EQ for it) */
+    if (usb != g_usb_card || bt != (g_bt_routed[0] != '\0')) fast_hold();
+    polls_pace();              /* (the screen went off, a key's 3 s are over, USB DAC mode began) */
 }
 
-/* ---- first-run scan, with progress on screen ---- */
+/* ---- first-run scan, with progress on screen ----
+ * Each step named, how far, and once it can tell (10 s in, 2 % done), about how
+ * long that step has left; and that only the first scan takes this long. */
 
-typedef struct { lv_obj_t *count, *path; uint32_t last; } scan_ui_t;
+typedef struct { lv_obj_t *step, *count, *left, *path; uint32_t last, t0, left_at; int covers; } scan_ui_t;
+
+/* Power held on one of the screens that come before the player proper (the
+ * first scan, a library being brought up to date, one that can't be opened):
+ * the keys aren't served there otherwise, and the only way out was to force
+ * the H2 off mid-write. The scan is stopped where it is (the next start
+ * carries on from there), what's written is put on the card, and the H2
+ * powers off. */
+static int g_early_off;
+static library_t *g_early_lib;       /* the scan to stop (NULL: none running) */
+
+static void early_keys(void)
+{
+    input_event_t ev;
+    while (input_next(&ev, ms_now()))
+        if (ev.kind == IN_POWER_OFF) g_early_off = 1;
+    if (g_early_off && g_early_lib) library_scan_cancel(g_early_lib);
+}
+
+static void early_power_off(lv_obj_t *label)
+{
+    fprintf(stderr, "power off: Power held before the player was up\n");
+    if (label) {
+        lv_label_set_text(label, tr("Powering off"));
+        lv_refr_now(NULL);
+    }
+    clock_save();
+    settings_save();
+    sync();
+    if (system("/sbin/poweroff") != 0) fprintf(stderr, "poweroff failed\n");
+    for (;;) pause();                /* (init stops us) */
+}
+
+static void left_words(uint32_t left_s, char *t, size_t n)
+{
+    char m[16];
+    if (left_s < 45) snprintf(t, n, "%s", tr("Less than a minute left"));
+    else if (left_s < 90) snprintf(t, n, "%s", tr("About a minute left"));
+    else {
+        snprintf(m, sizeof m, "%u", (left_s + 30) / 60);
+        tr_fill(t, n, "About %s minutes left", m, NULL);
+    }
+}
+
+static void scan_left(scan_ui_t *s, int done, int total, uint32_t now)
+{
+    uint32_t el = now - s->t0;
+    if (total <= 0 || done <= 0 || el < 10000 || done * 50 < total) { lv_label_set_text(s->left, ""); return; }
+    if (now - s->left_at < 2000) return;                 /* (steadier: every 2 s) */
+    s->left_at = now;
+    uint32_t left_s = (uint32_t)((uint64_t)el * (uint32_t)(total - done) / (uint32_t)done / 1000);
+    char t[64];
+    left_words(left_s, t, sizeof t);
+    lv_label_set_text(s->left, t);
+}
 
 static void scan_progress(int done, int total, const char *path, void *ctx)
 {
     scan_ui_t *s = ctx;
+    early_keys();                                        /* (Power held: the scan stops) */
+    if (path && !strcmp(path, "done")) return;           /* (the screen goes) */
+    if (path && (!strcmp(path, "albums") || !strcmp(path, "indexes"))) {   /* no count: steps of their own */
+        lv_label_set_text(s->step, tr(path[0] == 'a' ? "Sorting albums and artists" : "Getting your lists ready"));
+        lv_label_set_text(s->count, "");
+        lv_label_set_text(s->left, "");
+        lv_label_set_text(s->path, "");
+        lv_refr_now(NULL);
+        if (g_shot) { g_shot = 0; screen_shot(); }
+        return;
+    }
     uint32_t now = ms_now();
+    int covers = total < 0;
+    if (covers) total = -total - 1;
+    if (covers != s->covers) {                           /* the next step: its own clock */
+        s->covers = covers;
+        s->t0 = now;
+        s->left_at = 0;
+        lv_label_set_text(s->step, tr(covers ? "Finding covers" : "Reading songs"));
+        lv_label_set_text(s->left, "");
+    }
     if (now - s->last < 250 && done != total) return;   /* redraw at most 4x per second */
     s->last = now;
     char a[16], b[16], t[64];
     snprintf(a, sizeof a, "%d", done);
     snprintf(b, sizeof b, "%d", total);
-    tr_fill(t, sizeof t, "%s of %s", a, b);
-    if (total > 0) lv_label_set_text(s->count, t);
-    else lv_label_set_text_fmt(s->count, "%d", done);
-    const char *slash = path ? strrchr(path, '/') : NULL;
-    lv_label_set_text(s->path, slash ? slash + 1 : path ? path : "");
+    if (total > 0 && done <= total) tr_fill(t, sizeof t, covers ? "%s of %s albums" : "%s of %s songs", a, b);
+    else snprintf(t, sizeof t, "%d", done);
+    lv_label_set_text(s->count, t);
+    scan_left(s, done, total, now);
+    const char *slash = path && !covers ? strrchr(path, '/') : NULL;
+    lv_label_set_text(s->path, slash ? slash + 1 : "");
     lv_refr_now(NULL);
+    if (g_shot) { g_shot = 0; screen_shot(); }          /* (kill -USR1: this screen too) */
+}
+
+/* These screens' rows: a column, so a title that wraps (a wide font, a
+ * translation) pushes the rest down instead of over them; each row one line
+ * (cut with "..."), the title and the note at the foot wrapped */
+static lv_obj_t *scan_column(lv_obj_t *scr)
+{
+    lv_obj_t *col = lv_obj_create(scr);
+    lv_obj_remove_style_all(col);
+    lv_obj_set_size(col, UI_W, UI_H - 44);
+    lv_obj_set_style_pad_hor(col, 16, 0);
+    lv_obj_set_style_pad_top(col, 16, 0);
+    lv_obj_set_style_pad_row(col, 6, 0);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+    return col;
+}
+
+static lv_obj_t *scan_label(lv_obj_t *col, const lv_font_t *f, uint32_t colour, int wrap)
+{
+    lv_obj_t *l = lv_label_create(col);
+    lv_obj_set_style_text_font(l, f, 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(colour), 0);
+    lv_obj_set_width(l, UI_W - 32);
+    lv_label_set_long_mode(l, wrap ? LV_LABEL_LONG_WRAP : LV_LABEL_LONG_DOT);
+    if (!wrap) lv_obj_set_height(l, lv_font_get_line_height(f));   /* (one line, kept when empty) */
+    lv_label_set_text(l, "");
+    return l;
+}
+
+/* The column down to the note at the foot (rows that don't fit are cut, not
+ * drawn over it: a big font's title and note on two lines each) */
+static void scan_fit(lv_obj_t *col, lv_obj_t *note)
+{
+    lv_obj_update_layout(note);
+    lv_obj_set_height(col, UI_H - 14 - lv_obj_get_height(note) - 6);
+    lv_obj_update_layout(col);
+    for (uint32_t i = 0; i < lv_obj_get_child_count(col); i++) {   /* (whole rows only) */
+        lv_obj_t *r = lv_obj_get_child(col, (int32_t)i);
+        if (lv_obj_get_y(r) + lv_obj_get_height(r) > lv_obj_get_height(col)) lv_obj_add_flag(r, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static lv_obj_t *scan_note(lv_obj_t *scr, const lv_font_t *f, uint32_t colour)
+{
+    lv_obj_t *l = lv_label_create(scr);
+    lv_obj_set_style_text_font(l, f, 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(colour), 0);
+    lv_obj_set_width(l, UI_W - 32);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_obj_align(l, LV_ALIGN_BOTTOM_LEFT, 16, -14);
+    return l;
 }
 
 static int scan_with_progress(library_t *lib, const char *music, const theme_t *t, const ui_fonts_t *f)
@@ -2585,33 +2991,131 @@ static int scan_with_progress(library_t *lib, const char *music, const theme_t *
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, lv_color_hex(t->bg), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);   /* (no theme to set it) */
-    lv_obj_t *title = lv_label_create(scr);
-    lv_obj_set_style_text_font(title, f->title, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(t->text), 0);
+    lv_obj_t *col = scan_column(scr);
+    lv_obj_t *title = scan_label(col, f->title, t->text, 1);
     lv_label_set_text(title, tr("Reading your library"));
-    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 16, 60);
-    scan_ui_t s = {.count = lv_label_create(scr), .path = lv_label_create(scr)};
-    lv_obj_set_style_text_font(s.count, f->body, 0);
-    lv_obj_set_style_text_color(s.count, lv_color_hex(t->signal), 0);
-    lv_obj_align(s.count, LV_ALIGN_TOP_LEFT, 16, 100);
-    lv_obj_set_style_text_font(s.path, f->meta, 0);
-    lv_obj_set_style_text_color(s.path, lv_color_hex(t->text_muted), 0);
-    lv_obj_set_width(s.path, 288);
-    lv_label_set_long_mode(s.path, LV_LABEL_LONG_DOT);
-    lv_obj_align(s.path, LV_ALIGN_TOP_LEFT, 16, 136);
-    lv_label_set_text(s.count, "");
-    lv_label_set_text(s.path, music);
+    scan_ui_t s = {.step = scan_label(col, f->body, t->text, 0), .count = scan_label(col, f->body, t->signal, 0),
+                   .left = scan_label(col, f->meta, t->text_muted, 0), .path = scan_label(col, f->meta, t->text_muted, 0),
+                   .t0 = ms_now(), .covers = -1};
+    lv_label_set_text(s.step, tr("Looking for music"));   /* (the folders first: a few seconds) */
+    lv_obj_t *note = scan_note(scr, f->meta, t->text_muted);
+    lv_label_set_text(note, tr("Only the initial scan takes this long"));
+    scan_fit(col, note);
     lv_obj_t *prev = lv_screen_active();
     lv_screen_load(scr);
     lv_refr_now(NULL);
 
     uint32_t t0 = ms_now();
+    /* The songs, albums and artists here; the covers (the longest step: a
+     * third of it and more) in the background once the library is in use
+     * (library_needs_art starts that scan, below in main) */
+    library_scan_defer_art(lib, 1);
+    g_early_lib = lib;
     int n = library_scan(lib, music, scan_progress, &s);
+    g_early_lib = NULL;
     fprintf(stderr, "library: %d tracks in %.1f s\n", n, (ms_now() - t0) / 1000.0);
+    early_keys();
+    if (g_early_off) {
+        library_close(lib);                              /* (its log emptied into the database) */
+        early_power_off(s.step);
+    }
+    /* Then the database rewritten tight: a first scan leaves it fragmented,
+     * and reading every song (Never played, a rescan) takes over twice as long
+     * (on the H2, 50,000 songs: 2.3 s a read, 1.0 s after; compacting took 36 s,
+     * about 0.75 ms a song). Here, where waiting is expected and nothing else
+     * writes; skipped if the card hasn't the room. */
+    if (n > 0) {
+        char left[64];
+        left_words((uint32_t)((int64_t)n * 3 / 4000 + 1), left, sizeof left);
+        lv_label_set_text(s.step, tr("Tidying up"));
+        lv_label_set_text(s.count, "");
+        lv_label_set_text(s.left, left);
+        lv_label_set_text(s.path, "");
+        lv_refr_now(NULL);
+        if (g_shot) { g_shot = 0; screen_shot(); }
+        library_compact(lib);
+    }
 
     lv_screen_load(prev);
     lv_obj_delete(scr);
     return n;
+}
+
+/* ---- a library from an older version, brought up to date ----
+ * library_open() does it (new indexes, a pass over every song): on a big
+ * library a while (50,000 songs: ~40 s on the H2), so a screen says what's
+ * happening and about how long it has left, then the library is tidied up
+ * (compacted) while at it. Smaller ones: under the logo, as before (2,400
+ * songs: a couple of seconds). */
+
+#define UPGRADE_SCREEN_SONGS 5000
+/* (measured on the H2, 50,000 songs: the upgrade ~0.8 ms a song, compacting ~0.75) */
+#define UPGRADE_US_PER_SONG 800
+#define TIDY_US_PER_SONG 750
+
+typedef struct { lv_obj_t *scr, *prev, *step, *left; uint32_t t0, estimate_ms, left_at; } upgrade_ui_t;
+
+static void upgrade_left(upgrade_ui_t *u, int force)
+{
+    uint32_t now = ms_now(), el = now - u->t0;
+    if (!force && now - u->left_at < 2000) return;   /* (steadier: every 2 s) */
+    u->left_at = now;
+    char t[64];
+    left_words(u->estimate_ms > el ? (u->estimate_ms - el) / 1000 : 0, t, sizeof t);
+    lv_label_set_text(u->left, t);
+    lv_refr_now(NULL);
+    if (g_shot) { g_shot = 0; screen_shot(); }
+}
+
+static void upgrade_progress(int done, int total, void *ctx)
+{
+    (void)done;
+    (void)total;
+    early_keys();                    /* (Power held: off once the library is open again, below) */
+    upgrade_left(ctx, 0);
+}
+
+static void upgrade_screen_open(upgrade_ui_t *u, int64_t songs, const theme_t *t, const ui_fonts_t *f)
+{
+    u->scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(u->scr, lv_color_hex(t->bg), 0);
+    lv_obj_set_style_bg_opa(u->scr, LV_OPA_COVER, 0);
+    lv_obj_t *col = scan_column(u->scr);
+    lv_label_set_text(scan_label(col, f->title, t->text, 1), tr("Updating your library"));
+    u->step = scan_label(col, f->body, t->text, 0);
+    lv_label_set_text(u->step, tr("Making your lists quicker"));
+    u->left = scan_label(col, f->meta, t->text_muted, 0);
+    lv_obj_t *note = scan_note(u->scr, f->meta, t->text_muted);
+    lv_label_set_text(note, tr("Only this once, after the update"));
+    scan_fit(col, note);
+    u->prev = lv_screen_active();
+    u->t0 = ms_now();
+    u->estimate_ms = (uint32_t)(songs * UPGRADE_US_PER_SONG / 1000);
+    lv_screen_load(u->scr);
+    upgrade_left(u, 1);
+    library_set_upgrade_progress(upgrade_progress, u);
+}
+
+/* After library_open(): tidied up, and the screen gone */
+static void upgrade_screen_close(upgrade_ui_t *u, library_t *lib, int64_t songs)
+{
+    library_set_upgrade_progress(NULL, NULL);
+    fprintf(stderr, "library: brought up to date in %.1f s\n", (ms_now() - u->t0) / 1000.0);
+    early_keys();
+    if (g_early_off) {
+        if (lib) library_close(lib);
+        early_power_off(u->step);
+    }
+    if (lib) {
+        lv_label_set_text(u->step, tr("Tidying up"));
+        u->t0 = ms_now();
+        u->estimate_ms = (uint32_t)(songs * TIDY_US_PER_SONG / 1000);
+        upgrade_left(u, 1);
+        library_compact(lib);
+    }
+    lv_screen_load(u->prev);
+    lv_obj_delete(u->scr);
+    u->scr = NULL;
 }
 
 /* What's new (fathom/assets/whatsnew.txt, from the release notes' summary by
@@ -2640,6 +3144,24 @@ static void whats_new_setup(int had_music)
     fprintf(stderr, "whats new: %s%s\n", ver, had_music && strcmp(seen, ver) ? " (shown)" : "");
 }
 
+/* The library's file moved to `bad` with its log (what was written last, play
+ * counts among it, is in the log until it's folded in): read from there once
+ * the music is scanned again (library_import_counts). */
+static void library_set_aside(const char *db, const char *bad)
+{
+    char from[640], to[640];
+    snprintf(to, sizeof to, "%s-wal", bad);
+    unlink(to);                                      /* (an earlier one's) */
+    snprintf(to, sizeof to, "%s-shm", bad);
+    unlink(to);
+    rename(db, bad);
+    snprintf(from, sizeof from, "%s-wal", db);
+    snprintf(to, sizeof to, "%s-wal", bad);
+    rename(from, to);
+    snprintf(from, sizeof from, "%s-shm", db);
+    unlink(from);
+}
+
 int main(int argc, char **argv)
 {
     const char *music = "/mnt/sd/Music", *data = "/mnt/sd/fathom", *assets = "/mnt/sd/fathom/assets";
@@ -2656,6 +3178,12 @@ int main(int argc, char **argv)
      * tables) on the card, not in /tmp: that's RAM. (Before SQLite starts.) */
     LAT("main: start");
     setenv("SQLITE_TMPDIR", data, 0);
+    if (pipe(g_quit_pipe) == 0) {
+        for (int i = 0; i < 2; i++) {
+            fcntl(g_quit_pipe[i], F_SETFD, FD_CLOEXEC);
+            fcntl(g_quit_pipe[i], F_SETFL, fcntl(g_quit_pipe[i], F_GETFL) | O_NONBLOCK);
+        }
+    } else g_quit_pipe[0] = g_quit_pipe[1] = -1;
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
     signal(SIGUSR1, on_usr1);
@@ -2725,6 +3253,7 @@ int main(int argc, char **argv)
         lv_refr_now(NULL);
         LAT("main: splash");
     }
+    boot_started();
 
     /* Library: database and cover cache live next to the music, on the card. */
     char db[512], art[512];
@@ -2734,9 +3263,63 @@ int main(int argc, char **argv)
     mkdir(art, 0755);
     tags_set_exact_mp3_length(0);   /* SD card: don't read whole MP3s for their length */
     tags_set_max_picture(FATHOM_ART_MAX_FILE);   /* embedded covers held in RAM */
+    library_set_trying_dir("/tmp");               /* (a file that kills the player: not read again for ever) */
+    /* The last stop: clean if the player left its marker on the way out (below,
+     * at the end of main); not, after a power cut, a forced power-off or a
+     * crash. Then the library is checked once the player is up. */
+    char clean_mark[600], rebuild_mark[600], bad_db[600];
+    snprintf(clean_mark, sizeof clean_mark, "%s/stopped-cleanly", data);
+    snprintf(rebuild_mark, sizeof rebuild_mark, "%s.rebuild", db);
+    snprintf(bad_db, sizeof bad_db, "%s.bad", db);
+    int unclean = unlink(clean_mark) != 0 && access(db, F_OK) == 0;
+    int rebuilt = 0;
+    if (access(rebuild_mark, F_OK) == 0) {            /* found damaged last time: set aside, a new one scanned */
+        fprintf(stderr, "library: damaged: set aside as %s, rebuilt\n", bad_db);
+        library_set_aside(db, bad_db);
+        unlink(rebuild_mark);
+        sync();
+        rebuilt = 1;
+        unclean = 0;
+    }
+    int64_t upgrade_songs = library_upgrade_needed(db);
+    upgrade_ui_t upgrade = {0};
+    if (upgrade_songs >= UPGRADE_SCREEN_SONGS) upgrade_screen_open(&upgrade, upgrade_songs, &themes[theme], theme_fonts);
     library_t *lib = library_open(db, art);
+    if (upgrade.scr) upgrade_screen_close(&upgrade, lib, upgrade_songs);
     LAT("main: library open");
-    if (!lib) { fprintf(stderr, "cannot open %s\n", db); return 1; }
+    if (!lib) {
+        /* It can't be opened: not a database any more (a damaged card), or
+         * the card can't be written. Leaving here meant being started again
+         * every 2 s for ever, the logo on the screen and no key served. The
+         * file is set aside (library.db.bad) and a new library started: the
+         * music is scanned again; play counts and favourites are in the old
+         * file. If that can't be done either, the card is the trouble: said,
+         * and Power turns the H2 off. */
+        fprintf(stderr, "library: cannot open %s: set aside\n", db);
+        library_set_aside(db, bad_db);
+        rebuilt = 1;
+        sync();
+        lib = library_open(db, art);
+    }
+    if (!lib) {
+        fprintf(stderr, "library: cannot make a new one either: the card?\n");
+        lv_obj_t *scr = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(scr, lv_color_hex(themes[theme].bg), 0);
+        lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+        lv_obj_t *col = scan_column(scr);
+        lv_label_set_text(scan_label(col, theme_fonts->title, themes[theme].text, 1), tr("The card can't be used"));
+        lv_obj_t *why = scan_label(col, theme_fonts->body, themes[theme].text, 1);
+        lv_label_set_text(why, tr("Fathom can't open or make its library on it. Check the card on a computer."));
+        lv_obj_t *note = scan_note(scr, theme_fonts->meta, themes[theme].text_muted);
+        lv_label_set_text(note, tr("Hold <Power> to turn off"));
+        lv_screen_load(scr);
+        lv_refr_now(NULL);
+        for (;;) {
+            early_keys();
+            if (g_early_off) early_power_off(why);
+            usleep(100000);
+        }
+    }
     char pl_dir[600];
     snprintf(pl_dir, sizeof pl_dir, "%s/playlists", data);   /* your own playlists: never in the music folder */
     library_set_playlist_dir(lib, pl_dir);
@@ -2744,9 +3327,7 @@ int main(int argc, char **argv)
     snprintf(found, sizeof found, "%s/covers", data);   /* (every library handle: scans use them too) */
     library_set_found_covers(found);
     fast_walk_setup(lib, music);
-    lib_list_t songs = {0};
-    int have = library_list(lib, LIB_SONGS, 0, &songs);
-    library_list_free(&songs);
+    int have = !library_empty(lib);      /* (not listing them all: 2.9 s for 50,000 songs on the H2) */
     char usb_msg[128];
     /* back from USB drive mode, or the card taken out and put back (fathom-sdcard) */
     int back_from_usb = take_tmp_file("/tmp/fathom-rescan", usb_msg, sizeof usb_msg) == 0;
@@ -2757,10 +3338,12 @@ int main(int argc, char **argv)
      * new music is looked for in the background, once the UI is up.) */
     if (force_scan || have <= 0)
         scan_with_progress(lib, music, &themes[theme], theme_fonts);
+    if (rebuilt && !library_empty(lib)) library_import_counts(lib, bad_db);   /* (plays and favourites, from the one set aside) */
 
     /* The engine's output: a router to the ALSA output (the H2's DAC, USB DACs)
      * or Bluetooth (bluez-alsa, when it's on the card). */
     static audio_output_t out, alsa_out, bt_out;
+    LAT("main: library ready");
     int out_is_alsa = out_alsa_create(&alsa_out, NULL) == 0;
     if (out_is_alsa) {
         int have_bt = bt_available() && out_bt_create(&bt_out, "/mnt/sd/fathom/bt") == 0;
@@ -2775,6 +3358,7 @@ int main(int argc, char **argv)
     player_t *player = eng ? player_new(lib, eng) : NULL;
     g_player = player;
     snprintf(g_queue_path, sizeof g_queue_path, "%s/queue.txt", data);
+    LAT("main: engine");
     int resumed = player && player_restore(player, g_queue_path) == 0;   /* paused where it was */
     if (player) g_queue_saved_seq = player_seq(player);
 
@@ -2783,6 +3367,7 @@ int main(int argc, char **argv)
     lv_obj_delete(splash);
     ui_logo_release();
     LAT("main: player ready");
+    ui_set_new_install(have <= 0);       /* (no library before this start: a fresh install) */
     ui_init(main_scr, themes, n_themes, base_fonts, 1, lib, player);
     LAT("main: ui_init");
     g_level = settings_get_int("display.brightness", UI_BRIGHTNESS_DEFAULT);
@@ -2797,7 +3382,7 @@ int main(int argc, char **argv)
         .transport_toggle = hook_transport_toggle, .battery_info = hook_battery_info,
         .battery_report = hook_battery_report,
         .languages = hook_languages, .language_set = hook_language_set,
-        .rescan = rescan, .restart = restart_player, .usb_drive = usb_drive, .usb_dac = usb_dac_mode, .about = about,
+        .rescan = rescan, .scan_progress = hook_scan_progress, .restart = restart_player, .usb_drive = usb_drive, .usb_dac = usb_dac_mode, .about = about,
         .clock_set = clock_set_by_hand,
         .eq_list = hook_eq_list, .eq_set = hook_eq_set, .eq_get = hook_eq_get, .eq_put = hook_eq_put,
         .eq_preview = hook_eq_preview, .eq_remove = hook_eq_remove,
@@ -2809,17 +3394,27 @@ int main(int argc, char **argv)
         hooks.bt_do = bt_ui_toggle_or_do;
         bt_init(settings_get_int("bluetooth.on", 0), settings_get("bluetooth.last", ""));
     }
+    LAT("main: bluetooth");
     if (wifi_available()) {
         hooks.wifi_state = wifi_ui_state;
         hooks.wifi_networks = wifi_ui_networks;
         hooks.wifi_do = wifi_ui_do;
+        hooks.wifi_wake = wifi_wake;
+        /* fathom/wifi.txt: networks typed on a computer; Wi-Fi on to save them */
+        char wtxt[700];
+        snprintf(wtxt, sizeof wtxt, "%s/wifi.txt", data);
+        int import = access(wtxt, F_OK) == 0;
+        if (import && !settings_get_int("wifi.on", 0)) settings_set_int("wifi.on", 1);
         wifi_init(settings_get_int("wifi.on", 0));
+        if (import) wifi_import(wtxt);
+        LAT("main: wifi");
         http_set_version(FATHOM_VERSION);
         updater_init(CARD_DIR, FATHOM_VERSION, settings_get("update.api", ""));   /* (a test server's) */
         if (!update_is_newer(settings_get("update.found", ""), FATHOM_VERSION) && settings_get("update.found", "")[0])
             settings_set("update.found", "");    /* installed since */
         hooks.update_state = updater_ui_state;
         hooks.update_do = hook_update_do;
+        LAT("main: updater");
         if (share_available()) {
             hooks.share_state = share_ui_state;
             hooks.share_do = hook_share_do;
@@ -2827,6 +3422,7 @@ int main(int argc, char **argv)
             share_init(music, on, share_password(0));
         }
     }
+    LAT("main: share");
     if (ssh_available()) {           /* root's password is set whether SSH is on or off */
         hooks.ssh_state = ssh_ui_state;
         hooks.ssh_do = hook_ssh_do;
@@ -2847,6 +3443,9 @@ int main(int argc, char **argv)
         char covers[600];                /* covers found online (Find cover): on the card, never beside the music */
         snprintf(covers, sizeof covers, "%s/covers", data);
         cf_start(covers);
+        char icons[600];                 /* your radio stations' logos, kept small (fetched when Home > Radio reads the list) */
+        snprintf(icons, sizeof icons, "%s/radio-icons", data);
+        ricon_start(icons);
     }
     LAT("main: podcasts, covers");
     g_lib = lib;
@@ -2859,6 +3458,12 @@ int main(int argc, char **argv)
     ui_set_theme(theme);
     LAT("main: theme");
     whats_new_setup(have > 0);
+    /* a fresh install (no library before this start): the welcome, once */
+    if (have <= 0 && !settings_get_int("welcome.seen", 0)) {
+        ui_show_welcome();
+        settings_set_int("welcome.seen", 1);
+        settings_save();
+    }
     screen_set(1);
     g_fast = lv_timer_create(every_100ms, 100, NULL);
     free_space_warm();
@@ -2881,16 +3486,34 @@ int main(int argc, char **argv)
         if (g_charge_mode) charge_screen_show();
         else started_mark();
     }
-    lv_timer_create(polls, 250, NULL);
+    g_polls = lv_timer_create(polls, 250, NULL);
     levelling_apply();                   /* (off in Pure mode) */
     if (take_tmp_file("/tmp/fathom-usbdisk.msg", usb_msg, sizeof usb_msg) == 0) ui_toast(usbdisk_text(usb_msg), 3000);
     else if (access(music, F_OK) != 0) {
         fprintf(stderr, "library: no music folder (%s)\n", music);
         ui_toast("No Music folder on the card", 5000);
     }
+    ui_set_music_missing(access(music, F_OK) != 0);
     boot_markers();                      /* (up: an update's kernel worked) */
     if (uninstaller_pending()) ui_toast("Uninstall Fathom is ready: Settings > About", 5000);
-    if (back_from_usb && have > 0 && !force_scan) scan_start();
+    int scanned_now = force_scan || have <= 0;       /* (the first scan ran on its screen: its covers are still to find) */
+    if (unclean && !scanned_now) {
+        fprintf(stderr, "library: the last stop wasn't clean: checking it\n");
+        g_scan_check = 1;
+        scan_start();
+    }
+    else if (scanned_now && !library_empty(lib) && library_needs_art(lib)) {
+        fprintf(stderr, "library: finding covers in the background\n");
+        scan_start();
+        ui_toast("Finding album covers. Settings > Library shows how far.", 5000);
+    }
+    else if (back_from_usb && have > 0 && !force_scan) scan_start();
+    /* the last scan cut short (switched off during the first one, say): finished
+     * in the background, or albums and artists stay missing until a rescan */
+    else if (have > 0 && !force_scan && library_scan_unfinished(lib)) {
+        fprintf(stderr, "library: finishing a scan that was cut short\n");
+        scan_start();
+    }
     /* a library from before some tags (composers): read them in the background, once */
     else if (have > 0 && !force_scan && library_needs_tags(lib)) {
         fprintf(stderr, "library: reading tags added since the last scan\n");
@@ -2901,9 +3524,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "library: looking again for missing covers\n");
         scan_start();
     }
+    /* covers kept a file each (0.15.1 and older): moved into the covers' store, once */
+    else if (have > 0 && !force_scan && library_art_legacy(lib)) {
+        fprintf(stderr, "library: moving covers into the store\n");
+        scan_start();
+    }
 
     LAT("main: loop");
-    struct pollfd pfd[INPUT_MAX_POLL];
+    sh_home_shown();                 /* (the radios', SSH's and the network drive's workers: their first work now) */
+    struct pollfd pfd[INPUT_MAX_POLL + 1];
     while (!g_quit) {
         input_event_t ev;
         while (input_next(&ev, ms_now())) {
@@ -2965,8 +3594,10 @@ int main(int argc, char **argv)
         int timeout = wait > 1000 ? 1000 : (int)wait;
         if (lp >= 0 && lp < timeout) timeout = lp;
         int npfd = input_pollfds(pfd, INPUT_MAX_POLL);   /* devices come and go (headphones) */
+        if (g_quit_pipe[0] >= 0) pfd[npfd++] = (struct pollfd){.fd = g_quit_pipe[0], .events = POLLIN};   /* (a stop: on_signal) */
         poll(pfd, (nfds_t)npfd, timeout);
     }
+    LAT("main: stopping");
 
     fprintf(stderr, "fathom-player: exiting%s\n", g_usb_drive ? " for USB drive mode" : "");
     scan_stop();
@@ -2986,9 +3617,18 @@ int main(int argc, char **argv)
     ui_save_state();       /* (where a podcast episode was left) */
     podsync_stop();        /* (a download under way: dropped, its .part removed) */
     cf_stop();
+    ricon_stop();          /* (an icon being fetched: dropped) */
     queue_save();
     if (player) player_free(player);
     if (eng) engine_free(eng);
+    LAT("main: saved, player and engine freed");
     library_close(lib);
+    LAT("main: library closed");
+    {   /* stopped cleanly: said to the next start (it checks the library otherwise) */
+        char mark[600];
+        snprintf(mark, sizeof mark, "%s/stopped-cleanly", data);
+        int fd = open(mark, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+        if (fd >= 0) { fsync(fd); close(fd); }
+    }
     return g_usb_drive ? USB_DRIVE_EXIT : 0;
 }

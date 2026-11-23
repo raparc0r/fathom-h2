@@ -93,7 +93,10 @@ void rdir_result_free(rdir_result_t *r);
 
 /* radio-browser counts a station's plays when a client asks for
  * /json/url/{uuid}: once when one is played from the directory (on its own
- * short-lived thread, the answer discarded; skipped if one is still going). */
+ * short-lived thread, the answer discarded). Asked a few seconds later, at
+ * the lowest priority, so it doesn't compete with the station's connection;
+ * of stations chosen within that time, the last is the one counted. */
 void rdir_count_click(const char *uuid);
+void rdir_test_click_wait(int ms);   /* tests: that wait (-1: the usual one) */
 
 #endif

@@ -7,10 +7,13 @@
  * pauses (Bluetooth ends the stream). Generated FLAC files; nothing is heard.
  */
 #include <FLAC/stream_encoder.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -174,7 +177,7 @@ static void al_create(audio_output_t *out, alsa_like_t *a)
     memset(a, 0, sizeof *a);
     pthread_mutex_init(&a->mu, NULL);
     pthread_cond_init(&a->cv, NULL);
-    *out = (audio_output_t){al_open, al_write, al_delay, al_drain, al_flush, al_pause, al_nop, al_describe, a, NULL, al_can_cut, NULL};
+    *out = (audio_output_t){al_open, al_write, al_delay, al_drain, al_flush, al_pause, al_nop, al_describe, a, NULL, al_can_cut, NULL, NULL};
 }
 
 static void al_gate(alsa_like_t *a, int on)
@@ -237,7 +240,7 @@ static void test_play_at(const char *dir)
         WAIT(status(e).state == ENG_PAUSED, 1000);
         sleep_ms(20);                                 /* (paused: the thread waits, idle) */
         al_watch(&al);
-        engine_play_at(e, a, 2, 1.0f, 3000);
+        engine_play_at(e, a, 2, 1.0f, 3000, 0);
         eng_status_t s = status(e);
         CHECK(!s.starting || s.start_ms == 3000);
         long first = 0;
@@ -255,6 +258,71 @@ static void test_play_at(const char *dir)
     CHECK(s.pos_ms == 1234 || (s.pos_ms >= 1234 && s.pos_ms < 1400));
     engine_free(e);
     unlink(a);
+}
+
+/* A track started paused (Next while paused): nothing of it is written until
+ * the resume, and then it starts at its beginning (or where it was asked to).
+ * A play and then a pause let the thread start it playing in between: a
+ * moment of the new track heard at each press. */
+static unsigned long long al_frames(alsa_like_t *a)
+{
+    pthread_mutex_lock(&a->mu);
+    unsigned long long n = a->frames;
+    pthread_mutex_unlock(&a->mu);
+    return n;
+}
+
+static void test_play_paused(const char *dir)
+{
+    char a[300], b[300];
+    snprintf(a, sizeof a, "%s/pp-a.flac", dir);
+    snprintf(b, sizeof b, "%s/pp-b.flac", dir);
+    CHECK(write_ramp(a, 44100, 44100 * 5) == 0 && write_ramp(b, 44100, 44100 * 5) == 0);
+    audio_output_t out;
+    static alsa_like_t al;
+    al_create(&out, &al);
+    engine_t *e = engine_new(&out);
+    for (int round = 0; round < 20; round++) {
+        uint32_t from = round % 2 ? 2000 : 0;
+        engine_play(e, a, 1);
+        WAIT(status(e).state == ENG_PLAYING && !status(e).starting && al_frames(&al) > 0, 2000);
+        engine_pause(e, 1);
+        WAIT(status(e).state == ENG_PAUSED, 1000);
+        if (round % 4 < 2) sleep_ms(20);              /* (the thread waiting in its write, or not there yet) */
+        al_watch(&al);
+        engine_play_at(e, b, 2, 1.0f, from, 1);
+        eng_status_t s = status(e);
+        CHECK(!s.starting || s.start_paused);
+        WAIT(status(e).track_id == 2 && !status(e).starting, 2000);
+        sleep_ms(30);                                 /* (time for it to play, if it would) */
+        s = status(e);
+        CHECK(s.track_id == 2 && s.state == ENG_PAUSED && !s.output_lost && !s.error);
+        CHECK(al_watched(&al, NULL) == 0);            /* nothing written since the skip */
+        if (al_watched(&al, NULL)) fprintf(stderr, "round %d: %llu frames written while paused\n", round, al_watched(&al, NULL));
+        /* a second skip while still paused: the same */
+        engine_play_at(e, a, 3, 1.0f, from, 1);
+        WAIT(status(e).track_id == 3 && !status(e).starting, 2000);
+        sleep_ms(10);
+        CHECK(status(e).state == ENG_PAUSED && al_watched(&al, NULL) == 0);
+        engine_pause(e, 0);                           /* the resume: from its start (or where asked) */
+        long first = 0;
+        WAIT(al_watched(&al, NULL) > 0, 2000);
+        CHECK(al_watched(&al, &first) > 0 && first == (long)from * 441 / 10);
+        s = status(e);
+        CHECK(s.track_id == 3 && s.state == ENG_PLAYING);
+    }
+    /* a pause or a resume before the thread has taken the command still decides */
+    engine_pause(e, 1);
+    WAIT(status(e).state == ENG_PAUSED, 1000);
+    al_gate(&al, 1);
+    engine_play_at(e, b, 4, 1.0f, 0, 1);
+    engine_pause(e, 0);
+    al_gate(&al, 0);
+    WAIT(status(e).track_id == 4 && status(e).state == ENG_PLAYING, 2000);
+    CHECK(status(e).track_id == 4 && status(e).state == ENG_PLAYING);
+    engine_free(e);
+    unlink(a);
+    unlink(b);
 }
 
 /* Crossfeed on a 16-bit stereo track: the output goes 24-bit (its low bits
@@ -523,7 +591,7 @@ static void test_pause_drops(const char *dir)
     bt_like_t bl;
     memset(&bl, 0, sizeof bl);
     pthread_mutex_init(&bl.mu, NULL);
-    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL, NULL};
+    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL, NULL, NULL};
     engine_t *e = engine_new(&out);
     engine_play(e, a, 1);
     sleep_ms(1000);
@@ -555,7 +623,7 @@ static void test_stall_drops(const char *dir)
     memset(&bl, 0, sizeof bl);
     pthread_mutex_init(&bl.mu, NULL);
     bl.first_after = 0;
-    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL, NULL};
+    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL, NULL, NULL};
     engine_t *e = engine_new(&out);
     engine_play(e, a, 1);
     sleep_ms(1000);
@@ -639,7 +707,7 @@ static void test_crossfeed_keeps_place(const char *dir)
     bt_like_t bl;
     memset(&bl, 0, sizeof bl);
     pthread_mutex_init(&bl.mu, NULL);
-    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL, NULL};
+    audio_output_t out = {bl_open, bl_write, bl_delay, bl_nop, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL, NULL, NULL};
     engine_t *e = engine_new(&out);
     engine_play(e, a, 1);
     sleep_ms(1000);
@@ -737,6 +805,378 @@ static void test_flush_soft(const char *dir)
     unlink(c);
 }
 
+/* ---- a file that is slow to open: a named pipe called .flac. The engine's
+ * open of it waits until something opens it for writing, then reads what is
+ * written: a FLAC file's bytes (it plays) or anything else (it can't be
+ * opened). The feeder waits for `go`, at most 5 s (a test that hangs says
+ * less than one that fails). ---- */
+
+typedef struct {
+    const char *fifo, *src;       /* src NULL: not a FLAC file */
+    volatile int go, fed;
+    pthread_t th;
+} feed_t;
+
+static void *feed_run(void *arg)
+{
+    feed_t *f = arg;
+    for (int i = 0; i < 1000 && !f->go; i++) sleep_ms(5);
+    int fd = -1;
+    for (int i = 0; i < 1000 && fd < 0; i++) {       /* (no reader yet: ENXIO) */
+        fd = open(f->fifo, O_WRONLY | O_NONBLOCK);
+        if (fd < 0) sleep_ms(5);
+    }
+    if (fd >= 0) {
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+        FILE *src = f->src ? fopen(f->src, "rb") : NULL;
+        char buf[4096];
+        size_t n;
+        while (src && (n = fread(buf, 1, sizeof buf, src)) > 0)
+            if (write(fd, buf, n) < 0) break;         /* (the reader gave it up: dropped) */
+        if (!src && write(fd, "not a flac file", 15) < 0) { /* (the same) */ }
+        if (src) fclose(src);
+        close(fd);
+        f->fed = 1;
+    }
+    return NULL;
+}
+
+static void feed_start(feed_t *f, const char *fifo, const char *src)
+{
+    f->fifo = fifo;
+    f->src = src;
+    f->go = f->fed = 0;
+    pthread_create(&f->th, NULL, feed_run, f);
+}
+
+static int feed_finish(feed_t *f)
+{
+    f->go = 1;
+    pthread_join(f->th, NULL);
+    return f->fed;
+}
+
+static unsigned al_soft(alsa_like_t *a)
+{
+    pthread_mutex_lock(&a->mu);
+    unsigned n = a->soft;
+    pthread_mutex_unlock(&a->mu);
+    return n;
+}
+
+static long al_queued(alsa_like_t *a)
+{
+    pthread_mutex_lock(&a->mu);
+    long n = a->queued;
+    pthread_mutex_unlock(&a->mu);
+    return n;
+}
+
+/* The engine playing `path` as `id`, held in a write (the output takes
+ * everything at once: without the gate a track is over in a moment). */
+static void play_held(engine_t *e, alsa_like_t *al, const char *path, int64_t id)
+{
+    al_gate(al, 1);
+    engine_play(e, path, id);
+    WAIT(status(e).track_id == id && !status(e).starting, 2000);
+    CHECK(al_wait_in_write(al) && status(e).track_id == id && status(e).state == ENG_PLAYING);
+}
+
+/* Next onto a file that is slow to open. What was playing stops at once: its
+ * queue is dropped before the open, and nothing more of it is written (it
+ * played on until the new file was open). The engine answers meanwhile (the
+ * open held its lock: the UI waited on it at every tick). A pause, a stop or
+ * another play command while it opens each take effect, and a file that
+ * can't be opened is reported as before. */
+static void test_slow_open(const char *dir)
+{
+    char a[300], b[300], c[300], fifo[300];
+    snprintf(a, sizeof a, "%s/so-a.flac", dir);
+    snprintf(b, sizeof b, "%s/so-b.flac", dir);
+    snprintf(c, sizeof c, "%s/so-c.flac", dir);
+    snprintf(fifo, sizeof fifo, "%s/so-slow.flac", dir);
+    CHECK(write_ramp(a, 44100, 44100 * 5) == 0 && write_ramp(b, 44100, 44100 * 5) == 0 &&
+          write_ramp(c, 44100, 22050) == 0);
+    CHECK(mkfifo(fifo, 0600) == 0);
+    audio_output_t out;
+    static alsa_like_t al;
+    al_create(&out, &al);
+    out.flush_soft = al_flush_soft;
+    engine_t *e = engine_new(&out);
+    feed_t f;
+    eng_status_t s, s0;
+
+    /* 1. the old track stops at the command, and the engine answers */
+    play_held(e, &al, a, 1);
+    s0 = status(e);
+    unsigned soft0 = al_soft(&al);
+    feed_start(&f, fifo, c);
+    engine_play(e, fifo, 2);
+    al_watch(&al);
+    al_gate(&al, 0);                              /* the write under way ends; then the command is taken */
+    WAIT(al_soft(&al) > soft0, 2000);
+    CHECK(al_soft(&al) == soft0 + 1);             /* dropped already, the file not yet open */
+    double t0 = now_s();
+    s = status(e);
+    CHECK(now_s() - t0 < 0.5);                    /* (not behind the open) */
+    CHECK(s.starting && s.track_id == 1 && s.seq == s0.seq);
+    unsigned long long w = al_watched(&al, NULL);
+    CHECK(w <= 2048 && al_queued(&al) == 0);      /* the chunk it was writing, at most; and that dropped */
+    sleep_ms(100);
+    CHECK(al_watched(&al, NULL) == w && al_queued(&al) == 0 && status(e).starting);
+    /* ...then it opens, and plays from its start to its end */
+    al_watch(&al);
+    CHECK(feed_finish(&f));
+    WAIT(status(e).ended, 3000);
+    s = status(e);
+    long first = -1;
+    CHECK(s.track_id == 2 && s.ended && !s.error && s.seq == s0.seq + 1 && s.stop_seq == s0.stop_seq + 1);
+    CHECK(al_watched(&al, &first) == 22050 && first == 0);
+    CHECK(al_soft(&al) == soft0 + 1 && al.flushes == 0);   /* (dropped once, not again as it started) */
+
+    /* 2. another play command while it opens: that one wins, the slow one is never on */
+    play_held(e, &al, a, 3);
+    s0 = status(e);
+    feed_start(&f, fifo, c);
+    engine_play(e, fifo, 4);
+    al_gate(&al, 0);
+    WAIT(status(e).starting && al_queued(&al) == 0 && !al.in_write, 2000);
+    sleep_ms(20);
+    al_gate(&al, 1);
+    al_watch(&al);
+    engine_play(e, b, 5);
+    CHECK(feed_finish(&f));
+    WAIT(status(e).track_id == 5 && !status(e).starting, 3000);
+    CHECK(al_wait_in_write(&al));
+    s = status(e);
+    CHECK(s.track_id == 5 && s.state == ENG_PLAYING && !s.error && !s.ended);
+    CHECK(s.seq == s0.seq + 1 && s.stop_seq == s0.stop_seq);
+    CHECK(al_watched(&al, NULL) == 0);            /* (b's first chunk is held; nothing of the slow one) */
+
+    /* 3. a pause while it opens: it starts paused, nothing written until the resume */
+    feed_start(&f, fifo, c);
+    engine_play(e, fifo, 6);
+    al_gate(&al, 0);
+    WAIT(status(e).starting && !al.in_write, 2000);
+    sleep_ms(20);
+    al_watch(&al);
+    engine_pause(e, 1);
+    s = status(e);
+    CHECK(s.starting && s.start_paused);
+    CHECK(feed_finish(&f));
+    WAIT(status(e).track_id == 6 && !status(e).starting, 3000);
+    sleep_ms(30);
+    s = status(e);
+    CHECK(s.track_id == 6 && s.state == ENG_PAUSED && al_watched(&al, NULL) == 0);
+    engine_pause(e, 0);
+    WAIT(status(e).ended, 3000);
+    CHECK(status(e).ended && !status(e).error && al_watched(&al, &first) == 22050 && first == 0);
+
+    /* 4. a stop while it opens: stopped at once, and it never starts */
+    play_held(e, &al, a, 7);
+    s0 = status(e);
+    feed_start(&f, fifo, c);
+    engine_play(e, fifo, 8);
+    al_gate(&al, 0);
+    WAIT(status(e).starting && !al.in_write, 2000);
+    sleep_ms(20);
+    al_watch(&al);
+    engine_stop(e);
+    s = status(e);
+    CHECK(!s.starting && s.state == ENG_STOPPED);
+    CHECK(feed_finish(&f));
+    sleep_ms(100);
+    s = status(e);
+    CHECK(s.state == ENG_STOPPED && !s.starting && s.track_id == 7 && s.seq == s0.seq && !s.error &&
+          s.stop_seq == s0.stop_seq && al_watched(&al, NULL) == 0);
+
+    /* 5. a file that can't be opened, slowly or at once, while another plays:
+     * stopped, an error, reported as the track that's on; and the next plays */
+    for (int slow = 1; slow >= 0; slow--) {
+        char gone[300];
+        snprintf(gone, sizeof gone, "%s/so-gone.flac", dir);
+        play_held(e, &al, a, 9);
+        s0 = status(e);
+        if (slow) feed_start(&f, fifo, NULL);
+        engine_play(e, slow ? fifo : gone, 10 + slow);
+        al_gate(&al, 0);
+        if (slow) {
+            WAIT(status(e).starting && !al.in_write, 2000);
+            sleep_ms(20);
+            CHECK(feed_finish(&f));
+        }
+        WAIT(status(e).error, 3000);
+        s = status(e);
+        CHECK(s.state == ENG_STOPPED && s.error && !s.error_output && s.ended && !s.starting && s.track_id == 10 + slow);
+        CHECK(s.seq == s0.seq + 1 && s.stop_seq == s0.stop_seq + 1 && s.pos_ms == 0 && al_queued(&al) == 0);
+        al_watch(&al);
+        engine_play(e, c, 20 + slow);
+        WAIT(status(e).ended, 3000);
+        s = status(e);
+        CHECK(s.track_id == 20 + slow && s.ended && !s.error && al_watched(&al, &first) == 22050 && first == 0);
+    }
+    engine_free(e);
+    unlink(a);
+    unlink(b);
+    unlink(c);
+    unlink(fifo);
+}
+
+/* ---- An output that queues a second, like the H2's DAC with a file: what's
+ * queued plays in real time, a write waits while it's full, and join_depth
+ * says a fifth of a second is enough ---- */
+
+typedef struct {
+    pthread_mutex_t mu;
+    unsigned rate;
+    double start;                  /* when what's written started to play */
+    unsigned long long written;    /* frames written since */
+    long deep, enough;             /* what it holds; what join_depth says */
+    long max_q;                    /* the most seen queued since it was last zeroed */
+    long last;                     /* the track frame written last (-1: none) */
+    long q_at_join;                /* what was queued as a track's first frames came after another's (-1: not yet) */
+    int ran_dry;                   /* writes that found the queue played out */
+} deep_like_t;
+
+static long dl_queued(deep_like_t *d)          /* (mu held) */
+{
+    double el = now_s() - d->start;
+    unsigned long long p = el > 0 ? (unsigned long long)(el * d->rate) : 0;
+    return p < d->written ? (long)(d->written - p) : 0;
+}
+
+static int dl_open(void *ctx, const audio_format_t *f)
+{
+    deep_like_t *d = ctx;
+    d->rate = f->rate;
+    d->deep = (long)f->rate;
+    d->enough = (long)f->rate / 5;
+    return 0;
+}
+
+static long dl_write(void *ctx, const int32_t *x, long n)
+{
+    deep_like_t *d = ctx;
+    for (;;) {
+        pthread_mutex_lock(&d->mu);
+        long q = dl_queued(d);
+        if (q + n <= d->deep) {
+            if (q == 0) {                        /* played out (or the first): from here */
+                if (d->written) d->ran_dry++;
+                d->start = now_s();
+                d->written = 0;
+            }
+            long first = frame_of(x);
+            if (d->last >= 0 && first < d->last && d->q_at_join < 0) d->q_at_join = q;   /* a ramp starting over */
+            d->last = frame_of(x + 2 * (n - 1));
+            d->written += (unsigned long long)n;
+            if (q + n > d->max_q) d->max_q = q + n;
+            pthread_mutex_unlock(&d->mu);
+            return n;
+        }
+        pthread_mutex_unlock(&d->mu);
+        sleep_ms(2);
+    }
+}
+
+static long dl_delay(void *ctx)
+{
+    deep_like_t *d = ctx;
+    pthread_mutex_lock(&d->mu);
+    long q = dl_queued(d);
+    pthread_mutex_unlock(&d->mu);
+    return q;
+}
+
+static void dl_drain(void *ctx) { while (dl_delay(ctx) > 0) sleep_ms(5); }
+
+static void dl_flush(void *ctx)
+{
+    deep_like_t *d = ctx;
+    pthread_mutex_lock(&d->mu);
+    d->written = 0;
+    d->last = -1;
+    pthread_mutex_unlock(&d->mu);
+}
+
+static void dl_pause(void *ctx, int on) { (void)ctx; (void)on; }
+static void dl_nop(void *ctx) { (void)ctx; }
+static void dl_describe(void *ctx, char *o, int cap) { (void)ctx; snprintf(o, (size_t)cap, "deep-like"); }
+static long dl_join_depth(void *ctx) { return ((deep_like_t *)ctx)->enough; }
+
+/* A file on an output that queues a second: the queue fills (a stall of the
+ * decoder shorter than that isn't a gap), but a gapless successor becomes the
+ * track that's on only once the queue has played down to what's enough, with
+ * no gap; a fade under way and a sound setting just changed keep it down too. */
+static void test_deep_queue(const char *dir)
+{
+    char a[300], b[300];
+    snprintf(a, sizeof a, "%s/deep-a.flac", dir);
+    snprintf(b, sizeof b, "%s/deep-b.flac", dir);
+    CHECK(write_ramp(a, 44100, 44100 * 2) == 0 && write_ramp(b, 44100, 44100 * 4) == 0);
+    deep_like_t dl = {.mu = PTHREAD_MUTEX_INITIALIZER, .last = -1, .q_at_join = -1};
+    audio_output_t out = {dl_open, dl_write, dl_delay, dl_drain, dl_flush, dl_pause, dl_nop, dl_describe, &dl, NULL, NULL,
+                          NULL, dl_join_depth};
+    engine_t *e = engine_new(&out);
+    engine_play(e, a, 1);
+    engine_queue_next(e, b, 2);
+    WAIT(dl_delay(&dl) > dl.deep * 3 / 4, 1500);
+    CHECK(dl_delay(&dl) > dl.deep * 3 / 4);                   /* it queues its second */
+    CHECK(status(e).track_id == 1);
+    /* the first track's two seconds are decoded within moments; it stays the
+     * one that's on while more than a fifth of a second of it is unheard */
+    double t0 = now_s();
+    int early = 0;
+    while (status(e).track_id == 1 && now_s() - t0 < 4) {
+        eng_status_t st = status(e);
+        if (st.track_id == 2 && dl_delay(&dl) > dl.enough + 2048) early = 1;
+        sleep_ms(5);
+    }
+    CHECK(status(e).track_id == 2);
+    CHECK(!early);
+    CHECK(now_s() - t0 > 0.5);                               /* (not at once: the queue played down first) */
+    WAIT(dl.q_at_join >= 0, 500);
+    pthread_mutex_lock(&dl.mu);
+    long qj = dl.q_at_join;
+    int dry = dl.ran_dry;
+    pthread_mutex_unlock(&dl.mu);
+    CHECK(qj > 0 && qj <= dl.enough);                        /* joined with what's enough queued: no gap, no second ahead */
+    CHECK(dry == 0);
+    CHECK(status(e).pos_ms < 400);
+    WAIT(dl_delay(&dl) > dl.deep * 3 / 4, 1500);
+    CHECK(dl_delay(&dl) > dl.deep * 3 / 4);                   /* and a second again after the join */
+
+    /* a fade (the sleep timer's): the queue plays down and stays down */
+    engine_set_fade(e, 0.5f);
+    WAIT(dl_delay(&dl) <= dl.enough, 1500);
+    CHECK(dl_delay(&dl) <= dl.enough);
+    long most = 0;
+    for (int i = 0; i < 40; i++) {
+        long q = dl_delay(&dl);
+        if (q > most) most = q;
+        sleep_ms(5);
+    }
+    CHECK(most <= dl.enough + 2048);                          /* (a chunk goes in once it's under) */
+    CHECK(most > 0);
+    engine_set_fade(e, 1.0f);
+    WAIT(dl_delay(&dl) > dl.deep * 3 / 4, 1500);
+    CHECK(dl_delay(&dl) > dl.deep * 3 / 4);                   /* the fade over: a second again */
+
+    /* a sound setting changed: down again, so the next change is heard at once */
+    engine_set_balance(e, 0.5f, 1.0f);
+    WAIT(dl_delay(&dl) <= dl.enough, 1500);
+    CHECK(dl_delay(&dl) <= dl.enough);
+    sleep_ms(200);
+    CHECK(dl_delay(&dl) <= dl.enough + 2048);
+    pthread_mutex_lock(&dl.mu);
+    CHECK(dl.ran_dry == 0);
+    pthread_mutex_unlock(&dl.mu);
+    engine_stop(e);
+    engine_free(e);
+    unlink(a);
+    unlink(b);
+}
+
 int main(void)
 {
     char dir[200];
@@ -748,11 +1188,15 @@ int main(void)
     test_pause_drops(dir);
     test_stall_drops(dir);
     test_play_at(dir);
+    test_play_paused(dir);
     test_cut_write(dir);
     test_crossfeed(dir);
     test_crossfeed_keeps_place(dir);
     test_crossfeed_16bit_output(dir);
     test_flush_soft(dir);
+    test_deep_queue(dir);
+    signal(SIGPIPE, SIG_IGN);                     /* (a pipe's reader gone: an error, not the test's end) */
+    test_slow_open(dir);
     rmdir(dir);
     if (failures) fprintf(stderr, "%d failure(s)\n", failures);
     else printf("engine: all checks passed\n");

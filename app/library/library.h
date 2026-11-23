@@ -12,6 +12,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "shuffle/shuffle.h"
 
@@ -62,9 +63,22 @@ typedef struct {
     uint8_t  bits, channels;
 } lib_track_t;
 
+/* A scan's progress: done of total songs read (path: the one now); path
+ * "albums": the albums and artists being sorted (no count); "indexes": a
+ * first scan's indexes being built (no count); then, for covers,
+ * total < 0: done albums looked at of -total - 1 (0: not known); path "done":
+ * finished. */
 typedef void (*lib_progress_cb)(int done, int total, const char *path, void *ctx);
 
 library_t *library_open(const char *db_path, const char *art_dir);
+/* A library from an older version, which library_open() brings up to date
+ * (on a big one, a while: 50,000 songs, ~40 s on the H2): about how many songs
+ * it has (its highest song id, read at once); 0 if it's up to date, new, or
+ * not there. */
+int64_t library_upgrade_needed(const char *db_path);
+/* Called as an upgrade in library_open() goes (done of total steps; on the
+ * thread that opens it). NULL: none. */
+void library_set_upgrade_progress(void (*cb)(int done, int total, void *ctx), void *ctx);
 void       library_close(library_t *lib);
 /* Hands back the database cache's memory (read again from the card as needed):
  * with the screen off, nothing browses for a while. */
@@ -78,8 +92,50 @@ int library_scan(library_t *lib, const char *root, lib_progress_cb cb, void *ctx
 /* The music folder is on FAT32 partition `dev` mounted at `mount`: scans first
  * read its FAT directly to tell quickly that nothing changed (fatwalk.h). */
 void library_set_fast_walk(library_t *lib, const char *dev, const char *mount);
+/* The next scan (only) leaves the covers for the scan after it: a first scan
+ * on its screen ends when the songs, albums and artists are in, and the
+ * covers (its longest step) are found in the background while the library is
+ * already in use (library_needs_art() says they're owed). */
+void library_scan_defer_art(library_t *lib, int on);
+/* Where what's being read is noted, so a file that kills the player isn't read
+ * again at every start (a folder in RAM: /tmp on the H2; NULL or "": no notes).
+ * A scan notes each song before its tags are read and each album before its
+ * cover is made, and sets aside the one a note was left for. For work of the
+ * player's own (levelling): library_trying(what, &fd, text) before each item
+ * (fd -1 at first), library_trying_done after the run, and at the next run
+ * library_trying_left(what, ...) gives the item it died on (1, and forgets it). */
+void library_set_trying_dir(const char *dir);
+void library_trying(const char *what, int *fd, const char *text);
+void library_trying_done(const char *what, int *fd);
+int  library_trying_left(const char *what, char *out, size_t cap);
 /* Tracks the last scan added, changed or dropped (0: the library is as it was). */
 int library_scan_changes(const library_t *lib);
+/* How the last scan listed the music folder: 1 the quick FAT listing, 0 the
+ * slow walk through the kernel. */
+int library_scan_quick(const library_t *lib);
+/* How many music files' names the last scan held in memory: all of them on a
+ * first scan, only the new and changed ones afterwards (the rest are ticked
+ * off against a table of the library's files as the folder is listed). */
+int library_scan_held(const library_t *lib);
+/* (tests) 0: every file held by name, as scans did before */
+void library_test_known(int on);
+/* How the last scan rebuilt albums, artists and folders: 0 not at all
+ * (nothing changed), 1 only where songs changed, 2 all of them. */
+int library_scan_groups(const library_t *lib);
+/* tests: albums, artists and folders rebuilt from every song, as a scan's
+ * full rebuild does */
+void library_test_rebuild_groups(library_t *lib);
+/* tests: the groups rebuilt a statement a track for everything, as before the
+ * shortcuts that leave out what the track before has written (1), or with them (0) */
+void library_test_groups_plain(int on);
+/* (tests) 0: a first scan makes its groups afterwards, all at once, as it did before (1: as each song is added) */
+void library_test_groups_direct(int on);
+/* tests: what reads the FAT (NULL: fatwalk(), fatwalk.h) */
+typedef int (*lib_fatwalk_fn)(const char *dev, const char *mount, const char *rel,
+                              int (*cb)(const char *path, int64_t mtime, int64_t size, void *ctx), void *ctx);
+void library_test_fatwalk(lib_fatwalk_fn fn);
+/* tests: from how many files a scan of an empty library loads in bulk (0: the usual 1000) */
+void library_test_bulk_min(int files);
 /* Stop a scan running on this library (from another thread): it returns -1.
  * Nothing is dropped; the tracks it had read are kept, and the next scan
  * puts them in their albums, playlists and search. */
@@ -132,6 +188,42 @@ int  library_needs_tags(library_t *lib);
  * left without, until something else made a scan run). One background scan
  * finds theirs. */
 int  library_needs_art(library_t *lib);
+/* Cover files from before the covers' store (0.15.1 and older: a file per
+ * album and size) are still in the art folder: one background scan moves them
+ * into it. They're read from where they are meanwhile. */
+int  library_art_legacy(library_t *lib);
+/* The last scan stopped before it was done (the H2 switched off, USB drive
+ * mode, a restart): tracks it had read may have no album, artist or search
+ * entry yet, and files it hadn't reached are missing. One background scan
+ * finishes it. */
+int  library_scan_unfinished(library_t *lib);
+/* After a stop that wasn't clean (a power cut): library_check() reads the
+ * whole database through (SQLite's quick_check: seconds; a background
+ * connection's job): 0 sound, -1 damaged. library_scan_distrust() makes the
+ * next scan compare every file again, not trust the last one's word that
+ * nothing changed. library_import_counts() brings plays, skips, favourites,
+ * resume places and the play log over from another library file (one set
+ * aside as damaged), by path, as far as it can still be read: how many songs
+ * got some, -1 if it can't be read at all. */
+int  library_check(library_t *lib);
+void library_scan_distrust(library_t *lib);
+int  library_import_counts(library_t *lib, const char *old_db);
+/* No songs at all (a fresh install, or nothing copied yet). */
+int  library_empty(library_t *lib);
+/* How many songs a smart playlist has (what library_list(LIB_SMART, which)
+ * would list), counted without listing them: Playlists' counts. */
+int  library_smart_count(library_t *lib, int which);
+/* VACUUM: the database rewritten tight (a first scan leaves it fragmented,
+ * which makes reading it about half as fast). Takes the write lock. It needs
+ * about twice the database free on the card (SQLite's temporary copy, in
+ * SQLITE_TMPDIR, and the write-ahead log, emptied afterwards): 0 done, -2 not
+ * enough room (nothing done), -1 failed. */
+int  library_compact(library_t *lib);
+/* Each query a person waits on (the lists, smart playlists, Shuffle all, the
+ * start's checks), its plan looked at: how many read the whole tracks table or
+ * sort its rows, beyond the few allowed; each one found (allowed ones too) to
+ * report, if not NULL. test_scan keeps it at 0. */
+int  library_check_plans(library_t *lib, FILE *report);
 /* A composer's tracks on one album (LIB_COMPOSER_TRACKS). */
 int  library_list_composer_tracks(library_t *lib, int64_t composer_id, int64_t album_id, lib_list_t *out);
 /* Names for screens' titles: 0, or -1 if there's no such one. A folder id of 0
@@ -179,9 +271,29 @@ int64_t library_track_album(library_t *lib, int64_t track_id);
 /* An image file's contents (JPEG, PNG) as a square cover, centre-cropped, as
  * RGB565 (size*size*2 bytes): a radio station's. 0 if decoded. */
 int library_art_decode(const unsigned char *enc, size_t len, int size, uint16_t *pixels);
+/* A radio station's logo (JPEG, PNG) at both sizes, whole inside each square
+ * with white around it and under its transparent parts, not cropped: small
+ * (LIB_ART_SMALL) always, large (LIB_ART_LARGE) too unless it's NULL.
+ * *short_side (may be NULL): the picture's shorter side as decoded, which is
+ * its own when that's under LIB_ART_LARGE * 3 / 2 (a bigger one is shrunk no
+ * further than that), so the caller can tell one too small to show large.
+ * Stricter limits than a cover's: 512 KB, 400,000 pixels decoded. 0 if decoded. */
+int library_logo_decode(const unsigned char *enc, size_t len, uint16_t *large, uint16_t *small, int *short_side);
+/* The same from an image file, at both sizes (LIB_ART_LARGE and LIB_ART_SMALL
+ * squares): read from where it is, a JPEG or a PNG of any size without its
+ * encoded bytes held in memory (a podcast's cover). 0 if decoded. */
+int library_art_decode_file(const char *path, uint16_t *large, uint16_t *small);
 
 /* All tracks in shuffle form (ids in shuf_track_t.id). Caller frees *out. */
 int library_shuffle_tracks(library_t *lib, shuf_track_t **out);
+/* The n tracks ids[] in shuffle form, out[i] for ids[i] (one that's gone: its
+ * id and nothing else): for shuffling an album or a playlist without reading
+ * every song of the library. Works are found among these songs. n, or -1. */
+int library_shuffle_tracks_for(library_t *lib, const int64_t *ids, int n, shuf_track_t *out);
+/* The highest track id (about how many songs there are, at no cost: no count). 0: none. */
+int64_t library_top_track(library_t *lib);
+/* The track with this id, or the next one there is after it (0: none): a song taken at random. */
+int64_t library_track_from(library_t *lib, int64_t id);
 /* Playback history for freshness and "most played". */
 void library_played(library_t *lib, int64_t track_id, int skipped_early, int64_t now);
 

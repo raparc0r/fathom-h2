@@ -2,6 +2,7 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Updates over Wi-Fi: versions, GitHub's answer, staging, installing (update.h). */
 #include "net/update.h"
+#include "core/fsafe.h"
 #include "core/lang.h"   /* N_(): the texts the UI translates */
 
 #include <ctype.h>
@@ -608,13 +609,14 @@ int update_install(const char *card, const char *stage)
      * install is finished at the next start (update_resume). (No sd/ left:
      * cut short while the stage was being removed, all of it installed.) */
     if (exists(sd) && move_tree(sd, card, "")) return UPDATE_ERR_INSTALL;
+    sync();                                         /* (the files moved in, before the kernel's copy pushes anything out) */
     if (exists(kernel)) {
         /* The old kernel kept for a person to go back to by hand (the
          * bootloader always starts uImage). Copied, not moved: uImage never
          * goes missing. */
         if (exists(now) && copy_file(now, prev)) return UPDATE_ERR_INSTALL;
         sync();
-        if (rename(kernel, now)) {
+        if (file_replace(kernel, now)) {            /* (its entry on the card before the marker is) */
             fprintf(stderr, "update: can't install uImage: %s\n", strerror(errno));
             return UPDATE_ERR_INSTALL;
         }

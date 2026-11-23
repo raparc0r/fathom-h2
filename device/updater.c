@@ -29,6 +29,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include "core/lang.h"   /* N_(): a text the UI translates */
 #include "net/http.h"
 #include "net/netclock.h"
 #include "net/update.h"
@@ -102,7 +103,7 @@ static void *check_thread(void *arg)
     (void)arg;
     low_priority();
     char *buf = malloc(ANSWER_MAX);
-    long n = buf ? http_get(U.api, buf, ANSWER_MAX, &U.abort) : -1;
+    long n = buf ? http_get_retry(U.api, buf, ANSWER_MAX, &U.abort) : -1;
     update_release_t r;
     int parsed = n > 0 ? update_parse_release(buf, (size_t)n, &r) : -1;
     if (n <= 0) memset(&r, 0, sizeof r);
@@ -156,6 +157,7 @@ static void *download_thread(void *arg)
     (void)arg;
     low_priority();
     const update_release_t *r = &U.rel;
+    const char *why = NULL;             /* (said in place of err's own words) */
     int err = UPDATE_OK, nospace = 0;
     long cluster = 32768;
     int64_t free_now = update_free_space(U.card, &cluster);
@@ -167,9 +169,12 @@ static void *download_thread(void *arg)
     if (mkdir(U.stage, 0755)) { err = UPDATE_ERR_WRITE; goto out; }
     snprintf(U.zip, sizeof U.zip, "%s/%s", U.stage, r->asset);
     set_state(UI_UPD_DOWNLOADING, (uint64_t)r->size);
-    int64_t got = http_download(r->url, U.zip, dl_progress, NULL, &U.abort);
+    int64_t got = http_download_retry(r->url, U.zip, dl_progress, NULL, &U.abort);
     fprintf(stderr, "update: %s: %lld of %lld bytes\n", r->url, (long long)got, (long long)r->size);
     if (U.abort) { err = UPDATE_ERR_CANCELLED; goto out; }
+    /* the card, not the network (the room was reckoned before, but other things are written meanwhile) */
+    if (got == HTTP_ERR_FULL) { err = UPDATE_ERR_SPACE; why = N_("The card is nearly full"); goto out; }
+    if (got == HTTP_ERR_WRITE) { err = UPDATE_ERR_WRITE; goto out; }
     if (got < 0) { err = UPDATE_ERR_DOWNLOAD; goto out; }
     if (got != r->size) { err = UPDATE_ERR_DAMAGED; goto out; }
     if (r->sha256[0]) {
@@ -200,7 +205,7 @@ out:
     if (err != UPDATE_OK || nospace || U.abort) update_remove_tree(U.stage);
     pthread_mutex_lock(&U.mu);
     if (err == UPDATE_ERR_CANCELLED || U.abort) U.st.state = UI_UPD_AVAILABLE;   /* (offered again) */
-    else if (err) fail_locked(err, NULL);
+    else if (err) fail_locked(err, why);
     else if (nospace) no_space_locked(need);
     else U.st.state = UI_UPD_READY;
     U.st.done = U.st.total = 0;

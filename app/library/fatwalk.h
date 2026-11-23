@@ -22,4 +22,10 @@ typedef int (*fatwalk_cb)(const char *path, int64_t mtime, int64_t size, void *c
  * device isn't FAT32 or can't be read. */
 int fatwalk(const char *dev, const char *mount, const char *rel, fatwalk_cb cb, void *ctx);
 
+/* tools (fathom-fatcheck --dangling): called for every file before cb, with
+ * the entry's first cluster, what the FAT holds for it (0: free; 0xFFFFFFFF:
+ * no such cluster) and its size. NULL: none. Not for concurrent walks. */
+typedef void (*fatwalk_entry_fn)(const char *path, uint32_t start, uint32_t fat, uint32_t size, void *ctx);
+void fatwalk_set_entry_hook(fatwalk_entry_fn fn, void *ctx);
+
 #endif

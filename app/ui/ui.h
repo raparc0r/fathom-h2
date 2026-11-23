@@ -82,6 +82,11 @@ enum { UI_SHARE_TOGGLE, UI_SHARE_NEW_PASSWORD };
 /* SSH (Settings > SSH): root's login over the USB link and Wi-Fi, and SFTP */
 enum { UI_SSH_OFF, UI_SSH_STARTING, UI_SSH_ON, UI_SSH_FAILED };
 typedef struct { int state; char usb_ip[16]; char wifi_ip[16]; char password[32]; } ui_ssh_t;
+
+/* How far a scan has got (ui_hooks_t.scan_progress): its step; songs read or
+ * albums looked at, done of total; the file it's reading (a song's name) */
+enum { UI_SCAN_LOOKING, UI_SCAN_SONGS, UI_SCAN_ALBUMS, UI_SCAN_COVERS };
+typedef struct { int step, done, total; char file[96]; } ui_scan_t;
 enum { UI_SSH_TOGGLE, UI_SSH_NEW_PASSWORD };
 enum { UI_SOUND_BALANCE, UI_SOUND_LIMIT, UI_SOUND_CROSSFEED };
 /* Updates (Settings > About > Check for updates): only ever when asked.
@@ -192,10 +197,13 @@ typedef struct {
      * it's doing ("Starting", "Searching", "Connecting") or ""; st the
      * connection. wifi_networks: those in range, strongest first. wifi_do:
      * UI_WIFI_TOGGLE, UI_WIFI_SCAN, UI_WIFI_CONNECT (ssid, password: "" for a
-     * saved or open network), UI_WIFI_FORGET (ssid). */
+     * saved or open network), UI_WIFI_FORGET (ssid). wifi_wake (may be NULL):
+     * something is waiting for a connection, so with nothing joined look for
+     * a network now, not at the next slow look. */
     int  (*wifi_state)(char *busy, size_t cap, ui_wifi_status_t *st);
     int  (*wifi_networks)(ui_wifi_net_t *out, int max);
     void (*wifi_do)(int what, const char *ssid, const char *password);
+    void (*wifi_wake)(void);
     /* Settings > Network drive (NULL: not available). share_state: 1 when it's
      * on (wanted; st says whether it's serving, waiting for Wi-Fi...). share_do:
      * UI_SHARE_TOGGLE, UI_SHARE_NEW_PASSWORD. */
@@ -225,6 +233,9 @@ typedef struct {
                         "added terms, no warranty. " \
                         "Licence: fathom/LICENSE."
     int  (*about)(int i, char *label, size_t lc, char *value, size_t vc);
+    /* A background scan running (after USB drive mode, Rescan...): 1, with
+     * how far (ui_scan_t); 0 none */
+    int  (*scan_progress)(ui_scan_t *p);
     /* About > Clock, set by hand (Date and time): t is seconds since 1970, UTC.
      * 0 once it's set (and kept for the next start). NULL: not settable here. */
     int  (*clock_set)(int64_t t);
@@ -255,6 +266,16 @@ void ui_tick_1s(void);
 /* What's new in this version: the release notes' summary, one point per line
  * (fathom/assets/whatsnew.txt). Shown at once if `show` (the first start of a
  * new version), and from then on in Settings > About > What's new. */
+/* Before ui_init: a fresh install (no library before this start), whose Home
+ * starts shorter (Genres and Folders hidden, one switch away in Settings >
+ * Home); an existing owner's stays as it was. */
+void ui_set_new_install(int on);
+/* A fresh install's welcome: the keys nobody would guess (also Settings >
+ * About > Tips), shown over everything until Play or Back */
+void ui_show_welcome(void);
+/* The card has no Music folder (an empty library then says so, not just
+ * that there's no music). */
+void ui_set_music_missing(int missing);
 void ui_set_whats_new(const char *version, const char *text, int show);          /* refreshes position and progress */
 void ui_set_theme(int index);
 /* Before the player exits: what the UI keeps on the card now and then (where
@@ -269,6 +290,8 @@ void ui_update_changed(void);   /* the update's state or progress changed: refre
 void ui_uninstall_changed(void);   /* Uninstall Fathom's state or progress changed */
 /* The library changed (a rescan): the open lists are read again, in place. */
 void ui_library_changed(void);
+/* Covers were made (a scan in the background): shown where they were missing. */
+void ui_covers_changed(void);
 /* Connected to a computer: ask what to be (USB drive, USB DAC, or keep playing). */
 void ui_usb_prompt(void);
 void ui_usb_prompt_close(void);   /* the cable came out: the question no longer stands */
@@ -311,6 +334,9 @@ int  ui_theme_count(void);
  * "about", "update" (Settings > About > Check for updates, in the state update_state gives);
  * Radio > Find stations: "rdir", "rdirgenres", "rdircountries", "rdirresults", "rdirsearch",
  * "rdirctx", "rdirbusy" (still asking), "rdirerror" (when the directory can't be reached). */
+/* The scan's progress over everything (Settings > Library > Rescan), while
+ * one runs (scan_progress); it goes when the scan ends, or on Back. */
+void ui_show_scan(void);
 void ui_show(const char *what);
 /* For the simulator's checks: how deep the lists go (1: Home; 0: Now Playing
  * shown), the open list's selected row and its number of rows; home_edit: 1

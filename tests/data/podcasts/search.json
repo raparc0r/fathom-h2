@@ -1,5 +1,5 @@
 {"resultCount":3,"results":[
- {"wrapperType":"track","kind":"podcast","collectionName":"Radiolab","artistName":"WNYC Studios","feedUrl":"https://feeds.simplecast.com/EmVW7VGp","artworkUrl100":"https://is1.example/100x100bb.jpg","trackCount":575},
+ {"wrapperType":"track","kind":"podcast","collectionName":"Radiolab","artistName":"WNYC Studios","feedUrl":"https://feeds.simplecast.com/EmVW7VGp","artworkUrl100":"https://is1.example/100x100bb.jpg","artworkUrl600":"https://is1.example/600x600bb.jpg","trackCount":575},
  {"collectionName":"No feed here","artistName":"X"},
- {"collectionName":"Café Talk","artistName":"Y","feedUrl":"https://example.com/cafe.rss","trackCount":"12"}
+ {"collectionName":"Café Talk","artistName":"Y","feedUrl":"https://example.com/cafe.rss","artworkUrl100":"https://is2.example/100x100bb.jpg","trackCount":"12"}
 ]}

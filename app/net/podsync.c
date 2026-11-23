@@ -2,6 +2,7 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Podcasts over the network: one worker, one job at a time (podsync.h). */
 #include "net/podsync.h"
+#include "core/fsafe.h"
 
 #include <dirent.h>
 #include <pthread.h>
@@ -10,8 +11,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
-#include "library/library.h"   /* library_art_decode: a show's cover */
+#include "library/library.h"   /* library_art_decode_file: a show's cover */
 #include "net/update.h"   /* update_free_space */
 
 enum { J_REFRESH, J_SUBSCRIBE, J_UNSUBSCRIBE, J_IMPORT, J_SEARCH, J_DOWNLOAD, J_AUTO };
@@ -42,6 +44,7 @@ static struct {
     int n_jobs;
     job_t *cur;               /* the job under way (owned by the worker) */
     volatile int abort;       /* the job under way gives up */
+    volatile int img_abort;   /* a show's image being downloaded gives up (cover_download) */
     int pct;                  /* its download's progress */
     unsigned changed;
     int last_failed;
@@ -116,40 +119,143 @@ static void touched(void)
 
 /* ---------- the jobs ---------- */
 
-/* A show's cover, kept small (pod_cover_path) when there's none yet or its
- * image changed: downloaded beside, decoded, the download removed. */
-#define COVER_MAX_FILE (4 * 1024 * 1024)
+/* ---------- a show's picture ----------
+ * Kept small on the card: cover.565 for Now Playing (pod_cover_path),
+ * thumb.565 for the list of shows (pod_thumb_path), and cover.url, the address
+ * of the image last dealt with: made into those two, or found to be no use
+ * (not there, too big, not a picture), so that one isn't downloaded again at
+ * every refresh. An image that couldn't be reached leaves no mark: the next
+ * refresh tries again. */
+#define COVER_MAX_FILE (8LL * 1024 * 1024)
+#define COVER_BYTES ((size_t)LIB_ART_LARGE * LIB_ART_LARGE * 2)
+#define THUMB_BYTES ((size_t)LIB_ART_SMALL * LIB_ART_SMALL * 2)
+
+/* path written whole: beside (path.tmp), then moved over. 0, -1 */
+static int put_file(const char *path, const void *data, size_t len)
+{
+    char tmp[840];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "wbe");
+    if (!f) return -1;
+    int ok = fwrite(data, 1, len, f) == len && fflush(f) == 0;
+    ok &= fsync(fileno(f)) == 0;
+    ok &= fclose(f) == 0;
+    if (!ok || file_replace(tmp, path)) { remove(tmp); return -1; }
+    return 0;
+}
+
+static int file_is(const char *path, size_t bytes)
+{
+    struct stat st;
+    return stat(path, &st) == 0 && (size_t)st.st_size == bytes;
+}
+
+/* The address in a show's cover.url ("": it has none) */
+static void marker_read(const char *path, char *out, size_t cap)
+{
+    out[0] = '\0';
+    FILE *f = fopen(path, "rbe");
+    if (!f) return;
+    size_t n = fread(out, 1, cap - 1, f);
+    fclose(f);
+    out[n] = '\0';
+    out[strcspn(out, "\r\n")] = '\0';
+}
+
+/* The list's thumbnail from the cover already on the card (each block of
+ * pixels averaged): a show subscribed to before there were thumbnails gets
+ * its own without the network. 0, -1 */
+static int thumb_from_cover(const char *cover_path, const char *thumb_path)
+{
+    enum { BIG = LIB_ART_LARGE, SMALL = LIB_ART_SMALL, K = BIG / SMALL };
+    uint16_t *px = malloc(COVER_BYTES), *out = malloc(THUMB_BYTES);
+    FILE *f = px && out ? fopen(cover_path, "rbe") : NULL;
+    int ok = f && fread(px, 1, COVER_BYTES, f) == COVER_BYTES;
+    if (f) fclose(f);
+    if (ok) {
+        const unsigned n = K * K;
+        for (int y = 0; y < SMALL; y++)
+            for (int x = 0; x < SMALL; x++) {
+                unsigned r = 0, g = 0, b = 0;
+                for (int v = 0; v < K; v++)
+                    for (int u = 0; u < K; u++) {
+                        unsigned p = px[(y * K + v) * BIG + x * K + u];
+                        r += p >> 11, g += (p >> 5) & 63, b += p & 31;
+                    }
+                out[y * SMALL + x] = (uint16_t)(((r + n / 2) / n) << 11 | ((g + n / 2) / n) << 5 | (b + n / 2) / n);
+            }
+        ok = put_file(thumb_path, out, THUMB_BYTES) == 0;
+    }
+    free(px);
+    free(out);
+    return ok ? 0 : -1;
+}
+
+/* The image's download gives up once it's over the cap (a feed can name
+ * anything as its image), or when the worker is stopping */
+static void cover_progress(uint64_t done, uint64_t total, void *ctx)
+{
+    int *over = ctx;
+    if (done > (uint64_t)COVER_MAX_FILE || total > (uint64_t)COVER_MAX_FILE) *over = 1;
+    if (*over || P.abort || P.stop) P.img_abort = 1;
+}
+
+/* Up to 3 tries as g_download, but not again for one that's too big */
+static int64_t cover_download(const char *url, const char *img, int *over)
+{
+    static const int WAIT[] = {2000, 5000};
+    int64_t n = -1;
+    *over = 0;
+    pthread_mutex_lock(&P.mu);
+    P.img_abort = P.stop || P.abort;                 /* (podsync_stop sets it too: a stalled download ends at once) */
+    pthread_mutex_unlock(&P.mu);
+    for (int i = 0; i < 3; i++) {
+        n = g_download_once(url, img, cover_progress, over, &P.img_abort);
+        if (n >= 0 || n == -3 || *over || i == 2 || wait_abortable(WAIT[i])) break;
+    }
+    return n;
+}
+
 static void cover(const pod_show_t *s, const char *old_image)
 {
-    char path[800], img[820];
+    if (!s->image[0]) return;
+    char path[800], thumb[800], mark[800], img[820], was[sizeof s->image];
     pod_cover_path(P.dir, s->id, path, sizeof path);
-    struct stat st;
-    if (!s->image[0] || (stat(path, &st) == 0 && !strcmp(s->image, old_image))) return;
+    pod_thumb_path(P.dir, s->id, thumb, sizeof thumb);
+    snprintf(mark, sizeof mark, "%s/%s/cover.url", P.dir, s->id);
+    marker_read(mark, was, sizeof was);
+    int have = file_is(path, COVER_BYTES);
+    /* A cover from before there were marks is its image's (it was fetched
+     * whenever the address changed), unless the address changed just now */
+    int legacy = !was[0] && have && !strcmp(s->image, old_image);
+    if (legacy || !strcmp(was, s->image)) {          /* nothing to fetch */
+        int made = have && !file_is(thumb, THUMB_BYTES) && thumb_from_cover(path, thumb) == 0;
+        if (legacy) put_file(mark, s->image, strlen(s->image));
+        if (made) touched();
+        return;
+    }
     snprintf(img, sizeof img, "%s.img", path);
-    if (g_download(s->image, img, NULL, NULL, &P.abort) <= 0) { remove(img); return; }
-    FILE *f = fopen(img, "rbe");
-    long n = -1;
-    unsigned char *buf = NULL;
-    if (f) {
-        fseek(f, 0, SEEK_END);
-        n = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        buf = n > 0 && n <= COVER_MAX_FILE ? malloc((size_t)n) : NULL;
-        if (buf && fread(buf, 1, (size_t)n, f) != (size_t)n) n = -1;
-        fclose(f);
+    int over = 0, written = 0;
+    int64_t got = cover_download(s->image, img, &over);
+    struct stat st;
+    if (got > 0 && stat(img, &st) == 0 && st.st_size > COVER_MAX_FILE) over = 1;   /* (a download that didn't say how far it was) */
+    /* the server answered (it isn't there, it's too big, or here it is): this
+     * image is dealt with, whatever it turns out to be */
+    int answered = over || got == -3 || got >= 0;
+    if (got > 0 && !over) {
+        uint16_t *large = malloc(COVER_BYTES), *small = malloc(THUMB_BYTES);
+        if (!large || !small) answered = 0;
+        else if (library_art_decode_file(img, large, small) == 0) {
+            /* the thumbnail, the cover, then the mark: a cut between them leaves no mark, and it's fetched again */
+            written = put_file(thumb, small, THUMB_BYTES) == 0 && put_file(path, large, COVER_BYTES) == 0;
+            if (!written) answered = 0;              /* (the card wouldn't take them: not this image's fault) */
+        }
+        free(large);
+        free(small);
     }
     remove(img);
-    static uint16_t px[LIB_ART_LARGE * LIB_ART_LARGE];
-    if (buf && n > 0 && library_art_decode(buf, (size_t)n, LIB_ART_LARGE, px) == 0) {
-        char tmp[820];
-        snprintf(tmp, sizeof tmp, "%s.tmp", path);
-        FILE *o = fopen(tmp, "we");
-        int ok = o && fwrite(px, 1, sizeof px, o) == sizeof px;
-        if (o) ok &= fclose(o) == 0;
-        if (!ok || rename(tmp, path)) remove(tmp);
-        else touched();
-    }
-    free(buf);
+    if (answered) put_file(mark, s->image, strlen(s->image));
+    if (written) touched();
 }
 
 /* Read a show's feed: its details and newest episodes onto the card. 0, -1. */
@@ -373,9 +479,20 @@ static void run(job_t *j, unsigned search_gen)
         if (j->url[0]) refresh_one(j->url);
         else refresh_all();
         break;
-    case J_SUBSCRIBE:
-        if (pod_shows_add(P.dir, &j->show) >= 0) { touched(); refresh_one(j->show.url); }
+    case J_SUBSCRIBE: {
+        int added = pod_shows_add(P.dir, &j->show);
+        if (added < 0) break;
+        touched();
+        /* found in the directory: its picture from there at once, so the show
+         * has one in the list a moment after it's added (its feed's own takes
+         * its place once the feed is read: a big feed and a big image take a while) */
+        if (added == 1 && j->show.image[0]) {
+            pod_hash(j->show.url, j->show.id);
+            cover(&j->show, "");
+        }
+        refresh_one(j->show.url);
         break;
+    }
     case J_UNSUBSCRIBE: pod_shows_remove(P.dir, j->url); touched(); break;
     case J_IMPORT: import(j); break;
     case J_SEARCH: search(j, search_gen); break;
@@ -386,13 +503,16 @@ static void run(job_t *j, unsigned search_gen)
 }
 
 /* What a download or a cover cut short left (the player killed, the card
- * pulled, the power gone): KEY.mp3.part, cover.565.img(.part), cover.565.tmp.
- * Only this worker writes those, so at its start none is under way. */
+ * pulled, the power gone): KEY.mp3.part, cover.565.img(.part), cover.565.tmp,
+ * thumb.565.tmp, cover.url.tmp. Only this worker writes those, so at its start
+ * none is under way. And a show with a cover from before there were
+ * thumbnails gets its thumbnail now (no network needed for that). */
 static void sweep(void)
 {
+    static const char *const LEFT[] = {"cover.565.tmp", "cover.565.img", "thumb.565.tmp", "cover.url.tmp"};
     DIR *d = opendir(P.dir);
     struct dirent *e;
-    char sd[1200], f[1500];
+    char sd[1200], f[1500], t[1500];
     while (d && (e = readdir(d))) {
         if (e->d_name[0] == '.' || strlen(e->d_name) != 12) continue;   /* the shows' folders: 12 hex */
         snprintf(sd, sizeof sd, "%s/%s", P.dir, e->d_name);
@@ -401,13 +521,18 @@ static void sweep(void)
         while (s && (g = readdir(s))) {
             size_t n = strlen(g->d_name);
             /* (only the worker's own: the UI may be writing a state.txt.tmp now) */
-            if ((n > 5 && !strcmp(g->d_name + n - 5, ".part")) || !strcmp(g->d_name, "cover.565.tmp") ||
-                !strcmp(g->d_name, "cover.565.img")) {
+            int left = n > 5 && !strcmp(g->d_name + n - 5, ".part");
+            for (size_t k = 0; k < sizeof LEFT / sizeof LEFT[0]; k++) left |= !strcmp(g->d_name, LEFT[k]);
+            if (left) {
                 snprintf(f, sizeof f, "%s/%s", sd, g->d_name);
                 remove(f);
             }
         }
-        if (s) closedir(s);
+        if (!s) continue;
+        closedir(s);
+        snprintf(f, sizeof f, "%s/cover.565", sd);
+        snprintf(t, sizeof t, "%s/thumb.565", sd);
+        if (file_is(f, COVER_BYTES) && !file_is(t, THUMB_BYTES) && thumb_from_cover(f, t) == 0) touched();
     }
     if (d) closedir(d);
 }
@@ -496,6 +621,7 @@ void podsync_stop(void)
     pthread_mutex_lock(&P.mu);
     P.stop = 1;
     P.abort = 1;
+    P.img_abort = 1;
     pthread_cond_signal(&P.cv);
     pthread_mutex_unlock(&P.mu);
     pthread_join(P.th, NULL);

@@ -4,7 +4,9 @@ CONFIG_UDHCPD=y
 # Fathom: the clock from the network when Wi-Fi connects (udhcpc hook fathom-ntp)
 CONFIG_NTPD=y
 CONFIG_TIMEOUT=y
-# Fathom: root's password for SSH and the serial console (fathom-ssh)
+# Fathom: root's password for SSH and the serial console (fathom-ssh). It asks
+# for an MD5 hash itself (chpasswd -c md5: quick, see there); the default
+# below is what a passwd typed by hand gets, and what fathom-ssh falls back to.
 CONFIG_CHPASSWD=y
 CONFIG_FEATURE_DEFAULT_PASSWD_ALGO="sha512"
 # Repeated lines are dropped from the RAM log (syslogd -D, /etc/default/syslogd)

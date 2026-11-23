@@ -15,6 +15,7 @@ static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 static int fetches, slow, cut_off;   /* cut_off: the feed arrives cut off (Wi-Fi gone mid-transfer) */
+static char alt_image[6];            /* the feed's image named this instead of "cover" (5 letters) */
 
 static long fake_fetch(const char *url, char *buf, size_t cap, const volatile int *abort)
 {
@@ -36,13 +37,46 @@ static long fake_fetch(const char *url, char *buf, size_t cap, const volatile in
         } else {                                      /* (the fixture stops mid-item: whole, it ends) */
             n += (size_t)snprintf(buf + n, cap - n, "\n</rss>\n");
         }
+        char *im = strstr(buf, "example.com/cover.jpg");
+        if (im && alt_image[0]) memcpy(im + 12, alt_image, 5);   /* the show's image changed */
     }
     return (long)n;
+}
+
+/* A show's image (any .jpg): a real picture, or what img_mode says */
+enum { IMG_OK, IMG_TEXT, IMG_BIG, IMG_NET, IMG_GONE };
+static int img_mode, img_calls;
+static char img_last[2][200];        /* the last two asked for, the latest first */
+
+static int64_t fake_image(const char *url, const char *path, http_progress_fn progress, void *ctx,
+                          const volatile int *abort)
+{
+    img_calls++;
+    snprintf(img_last[1], sizeof img_last[1], "%s", img_last[0]);
+    snprintf(img_last[0], sizeof img_last[0], "%s", url);
+    if (img_mode == IMG_NET) return -1;
+    if (img_mode == IMG_GONE) return -3;
+    if (img_mode == IMG_BIG) {                        /* 9 MB on its way: given up once told so */
+        if (progress) progress(64 * 1024, 9 * 1024 * 1024, ctx);
+        return *abort ? -1 : 9 * 1024 * 1024;
+    }
+    FILE *in = img_mode == IMG_OK ? fopen("tests/data/covers/cover.jpg", "rb") : NULL, *out = fopen(path, "wb");
+    char b[8192];
+    size_t k;
+    int64_t n = 0;
+    if (!out) { if (in) fclose(in); return -1; }
+    if (!in) n = (int64_t)fwrite("<html>not a picture</html>", 1, 26, out);
+    while (in && (k = fread(b, 1, sizeof b, in)) > 0) n += (int64_t)fwrite(b, 1, k, out);
+    if (in) fclose(in);
+    fclose(out);
+    if (progress) progress((uint64_t)n, (uint64_t)n, ctx);
+    return n;
 }
 
 static int64_t fake_download(const char *url, const char *path, http_progress_fn progress, void *ctx,
                              const volatile int *abort)
 {
+    if (strstr(url, ".jpg")) return fake_image(url, path, progress, ctx, abort);
     for (int i = 0; i < (slow ? 200 : 2); i++) {
         if (*abort) return -1;
         if (progress) progress((uint64_t)i * 1000, 200000, ctx);
@@ -66,6 +100,107 @@ static void settle(void)
     }
     printf("FAIL: the worker didn't settle\n");
     fails++;
+}
+
+static long size_of(const char *dir, const char *id, const char *name)
+{
+    char p[900];
+    struct stat sb;
+    snprintf(p, sizeof p, "%s/%s/%s", dir, id, name);
+    return stat(p, &sb) == 0 ? (long)sb.st_size : -1;
+}
+
+/* a show's cover.url: the image last dealt with */
+static const char *marker(const char *dir, const char *id)
+{
+    static char m[400];
+    char p[900];
+    snprintf(p, sizeof p, "%s/%s/cover.url", dir, id);
+    FILE *f = fopen(p, "rb");
+    m[f ? fread(m, 1, sizeof m - 1, f) : 0] = '\0';
+    if (f) fclose(f);
+    return m;
+}
+
+static void drop(const char *dir, const char *id, const char *name)
+{
+    char p[900];
+    snprintf(p, sizeof p, "%s/%s/%s", dir, id, name);
+    remove(p);
+}
+
+/* A show's picture: fetched once, kept at two sizes, and an image that's no
+ * use not asked for again (id: a show just subscribed to, its feed read) */
+static void pictures(const char *dir, const pod_show_t *show)
+{
+    const char *id = show->id, *url = show->url;
+    enum { COVER = 136 * 136 * 2, THUMB = 34 * 34 * 2 };
+    CHECK(img_calls == 1, "the show's image fetched: %d", img_calls);
+    CHECK(size_of(dir, id, "cover.565") == COVER, "its cover: %ld bytes", size_of(dir, id, "cover.565"));
+    CHECK(size_of(dir, id, "thumb.565") == THUMB, "its thumbnail: %ld bytes", size_of(dir, id, "thumb.565"));
+    CHECK(!strcmp(marker(dir, id), "https://example.com/cover.jpg"), "its image noted [%s]", marker(dir, id));
+    CHECK(size_of(dir, id, "cover.565.img") < 0, "the download removed");
+    podsync_refresh(url);
+    settle();
+    CHECK(img_calls == 1, "read again: the image not fetched again (%d)", img_calls);
+
+    /* no thumbnail and no note (a show from before there were any): both made from the cover, no download */
+    drop(dir, id, "thumb.565");
+    drop(dir, id, "cover.url");
+    podsync_refresh(url);
+    settle();
+    CHECK(img_calls == 1 && size_of(dir, id, "thumb.565") == THUMB, "the thumbnail made from the cover (%d fetched)", img_calls);
+    CHECK(!strcmp(marker(dir, id), "https://example.com/cover.jpg"), "and its image noted [%s]", marker(dir, id));
+    /* the thumbnail alone gone: made again */
+    drop(dir, id, "thumb.565");
+    podsync_refresh(url);
+    settle();
+    CHECK(img_calls == 1 && size_of(dir, id, "thumb.565") == THUMB, "the thumbnail made again");
+
+    /* its image changed, to something that's no picture: fetched once, noted, the cover it had kept */
+    snprintf(alt_image, sizeof alt_image, "nopic");
+    img_mode = IMG_TEXT;
+    podsync_refresh(url);
+    settle();
+    CHECK(img_calls == 2 && !strcmp(marker(dir, id), "https://example.com/nopic.jpg"), "not a picture: noted (%d) [%s]", img_calls, marker(dir, id));
+    CHECK(size_of(dir, id, "cover.565") == COVER && size_of(dir, id, "thumb.565") == THUMB, "the cover it had stays");
+    podsync_refresh(url);
+    settle();
+    CHECK(img_calls == 2, "not a picture: not fetched again (%d)", img_calls);
+
+    /* one over the cap: given up at once, one try, noted */
+    snprintf(alt_image, sizeof alt_image, "toobg");
+    img_mode = IMG_BIG;
+    podsync_refresh(url);
+    settle();
+    CHECK(img_calls == 3 && !strcmp(marker(dir, id), "https://example.com/toobg.jpg"), "too big: one try, noted (%d) [%s]", img_calls, marker(dir, id));
+    CHECK(size_of(dir, id, "cover.565.img") < 0 && size_of(dir, id, "cover.565") == COVER, "too big: nothing kept of it");
+    podsync_refresh(url);
+    settle();
+    CHECK(img_calls == 3, "too big: not fetched again (%d)", img_calls);
+
+    /* one the server says isn't there: one try, noted */
+    snprintf(alt_image, sizeof alt_image, "gone1");
+    img_mode = IMG_GONE;
+    podsync_refresh(url);
+    settle();
+    CHECK(img_calls == 4 && !strcmp(marker(dir, id), "https://example.com/gone1.jpg"), "not there: one try, noted (%d)", img_calls);
+
+    /* the network gone: three tries, nothing noted, tried again at the next refresh */
+    snprintf(alt_image, sizeof alt_image, "later");
+    img_mode = IMG_NET;
+    podsync_refresh(url);
+    settle();
+    CHECK(img_calls == 7 && !strcmp(marker(dir, id), "https://example.com/gone1.jpg"), "no network: nothing noted (%d) [%s]", img_calls, marker(dir, id));
+    img_mode = IMG_OK;
+    podsync_refresh(url);
+    settle();
+    CHECK(img_calls == 8 && !strcmp(marker(dir, id), "https://example.com/later.jpg"), "no network: fetched the next time (%d)", img_calls);
+    CHECK(size_of(dir, id, "cover.565") == COVER && size_of(dir, id, "thumb.565") == THUMB, "and kept");
+    alt_image[0] = '\0';
+    podsync_refresh(url);                             /* (back to the feed's own, for the rest) */
+    settle();
+    CHECK(img_calls == 9, "changed back: fetched (%d)", img_calls);
 }
 
 int main(void)
@@ -96,6 +231,32 @@ int main(void)
     int ne = n ? pod_episodes_load(dir, shows[0].id, e, 10) : 0;
     CHECK(ne == 3, "episodes on the card: %d", ne);
     CHECK(n && shows[0].seen == e[1].date && shows[0].latest == e[0].date, "only the newest is new");
+    if (n) pictures(dir, &shows[0]);
+
+    /* a show found in the directory: the picture the search gave first, at
+     * once, then its feed's own in its place */
+    {
+        pod_show_t d = {0}, all[4];
+        snprintf(d.title, sizeof d.title, "Found");
+        snprintf(d.url, sizeof d.url, "https://feeds.example.com/found.xml");
+        snprintf(d.image, sizeof d.image, "https://is1.example/600x600bb.jpg");
+        int before = img_calls;
+        podsync_subscribe(&d);
+        settle();
+        int k = pod_shows_load(dir, all, 4);
+        CHECK(k == 2 && img_calls == before + 2, "found: two images fetched (%d)", img_calls - before);
+        CHECK(!strcmp(img_last[1], "https://is1.example/600x600bb.jpg") && !strcmp(img_last[0], "https://example.com/cover.jpg"),
+              "the directory's, then the feed's [%s] [%s]", img_last[1], img_last[0]);
+        if (k == 2) {
+            CHECK(!strcmp(marker(dir, all[1].id), "https://example.com/cover.jpg"), "the feed's noted");
+            CHECK(size_of(dir, all[1].id, "thumb.565") == 34 * 34 * 2, "its thumbnail");
+        }
+        podsync_subscribe(&d);                        /* again: nothing fetched */
+        settle();
+        CHECK(img_calls == before + 2, "subscribed already: no image fetched");
+        podsync_unsubscribe(d.url);
+        settle();
+    }
 
     /* download, with progress; again: nothing */
     if (n && ne) {
@@ -227,13 +388,17 @@ int main(void)
     /* what a download cut short left: gone when the worker starts again */
     n = pod_shows_load(dir, shows, 4);
     if (n) {
-        char left[4][800], ui_tmp[800];
+        char left[6][800], ui_tmp[800];
+        int had_cover = size_of(dir, shows[0].id, "cover.565") > 0;
+        drop(dir, shows[0].id, "thumb.565");          /* (a show from before there were thumbnails) */
         snprintf(left[0], sizeof left[0], "%s/%s/0123456789ab.mp3.part", dir, shows[0].id);
         snprintf(left[1], sizeof left[1], "%s/%s/cover.565.tmp", dir, shows[0].id);
         snprintf(left[2], sizeof left[2], "%s/%s/cover.565.img", dir, shows[0].id);
         snprintf(left[3], sizeof left[3], "%s/%s/cover.565.img.part", dir, shows[0].id);
+        snprintf(left[4], sizeof left[4], "%s/%s/thumb.565.tmp", dir, shows[0].id);
+        snprintf(left[5], sizeof left[5], "%s/%s/cover.url.tmp", dir, shows[0].id);
         snprintf(ui_tmp, sizeof ui_tmp, "%s/%s/state.txt.tmp", dir, shows[0].id);   /* (the UI's, maybe being written) */
-        for (int i = 0; i < 4; i++) { FILE *f = fopen(left[i], "wb"); if (f) { fputs("x", f); fclose(f); } }
+        for (int i = 0; i < 6; i++) { FILE *f = fopen(left[i], "wb"); if (f) { fputs("x", f); fclose(f); } }
         FILE *uf = fopen(ui_tmp, "wb");
         if (uf) { fputs("x", uf); fclose(uf); }
         podsync_stop();
@@ -242,10 +407,12 @@ int main(void)
         int gone = 0;
         for (int i = 0; i < 200 && !gone; i++) {
             gone = 1;
-            for (int q = 0; q < 4; q++) gone &= stat(left[q], &sb) != 0;
+            for (int q = 0; q < 6; q++) gone &= stat(left[q], &sb) != 0;
+            gone &= size_of(dir, shows[0].id, "thumb.565") == 34 * 34 * 2;
             if (!gone) usleep(10000);
         }
         CHECK(gone, "a cut-short download's .part and a cover's leftovers removed at the start");
+        CHECK(had_cover && size_of(dir, shows[0].id, "thumb.565") == 34 * 34 * 2, "a cover without a thumbnail given one at the start");
         CHECK(stat(ui_tmp, &sb) == 0, "the UI's state.txt.tmp left alone");
         remove(ui_tmp);
     }

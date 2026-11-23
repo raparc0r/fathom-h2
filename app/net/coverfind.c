@@ -2,6 +2,7 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Covers found online: MusicBrainz and the Cover Art Archive, then Apple (coverfind.h). */
 #include "net/coverfind.h"
+#include "core/fsafe.h"
 
 #include <ctype.h>
 #include <pthread.h>
@@ -211,7 +212,7 @@ int cf_parse_mb(const char *json, size_t len, const cf_album_t *a, cf_match_t *o
         }
         m.year = year_of(date);
         m.source = CF_MUSICBRAINZ;
-        snprintf(m.image, sizeof m.image, "https://coverartarchive.org/release-group/%s/front-500", id);
+        snprintf(m.image, sizeof m.image, "https://coverartarchive.org/release-group/%s/front-250", id);   /* (shown at 136 px) */
         cf_rate(a, &m);
         out[n++] = m;
     }
@@ -234,8 +235,8 @@ int cf_parse_apple(const char *json, size_t len, const cf_album_t *a, cf_match_t
         if (json_member(r, "collectionName", &v)) json_string(v, m.title, sizeof m.title);
         if (json_member(r, "artistName", &v)) json_string(v, m.artist, sizeof m.artist);
         if (json_member(r, "releaseDate", &v)) json_string(v, date, sizeof date);
-        char *size = strstr(img, "100x100bb");      /* the same picture at 600 px */
-        if (size) snprintf(m.image, sizeof m.image, "%.*s600x600bb%s", (int)(size - img), img, size + 9);
+        char *size = strstr(img, "100x100bb");      /* the same picture at 300 px (shown at 136) */
+        if (size) snprintf(m.image, sizeof m.image, "%.*s300x300bb%s", (int)(size - img), img, size + 9);
         else snprintf(m.image, sizeof m.image, "%s", img);
         m.year = year_of(date);
         m.source = CF_APPLE;
@@ -370,41 +371,47 @@ static long fetch(const char *url, char *buf, size_t cap, const volatile int *ab
 }
 
 /* A picture, tried up to 3 times as an answer is: its size, -3 if the server
- * says it isn't there (the Cover Art Archive has none for that album), or -1 */
+ * says it isn't there (the Cover Art Archive has none for that album), or -1.
+ * Not again when it was the card that stopped it (HTTP_ERR_FULL, _WRITE). */
 static int64_t download(const char *url, const char *path, const volatile int *abort)
 {
     int64_t n = -1;
     for (int i = 0; i < 3; i++) {
         n = g_download_once(url, path, NULL, NULL, abort);
-        if (n > 0 || n == -3 || i == 2 || wait_ms(g_retry_ms[i], abort)) break;
+        if (n > 0 || n == -3 || n == HTTP_ERR_FULL || n == HTTP_ERR_WRITE || i == 2 || wait_ms(g_retry_ms[i], abort)) break;
     }
     return n;
 }
 
-/* Both searches' matches for a, best first (at most max): how many, or -1
- * if neither could be asked */
-static int search(const cf_album_t *a, cf_match_t *out, int max, const volatile int *abort, int *mb_n)
+/* One search's matches for a (mb: MusicBrainz's, else Apple's), best first
+ * (at most max): how many, or -1 if it couldn't be asked */
+static int search_one(const cf_album_t *a, int mb, cf_match_t *out, int max, const volatile int *abort)
 {
     char url[1600];
     char *buf = malloc(ANSWER_MAX);
     cf_match_t tmp[CF_MAX];
-    int n = 0, asked = 0;
-    *mb_n = 0;
     if (!buf) return -1;
-    cf_mb_url(a, url, sizeof url);
-    long len = fetch(url, buf, ANSWER_MAX, abort, 1);
-    int k = len > 0 ? cf_parse_mb(buf, (size_t)len, a, tmp, CF_MAX) : -1;
-    if (k >= 0) asked = 1;
-    for (int i = 0; i < k && n < max; i++) out[n++] = tmp[i];
-    *mb_n = n;
-    if (!*abort && !C.stop) {
-        cf_apple_url(a, url, sizeof url);
-        len = fetch(url, buf, ANSWER_MAX, abort, 0);
-        k = len > 0 ? cf_parse_apple(buf, (size_t)len, a, tmp, CF_MAX) : -1;
-        if (k >= 0) asked = 1;
-        for (int i = 0; i < k && n < max; i++) out[n++] = tmp[i];
-    }
+    if (mb) cf_mb_url(a, url, sizeof url);
+    else cf_apple_url(a, url, sizeof url);
+    long len = fetch(url, buf, ANSWER_MAX, abort, mb);
+    int k = len <= 0 ? -1 : mb ? cf_parse_mb(buf, (size_t)len, a, tmp, CF_MAX) : cf_parse_apple(buf, (size_t)len, a, tmp, CF_MAX);
     free(buf);
+    int n = 0;
+    for (int i = 0; i < k && n < max; i++) out[n++] = tmp[i];
+    return k < 0 ? -1 : n;
+}
+
+/* Both searches' matches for a, best first (at most max): how many, or -1
+ * if neither could be asked */
+static int search(const cf_album_t *a, cf_match_t *out, int max, const volatile int *abort)
+{
+    int n = 0, asked = 0;
+    int k = search_one(a, 1, out, max, abort);
+    if (k >= 0) { asked = 1; n = k; }
+    if (!*abort && !C.stop) {
+        k = search_one(a, 0, out + n, max - n, abort);
+        if (k >= 0) { asked = 1; n += k; }
+    }
     if (*abort || C.stop || !asked) return -1;
     return n;
 }
@@ -459,8 +466,7 @@ static void drop_pics(void)
 static void do_find(unsigned gen, cf_album_t a)
 {
     cf_match_t m[CF_MAX * 2];
-    int mb_n;
-    int n = search(&a, m, CF_MAX * 2, &C.find_abort, &mb_n);
+    int n = search(&a, m, CF_MAX * 2, &C.find_abort);
     if (n > 0) qsort(m, (size_t)n, sizeof *m, by_score);
     int keep = 0;                                      /* those with anything in common */
     for (int i = 0; i < n && keep < CF_MAX; i++)
@@ -532,25 +538,29 @@ static int do_batch_one(const cf_album_t *a)
     pthread_mutex_unlock(&C.mu);
     if (kept_meanwhile || (library_found_cover_path(a->key, "none", none, sizeof none) == 0 && stat(none, &st) == 0))
         return 1;
+    /* Each source's sure match, MusicBrainz's first. Apple is asked only when
+     * MusicBrainz had none, or none whose picture could be had: for most
+     * albums one lookup (and one more TLS connection) fewer. */
     cf_match_t m[CF_MAX * 2];
-    int mb_n;
-    int n = search(a, m, CF_MAX * 2, &C.batch_abort, &mb_n);
-    if (n < 0) return -1;
-    /* each source's sure match, MusicBrainz's first; one whose picture fails: the other */
-    int picks[2] = {cf_pick(a, m, mb_n), cf_pick(a, m + mb_n, n - mb_n)};
-    if (picks[1] >= 0) picks[1] += mb_n;
-    int kept = 0;
+    int n = 0, asked = 0, kept = 0;
     for (int s = 0; s < 2 && !kept && !C.batch_abort && !C.stop; s++) {
-        if (picks[s] < 0) continue;
+        int k = search_one(a, s == 0, m + n, CF_MAX, &C.batch_abort);
+        if (C.batch_abort || C.stop) return -1;
+        if (k < 0) continue;                           /* (couldn't be asked: the other may) */
+        asked = 1;
+        int pick = cf_pick(a, m + n, k);
+        if (pick >= 0) pick += n;
+        n += k;
+        if (pick < 0) continue;
         char tmp[600], dest[1200];
         snprintf(tmp, sizeof tmp, "%s/.batch.jpg", C.dir);
         uint16_t *large, *small;
-        if (picture(m[picks[s]].image, tmp, &C.batch_abort, &large, &small)) continue;
+        if (picture(m[pick].image, tmp, &C.batch_abort, &large, &small)) continue;
         /* (with the lock: a keep from Menu > Find cover for this album now
          * either came first, and this one goes, or renames over it after) */
         pthread_mutex_lock(&C.mu);
         int mine = !user_kept(a->id);
-        int moved = mine && library_found_cover_path(a->key, "jpg", dest, sizeof dest) == 0 && rename(tmp, dest) == 0;
+        int moved = mine && library_found_cover_path(a->key, "jpg", dest, sizeof dest) == 0 && file_replace(tmp, dest) == 0;
         pthread_mutex_unlock(&C.mu);
         if (!moved) {
             remove(tmp);
@@ -574,6 +584,7 @@ static int do_batch_one(const cf_album_t *a)
         free(large);
         free(small);
     }
+    if (!asked) return -1;
     pthread_mutex_lock(&C.mu);
     if (kept) C.bst.found++;
     else {
@@ -765,7 +776,7 @@ int cf_find_keep(int k, uint16_t *large, uint16_t *small)
     find_file(k, from, sizeof from);
     /* (with the lock, and noted for a batch under way: it won't put its own over this) */
     pthread_mutex_lock(&C.mu);
-    int r = library_found_cover_path(key, "jpg", to, sizeof to) || rename(from, to) ? -1 : 0;
+    int r = library_found_cover_path(key, "jpg", to, sizeof to) || file_replace(from, to) ? -1 : 0;
     if (r == 0 && !user_kept(id)) {
         if (C.n_user_kept == (int)(sizeof C.user_kept / sizeof C.user_kept[0])) C.n_user_kept = 0;   /* (32 in one batch: start over) */
         C.user_kept[C.n_user_kept++] = id;

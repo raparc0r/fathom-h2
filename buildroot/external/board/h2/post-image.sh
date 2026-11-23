@@ -20,7 +20,15 @@ gzip -9 -n -c "$BINARIES_DIR/vmlinux.bin" > "$BINARIES_DIR/vmlinux.bin.gz"
 
 # Console on the USB gadget's serial port only (there's no text console on the
 # screen: h2boot's logo stays until the player; messages are in dmesg and pstore).
-printf '%s\n' "loglevel=7 panic=10 console=ttyGS0,115200 snd_usb_audio.lowlatency=0 firmware_class.path=/mnt/sd/fathom/firmware" > "$sd/linux_cmdline.txt"
+# lpj: the delay loop's count as the kernel measures it at every start on this
+# CPU (always 5038080 at 1008 MHz: "Calibrating delay loop" in dmesg), given so
+# it needn't be measured: 90 ms of each start.
+# driver_async_probe=dwc2: the USB controller's driver waits 0.3 s on the
+# controller as it sets it up (forced into host mode and back to read what it
+# can do), and everything after it waited too: set up beside the rest instead
+# (init starts 0.27 s sooner; S30usbgadget waits for the controller if it
+# isn't there yet).
+printf '%s\n' "loglevel=7 panic=10 console=ttyGS0,115200 snd_usb_audio.lowlatency=0 firmware_class.path=/mnt/sd/fathom/firmware lpj=5038080 driver_async_probe=dwc2" > "$sd/linux_cmdline.txt"
 
 # The player and its assets, run from the card (see S90fathom): fathom/bin, fathom/assets
 if [ -f "$BINARIES_DIR/fathom-player" ]; then

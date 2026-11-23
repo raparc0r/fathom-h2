@@ -17,17 +17,46 @@
 void http_set_version(const char *version);
 
 /* The body of url into buf (NUL-terminated, at most cap - 1 bytes): its length,
- * or -1 (no network, an HTTP error, a certificate that doesn't check out, or
- * *abort set meanwhile; abort may be NULL). A body longer than cap - 1 is cut
- * there and its full length isn't known: -2. -3: the server says it isn't
- * there (HTTP 4xx), so trying again won't help. */
+ * or -1 (no network, an HTTP error, a certificate that doesn't check out, a
+ * body that stopped short of the length the server gave, or *abort set
+ * meanwhile; abort may be NULL). A body longer than cap - 1 is cut there and
+ * its full length isn't known: -2. -3: the server says it isn't there (HTTP
+ * 4xx), so trying again won't help. */
 long http_get(const char *url, char *buf, size_t cap, const volatile int *abort);
+/* What http_get returns for a body read: n bytes of total (the length the
+ * server gave; 0 or less: none given), cut (the buffer filled and there was
+ * more), failed (the read ended in an error), aborted. Apart for the tests. */
+long http_get_result(size_t n, int64_t total, int cut, int failed, int aborted);
 
 /* The body of url saved to path (written to path.part, renamed when complete):
- * its size, or -1 (-3: the server says it isn't there, as for http_get). progress (may be NULL) is called now and then with the bytes
- * so far and the total (0 if the server didn't say). */
+ * its size, or -1 (-3: the server says it isn't there, as for http_get), or
+ * what stopped it at the card's end, where trying again won't help either:
+ * HTTP_ERR_FULL (the card would be left with too little free) or
+ * HTTP_ERR_WRITE (it couldn't be written: the .part not made, a write or the
+ * rename failed). A connection that goes partway is taken up again where it
+ * stopped, when the server allows (http.c). progress (may be NULL) is called
+ * now and then with the bytes so far and the total (0 if the server didn't
+ * say). */
+#define HTTP_ERR_FULL  (-4)
+#define HTTP_ERR_WRITE (-5)
 typedef void (*http_progress_fn)(uint64_t done, uint64_t total, void *ctx);
 int64_t http_download(const char *url, const char *path, http_progress_fn progress, void *ctx,
                       const volatile int *abort);
+
+/* The same, tried up to 3 times, 2 s and then 5 s apart, while they fail for
+ * want of the network (-1): a name lookup fails now and then (a home router
+ * slow to answer for a name it hasn't looked up lately: "Try again"), and a
+ * download goes through several hosts' redirects. Not again after -2 or -3
+ * (the server answered) or HTTP_ERR_FULL, HTTP_ERR_WRITE (the card), nor once
+ * *abort is set (the wait ends at once). */
+long http_get_retry(const char *url, char *buf, size_t cap, const volatile int *abort);
+int64_t http_download_retry(const char *url, const char *path, http_progress_fn progress, void *ctx,
+                            const volatile int *abort);
+
+/* tests: what one try is (NULL: http_get, http_download) and the two waits (ms) */
+typedef long (*http_get_fn)(const char *url, char *buf, size_t cap, const volatile int *abort);
+typedef int64_t (*http_download_fn)(const char *url, const char *path, http_progress_fn progress, void *ctx,
+                                    const volatile int *abort);
+void http_test_tries(http_get_fn get, http_download_fn download, int wait1_ms, int wait2_ms);
 
 #endif

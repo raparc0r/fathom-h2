@@ -221,7 +221,7 @@ static void t_tags(const uint8_t *d, size_t n, const char *ext)
 
 static void t_art(const uint8_t *d, size_t n)
 {
-    art_limits_t lim = {4 << 20, 4LL << 20, 4 << 20};
+    art_limits_t lim = {4 << 20, 4LL << 20, 4 << 20, 0};
     unsigned char *rgb = NULL;
     int w, h;
     if (art_decode_mem(d, n, 120, &lim, &rgb, &w, &h) == 0) free(rgb);

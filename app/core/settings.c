@@ -2,6 +2,9 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 #define _DEFAULT_SOURCE   /* getline, strdup (musl, glibc) */
 #include "core/settings.h"
+#include "core/fsafe.h"
+
+#include <errno.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,7 +66,14 @@ int settings_load(const char *path)
     clear();
     g_dirty = g_short = 0;
     FILE *f = fopen(path, "re");
-    if (!f) return 0;
+    if (!f) {
+        /* None yet (a first start): the defaults. There but unreadable (the
+         * card's reads failing, no memory, no handles): not to be taken for
+         * none, or the next save would write a file with only what was set
+         * since, over the owner's settings. Nothing is saved this session. */
+        if (errno != ENOENT) g_short = 1;
+        return 0;
+    }
     char *line = NULL;
     size_t cap = 0;
     while (getline(&line, &cap, f) >= 0) {
@@ -124,7 +134,7 @@ int settings_save(void)
     for (int i = 0; i < g_n; i++) fprintf(f, "%s = %s\n", g_e[i].key, g_e[i].value);
     int ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
     ok = fclose(f) == 0 && ok;
-    if (!ok || rename(tmp, g_path)) { unlink(tmp); return -1; }
+    if (!ok || file_replace(tmp, g_path)) { unlink(tmp); return -1; }
     g_dirty = 0;
     return 0;
 }

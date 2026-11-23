@@ -10,6 +10,9 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "net/http.h"
 #include "net/json.h"
@@ -163,6 +166,9 @@ int rdir_parse_stations(const char *text, size_t len, radio_station_t *st, rdir_
         cut_utf8(name, sizeof s->name);
         snprintf(s->name, sizeof s->name, "%s", name);
         snprintf(s->url, sizeof s->url, "%s", url);
+        char icon[512];                      /* its logo, when the directory has one that can be kept */
+        member_str(o, "favicon", icon, sizeof icon);
+        if (radio_icon_ok(icon)) snprintf(s->icon, sizeof s->icon, "%s", icon);
         if (meta) {
             rdir_meta_t *m = &meta[n];
             memset(m, 0, sizeof *m);
@@ -284,7 +290,8 @@ static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static rdir_fetch_fn g_fetch = http_get;
 static int g_server = -1;        /* the server that answered last (under mu); -1: none yet */
 static job_t *g_job;             /* the request the UI waits for (the UI's thread only) */
-static int g_clicking;           /* (under mu) */
+static int g_clicking;           /* (under mu) the click worker is running */
+static char *g_click_url;        /* (under mu) the play it counts next */
 
 void rdir_set_fetch(rdir_fetch_fn fn) { g_fetch = fn ? fn : http_get; }
 
@@ -411,34 +418,59 @@ void rdir_cancel(void)
     }
 }
 
+/* A play is counted the moment a station is chosen, which is when the
+ * station's own connection needs the one core: the request (a TLS handshake
+ * for an answer that's thrown away) waits a few seconds first, and runs at
+ * the lowest priority. A station chosen meanwhile is the one counted. */
+#define CLICK_WAIT_MS 5000
+static int g_click_wait_ms = CLICK_WAIT_MS;
+
+void rdir_test_click_wait(int ms) { g_click_wait_ms = ms >= 0 ? ms : CLICK_WAIT_MS; }
+
 static void *click_run(void *arg)
 {
-    char *url = arg, buf[4096];
-    g_fetch(url, buf, sizeof buf, NULL);
-    free(url);
-    pthread_mutex_lock(&mu);
-    g_clicking = 0;
-    pthread_mutex_unlock(&mu);
-    return NULL;
+    (void)arg;
+#ifdef __linux__
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);   /* (this thread only) */
+#endif
+    for (;;) {
+        struct timespec ts = {g_click_wait_ms / 1000, (long)(g_click_wait_ms % 1000) * 1000000L};
+        nanosleep(&ts, NULL);
+        pthread_mutex_lock(&mu);
+        char *url = g_click_url;
+        g_click_url = NULL;
+        pthread_mutex_unlock(&mu);
+        if (url) {
+            char buf[4096];
+            g_fetch(url, buf, sizeof buf, NULL);
+            free(url);
+        }
+        pthread_mutex_lock(&mu);
+        int more = g_click_url != NULL;           /* another chosen while that one was counted */
+        if (!more) g_clicking = 0;
+        pthread_mutex_unlock(&mu);
+        if (!more) return NULL;
+    }
 }
 
 void rdir_count_click(const char *uuid)
 {
     if (!uuid || !uuid[0]) return;
-    pthread_mutex_lock(&mu);
-    int busy = g_clicking;
-    if (!busy) g_clicking = 1;
-    pthread_mutex_unlock(&mu);
-    if (busy) return;
     char *url = malloc(256);
-    if (url) {
-        char id[64];
-        encode(id, sizeof id, uuid);
-        snprintf(url, 256, "https://%s/json/url/%s", SERVERS[first_server()], id);
-    }
-    if (!url || spawn(click_run, url)) {
-        free(url);
+    if (!url) return;
+    char id[64];
+    encode(id, sizeof id, uuid);
+    snprintf(url, 256, "https://%s/json/url/%s", SERVERS[first_server()], id);
+    pthread_mutex_lock(&mu);
+    free(g_click_url);                            /* (one not counted yet: this one instead) */
+    g_click_url = url;
+    int start = !g_clicking;
+    if (start) g_clicking = 1;
+    pthread_mutex_unlock(&mu);
+    if (start && spawn(click_run, NULL)) {
         pthread_mutex_lock(&mu);
+        free(g_click_url);
+        g_click_url = NULL;
         g_clicking = 0;
         pthread_mutex_unlock(&mu);
     }

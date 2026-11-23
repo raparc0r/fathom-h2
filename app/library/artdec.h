@@ -14,6 +14,9 @@
  *     come, so only a few rows are ever held (interlaced ones: as below).
  *   - Anything else stb_image reads (and interlaced PNGs): whole, in memory,
  *     within the limits.
+ *
+ * A PNG's transparency is left out (its colours as they are) unless the limits
+ * say `matte`: then it's laid over white, as a logo drawn for a web page is.
  */
 #ifndef FATHOM_ARTDEC_H
 #define FATHOM_ARTDEC_H
@@ -25,6 +28,7 @@ typedef struct {
     long jpeg_memory;       /* libjpeg's working memory for one image */
     long long max_pixels;   /* an image decoded whole (or a PNG's shrunk result) */
     long max_file;          /* encoded bytes read into memory for those */
+    int matte;              /* 1: a PNG's transparent parts over white (0, as when left out: its colours as they are) */
 } art_limits_t;
 
 /* The image `len` bytes long (-1: to the end of the file) at `off` in f,

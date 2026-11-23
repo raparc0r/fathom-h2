@@ -29,6 +29,11 @@ static void r_flush_soft(void *c)
     if (cur()->flush_soft) cur()->flush_soft(cur()->ctx);
     else cur()->flush(cur()->ctx);
 }
+static long r_join_depth(void *c)
+{
+    (void)c;
+    return cur()->join_depth ? cur()->join_depth(cur()->ctx) : 0;
+}
 static int r_set_eq(void *c, const eq_profile_t *p)
 {
     (void)c;
@@ -40,7 +45,7 @@ void out_router_create(audio_output_t *out, const audio_output_t *alsa, const au
     R.alsa = *alsa;
     if (bt) R.bt = *bt;
     *out = (audio_output_t){r_open, r_write, r_delay, r_drain, r_flush, r_pause, r_close, r_describe, &R, r_set_eq, r_can_cut,
-                            r_flush_soft};
+                            r_flush_soft, r_join_depth};
 }
 
 void out_router_alsa(void *ctx, void *device)

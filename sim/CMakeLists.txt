@@ -35,3 +35,5 @@ endif()
 # The UI redraws only what changed: nothing at rest or with the screen off, and
 # the panel (direct mode, as on the H2) always matches the screen drawn whole.
 add_test(NAME ui_redraw COMMAND fathom-sim --bench 1 WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+# A station chosen while Wi-Fi is still joining is kept and starts once it has joined.
+add_test(NAME ui_wifi_wait COMMAND fathom-sim --wifi-wait)
