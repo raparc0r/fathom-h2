@@ -19,9 +19,9 @@ the H2, so you can go back to it any time. The Rockbox port for the H2 was instr
 sorting out the hardware, though. Rockbox is a great project, and if you haven't tried it,
 I recommend you check it out: [rockbox.org](https://www.rockbox.org).
 
-| | | | |
-|---|---|---|---|
-| ![Home](screenshots/studio-mint-home.png) | ![Now Playing](screenshots/studio-mint-nowplaying.png) | ![Albums, Pixel Pastel](screenshots/pixel-pastel-albums.png) | ![Quick settings, Studio Pastel](screenshots/studio-pastel-quick.png) |
+![Now Playing, Home and Settings](screenshots/showcase-playing-home-settings.png)
+
+![Albums in the Studio Pastel theme, the theme selector on Studio Ember, and Search](screenshots/showcase-albums-themes-search.png)
 
 ## Features
 
