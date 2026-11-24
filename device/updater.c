@@ -4,7 +4,7 @@
  * Updates over Wi-Fi (Settings > About > Check for updates), on a worker
  * thread at the lowest priority (nice 19: the audio thread is SCHED_FIFO and
  * the UI comes first too), one step at a time, each only when asked (the
- * check also by itself once a day when Settings > About > Check automatically
+ * check also by itself three times a day when Settings > About > Check automatically
  * is on, quietly: updater_check_quiet):
  *
  *   check     GitHub's latest release (pre-releases and drafts aren't

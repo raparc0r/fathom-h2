@@ -188,6 +188,12 @@ target_link_libraries(test_crossfeed PRIVATE fathom_player)
 target_include_directories(test_crossfeed PRIVATE tests)
 target_compile_options(test_crossfeed PRIVATE ${FATHOM_WARNINGS})
 add_test(NAME crossfeed COMMAND test_crossfeed WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# Stereo width: the arithmetic, and through the engine
+add_executable(test_width tests/test_width.c)
+target_link_libraries(test_width PRIVATE fathom_player)
+target_include_directories(test_width PRIVATE tests)
+target_compile_options(test_width PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME width COMMAND test_width WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_executable(test_tempo tests/test_tempo.c)
 target_link_libraries(test_tempo PRIVATE fathom_player m)

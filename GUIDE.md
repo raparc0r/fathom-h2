@@ -11,7 +11,7 @@ does.
 | Wheel | move through a list | |
 | Play | choose; on Now Playing, play or pause | |
 | Back | go back | jump to Now Playing, and back |
-| Menu | options for what's selected (shuffle an album or an artist, play next, add to a playlist, go to the album...) | quick settings: brightness, shuffle, repeat, EQ, Bluetooth, Wi-Fi, sleep timer |
+| Menu | options for what's selected (shuffle an album or an artist, play next, add to a playlist, go to the album...) | quick settings: brightness, shuffle, repeat, EQ, stereo width, Bluetooth, Wi-Fi, sleep timer |
 | Menu + wheel | | brightness: hold Menu and turn the wheel |
 | Prev / Next | previous or next track | seek |
 | Power | screen off or on | switch off (2 seconds) |
@@ -29,6 +29,22 @@ as one file with a CUE sheet.
 You can also take the card out and put it back: Fathom stops, shows "No/bad card", and
 starts again with your new music when the card is back. Over Wi-Fi, the network drive
 (below) lets you copy music while the H2 plays.
+
+## Search
+
+Home → **Search**: turn the wheel to a letter and press Play to type it (Back takes one
+away; Prev and Next move the cursor back into what you've typed, to put a letter right
+without deleting the rest); the results change as you type, and **Results** on the wheel (or Play twice) takes
+you down to them. From then on the wheel moves through the list, the row with what you
+typed included: Back takes you up to that row, where Play types again and Back once more
+leaves Search. Artists, albums and songs come in one list, each with its icon, the
+names closest to what you typed first: the name itself, then names that start with it,
+then names that have it, then names with all your words somewhere. A word you've typed a
+space after counts as a whole word, so "in the" finds *In the Night* and not *Infinite*.
+Typing an artist's name gives the artist: open it for the albums and songs. If hardly
+anything matches, looser matches follow: words that only begin the way you typed ("dav
+mat"), and an artist's name with a title ("marley exodus"). Up to 40 results are shown:
+type a little more to narrow them.
 
 ## Smart playlists
 
@@ -117,7 +133,14 @@ is charging and not playing, which can take hours for a big library. While it me
 setting shows how far it has got ("Track, 63%"), and Menu on it gives the number of songs.
 With levelling off (the default) nothing is measured.
 
-**Pure mode** (Settings → Sound) turns off the EQ, crossfeed, balance and volume levelling in
+**Stereo width** (Settings → Sound → Stereo width: press Play, turn the wheel, Play again)
+sets how far apart left and right are: Mono, 50 %, 75 %, Off, then 110 % to 200 % in tens.
+Narrower brings sounds panned hard to one side toward the middle; Mono is for one earbud;
+wider spreads them further and turns the level down so nothing clips (0.8 dB at 110 %,
+3.5 dB at 150 %, 6 dB at 200 %). Each output keeps its own, and at Off the sound is left exactly
+as it is.
+
+**Pure mode** (Settings → Sound) turns off the EQ, crossfeed, stereo width, balance and volume levelling in
 one go, and Now Playing shows "Bit+" while the music reaches the DAC exactly as in the file.
 
 ## Bluetooth headphones
@@ -236,12 +259,13 @@ about 1 to 2 MB/s, so for a whole library USB drive mode is faster.
 
 Settings → Power → Battery shows how much charge is left and roughly how long it lasts,
 and opens a graph of the last day or week. **Power off when idle** switches the H2 off
-when it's paused and untouched on battery (15 minutes by default), and the **sleep timer**
-stops the music after a while or at the end of the album.
+when it's paused and untouched on battery (15 minutes by default). The **sleep timer**
+(Settings → Playback, and in quick settings) stops the music after a while or at the end
+of the album.
 
 ## Updating Fathom
 
-Once a day, while the H2 rests on a Wi-Fi network it has joined before, Fathom asks GitHub
+Three times a day, while the H2 rests on a Wi-Fi network it has joined before, Fathom asks GitHub
 whether there's a newer version, tells you the next time you wake the H2, and puts
 **Update available!** at the top of Home. Choose it, then **Install new version** to get
 it, or **Ignore** to hide it until a newer one comes out. Turn it off in Settings → About

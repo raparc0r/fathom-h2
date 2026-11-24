@@ -4,6 +4,7 @@
 #include "gain.h"
 #include "tempo.h"
 #include "crossfeed.h"
+#include "width.h"
 #include "core/lat.h"
 
 #include <errno.h>
@@ -92,6 +93,8 @@ struct engine {
     eq_t *eq;                  /* the filters for the current track (engine thread only) */
     int eq_in_out;             /* the output runs the EQ itself (set_eq) */
     int xf_level;              /* crossfeed wanted (engine_set_crossfeed): XF_OFF.. */
+    int width;                 /* stereo width wanted (engine_set_width), percent: 100 = as recorded */
+    int width_dirty;           /* (under mu) it changed: the output may have to open deeper for it */
     crossfeed_t *xf;           /* ...its filter for the current track (engine thread only) */
     int dop;                   /* DSD goes out as DoP (engine_set_dop) */
     char path[1024];           /* the current track's */
@@ -206,7 +209,8 @@ static audio_format_t out_format(const engine_t *e, const audio_format_t *f)
     o.stream = (uint8_t)e->dec_net;
     if (f->dop) return o;                      /* DoP: never changed, 24 bits already */
     int changed = (e->eq_on && !e->eq_in_out) || e->gain * e->track_gain != 1.0f ||
-                  (f->channels == 2 && (e->bal[0] != 1.0f || e->bal[1] != 1.0f || e->xf_level != XF_OFF));
+                  (f->channels == 2 && (e->bal[0] != 1.0f || e->bal[1] != 1.0f || e->xf_level != XF_OFF ||
+                                        e->width != WIDTH_NORMAL));
     if (changed && o.bits && o.bits < 24) o.bits = 24;
     return o;
 }
@@ -654,6 +658,11 @@ static void *run(void *arg)
         }
 
         eq_sync(e, 1);                               /* the EQ changed meanwhile */
+        if (e->width_dirty) {                        /* ...or the width: on, a 16-bit output opens at 24 */
+            e->width_dirty = 0;
+            audio_format_t wo = out_format(e, &e->fmt);
+            if (e->out_open && !same_out_format(&e->out_fmt, &wo)) out_deepen(e, &wo, 1);
+        }
         if (!e->out_open || e->rewind) continue;     /* (reopened: back to what was heard, or it didn't open) */
         if (shallow_now(e) && queue_over(e) && nap(e)) continue;   /* (a fade, a setting just changed) */
         decoder_t *dec = e->dec;
@@ -662,6 +671,7 @@ static void *run(void *arg)
         int ch = e->fmt.channels;
         float gain = e->fmt.dop ? 1.0f : e->gain * e->fade * e->track_gain;
         float bl = ch == 2 && !e->fmt.dop ? e->bal[0] : 1.0f, br = ch == 2 && !e->fmt.dop ? e->bal[1] : 1.0f;
+        int width = ch == 2 && !e->fmt.dop ? e->width : WIDTH_NORMAL;
         long w = 0;
         unsigned cut = e->cut;
         /* faster: through the stretch (made for this format, afresh when asked) */
@@ -698,6 +708,11 @@ static void *run(void *arg)
         long n = decoder_read(dec, e->buf, CHUNK_FRAMES);
         e->net_read_ms = 0;
         if (n > 0) {
+            if (width != WIDTH_NORMAL) {             /* the width first: the balance is of what comes out of it */
+                int32_t ka, kb;
+                width_coeffs(width, &ka, &kb);
+                width_run(e->buf, n, ka, kb);
+            }
             if (bl != 1.0f || br != 1.0f) gain_run2(e->buf, n, gain_q28(gain * bl), gain_q28(gain * br));
             else if (gain != 1.0f) gain_run(e->buf, n * ch, gain_q28(gain));
             if (eq) eq_run(eq, e->buf, n);
@@ -805,6 +820,7 @@ engine_t *engine_new(const audio_output_t *out)
     e->track_gain = 1.0f;
     e->bal[0] = e->bal[1] = 1.0f;
     e->speed = 100;
+    e->width = WIDTH_NORMAL;
     /* Priority inheritance: the UI thread holding the lock (engine_status)
      * runs at the playback thread's priority until it lets go, so a busy H2
      * can't hold playback up behind it. */
@@ -998,6 +1014,19 @@ void engine_set_crossfeed(engine_t *e, int level)
     pthread_mutex_unlock(&e->mu);
 }
 
+void engine_set_width(engine_t *e, int pct)
+{
+    pthread_mutex_lock(&e->mu);
+    int w = pct < WIDTH_MONO ? WIDTH_MONO : pct > WIDTH_MAX ? WIDTH_MAX : pct;
+    if (w != e->width) {
+        e->width = w;
+        e->width_dirty = 1;
+        sound_changed(e);
+        pthread_cond_signal(&e->cv);
+    }
+    pthread_mutex_unlock(&e->mu);
+}
+
 void engine_set_dop(engine_t *e, int on)
 {
     pthread_mutex_lock(&e->mu);
@@ -1096,6 +1125,7 @@ void engine_status(engine_t *e, eng_status_t *st)
     st->start_paused = e->start_paused;
     st->eq = e->eq_on && !e->fmt.dop;
     st->crossfeed = e->xf_level != XF_OFF && !e->fmt.dop && e->fmt.channels == 2 ? e->xf_level : XF_OFF;
+    st->width = !e->fmt.dop && e->fmt.channels == 2 ? e->width : WIDTH_NORMAL;
     st->stream = e->connecting || e->dec_net;
     uint32_t since = e->net_read_ms;
     st->connecting = e->connecting || (e->dec_net && since && mono_ms() - since > STALL_MS);
@@ -1110,7 +1140,8 @@ void engine_status(engine_t *e, eng_status_t *st)
     st->balance[0] = stereo ? e->bal[0] : 1.0f;
     st->balance[1] = stereo ? e->bal[1] : 1.0f;
     st->untouched = e->fmt.dop || (!e->eq_on && e->gain * e->track_gain == 1.0f && e->fade == 1.0f &&
-                                   st->balance[0] == 1.0f && st->balance[1] == 1.0f && st->crossfeed == XF_OFF);
+                                   st->balance[0] == 1.0f && st->balance[1] == 1.0f && st->crossfeed == XF_OFF &&
+                                   st->width == WIDTH_NORMAL);
     if (e->fmt.rate) {
         long delay = e->out_open ? e->out.delay(e->out.ctx) : 0;
         int64_t heard = e->rewind ? (int64_t)e->rewind_to : (int64_t)e->pos_frames - ahead_frames(e, delay);

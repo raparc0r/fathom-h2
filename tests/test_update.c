@@ -282,8 +282,9 @@ static void test_versions(void)
     CHECK(update_is_newer("v0.8.0", "unknown"));
     CHECK(!update_is_newer("garbage", "v0.7.0"));
 
-    /* automatic checks: once a day, a failed try again after an hour */
-    long day = UPDATE_AUTO_EVERY, t = 1795000000;
+    /* automatic checks: three times a day (every 8 hours), a failed try again after an hour */
+    long day = UPDATE_AUTO_EVERY, t = 1795000000;   /* (the time between two) */
+    CHECK(UPDATE_AUTO_EVERY == 8 * 3600);
     CHECK(update_auto_due(t, 0, 0));                          /* never checked */
     CHECK(!update_auto_due(t, t - 60, t - 60));               /* answered a minute ago */
     CHECK(!update_auto_due(t, t - day + 60, t - day + 60));

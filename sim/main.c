@@ -12,6 +12,7 @@
  *   fathom-sim --lang-check FILE               headless: every screen's words through the menus, in
  *                                              the language FILE (tools/lang/check.py)
  *   fathom-sim --wifi-wait                     headless: a station chosen while Wi-Fi is still joining
+ *   fathom-sim --type-test                     headless: typing with the wheel, the cursor moved with Prev and Next
  *                                              plays once it has joined (a test)
  *
  * Keys: Up/Down = wheel, Enter = centre (Play), Esc/Backspace = Back,
@@ -20,6 +21,8 @@
  *       [ / ] = hold Menu + wheel (brightness), , / . = hold Prev / Next (seek),
  *       T = next theme, Q = quit.
  */
+#include <FLAC/metadata.h>
+#include <FLAC/stream_encoder.h>
 #include <SDL.h>
 #include <ftw.h>
 #include <limits.h>
@@ -45,6 +48,7 @@
 #include "net/coverfind.h"
 #include "net/radioicon.h"
 #include "audio/crossfeed.h"
+#include "audio/width.h"
 #include "lvgl.h"
 #include "player/player.h"
 #include "ui/theme.h"
@@ -331,11 +335,20 @@ static int sim_ssh_state(ui_ssh_t *st)
 }
 static void sim_ssh_do(int what) { (void)what; }
 /* Sound > Balance and Volume limit, as on the headphone jack (balance on the engine) */
-static int g_sim_bal, g_sim_limit, g_sim_xf;
+static int g_sim_bal, g_sim_limit, g_sim_xf, g_sim_width = 3;
+static const int SIM_WIDTHS[] = {WIDTH_MONO, 50, 75, WIDTH_NORMAL, 110, 120, 130, 140, 150, 160, 170, 180, 190, WIDTH_MAX};
+#define SIM_N_WIDTHS ((int)(sizeof SIM_WIDTHS / sizeof SIM_WIDTHS[0]))
 static void sim_sound_value(int what, char *out, size_t cap)
 {
     char n[16];   /* (translated, as the H2's) */
     if (what == UI_SOUND_CROSSFEED) { snprintf(out, cap, "%s", tr(crossfeed_name(g_sim_xf))); return; }
+    if (what == UI_SOUND_WIDTH) {
+        int w = SIM_WIDTHS[g_sim_width];
+        if (w == WIDTH_MONO) snprintf(out, cap, "%s", tr("Mono"));
+        else if (w == WIDTH_NORMAL) snprintf(out, cap, "%s", tr("Off"));
+        else snprintf(out, cap, "%d %%", w);
+        return;
+    }
     snprintf(n, sizeof n, "%d", abs(g_sim_bal));
     if (what == UI_SOUND_BALANCE && !g_sim_bal) snprintf(out, cap, "%s", tr("Centre"));
     else if (what == UI_SOUND_BALANCE) tr_fill(out, cap, g_sim_bal < 0 ? "%s dB left" : "%s dB right", n, NULL);
@@ -347,6 +360,11 @@ static int sim_sound_adjust(int what, int dir)
     if (what == UI_SOUND_CROSSFEED) {
         g_sim_xf = (g_sim_xf + (dir < 0 ? XF_LEVELS - 1 : 1)) % XF_LEVELS;
         if (g_eng) engine_set_crossfeed(g_eng, g_sim_xf);
+        return 0;
+    }
+    if (what == UI_SOUND_WIDTH) {
+        g_sim_width = g_sim_width + dir < 0 ? 0 : g_sim_width + dir >= SIM_N_WIDTHS ? SIM_N_WIDTHS - 1 : g_sim_width + dir;
+        if (g_eng) engine_set_width(g_eng, SIM_WIDTHS[g_sim_width]);
         return 0;
     }
     if (what == UI_SOUND_BALANCE) {
@@ -713,7 +731,15 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 settings_set("update.found", "");
             } else if (!strncmp(screens[s], "whatsnew", 8)) {   /* after an update: the release's points (and turned to the end) */
                 ui_show("home");
-                ui_set_whats_new(SIM_WHATS_NEW_VERSION, SIM_WHATS_NEW, 1);
+                /* FATHOM_SIM_WHATSNEW: a release's whatsnew.txt instead (its version, then its points) */
+                char wv[32] = "", wt[1024] = "";
+                FILE *wf = getenv("FATHOM_SIM_WHATSNEW") ? fopen(getenv("FATHOM_SIM_WHATSNEW"), "r") : NULL;
+                if (wf) {
+                    if (fgets(wv, sizeof wv, wf)) wv[strcspn(wv, "\r\n")] = '\0';
+                    wt[fread(wt, 1, sizeof wt - 1, wf)] = '\0';
+                    fclose(wf);
+                }
+                ui_set_whats_new(wt[0] ? wv : SIM_WHATS_NEW_VERSION, wt[0] ? wt : SIM_WHATS_NEW, 1);
                 if (!strcmp(screens[s], "whatsnewend")) for (int k = 0; k < 8; k++) ui_key(UI_KEY_DOWN);
             } else if (!strcmp(screens[s], "aboutwn")) {  /* Settings > About, its What's new row */
                 ui_set_whats_new(SIM_WHATS_NEW_VERSION, SIM_WHATS_NEW, 0);
@@ -1042,6 +1068,169 @@ static void ww_radio_list(int row)
     int sel = 0;
     for (int g = 0; g < 8 && ui_list_state(&sel, NULL, NULL) && sel != row; g++) ui_key(sel < row ? UI_KEY_DOWN : UI_KEY_UP);
     advance(300);
+}
+
+/* ---- typing with the wheel (the ui_typing test): letters go in at the
+ * cursor, <Prev> and <Next> move it, Back deletes the letter before it ---- */
+static int g_ty_bad;
+#define TY(cond) do { if (!(cond)) { fprintf(stderr, "type-test: line %d: %s\n", __LINE__, #cond); g_ty_bad++; } } while (0)
+static int ty_is(const char *text, int cursor)
+{
+    int c = -1;
+    const char *e = ui_test_entry(&c);
+    if (strcmp(e, text) || c != cursor) fprintf(stderr, "type-test: \"%s\" at %d (wanted \"%s\" at %d)\n", e, c, text, cursor);
+    return !strcmp(e, text) && c == cursor;
+}
+
+/* Three short songs for the scratch library (Easy, Echo, Ember), so a search
+ * has results. */
+static int ty_songs(void)
+{
+    static const char *const NAME[] = {"Easy", "Echo", "Ember"};
+    if (mkdir("ty-music", 0755)) return -1;
+    for (int i = 0; i < 3; i++) {
+        char path[64];
+        snprintf(path, sizeof path, "ty-music/%s.flac", NAME[i]);
+        FLAC__StreamEncoder *e = FLAC__stream_encoder_new();
+        FLAC__stream_encoder_set_channels(e, 2);
+        FLAC__stream_encoder_set_bits_per_sample(e, 16);
+        FLAC__stream_encoder_set_sample_rate(e, 44100);
+        FLAC__StreamMetadata *vc = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
+        const char *kv[][2] = {{"TITLE", NAME[i]}, {"ARTIST", "Some Band"}, {"ALBUM", "An Album"}};
+        for (int k = 0; k < 3; k++) {
+            FLAC__StreamMetadata_VorbisComment_Entry en;
+            FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, kv[k][0], kv[k][1]);
+            FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
+        }
+        FLAC__stream_encoder_set_metadata(e, &vc, 1);
+        int ok = FLAC__stream_encoder_init_file(e, path, NULL, NULL) == FLAC__STREAM_ENCODER_INIT_STATUS_OK;
+        if (ok) {
+            static FLAC__int32 pcm[2 * 441];
+            FLAC__stream_encoder_process_interleaved(e, pcm, 441);
+            FLAC__stream_encoder_finish(e);
+        }
+        FLAC__stream_encoder_delete(e);
+        FLAC__metadata_object_delete(vc);
+        if (!ok) return -1;
+    }
+    return library_scan(g_lib, "ty-music", NULL, NULL) == 3 ? 0 : -1;
+}
+
+static int type_check(theme_t *themes, const ui_fonts_t *fonts)
+{
+    lv_tick_set_cb(fake_tick);
+    lv_display_t *d = lv_display_create(UI_W, UI_H);
+    lv_display_set_buffers(d, g_fb, NULL, sizeof g_fb, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(d, null_flush);
+    if (!g_player) { fprintf(stderr, "type-test: no player\n"); return 1; }
+    ui_init(lv_screen_active(), themes, g_n_themes, fonts, 1, g_lib, g_player);
+    ui_set_hooks(&g_hooks);
+    ui_set_theme(0);
+    setenv("FATHOM_SIM_SEARCH", "abd", 1);        /* typed already; the wheel on E */
+    ui_show("search");
+    advance(400);
+    int depth = ui_list_state(NULL, NULL, NULL);
+    TY(ty_is("abd", 3));
+    ui_key(UI_KEY_PREV);                          /* before the d */
+    TY(ty_is("abd", 2));
+    ui_key(UI_KEY_UP);
+    ui_key(UI_KEY_UP);                            /* E, D, C */
+    ui_key(UI_KEY_OK);
+    TY(ty_is("abcd", 3));                         /* in at the cursor, which moves on */
+    advance(600);
+    ui_key(UI_KEY_BACK);                          /* the letter before the cursor */
+    TY(ty_is("abd", 2));
+    ui_key(UI_KEY_PREV);
+    ui_key(UI_KEY_PREV);
+    ui_key(UI_KEY_PREV);                          /* (no further than the start) */
+    TY(ty_is("abd", 0));
+    ui_key(UI_KEY_BACK);                          /* nothing before it: nothing goes, and Search stays */
+    TY(ty_is("abd", 0) && ui_list_state(NULL, NULL, NULL) == depth);
+    ui_key(UI_KEY_OK);
+    TY(ty_is("cabd", 1));
+    advance(100);
+    ui_key(UI_KEY_OK);                            /* twice fast: that letter back out (and Results) */
+    TY(ty_is("abd", 0));
+    advance(600);
+    for (int i = 0; i < 5; i++) ui_key(UI_KEY_NEXT);   /* (no further than the end) */
+    TY(ty_is("abd", 3));
+    ui_key(UI_KEY_BACK);
+    ui_key(UI_KEY_BACK);
+    ui_key(UI_KEY_BACK);
+    TY(ty_is("", 0) && ui_list_state(NULL, NULL, NULL) == depth);
+    ui_key(UI_KEY_BACK);                          /* nothing typed: Back leaves */
+    advance(400);
+    TY(ui_list_state(NULL, NULL, NULL) < depth);
+
+    /* With results: twice <Play> goes to them and the typing is left (no
+     * cursor, the wheel moves through the list, the typing row one of its
+     * rows); <Play> on that row types again; <Back> goes up to it, then out. */
+    TY(ty_songs() == 0);
+    setenv("FATHOM_SIM_SEARCH", "", 1);
+    ui_show("search");
+    advance(400);
+    int sel = -1, n = 0;
+    TY(ui_test_typing());
+    ui_key(UI_KEY_OK);                            /* the wheel's letter: e */
+    TY(ty_is("e", 1));
+    ui_list_state(&sel, &n, NULL);
+    TY(sel == 0 && n > 2);                        /* (the test library has names with a word in e) */
+    ui_key(UI_KEY_DOWN);                          /* typing: the wheel changes the letter, not the row */
+    ui_list_state(&sel, NULL, NULL);
+    TY(sel == 0 && ui_test_typing());
+    advance(600);
+    ui_key(UI_KEY_OK);
+    advance(100);
+    ui_key(UI_KEY_OK);                            /* twice fast: the letter back out, and the results */
+    ui_list_state(&sel, NULL, NULL);
+    TY(ty_is("e", 1) && sel == 1 && !ui_test_typing());
+    advance(600);
+    ui_key(UI_KEY_DOWN);
+    ui_key(UI_KEY_UP);
+    ui_key(UI_KEY_UP);                            /* up onto the typing row: a row */
+    ui_list_state(&sel, NULL, NULL);
+    TY(sel == 0 && !ui_test_typing());
+    ui_key(UI_KEY_UP);                            /* (and no further) */
+    ui_key(UI_KEY_DOWN);                          /* down again: the first result, the letters as they were */
+    ui_list_state(&sel, NULL, NULL);
+    TY(sel == 1 && ty_is("e", 1) && !ui_test_typing());
+    ui_key(UI_KEY_UP);
+    ui_key(UI_KEY_OK);                            /* <Play> on the typing row: typing again, nothing added */
+    ui_list_state(&sel, NULL, NULL);
+    TY(sel == 0 && ui_test_typing() && ty_is("e", 1));
+    advance(100);
+    ui_key(UI_KEY_OK);                            /* (not the second of two: a letter) */
+    ui_list_state(&sel, NULL, NULL);
+    TY(sel == 0 && ui_test_typing() && strlen(ui_test_entry(NULL)) == 2);
+    advance(600);
+    ui_key(UI_KEY_BACK);
+    TY(ty_is("e", 1));
+    ui_key(UI_KEY_OK);
+    advance(100);
+    ui_key(UI_KEY_OK);                            /* to the results again */
+    ui_key(UI_KEY_DOWN);
+    ui_list_state(&sel, NULL, NULL);
+    TY(sel == 2 && !ui_test_typing());
+    advance(600);
+    ui_key(UI_KEY_BACK);                          /* <Back> in the results: up to the typing row, a row still */
+    ui_list_state(&sel, NULL, NULL);
+    TY(sel == 0 && !ui_test_typing() && ty_is("e", 1));
+    ui_key(UI_KEY_OK);                            /* <Play> there: the letters */
+    TY(ui_test_typing() && ty_is("e", 1));
+    advance(600);
+    ui_key(UI_KEY_OK);
+    advance(100);
+    ui_key(UI_KEY_OK);                            /* the results once more */
+    advance(600);
+    depth = ui_list_state(&sel, NULL, NULL);
+    TY(sel == 1);
+    ui_key(UI_KEY_BACK);
+    TY(ui_list_state(NULL, NULL, NULL) == depth); /* (the first <Back>: still Search) */
+    ui_key(UI_KEY_BACK);                          /* the second: out, with a letter typed */
+    advance(400);
+    TY(ui_list_state(NULL, NULL, NULL) < depth);
+    if (!g_ty_bad) printf("type-test: all checks passed\n");
+    return g_ty_bad != 0;
 }
 
 static int wifi_wait_check(theme_t *themes, const ui_fonts_t *fonts)
@@ -1442,7 +1631,7 @@ static void setup_player(const char *music, int silent)
 int main(int argc, char **argv)
 {
     const char *shots = NULL, *motion_dir = NULL, *music = NULL, *lang_file = NULL;
-    int theme = 0, zoom = 3, bench_s = 0, wifi_wait = 0;
+    int theme = 0, zoom = 3, bench_s = 0, wifi_wait = 0, type_test = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--screenshots") && i + 1 < argc) shots = argv[++i];
         else if (!strcmp(argv[i], "--motion") && i + 1 < argc) motion_dir = argv[++i];
@@ -1451,6 +1640,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--music") && i + 1 < argc) music = argv[++i];
         else if (!strcmp(argv[i], "--lang-check") && i + 1 < argc) lang_file = argv[++i];
         else if (!strcmp(argv[i], "--wifi-wait")) wifi_wait = 1;
+        else if (!strcmp(argv[i], "--type-test")) type_test = wifi_wait = 1;   /* (set up as that test is) */
         else if (!strcmp(argv[i], "--bench")) { bench_s = i + 1 < argc && atoi(argv[i + 1]) > 0 ? atoi(argv[++i]) : 5; g_bench = 1; }
         else { fprintf(stderr, "usage: %s [--theme N] [--zoom Z] [--music DIR] | --screenshots DIR | --motion DIR | --bench [S] | --wifi-wait\n", argv[0]); return 2; }
     }
@@ -1466,7 +1656,7 @@ int main(int argc, char **argv)
     setup_player(music, shots || motion_dir || bench_s || lang_file || wifi_wait);
     if (bench_s) return bench(themes, fonts, bench_s);
     if (wifi_wait) {
-        int bad = wifi_wait_check(themes, fonts);
+        int bad = type_test ? type_check(themes, fonts) : wifi_wait_check(themes, fonts);
         nftw(scratch, ww_rm, 8, FTW_DEPTH | FTW_PHYS);
         return bad;
     }

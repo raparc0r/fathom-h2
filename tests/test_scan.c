@@ -175,7 +175,7 @@ static void test_open_and_levelling(const char *dir)
     library_t *lib = library_open(db, art);
     CHECK(lib && library_scan(lib, music, NULL, NULL) == 5);
     library_close(lib);
-    CHECK(db_int(db, "PRAGMA user_version") == 8);
+    CHECK(db_int(db, "PRAGMA user_version") == 9);
 
     /* a column an upgrade would fill, emptied: an open of an up-to-date
      * library leaves it (it doesn't look) */
@@ -201,7 +201,27 @@ static void test_open_and_levelling(const char *dir)
     CHECK(up_calls > 10 && up_last_done == up_last_total && up_calls == up_last_total);
     CHECK(library_upgrade_needed(db) == 0);
     CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE sort IS NULL") == 0);
-    CHECK(db_int(db, "PRAGMA user_version") == 8);
+    CHECK(db_int(db, "PRAGMA user_version") == 9);
+    library_close(lib);
+    /* ...and one from 0.16.0 (8: the search text every word in a row, no index
+     * of it) gets its search keys (name|artist|album) and their index, and
+     * finds its songs */
+    CHECK(db_exec(db, "DROP INDEX tracks_search; UPDATE tracks SET search='song 3 an artist an artist an album';"
+                      "UPDATE albums SET search='an album an artist'; UPDATE artists SET search='an artist';"
+                      "PRAGMA user_version=8") == SQLITE_OK);
+    CHECK(library_upgrade_needed(db) == 5);
+    lib = library_open(db, art);
+    CHECK(lib != NULL && library_upgrade_needed(db) == 0);
+    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE search LIKE '%|%|%'") == 5);
+    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE search LIKE 'song 3|%'") == 1);
+    CHECK(db_int(db, "SELECT COUNT(*) FROM albums WHERE search NOT LIKE '%|%|'") == 0);
+    CHECK(db_int(db, "SELECT COUNT(*) FROM artists WHERE search NOT LIKE '%||'") == 0);
+    CHECK(db_int(db, "SELECT COUNT(*) FROM sqlite_master WHERE name='tracks_search'") == 1);
+    {
+        lib_search_t found;
+        CHECK(library_search(lib, "song 3", &found) >= 1 && found.n_songs >= 1 && found.hits[0].tier == 1);
+        library_search_free(&found);
+    }
 
     /* levelling: the tracks left come from tracks_rg_todo, in id order */
     sqlite3 *raw = NULL;
@@ -409,7 +429,7 @@ static void test_scans(const char *dir)
     CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE album_id IS NULL") == 0);
     CHECK(db_int(db, "SELECT COUNT(*) FROM albums WHERE title='Aa New' AND ntracks=20") == 1);
     lib_search_t hits;
-    CHECK(library_search(player, "aa new 7", &hits) > 0 && hits.songs.n == 1);
+    CHECK(library_search(player, "aa new 7", &hits) > 0 && hits.n_songs == 1);
     library_search_free(&hits);
     CHECK(library_scan(player, music, NULL, NULL) == 635 && library_scan_changes(player) == 0);
 

@@ -2,7 +2,7 @@
 
 # Fathom
 
-Latest version: [0.16.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.16.0) released November 23rd 2026
+Latest version: [0.17.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.17.0) released November 23rd 2026
 
 [Features](#features) · [Compatibility](#compatibility) · [Installing](#installing) · [Navigation](#navigation) · [Licence](#licence) · [How it was made](#how-it-was-made)
 
@@ -45,6 +45,7 @@ I recommend you check it out: [rockbox.org](https://www.rockbox.org).
 - **USB DACs.** The H2 can play through one, or be your computer's sound card.
 - **A parametric EQ.** Load your headphones' profile from AutoEQ, or make your own on the
   H2. Each output remembers its own.
+- **Stereo width**, from mono to twice as wide.
 - **A better shuffle.** It spreads songs across artists and albums, and plays what you
   haven't heard in a while first.
 - **Themes**: use one of the four built-in themes, or make your own on the H2 itself.
@@ -94,7 +95,7 @@ More: [INSTALL.md](INSTALL.md) (the full steps, and a recommended backup),
 | Wheel | move through a list | |
 | Play | choose; on Now Playing, play or pause | |
 | Back | go back | jump to Now Playing, and back |
-| Menu | options for what's selected (shuffle an album or an artist, play next, add to a playlist, go to the album...) | quick settings: brightness, shuffle, repeat, EQ, Bluetooth, Wi-Fi, sleep timer |
+| Menu | options for what's selected (shuffle an album or an artist, play next, add to a playlist, go to the album...) | quick settings: brightness, shuffle, repeat, EQ, stereo width, Bluetooth, Wi-Fi, sleep timer |
 | Menu + wheel | | brightness: hold Menu and turn the wheel |
 | Prev / Next | previous or next track | seek |
 | Power | screen off or on | switch off (2 seconds) |

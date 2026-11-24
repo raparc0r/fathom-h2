@@ -79,6 +79,7 @@
 #include "net/coverfind.h"
 #include "net/radioicon.h"
 #include "audio/crossfeed.h"
+#include "audio/width.h"
 #include "audio/decoder.h"
 #include "audio/ff_util.h"
 #include "audio/eq.h"
@@ -872,6 +873,7 @@ static void eq_path(const char *name, char *out, size_t cap)
 /* Sets the engine's EQ for the output playing now, from its saved choice. */
 static void balance_apply(void);
 static void crossfeed_apply(void);
+static void width_apply(void);
 static void limit_apply(void);
 static int pure_on(void);
 static void levelling_apply(void);
@@ -900,6 +902,7 @@ static void eq_apply(void)
     fprintf(stderr, "eq: %s: %s%s\n", key, on ? name : "off", pure ? " (Pure mode: bypassed)" : "");
     balance_apply();                     /* (a new output: its balance, crossfeed, limit and Pure mode too) */
     crossfeed_apply();
+    width_apply();
     limit_apply();
     levelling_apply();
     dop_apply();
@@ -947,6 +950,27 @@ static int crossfeed_now(void)
 static void crossfeed_apply(void)
 {
     if (g_eng) engine_set_crossfeed(g_eng, pure_on() ? XF_OFF : crossfeed_now());
+}
+
+/* Stereo width, per output like the balance ("width.<output>", percent: one
+ * of WIDTHS; 100 by default, shown as Off: the samples untouched; wider in
+ * tens, as the owner asked, 2026-11-23); Pure mode bypasses it */
+static const int WIDTHS[] = {WIDTH_MONO, 50, 75, WIDTH_NORMAL, 110, 120, 130, 140, 150, 160, 170, 180, 190, WIDTH_MAX};
+#define N_WIDTHS ((int)(sizeof WIDTHS / sizeof WIDTHS[0]))
+
+static int width_step(void)                         /* which of WIDTHS: the nearest to what's saved */
+{
+    char key[80];
+    out_setting_key("width", key, sizeof key);
+    int w = settings_get_int(key, WIDTH_NORMAL), best = 0;
+    for (int i = 1; i < N_WIDTHS; i++)
+        if (abs(WIDTHS[i] - w) < abs(WIDTHS[best] - w)) best = i;
+    return best;
+}
+
+static void width_apply(void)
+{
+    if (g_eng) engine_set_width(g_eng, pure_on() ? WIDTH_NORMAL : WIDTHS[width_step()]);
 }
 
 static void balance_apply(void)
@@ -999,6 +1023,13 @@ static void hook_sound_value(int what, char *out, size_t cap)
         snprintf(out, cap, "%s", tr(crossfeed_name(crossfeed_now())));
         return;
     }
+    if (what == UI_SOUND_WIDTH) {
+        int w = WIDTHS[width_step()];
+        if (w == WIDTH_MONO) snprintf(out, cap, "%s", tr("Mono"));
+        else if (w == WIDTH_NORMAL) snprintf(out, cap, "%s", tr("Off"));
+        else snprintf(out, cap, "%d %%", w);
+        return;
+    }
     if (what == UI_SOUND_BALANCE) {
         int b = balance_db();
         char n[16];
@@ -1029,6 +1060,13 @@ static int hook_sound_adjust(int what, int dir)
         out_setting_key("crossfeed", key, sizeof key);
         settings_set_int(key, (crossfeed_now() + (dir < 0 ? XF_LEVELS - 1 : 1)) % XF_LEVELS);
         crossfeed_apply();
+        return 0;
+    }
+    if (what == UI_SOUND_WIDTH) {            /* Mono, 50, 75, Off, 110 ... 200 %: the wheel stops at each end */
+        int i = width_step() + dir;
+        out_setting_key("width", key, sizeof key);
+        settings_set_int(key, WIDTHS[i < 0 ? 0 : i >= N_WIDTHS ? N_WIDTHS - 1 : i]);
+        width_apply();
         return 0;
     }
     if (what == UI_SOUND_BALANCE) {
@@ -1144,6 +1182,7 @@ static int hook_signal_path(int i, char *label, size_t lc, char *value, size_t v
         WHY(st.track_gain != 1.0f, tr("levelling"));
         WHY(st.balance[0] != 1.0f || st.balance[1] != 1.0f, tr("balance"));
         WHY(st.crossfeed != XF_OFF, tr("crossfeed"));
+        WHY(st.width != WIDTH_NORMAL, tr("stereo width"));
         WHY(st.gain != 1.0f, tr("software volume"));
         WHY(st.out_fmt.rate && st.out_fmt.rate != st.fmt.rate, tr("resampled"));
         WHY(!st.fmt.bits && strncmp(st.fmt.codec, "DSD", 3), tr("lossy file"));
@@ -1531,7 +1570,7 @@ static void net_poll(lv_timer_t *t)
 }
 
 /* ---- updates (Settings > About > Check for updates) ----
- * When asked, or a quiet check by itself once a day with Check automatically
+ * When asked, or a quiet check by itself three times a day with Check automatically
  * on (auto_update_poll); downloads and installs only ever when asked.
  * settings.ini keeps: update.auto (0/1), update.checked (the last answer's
  * time), update.found (a newer release seen, "" if none) and update.told (the

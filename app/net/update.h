@@ -38,10 +38,12 @@ int update_parse_version(const char *s, int v[3]);
 int update_is_newer(const char *latest, const char *running);
 
 /* Automatic checks (Settings > About > Check automatically): 1 if one is due
- * at `now`, the last answer (last_ok) a day old and the last try an hour old
- * (a failed one isn't retried sooner). Seconds, as time() gives them; 0 for
+ * at `now`, the last answer (last_ok) 8 hours old (three times a day: a
+ * release is seen the day it's out, where once a day could take until the
+ * next; the check is one small request, with the H2 idle on Wi-Fi) and the
+ * last try an hour old (a failed one isn't retried sooner). Seconds, as time() gives them; 0 for
  * never. A clock set back since (NTP after a start without it) makes it due. */
-#define UPDATE_AUTO_EVERY (24 * 3600)
+#define UPDATE_AUTO_EVERY (8 * 3600)
 #define UPDATE_AUTO_RETRY 3600
 int update_auto_due(long now, long last_ok, long last_try);
 

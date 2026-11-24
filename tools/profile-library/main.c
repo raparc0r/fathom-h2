@@ -15,6 +15,11 @@
  * SQLite's temporary files go to DIR, as in the player (never /tmp: RAM on
  * the H2).
  *
+ *   profile-library --search DIR "WORDS"...
+ *
+ * Each search on DIR/library.db itself (opened, and upgraded, as it is: give
+ * it a copy), three times over, with what it found.
+ *
  *   profile-library --rescan DIR MUSIC [DEV MOUNT]
  *
  * One scan of MUSIC into a copy of DIR/library.db, timed, as the player's
@@ -219,8 +224,47 @@ static int check(int argc, char **argv)
     return 0;
 }
 
+/* --search DIR WORDS...: each of the searches typed on DIR/library.db (opened
+ * as it is: a copy made for this), the first cold and every one three times
+ * over: what a letter typed on Search waits for. */
+static int search(int argc, char **argv)
+{
+    if (argc < 4) { fprintf(stderr, "usage: %s --search DIR \"WORDS\"...\n", argv[0]); return 2; }
+    char db[600], art[600];
+    snprintf(db, sizeof db, "%s/library.db", argv[2]);
+    snprintf(art, sizeof art, "%s/art", argv[2]);
+    setenv("SQLITE_TMPDIR", argv[2], 1);
+    library_t *lib = NULL;
+    TIME("library_open", (lib = library_open(db, art)) != NULL);
+    if (!lib) return 1;
+    drop_caches();
+    for (int i = 3; i < argc; i++) {
+        double ms[3];
+        int n = 0, tiers[7] = {0};
+        unsigned set = 0;                            /* (what was found, whatever its order: two builds compared) */
+        for (int k = 0; k < 3; k++) {
+            lib_search_t r;
+            double t0 = now_ms();
+            n = library_search(lib, argv[i], &r);
+            ms[k] = now_ms() - t0;
+            for (int j = 0; !k && j < r.n; j++) {
+                tiers[r.hits[j].tier < 7 ? r.hits[j].tier : 0]++;
+                set += (unsigned)(r.hits[j].id * 31 + r.hits[j].kind * 7 + r.hits[j].tier) * 2654435761u;
+            }
+            library_search_free(&r);
+        }
+        printf("search %-18s %8.1f %8.1f %8.1f ms   (%d found: %d %d %d %d %d %d by closeness, set %08x)%s\n", argv[i],
+               ms[0], ms[1], ms[2], n, tiers[1], tiers[2], tiers[3], tiers[4], tiers[5], tiers[6], set,
+               i == 3 ? "   (the first: nothing read yet)" : "");
+        fflush(stdout);
+    }
+    library_close(lib);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "--search")) return search(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--check")) return check(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--rescan")) return rescan(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--again")) return again(argc, argv);

@@ -991,18 +991,56 @@ int main(void)
     library_rg_store(lib, t[1], &rg);
     CHECK(fabsf(20 * log10f(library_rg_gain(lib, t[1], 1)) + 8.0f) < 0.01f);
 
-    /* search: words must start words; case and accents ignored; title, artist, album */
+    /* search: one list, the closest names first; case and accents ignored */
     lib_search_t sr;
-    CHECK(library_search(lib, "tes alb", &sr) > 0 && sr.albums.n == 1 && sr.artists.n == 0 && sr.songs.n == N);
+    CHECK(library_search(lib, "tes alb", &sr) == 1 && sr.n_albums == 1 && sr.hits[0].tier == 5);   /* (loosely: nothing closer) */
     library_search_free(&sr);
-    CHECK(library_search(lib, "TEST art", &sr) > 0 && sr.artists.n == 1 && sr.albums.n == 1);
+    CHECK(library_search(lib, "test alb", &sr) == 1 && sr.n_albums == 1 && sr.hits[0].tier == 2);  /* "test" whole, "alb" being typed */
     library_search_free(&sr);
-    CHECK(library_search(lib, "T3", &sr) == 1 && sr.songs.n == 1 && sr.songs.ids[0] == t[2]);
+    CHECK(library_search(lib, "TEST art", &sr) > 0 && sr.n_artists == 1 && sr.n_albums == 0 && sr.n_songs == 0);
     library_search_free(&sr);
-    CHECK(library_search(lib, "guest", &sr) > 0 && sr.artists.n == 2);   /* guests are found too */
+    CHECK(library_search(lib, "test", &sr) > 0 && sr.n_artists == 1 && sr.n_albums == 1 && sr.n_songs == 0 &&
+          sr.hits[0].kind == LIB_HIT_ARTIST && sr.hits[1].kind == LIB_HIT_ALBUM);                 /* as close: the artist first */
+    library_search_free(&sr);
+    CHECK(library_search(lib, "art t3", &sr) == 1 && sr.n_songs == 1 && sr.songs[0] == t[2] && sr.hits[0].tier == 6);   /* the artist, and the song */
+    library_search_free(&sr);
+    CHECK(library_search(lib, "alb t3", &sr) == 1 && sr.n_songs == 1 && sr.songs[0] == t[2]);     /* the album, and the song */
+    library_search_free(&sr);
+    CHECK(library_search(lib, "T3", &sr) == 1 && sr.n_songs == 1 && sr.songs[0] == t[2] && sr.hits[0].tier == 1);
+    library_search_free(&sr);
+    CHECK(library_search(lib, "t", &sr) > 0 && sr.n_songs == N && sr.songs[0] == t[0]);           /* (T1...: in their order) */
+    library_search_free(&sr);
+    CHECK(library_search(lib, "guest", &sr) == 3 && sr.n_artists == 2 && sr.n_songs == 1 &&      /* guests are found too, */
+          sr.songs[0] == t[4] && sr.hits[0].kind == LIB_HIT_ARTIST);                              /* and the song with one in its title, after them */
     library_search_free(&sr);
     CHECK(library_search(lib, "est", &sr) == 0);              /* not the start of a word */
     library_search_free(&sr);
+    {   /* how close a name is to what was typed (library_search_tier) */
+        const char *BMW = "Bob Marley & The Wailers";
+#define TIER(name, artist, album, lw, ...) library_search_tier(name, artist, album, (const char *[]){__VA_ARGS__}, \
+            (int)(sizeof((const char *[]){__VA_ARGS__}) / sizeof(char *)), lw)
+        CHECK(TIER("Exodus", BMW, "Exodus", 0, "exodus") == 1);                          /* the name itself */
+        CHECK(TIER("The Wailers", NULL, NULL, 0, "wailers") == 1);                       /* (a leading The passed over) */
+        CHECK(TIER("Exodus (Live)", BMW, "Babylon by Bus", 0, "exodus") == 2);           /* starts with it */
+        CHECK(TIER("IAM", NULL, NULL, 0, "i") == 2 && TIER("Death in Vegas", NULL, NULL, 0, "i") == 3);
+        CHECK(TIER("In the Night", "Bauhaus", "Mask", 0, "in", "the") == 2);
+        CHECK(TIER("Compton\'s In The House (Remix)", "N.W.A", "Straight Outta Compton", 0, "in", "the") == 3);   /* together */
+        CHECK(TIER("The Beast in Me", "Johnny Cash", "American Recordings", 0, "in", "the") == 4);                   /* all, apart */
+        CHECK(TIER("Mellon Collie And The Infinite Sadness", "The Smashing Pumpkins", NULL, 0, "in", "the") == 5);  /* "in": not a word of it */
+        CHECK(TIER("Dave Matthews Band", NULL, NULL, 0, "dav", "mat") == 5 && TIER("Dave Matthews Band", NULL, NULL, 0, "dave", "mat") == 2);
+        CHECK(TIER("Then Came You", "X", "Y", 0, "the") == 2 && TIER("Then Came You", "X", "Y", 1, "the") == 5);   /* a space after it: a whole word (so: loosely) */
+        CHECK(TIER("Exodus", BMW, "Exodus", 0, "marley", "exodus") == 6);                /* the artist and the title */
+        CHECK(TIER("Jamming", BMW, "Exodus", 0, "marley", "exodus") == 0);               /* (on Exodus: not for its album) */
+        CHECK(TIER("Jamming", BMW, "Exodus", 0, "exodus", "jam") == 6);                  /* the album and the title */
+        CHECK(TIER("Exodus", BMW, NULL, 0, "bob", "marley") == 0);                       /* an artist's name: not their albums */
+        CHECK(TIER("I Shot The Sheriff", BMW, "Burnin", 0, "the", "wailers") == 0);      /* ...nor a song for its "the" */
+        CHECK(TIER("Legend - The Best Of Bob Marley And The Wailers", BMW, NULL, 0, "bob", "marley") == 3);
+        CHECK(TIER("Queen", "Queen", NULL, 0, "queen") == 1 && TIER("A Night at the Opera", "Queen", NULL, 0, "queen") == 0);
+        CHECK(TIER("Ab\xc3\xa9" "c\xc3\xa9" "daire des cons", "Sa\xc3\xaf" "an Supa Crew", "KLR", 0, "abe") == 2);   /* accents */
+        CHECK(TIER("Cha Cha Cha", "Abelardo Barroso", NULL, 0, "abe") == 0);
+        CHECK(TIER("Bob Marley", NULL, NULL, 0, "marley", "exodus") == 0);               /* an artist: by the name alone */
+#undef TIER
+    }
     CHECK(library_search(lib, "", &sr) == 0);
     library_search_free(&sr);
 

@@ -37,6 +37,7 @@ typedef struct {
     int            start_paused; /* ...and it will start paused */
     int            eq;           /* the EQ is on for this track */
     int            crossfeed;    /* ...and the crossfeed (XF_LIGHT..; XF_OFF: off, or a mono track) */
+    int            width;        /* ...and the stereo width, in percent (100: untouched, or a mono track) */
     int            stream;       /* the track is an internet stream (no length, no seeking) */
     int            connecting;   /* ...and it is still connecting */
     unsigned       meta_seq;     /* changes with meta */
@@ -101,6 +102,8 @@ void engine_set_dop(engine_t *e, int on);
 /* Crossfeed for headphones (audio/crossfeed.h: XF_OFF, XF_LIGHT...), on stereo
  * PCM from the next chunk; on, the output is at least 24-bit, as with the EQ. */
 void engine_set_crossfeed(engine_t *e, int level);
+/* Stereo width, in percent (audio/width.h): 0 mono, 100 as recorded, up to 150. */
+void engine_set_width(engine_t *e, int pct);
 /* A fade (0..1) applied on top of the gain: the sleep timer's. 1.0 = none. */
 void engine_set_fade(engine_t *e, float fade);
 /* Faster without the pitch going up (audio/tempo.h), in percent: 100 = off

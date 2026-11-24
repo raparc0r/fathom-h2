@@ -310,11 +310,41 @@ int     library_playlist_delete(library_t *lib, int64_t playlist_id);
 int     library_playlist_rename(library_t *lib, int64_t playlist_id, const char *name);   /* and its file */
 int     library_playlist_count_writable(library_t *lib);
 
-/* Search: every word of `query` must start a word of the title, artist or
- * album (case and accents ignored). Up to 5 artists, 10 albums, 40 songs. */
-typedef struct { lib_list_t artists, albums, songs; } lib_search_t;
-int  library_search(library_t *lib, const char *query, lib_search_t *out);   /* total found */
+/* Search: one list, the names closest to what was typed first, whatever they
+ * are (case and accents ignored). A word followed by a space is a whole
+ * word; the last one is still being typed, and may be the start of one.
+ * How close, best first (library_search_tier):
+ *   1  the name is what was typed ("exodus": Exodus)
+ *   2  it starts with it ("in the": In the Night; a leading The passed over)
+ *   3  it has it, the words together and in order (Compton's in the House)
+ *   4  it has all the words, somewhere (The Beast in Me)
+ * and, only when fewer than LIB_SEARCH_FEW names are that close, after them:
+ *   5  its words only begin that way ("dav mat": Dave Matthews Band; "in the":
+ *      ...and the Infinite Sadness)
+ *   6  the words are split between its name and its artist's or album's, one
+ *      of them at least in its own name and not its artist's ("marley
+ *      exodus": the album and the songs called Exodus; an artist's name alone
+ *      never lists their albums and songs)
+ * Within one: artists, then albums, then songs, each in its list's order. Up
+ * to LIB_SEARCH_MAX in all. */
+#define LIB_SEARCH_MAX 40
+#define LIB_SEARCH_FEW 5
+enum { LIB_HIT_ARTIST, LIB_HIT_ALBUM, LIB_HIT_SONG };
+typedef struct { int kind; int64_t id; int tier; } lib_hit_t;
+typedef struct {
+    lib_hit_t *hits;       /* in the order shown */
+    int n;
+    int64_t *songs;        /* the songs among them, in that order (what choosing one plays) */
+    int n_artists, n_albums, n_songs;
+} lib_search_t;
+int  library_search(library_t *lib, const char *query, lib_search_t *out);   /* how many */
 void library_search_free(lib_search_t *r);
+/* How close a name is to what was typed: 1..6 as above, 0 not at all. words:
+ * folded (text_search_fold), n of them; last_whole: the last one is a whole
+ * word too (a space was typed after it); artist, album: NULL for an artist
+ * (found by the name alone), an album has no album. (Exposed for tests.) */
+int  library_search_tier(const char *name, const char *artist, const char *album, const char *const *words, int n,
+                         int last_whole);
 
 /* Favourites. */
 void library_set_favourite(library_t *lib, int64_t track_id, int on);

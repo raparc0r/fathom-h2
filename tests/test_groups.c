@@ -184,7 +184,7 @@ int main(void)
     CHECK(library_list(lib, LIB_ALBUM_ARTISTS, 0, &l) > 0 && !strcmp(row(lib, &l, 0, NULL), "ANA RUIZ"));
     library_list_free(&l);
     lib_search_t hits;
-    CHECK(library_search(lib, "ana ruiz", &hits) > 0 && hits.artists.n == 1);
+    CHECK(library_search(lib, "ana ruiz", &hits) > 0 && hits.n_artists == 1);
     library_search_free(&hits);
 
     /* A soundtrack earlier in path order spelling her "ana ruiz" as a track

@@ -66,7 +66,7 @@
 
 /* ---------- menus ---------- */
 
-/* Home: every item, in the default order. Settings > Home shows, hides and
+/* Home: every item, in the default order. Settings > Interface > Home screen items shows, hides and
  * reorders them (settings key home.items: ids in order, "-" before a hidden
  * one); Settings always stays. */
 static const char *const HOME[] = {"Now playing", "Shuffle all songs", "Search", "Albums", "Artists",
@@ -82,7 +82,7 @@ static const char *const HOME_ID[] = {"nowplaying", "shuffle", "search", "albums
 enum { H_NOWPLAYING, H_SHUFFLE, H_SEARCH, H_ALBUMS, H_ARTISTS, H_ALBUM_ARTISTS, H_SONGS, H_PLAYLISTS,
        H_FAVOURITES, H_RECENT_ADDED, H_HISTORY, H_RADIO, H_SETTINGS, H_GENRES, H_COMPOSERS, H_YEARS, H_FOLDERS,
        H_PODCASTS, H_N };
-/* Hidden until shown in Settings > Home (fewer people tag them); on a fresh
+/* Hidden until shown in Settings > Interface > Home screen items (fewer people tag them); on a fresh
  * install also Genres and Folders, for a shorter Home (ui_set_new_install) */
 static int g_new_install;
 static int home_hidden_by_default(int h)
@@ -100,7 +100,7 @@ static void home_save(void);
  * from tools/icons/pixel_icons.py), in the same order. */
 /* Home's "Update available!": first on Home while a newer Fathom is on offer
  * (update.found, from the update check) and not ignored (update.ignored); not
- * an item Settings > Home shows, hides or moves. Its icon: circle-arrow-up
+ * an item Settings > Interface > Home screen items shows, hides or moves. Its icon: circle-arrow-up
  * (Tabler), and Pixel Pastel's own after the items' (pixel_icons.h). */
 #define H_UPDATE H_N
 #define UPDATE_ICON 0xf703
@@ -129,11 +129,12 @@ static const char PASS_CHARS[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRST
                                  " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
 static const int PASS_GROUPS[] = {0, 26, 52, 62};   /* a, A, 0, symbols */
 static const char *const HISTORY[] = {"Recently played", "Most played"};
-static const char *const SETTINGS[] = {"Interface", "Home", "Display", "Sound", "Bluetooth", "Wi-Fi",
-                                       "Network drive", "SSH", "USB connection", "Playback", "Podcasts", "Power",
-                                       "Library", "About"};
-enum { SET_INTERFACE, SET_HOME, SET_DISPLAY, SET_SOUND, SET_BLUETOOTH, SET_WIFI, SET_SHARE, SET_SSH, SET_USB, SET_PLAYBACK,
-       SET_PODCASTS, SET_POWER, SET_LIBRARY, SET_ABOUT };
+/* Settings' pages, in the order the owner set (2026-11-23): what's most
+ * wanted first. (The Home screen's page is a row of Interface's.) */
+static const char *const SETTINGS[] = {"Sound", "Playback", "Interface", "Wi-Fi", "Bluetooth", "Podcasts", "Display",
+                                       "Library", "USB connection", "Network drive", "Power", "SSH", "About"};
+enum { SET_SOUND, SET_PLAYBACK, SET_INTERFACE, SET_WIFI, SET_BLUETOOTH, SET_PODCASTS, SET_DISPLAY, SET_LIBRARY, SET_USB,
+       SET_SHARE, SET_POWER, SET_SSH, SET_ABOUT };
 
 /* Rows of the quick settings panel and of Settings > Display. */
 typedef enum {
@@ -142,19 +143,27 @@ typedef enum {
     ST_RESCAN, ST_USB_DRIVE, ST_USB_COMPUTER, ST_USB_DAC, ST_N_SONGS, ST_N_ALBUMS, ST_N_ARTISTS, ST_N_PLAYLISTS,
     ST_BT, ST_WIFI,
     ST_SHUF_BY, ST_SHUF_FRESH, ST_SHUF_INTERLUDES, ST_SHUF_WORKS, ST_SHUF_SPOKEN, ST_BALANCE, ST_VOL_LIMIT, ST_PURE, ST_TRANSPORT, ST_BATTERY, ST_LANGUAGE,
-    ST_THEME, ST_ALBUM_ARTISTS, ST_POD_AUTO, ST_POD_KEEP, ST_POD_CLEAN, ST_POD_SPEED, ST_FIND_COVERS, ST_CROSSFEED,
+    ST_THEME, ST_ALBUM_ARTISTS, ST_POD_AUTO, ST_POD_KEEP, ST_POD_CLEAN, ST_POD_SPEED, ST_FIND_COVERS, ST_CROSSFEED, ST_WIDTH,
+    ST_HOME_SCREEN,
 } setting_t;
 /* Quick settings (quick_rows(): Bluetooth's and Wi-Fi's rows where they are) */
-static const setting_t QUICK[] = {ST_BRIGHTNESS, ST_SHUFFLE, ST_REPEAT, ST_EQ, ST_BT, ST_WIFI,
-                                  ST_SLEEP, ST_STOP_AFTER, ST_TIMEOUT};
-static const setting_t SOUND_ROWS[] = {ST_OUTPUT, ST_PURE, ST_EQ, ST_CROSSFEED, ST_BALANCE, ST_VOL_LIMIT, ST_LEVELLING, ST_TRANSPORT,
-                                       ST_USB_DAC, ST_DAC_FILTER};   /* sound_rows(): those with their hooks */
+static const setting_t QUICK[] = {ST_BRIGHTNESS, ST_SHUFFLE, ST_REPEAT, ST_EQ, ST_WIDTH, ST_BT, ST_WIFI,
+                                  ST_SLEEP, ST_STOP_AFTER};
+/* (the two modes for the cleanest sound, then the tone, then the level; USB
+ * DAC mode is USB connection's) */
+static const setting_t SOUND_ROWS[] = {ST_OUTPUT, ST_PURE, ST_TRANSPORT, ST_EQ, ST_CROSSFEED, ST_WIDTH, ST_BALANCE,
+                                       ST_LEVELLING, ST_VOL_LIMIT, ST_DAC_FILTER};
+/* The sound hook's name for a setting changed with the wheel. */
+static int sound_of(setting_t st)
+{
+    return st == ST_BALANCE ? UI_SOUND_BALANCE : st == ST_WIDTH ? UI_SOUND_WIDTH : UI_SOUND_LIMIT;
+}   /* sound_rows(): those with their hooks */
 static const setting_t PLAYBACK_ROWS[] = {ST_SHUFFLE, ST_SHUF_BY, ST_SHUF_FRESH, ST_SHUF_INTERLUDES, ST_SHUF_WORKS,
-                                         ST_SHUF_SPOKEN, ST_REPEAT, ST_PAUSE_UNPLUG};
+                                         ST_SHUF_SPOKEN, ST_REPEAT, ST_SLEEP, ST_PAUSE_UNPLUG};
 
 /* Settings > Playback's shuffle rows, to the player (at start and when changed). */
 static void shuffle_prefs_apply(void);
-static const setting_t POWER_ROWS[] = {ST_BATTERY, ST_AUTO_OFF, ST_SLEEP};
+static const setting_t POWER_ROWS[] = {ST_BATTERY, ST_AUTO_OFF};
 static const setting_t POD_ROWS[] = {ST_POD_AUTO, ST_POD_KEEP, ST_POD_CLEAN, ST_POD_SPEED};
 static const int POD_KEEPS[] = {1, 2, 3, 5};
 static const int POD_CLEANS[] = {1, 3, 7, 30, 0};            /* days; 0 = never */
@@ -163,7 +172,7 @@ static const setting_t USB_ROWS[] = {ST_USB_COMPUTER, ST_USB_DRIVE, ST_USB_DAC};
 static const int AUTO_OFFS[] = {5, 15, 30, 0};               /* minutes; 0 = never */
 static const int SLEEPS[] = {0, 15, 30, 45, 60, 90, PLAYER_SLEEP_END_ALBUM};   /* minutes; 0 = off */
 static const setting_t DISPLAY_ROWS[] = {ST_BRIGHTNESS, ST_TIMEOUT, ST_DIM, ST_ON_CHARGING};
-static const setting_t INTERFACE_ROWS[] = {ST_THEME, ST_COVERS, ST_ALBUM_ARTISTS, ST_LANGUAGE};
+static const setting_t INTERFACE_ROWS[] = {ST_THEME, ST_HOME_SCREEN, ST_COVERS, ST_ALBUM_ARTISTS, ST_LANGUAGE};
 static const int TIMEOUTS[] = {15, 30, 60, 120, 300, 0};   /* seconds; 0 = never */
 
 /* The theme editor: its colours, as it names them, and its rows */
@@ -222,6 +231,7 @@ typedef struct {
     char title[128];
     int title_ui;           /* the title is the UI's own words (translated), not a name */
     int back_to_np;         /* opened from Now Playing: closing it goes back there */
+    int typed;              /* a typing screen with results: the typing was left for them (typing_on) */
 } level_t;
 
 typedef enum { R_SNAP, R_ANIMATE, R_CONTENT } render_mode_t;
@@ -250,6 +260,7 @@ static struct {
     /* typing with the wheel (Search, Rename): the text, and the letter shown */
     char entry[64];
     int entry_ch;                           /* index into the letters; == strlen(letters): results / done */
+    int entry_back;                         /* the cursor: how many letters from the end (<Prev>, <Next>); 0: at the end */
     uint32_t ok_tick;                       /* when OK last added a letter (a second OK soon after: double-click) */
     int ok_added;
     lib_search_t found;                     /* Search: the results */
@@ -260,7 +271,7 @@ static struct {
     int editing;            /* a value row is being changed with the wheel */
 
     int moving;             /* Queue: the selected track moves with the wheel */
-    int home_order[H_N];    /* every Home item, in the order set in Settings > Home */
+    int home_order[H_N];    /* every Home item, in the order set in Settings > Interface > Home screen items */
     int home_hidden[H_N];   /* by item */
     int home[H_N + 1], home_n;  /* the items shown on Home (+ H_UPDATE, first, when there's one) */
     lv_timer_t *marquee_timer;  /* starts scrolling long text after a pause */
@@ -690,7 +701,7 @@ static void home_save(void)
     settings_set("home.items", buf);
 }
 
-/* Settings > Home changed something: keep it, and keep Home's selection valid. */
+/* Settings > Interface > Home screen items changed something: keep it, and keep Home's selection valid. */
 static void home_changed(void)
 {
     int was = S.stack[0].sel < S.home_n ? S.home[S.stack[0].sel] : H_SETTINGS;
@@ -899,7 +910,7 @@ static int list_count(const level_t *l)
     case L_INFO: return INFO_N;
     case L_QUEUE: return S.player ? player_queue_len(S.player) : 0;
     case L_PICK_PLAYLIST: return 1 + S.pick_pls.n;   /* "New playlist" + yours */
-    case L_SEARCH: return 1 + S.found.artists.n + S.found.albums.n + S.found.songs.n;
+    case L_SEARCH: return 1 + S.found.n;
     case L_RENAME: return 1;
     default: return 1;
     }
@@ -934,13 +945,14 @@ static void next_timeout(void)
     if (S.hooks.screen_timeout) S.hooks.screen_timeout(v);
 }
 
-/* Quick settings' rows: Bluetooth's and Wi-Fi's only where there are. */
+/* Quick settings' rows: Bluetooth's, Wi-Fi's and the stereo width's only where there are. */
 static int quick_rows(setting_t *out)
 {
     int n = 0;
     for (size_t i = 0; i < sizeof QUICK / sizeof QUICK[0]; i++) {
         if (QUICK[i] == ST_BT && !S.hooks.bt_state) continue;
         if (QUICK[i] == ST_WIFI && !S.hooks.wifi_state) continue;
+        if (QUICK[i] == ST_WIDTH && !S.hooks.sound_value) continue;
         out[n++] = QUICK[i];
     }
     return n;
@@ -959,7 +971,7 @@ static int sound_rows(setting_t *r)
     for (size_t i = 0; i < sizeof SOUND_ROWS / sizeof SOUND_ROWS[0]; i++) {
         setting_t st = SOUND_ROWS[i];
         if (st == ST_DAC_FILTER && !S.hooks.dac_filter_name) continue;
-        if ((st == ST_BALANCE || st == ST_VOL_LIMIT || st == ST_CROSSFEED) && !S.hooks.sound_value) continue;
+        if ((st == ST_BALANCE || st == ST_VOL_LIMIT || st == ST_CROSSFEED || st == ST_WIDTH) && !S.hooks.sound_value) continue;
         if (st == ST_PURE && !S.hooks.pure_toggle) continue;
         if (st == ST_TRANSPORT && !S.hooks.transport_toggle) continue;
         r[n++] = st;
@@ -1203,6 +1215,7 @@ static void setting_row(setting_t st, int editing, char *main, size_t mn, char *
         snprintf(main, mn, "%s", tr("Theme"));
         snprintf(meta, tn, "%.*s", (int)tn - 1, S.cur_theme < S.n_themes ? S.themes[S.cur_theme].name : "");
         break;
+    case ST_HOME_SCREEN: snprintf(main, mn, "%s", tr("Home screen items")); break;
     case ST_ALBUM_ARTISTS:
         snprintf(main, mn, "%s", tr("Artist names in Albums"));
         snprintf(meta, tn, "%s", on_off(album_artists_on()));
@@ -1258,11 +1271,12 @@ static void setting_row(setting_t st, int editing, char *main, size_t mn, char *
         break;
     }
     case ST_BALANCE:
+    case ST_WIDTH:
     case ST_VOL_LIMIT: {
         char v[48] = "";
-        snprintf(main, mn, "%s", tr(st == ST_BALANCE ? "Balance" : "Volume limit"));
-        if (st == ST_BALANCE && S.pure) { snprintf(meta, tn, "%s", tr("Bypassed")); break; }
-        if (S.hooks.sound_value) S.hooks.sound_value(st == ST_BALANCE ? UI_SOUND_BALANCE : UI_SOUND_LIMIT, v, sizeof v);
+        snprintf(main, mn, "%s", tr(st == ST_BALANCE ? "Balance" : st == ST_WIDTH ? "Stereo width" : "Volume limit"));
+        if (st != ST_VOL_LIMIT && S.pure) { snprintf(meta, tn, "%s", tr("Bypassed")); break; }
+        if (S.hooks.sound_value) S.hooks.sound_value(sound_of(st), v, sizeof v);
         snprintf(meta, tn, editing ? "< %s >" : "%s", v);
         break;
     }
@@ -1442,10 +1456,27 @@ static void entry_glyph(list_kind_t k, int i, char *out, size_t cap)
 /* The typing row: what's typed so far, and the wheel's letter with its
  * neighbours ("d E f", the wheel's letter drawn larger). A word (Results,
  * Done, space) is shown alone, with no neighbours. */
+/* Where the next letter goes in what's typed (its end, unless <Prev> moved it). */
+static int entry_cur(void)
+{
+    int len = (int)strlen(S.entry);
+    if (S.entry_back > len) S.entry_back = len;
+    if (S.entry_back < 0) S.entry_back = 0;
+    return len - S.entry_back;
+}
+
+const char *ui_test_entry(int *cursor)
+{
+    if (cursor) *cursor = entry_cur();
+    return S.entry;
+}
+
 static void entry_row(list_kind_t k, char *main, size_t mn, char wheel[3][WHEEL_CAP])
 {
-    if ((k == L_SEARCH || k == L_RDIR_SEARCH || k == L_POD_SEARCH) && !S.entry[0]) snprintf(main, mn, "%s", tr("Type with the wheel"));
+    int cur = entry_cur();
+    if ((k == L_SEARCH || k == L_RDIR_SEARCH || k == L_POD_SEARCH) && !S.entry[0]) snprintf(main, mn, "_");   /* (how to type is said under it) */
     else if (k == L_WIFI_PASS && !S.entry[0]) snprintf(main, mn, "%s", tr("Password"));
+    else if (S.entry[cur]) snprintf(main, mn, "%.*s\xC2\xA6%s", cur, S.entry, S.entry + cur);   /* inside it: a broken bar, no letter of a password */
     else snprintf(main, mn, "%s_", S.entry);
     entry_glyph(k, S.entry_ch - 1, wheel[0], WHEEL_CAP);
     entry_glyph(k, S.entry_ch, wheel[1], WHEEL_CAP);
@@ -1463,15 +1494,28 @@ static int is_typing_row(const level_t *l, int i)
             l->kind == L_POD_SEARCH) && i == 0;
 }
 
-/* Search result r: artists, then albums, then songs. */
+/* The wheel is typing: the typing row is selected and hasn't been left. Once
+ * the results under it were gone to (twice <Play>, or they came), the row is
+ * one more row of the list: the wheel passes over it (an overshoot at the top
+ * of the results no longer changed letters, with twice <Play> to get back),
+ * what's typed shows without its cursor or the wheel's letters, and <Play> on
+ * it types again (<Back> in the results goes up to it; <Back> on it leaves). */
+static int typing_on(level_t *l)
+{
+    if (!is_typing_row(l, 0)) return 0;
+    if (l->sel != 0) l->typed = 1;
+    return !l->typed;
+}
+
+int ui_test_typing(void) { return typing_on(&S.stack[S.depth - 1]); }
+
+/* Search result r (the closest names first, whatever they are): 0 an artist,
+ * 1 an album, 2 a song, and its id (-1: none). */
 static int search_kind(int r, int64_t *id)
 {
-    if (r < S.found.artists.n) { *id = S.found.artists.ids[r]; return 0; }
-    r -= S.found.artists.n;
-    if (r < S.found.albums.n) { *id = S.found.albums.ids[r]; return 1; }
-    r -= S.found.albums.n;
-    *id = r < S.found.songs.n ? S.found.songs.ids[r] : -1;
-    return 2;
+    if (r < 0 || r >= S.found.n) { *id = -1; return 2; }
+    *id = S.found.hits[r].id;
+    return S.found.hits[r].kind == LIB_HIT_ARTIST ? 0 : S.found.hits[r].kind == LIB_HIT_ALBUM ? 1 : 2;
 }
 
 static void search_row(int r, char *main, size_t mn, char *meta, size_t tn)
@@ -1479,9 +1523,12 @@ static void search_row(int r, char *main, size_t mn, char *meta, size_t tn)
     int64_t id;
     int kind = search_kind(r, &id);
     if (!S.lib || id < 0) return;
-    if (kind == 0) { library_row(S.lib, LIB_ARTISTS, id, main, mn, meta, tn); snprintf(meta, tn, "%s", tr("Artist")); }
-    else if (kind == 1) { library_row(S.lib, LIB_ALBUMS, id, main, mn, meta, tn); snprintf(meta, tn, "%s", tr("Album")); }
-    else library_row(S.lib, LIB_PLAYLIST_TRACKS, id, main, mn, meta, tn);
+    /* (what each is, its icon says: render(); at the right, as in its own
+     * list: an artist's albums, an album's artist or year, a song's length.
+     * A song's artist goes after its title, smaller: render()) */
+    if (kind == 0) library_row(S.lib, LIB_ARTISTS, id, main, mn, meta, tn);
+    else if (kind == 1) library_row(S.lib, LIB_ALBUMS, id, main, mn, meta, tn);
+    else library_row(S.lib, LIB_SONGS, id, main, mn, meta, tn);
 }
 
 static void search_run(void)
@@ -2872,6 +2919,7 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
  * around it whatever the font. */
 #define CHIP_H 22
 #define NP_ALBUM_Y 98      /* Now Playing: the album's line, and "Next:" */
+#define NP_ARTIST_Y 74     /* ...and the artist's, in the subtitle size (see apply_theme) */
 #define NP_NEXT_Y 148
 /* Where a font's capitals start below the top of its line, and how tall they are. */
 static void cap_metrics(const lv_font_t *f, int *cap_top, int *cap_h)
@@ -2973,7 +3021,12 @@ static void apply_theme(void)
     fill(S.np_shadow, 0x0B0918);
     show(S.np_shadow, t->shadow_hard);
     style_label(S.np_title, S.f->title, t->text);
-    style_label(S.np_artist, S.f->sub, t->artist);
+    /* The artist in the body size (Atkinson: 20 px, where the other second
+     * lines are 18), raised by what that adds to the line so its foot stays
+     * where it was, clear of the album under it. (Ark Pixel's two sizes are
+     * the same: nothing moves.) */
+    style_label(S.np_artist, S.f->body, t->artist);
+    lv_obj_set_y(S.np_artist, NP_ARTIST_Y - (lv_font_get_line_height(S.f->body) - lv_font_get_line_height(S.f->sub)));
     style_label(S.np_album, S.f->meta, t->album);
     style_label(S.np_next, S.f->meta, t->text_muted);
     style_label(S.np_out, S.f->meta, t->info);
@@ -3575,7 +3628,7 @@ static void fill_slots(const level_t *l, int n)
             x += LIB_ART_SMALL + ICON_GAP;
         }
 
-        /* Home (and Settings > Home): an icon before each item; on Now playing,
+        /* Home (and Settings > Interface > Home screen items): an icon before each item; on Now playing,
          * while music plays, the equalizer (or dot) takes its place, centred in
          * the icons' column */
         int hid = l->kind == L_HOME ? S.home[i] : l->kind == L_HOME_EDIT ? S.home_order[i] : -1;
@@ -3585,6 +3638,12 @@ static void fill_slots(const level_t *l, int n)
             int smart = l->items.ids[i] < 0;
             cp = smart ? SMART_ICON : HOME_ICON[H_PLAYLISTS];
             pic = smart ? PIXEL_SMART : H_PLAYLISTS;
+        }
+        if (l->kind == L_SEARCH) {                 /* Search: Home's icon for what each result is, and its own on the typing row */
+            int64_t rid;
+            int kind = i > 0 ? search_kind(i - 1, &rid) : -1;
+            pic = i == 0 ? H_SEARCH : kind == 0 ? H_ARTISTS : kind == 1 ? H_ALBUMS : H_SONGS;
+            cp = HOME_ICON[pic];
         }
         if (blank) {                               /* Podcasts, Radio: a row without a picture: Search's icon to find some, else the list's own */
             pic = i == 0 ? H_SEARCH : l->kind == L_RADIO ? H_RADIO : H_PODCASTS;
@@ -3640,9 +3699,13 @@ static void fill_slots(const level_t *l, int n)
             x += SWATCH_W + ICON_GAP;
         }
 
-        int typing = is_typing_row(l, i);
-        show(S.row_wheel[j], typing);
-        if (typing) {
+        int typing = is_typing_row(l, i), live = typing && typing_on(&S.stack[S.depth - 1]);
+        show(S.row_wheel[j], live);
+        if (typing && !live) {                     /* left for the results: what was typed, as it is */
+            snprintf(main, sizeof main, "%s", S.entry);
+            meta[0] = '\0';
+        }
+        if (live) {
             char wheel[3][WHEEL_CAP];
             entry_row(l->kind, main, sizeof main, wheel);
             for (int w = 0; w < 3; w++) {
@@ -3672,22 +3735,41 @@ static void fill_slots(const level_t *l, int n)
         }
         int line = !typing && library_backed(l->kind) && library_row_shows_artist(view_of(l->kind)) &&
                    album_artists_on();
+        /* Search: an album found is drawn as in Albums; a song has its artist
+         * after its title the same way, and keeps its length at the right */
+        char by[160] = "";
+        const char *after = meta;                  /* what follows the title on the line */
+        int keep_meta = 0;
+        if (l->kind == L_SEARCH && i > 0 && !typing) {
+            int64_t rid;
+            int kind = search_kind(i - 1, &rid);
+            lib_track_t st;
+            if (kind == 1) line = meta[0] && album_artists_on();
+            else if (kind == 2 && S.lib && rid >= 0 && library_track(S.lib, rid, &st) == 0 && st.artist[0]) {
+                snprintf(by, sizeof by, "%s", st.artist);
+                after = by;
+                keep_meta = meta[0] != '\0';
+                line = 1;
+            }
+        }
         S.line_on[j] = line;
         show(S.row_line[j], line);
         show(S.row_lbl[j], !line);
-        show(S.row_meta[j], !line);
+        show(S.row_meta[j], !line || keep_meta);
         if (line) {   /* an album: its title and artist on one line */
-            int same = text_is(S.row_lt[j], main) && text_is(S.row_la[j], meta) &&
-                       lv_obj_get_style_x(S.row_line[j], 0) == x;
+            int lw = UI_W - 2 * ROW_MARGIN - x - (keep_meta ? meta_w : 10);
+            int same = text_is(S.row_lt[j], main) && text_is(S.row_la[j], after) &&
+                       lv_obj_get_style_x(S.row_line[j], 0) == x && line_width(j) == lw;
+            if (keep_meta) set_text(S.row_meta[j], meta);
             if (!same || !lv_anim_get(S.row_line[j], line_scroll_cb)) {   /* (a scrolling one left to scroll) */
                 lv_point_t tz, az = {0, 0};
                 lv_text_get_size(&tz, main, S.f->body, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-                if (meta[0]) lv_text_get_size(&az, meta, S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+                if (after[0]) lv_text_get_size(&az, after, S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
                 S.line_tw[j] = tz.x;
                 S.line_aw[j] = az.x;
-                set_pos_width(S.row_line[j], x, 0, UI_W - 2 * ROW_MARGIN - x - 10);
+                set_pos_width(S.row_line[j], x, 0, lw);
                 set_text(S.row_lt[j], main);
-                set_text(S.row_la[j], meta);
+                set_text(S.row_la[j], after);
                 lv_anim_delete(S.row_line[j], line_scroll_cb);
                 line_layout(j);
             }
@@ -3747,7 +3829,28 @@ static void render_list(render_mode_t mode)
     if (!same) fill_slots(l, n);
     S.fill_sig = sig;
     show(S.pill, n > 0);
-    show(S.empty, n == 0);
+    /* A typing screen with nothing under its row (nothing typed yet, nothing
+     * found, a name or a password being typed): how the wheel types, where
+     * the results would be */
+    int typing_alone = n == 1 && is_typing_row(l, 0);
+    show(S.empty, n == 0 || typing_alone);
+    static int empty_dy = -10;                 /* (moved only when it changes: an idle list isn't redrawn) */
+    int dy = typing_alone ? ROW_H / 2 : -10;
+    if (dy != empty_dy) {
+        lv_obj_align(S.empty, LV_ALIGN_CENTER, 0, dy);
+        empty_dy = dy;
+    }
+    if (typing_alone) {
+        char help[320];
+        /* typed, and nothing has it: how to mend what's typed (the whole of
+         * the help under "Nothing found" is taller than the screen in a pixel font) */
+        if (l->kind == L_SEARCH && S.entry[0])
+            snprintf(help, sizeof help, "%s\n\n%s", tr("Nothing found"), tr("<Back> deletes, <Prev> and <Next> move the cursor."));
+        else
+            snprintf(help, sizeof help, "%s",
+                     tr("Scroll the wheel, <Play> once to type, twice fast to finish, <Back> deletes, <Prev> and <Next> move the cursor."));
+        set_text(S.empty, help);
+    }
     if (n == 0) {
         const char *msg = l->kind == L_QUEUE ? "Nothing queued after this track"
                         : l->kind == L_PLAYLISTS ? "No playlists in the music folder"
@@ -4565,15 +4668,20 @@ static void points_open(int welcome)
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
         lv_obj_set_style_pad_column(row, 10, 0);
+        /* a line that starts with spaces: a point under the one before it
+         * ("Improved:", then what was), set in under its text, its dot quieter */
+        int sub = line[0] == ' ';
+        const char *words = line + strspn(line, " ");
+        if (sub) lv_obj_set_style_pad_left(row, dot + 10, 0);
         lv_obj_t *d = box(row, 0, 0, dot, dot);
-        fill(d, t->signal);
+        fill(d, sub ? t->text_muted : t->signal);
         lv_obj_set_style_radius(d, t->corner == THEME_CORNER_ROUND ? LV_RADIUS_CIRCLE : 0, 0);
         lv_obj_set_style_margin_top(d, (lh - dot) / 2, 0);
         lv_obj_t *l = lv_label_create(row);
         style_label(l, pf, t->text);
         lv_obj_set_flex_grow(l, 1);
         lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
-        lv_label_set_text(l, tr(line));
+        lv_label_set_text(l, tr(words));
     }
     S.wn_hint = lv_label_create(col);
     style_label(S.wn_hint, S.f->meta, t->text_muted);
@@ -4848,6 +4956,7 @@ static const char *setting_help(setting_t st)
 {
     switch (st) {
     case ST_THEME: return "Pick how Fathom looks. More themes can go in fathom/themes.";
+    case ST_HOME_SCREEN: return "Show, hide and move the items on the Home screen.";
     case ST_COVERS: return "Show album covers in lists of albums and of songs.";
     case ST_ALBUM_ARTISTS: return "Display artist name when browsing albums.";
     case ST_BRIGHTNESS: return "How bright the screen is. Press <Play>, then turn the wheel.";
@@ -4860,6 +4969,7 @@ static const char *setting_help(setting_t st)
     case ST_EQ: return "Shape the sound with an equaliser. Each output keeps its own.";
     case ST_BALANCE: return "Left/right balance. Press <Play>, then turn the wheel.";
     case ST_CROSSFEED: return "Each ear hears a little of the other side, as with speakers.";
+    case ST_WIDTH: return "How far apart left and right are, from mono to wider. Press <Play>, then turn the wheel.";
     case ST_VOL_LIMIT: return "Caps the volume, to protect your ears. Per output.";
     case ST_LEVELLING: return "Plays songs at the same loudness, or albums as mastered.";
     case ST_TRANSPORT: return "With a USB DAC: Bluetooth and screen off for the cleanest sound.";
@@ -4892,18 +5002,17 @@ static const char *setting_help(setting_t st)
 static const char *page_help(int set)
 {
     static const char *const H[] = {
-        [SET_INTERFACE] = "Themes, list settings and languages.",
-        [SET_HOME] = "Show, hide and move the items on the Home screen.",
+        [SET_INTERFACE] = "Themes, the Home screen, list settings and languages.",
         [SET_DISPLAY] = "Screen brightness and time-outs.",
-        [SET_SOUND] = "Output, EQ, balance, volume and levelling.",
+        [SET_SOUND] = "Output, EQ, stereo width, balance, volume and levelling.",
         [SET_BLUETOOTH] = "Pair and connect Bluetooth headphones and speakers.",
         [SET_WIFI] = "Join and manage Wi-Fi networks.",
         [SET_SHARE] = "Copy music to the H2 from a computer, over Wi-Fi.",
         [SET_SSH] = "Connect to the H2 through SSH.",
         [SET_USB] = "What the H2 does when you plug it into a computer.",
-        [SET_PLAYBACK] = "Shuffle options, repeat and pause on unplug.",
+        [SET_PLAYBACK] = "Shuffle options, repeat, sleep timer and pause on unplug.",
         [SET_PODCASTS] = "Downloading new episodes, keeping and deleting them, speed.",
-        [SET_POWER] = "Battery, sleep timer and auto power off.",
+        [SET_POWER] = "Battery and auto power off.",
         [SET_LIBRARY] = "Rescan library and library stats.",
         [SET_ABOUT] = "Device info and firmware updates.",
     };
@@ -4948,7 +5057,7 @@ static const char *row_help(const level_t *l)
         switch (about_row(i)) {
         case AB_RESET: return "Reset all settings to defaults. Press <Play> twice.";
         case AB_UNINSTALL: return "Put the H2 back on HiBy's own firmware.";
-        case AB_AUTO: return "Check for updates once a day over Wi-Fi.";
+        case AB_AUTO: return "Check for updates three times a day over Wi-Fi.";
         case AB_CHECK: return "Check for a newer version of Fathom.";
         case AB_TIPS: return "The keys worth knowing, as shown after installing.";
         case AB_WHATSNEW: return NULL;
@@ -5752,6 +5861,7 @@ static void the_ok(level_t *l)
     case TE_NAME:
         S.rename_theme = 1;
         snprintf(S.entry, sizeof S.entry, "%s", t->name);
+        S.entry_back = 0;
         S.entry_ch = 0;
         push_ui(L_RENAME, "Theme name", 0);
         return;
@@ -6134,7 +6244,7 @@ static int open_context(void)
         eqe_open(S.eq_names[l->sel - 1]);
         return 0;
     }
-    if (l->kind == L_HOME_EDIT && !on_np) {   /* Settings > Home: move an item */
+    if (l->kind == L_HOME_EDIT && !on_np) {   /* Settings > Interface > Home screen items: move an item */
         CTX_ADD(CTX_HOME_MOVE);
         push_from_here(L_CONTEXT, HOME[S.home_order[l->sel]], 0, 1);
         return 0;
@@ -6688,9 +6798,9 @@ static void setting_ok(setting_t st)
         if (S.pure) { ui_toast("Bypassed in Pure mode", 1500); break; }
         if (S.hooks.sound_adjust) S.hooks.sound_adjust(UI_SOUND_CROSSFEED, 1);
         break;
-    case ST_BALANCE: case ST_VOL_LIMIT:
-        if (st == ST_BALANCE && S.pure) { ui_toast("Bypassed in Pure mode", 1500); break; }
-        if (S.hooks.sound_adjust && S.hooks.sound_adjust(st == ST_BALANCE ? UI_SOUND_BALANCE : UI_SOUND_LIMIT, 0) == 0)
+    case ST_BALANCE: case ST_WIDTH: case ST_VOL_LIMIT:
+        if (st != ST_VOL_LIMIT && S.pure) { ui_toast("Bypassed in Pure mode", 1500); break; }
+        if (S.hooks.sound_adjust && S.hooks.sound_adjust(sound_of(st), 0) == 0)
             S.editing = !S.editing;
         break;
     case ST_SHUFFLE: if (S.player) player_set_shuffle(S.player, !player_shuffle(S.player)); break;
@@ -6707,6 +6817,10 @@ static void setting_ok(setting_t st)
     case ST_ON_CHARGING: settings_set_int("display.on_charging", !settings_get_int("display.on_charging", UI_ON_CHARGING_DEFAULT)); break;
     case ST_COVERS: settings_set_int("display.covers", (settings_get_int("display.covers", UI_COVERS_DEFAULT) + 1) & 3); break;
     case ST_THEME: push_ui(L_THEMES, "Theme", 0); break;
+    case ST_HOME_SCREEN:
+        push_ui(L_HOME_EDIT, "Home screen items", 0);
+        ui_toast("<Play> shows or hides. <Menu>: Move", 2500);
+        break;
     case ST_ALBUM_ARTISTS:
         settings_set_int("display.album_artists", !album_artists_on());
         library_set_album_artists(S.lib, album_artists_on());
@@ -7033,6 +7147,7 @@ static void open_selected(void)
         case H_FOLDERS: push_ui(L_FOLDER, "Folders", 0); break;
         case H_SEARCH:
             S.entry[0] = '\0';
+            S.entry_back = 0;
             S.entry_ch = 0;
             search_run();
             push_ui(L_SEARCH, "Search", 0);
@@ -7105,6 +7220,7 @@ static void open_selected(void)
         switch (l->sel) {
         case RD_MENU_SEARCH:
             S.entry[0] = '\0';
+            S.entry_back = 0;
             S.entry_ch = 0;
             S.ok_added = 0;
             push_ui(L_RDIR_SEARCH, "Search by name", 0);
@@ -7255,6 +7371,7 @@ static void open_selected(void)
             else {                                         /* a new network: its password */
                 snprintf(S.wifi_pass_ssid, sizeof S.wifi_pass_ssid, "%s", w->ssid);
                 memset(S.entry, 0, sizeof S.entry);
+                S.entry_back = 0;
                 S.entry_ch = 0;
                 char t[80];
                 subst(t, sizeof t, tr("Password for %s"), w->ssid, NULL);
@@ -7310,10 +7427,9 @@ static void open_selected(void)
         else if (l->sel - BT_DEV_ROW < S.bt_n) S.hooks.bt_do(UI_BT_PRESS, S.bt[l->sel - BT_DEV_ROW].addr);
         break;
     case L_SETTINGS: {
-        static const list_kind_t sub[] = {L_INTERFACE, L_HOME_EDIT, L_DISPLAY, L_SOUND, L_BLUETOOTH, L_WIFI, L_SHARE, L_SSH,
-                                          L_USB, L_PLAYBACK, L_POD_SETTINGS, L_POWER, L_LIBRARY, L_ABOUT};
+        static const list_kind_t sub[] = {L_SOUND, L_PLAYBACK, L_INTERFACE, L_WIFI, L_BLUETOOTH, L_POD_SETTINGS, L_DISPLAY,
+                                          L_LIBRARY, L_USB, L_SHARE, L_POWER, L_SSH, L_ABOUT};   /* (as SETTINGS) */
         push_ui(sub[l->sel], SETTINGS[l->sel], 0);
-        if (sub[l->sel] == L_HOME_EDIT) ui_toast("<Play> shows or hides. <Menu>: Move", 2500);
         if (sub[l->sel] == L_WIFI && S.hooks.wifi_do) S.hooks.wifi_do(UI_WIFI_SCAN, NULL, NULL);   /* fresh networks */
         break;
     }
@@ -7332,7 +7448,7 @@ static void open_selected(void)
             int on = !settings_get_int("update.auto", UI_UPDATE_AUTO_DEFAULT);
             settings_set_int("update.auto", on);
             settings_save();
-            if (on) ui_toast("Once a day, while the H2 rests on Wi-Fi", 3000);
+            if (on) ui_toast("Three times a day, while the H2 rests on Wi-Fi", 3000);
         } else if (about_row(l->sel) == AB_UNINSTALL) {
             uninstall_look();
             if (S.uni.state != UI_UNI_PENDING) S.hooks.uninstall_do(UI_UNI_CHECK);
@@ -7451,6 +7567,7 @@ static void open_selected(void)
     case L_PODCASTS:
         if (l->sel == 0) {                        /* Find podcasts */
             S.entry[0] = '\0';
+            S.entry_back = 0;
             S.entry_ch = 0;
             S.ok_added = 0;
             if (S.pod_search != 0) { S.pod_search = -1; S.pod_nf = 0; }
@@ -7500,9 +7617,11 @@ static void open_selected(void)
             if (rid < 0) break;
             if (kind == 0 && library_artist_name(S.lib, rid, name, sizeof name) == 0) push_artist(rid, name);
             else if (kind == 1 && library_album_name(S.lib, rid, name, sizeof name) == 0) push(L_TRACKS, name, rid);
-            else if (kind == 2 && S.player) {    /* the matching songs, from this one */
-                player_play(S.player, S.found.songs.ids, S.found.songs.n,
-                            l->sel - 1 - S.found.artists.n - S.found.albums.n);
+            else if (kind == 2 && S.player) {    /* the songs found, from this one */
+                int at = 0;
+                for (int i = 0; i < S.found.n_songs; i++)
+                    if (S.found.songs[i] == rid) { at = i; break; }
+                player_play(S.player, S.found.songs, S.found.n_songs, at);
                 S.now_playing_view = 1;
             }
         }
@@ -7798,6 +7917,16 @@ void ui_key(ui_key_t k)
     if (S.wn_ov && whats_new_key(k)) return;
     if (S.uni_ov && uninstall_overlay_key(k)) return;
     if (S.clk_ov && clock_key(k)) return;
+    /* Typing: <Prev> and <Next> move the cursor through what's typed (not the
+     * track: a letter wrong at the start no longer means deleting the rest) */
+    if (!S.now_playing_view && typing_on(l) && (k == UI_KEY_PREV || k == UI_KEY_NEXT)) {
+        int cur = entry_cur();
+        if (k == UI_KEY_PREV && cur > 0) S.entry_back++;
+        if (k == UI_KEY_NEXT && S.entry_back > 0) S.entry_back--;
+        S.ok_added = 0;
+        render(R_CONTENT);
+        return;
+    }
     /* keys that do the same thing everywhere */
     switch (k) {
     case UI_KEY_PLAY: if (pl) player_toggle_pause(pl); render(R_CONTENT); return;
@@ -7890,11 +8019,11 @@ void ui_key(ui_key_t k)
         return;
     }
     int n = list_count(l);
-    if ((l->kind == L_SEARCH || l->kind == L_RENAME || l->kind == L_WIFI_PASS || l->kind == L_RDIR_SEARCH ||
-         l->kind == L_POD_SEARCH) && l->sel == 0) {   /* typing with the wheel */
+    if (typing_on(l)) {                               /* typing with the wheel */
         const char *letters = entry_letters(l->kind);
         int nl = (int)strlen(letters);
         size_t len = strlen(S.entry);
+        size_t cur = (size_t)entry_cur();          /* letters go in, and Back takes one out, here */
         switch (k) {
         case UI_KEY_UP: S.entry_ch = (S.entry_ch + nl) % (nl + 1); S.ok_added = 0; break;
         case UI_KEY_DOWN: S.entry_ch = (S.entry_ch + 1) % (nl + 1); S.ok_added = 0; break;
@@ -7902,8 +8031,10 @@ void ui_key(ui_key_t k)
             /* a double-click: undo the letter the first click added, then Results / Done */
             int dbl = S.ok_added && len && lv_tick_elaps(S.ok_tick) < DOUBLE_CLICK_MS;
             S.ok_added = 0;
-            if (dbl) {
-                S.entry[--len] = '\0';
+            if (dbl && cur > 0) {                    /* (the one just added: before the cursor) */
+                memmove(S.entry + cur - 1, S.entry + cur, len - cur + 1);
+                len--;
+                cur--;
                 if (l->kind == L_SEARCH) search_run();
                 n = list_count(l);
             }
@@ -7922,6 +8053,7 @@ void ui_key(ui_key_t k)
                     if (strlen(S.entry) < 8) { ui_toast("At least 8 characters", 1500); break; }
                     if (S.hooks.wifi_do) S.hooks.wifi_do(UI_WIFI_CONNECT, S.wifi_pass_ssid, S.entry);
                     memset(S.entry, 0, sizeof S.entry);
+                    S.entry_back = 0;
                     pop();
                     ui_toast("Joining...", 1500);
                 }
@@ -7944,24 +8076,24 @@ void ui_key(ui_key_t k)
             } else if (len + 1 < sizeof S.entry) {
                 char c = letters[S.entry_ch];
                 /* names: a capital at the start of each word */
-                if (l->kind == L_RENAME && c >= 'a' && c <= 'z' && (len == 0 || S.entry[len - 1] == ' ')) c -= 32;
+                if (l->kind == L_RENAME && c >= 'a' && c <= 'z' && (cur == 0 || S.entry[cur - 1] == ' ')) c -= 32;
                 if (l->kind == L_WIFI_PASS && len + 1 > 63) { ui_toast("63 characters at most", 1500); break; }
-                S.entry[len] = c;
-                S.entry[len + 1] = '\0';
+                memmove(S.entry + cur + 1, S.entry + cur, len - cur + 1);
+                S.entry[cur] = c;
                 if (l->kind == L_SEARCH) search_run();
                 S.ok_added = 1;
                 S.ok_tick = lv_tick_get();
             }
             break;
         }
-        case UI_KEY_BACK:                                  /* delete a letter; nothing left: leave */
+        case UI_KEY_BACK:                                  /* delete the letter before the cursor; nothing typed: leave */
             S.ok_added = 0;
-            if (len) {
-                S.entry[len - 1] = '\0';
+            if (cur > 0) {
+                memmove(S.entry + cur - 1, S.entry + cur, len - cur + 1);
                 if (l->kind == L_SEARCH) search_run();
-            } else {
+            } else if (!len) {
                 pop();
-            }
+            }                                              /* (at the start of something typed: nothing to delete) */
             break;
         case UI_KEY_BACK_LONG: S.now_playing_view = 1; break;
         default: break;
@@ -7969,8 +8101,19 @@ void ui_key(ui_key_t k)
         render(R_ANIMATE);
         return;
     }
-    if ((l->kind == L_SEARCH || l->kind == L_RDIR_SEARCH || l->kind == L_POD_SEARCH) && k == UI_KEY_BACK) {   /* in the results: back to the letters */
-        l->sel = 0;
+    /* The typing left for the results. <Back> in them: up to the typing row
+     * (a row still: what's typed is kept, and nothing is deleted); <Back>
+     * there: out of the screen (two presses however much is typed, where it
+     * took one a letter); <Play> there: the letters again. */
+    if (is_typing_row(l, 0) && (k == UI_KEY_BACK || (k == UI_KEY_OK && l->sel == 0))) {
+        if (k == UI_KEY_OK) {
+            l->typed = 0;
+            S.ok_added = 0;                        /* (this <Play> isn't the first of two) */
+        } else if (l->sel > 0) {
+            l->sel = 0;
+        } else {
+            pop();
+        }
         render(R_ANIMATE);
         return;
     }
@@ -8049,7 +8192,7 @@ void ui_key(ui_key_t k)
         case UI_KEY_DOWN:
             if (st == ST_BRIGHTNESS) set_brightness(brightness() + dir);
             else if (S.hooks.sound_adjust)
-                S.hooks.sound_adjust(st == ST_BALANCE ? UI_SOUND_BALANCE : UI_SOUND_LIMIT, dir);
+                S.hooks.sound_adjust(sound_of(st), dir);
             break;
         case UI_KEY_OK: case UI_KEY_BACK: S.editing = 0; break;
         default: break;
@@ -8322,6 +8465,7 @@ void ui_show(const char *what)
         if (!strcmp(what, "podsearch")) {
             S.stack[S.depth - 1].sel = 0;
             snprintf(S.entry, sizeof S.entry, "radiolab");
+            S.entry_back = 0;
             S.entry_ch = 0;
             push_ui(L_POD_SEARCH, "Find podcasts", 0);
             pod_search_run();
@@ -8402,6 +8546,7 @@ void ui_show(const char *what)
             m->sel = RD_MENU_SEARCH;
             open_selected();
             snprintf(S.entry, sizeof S.entry, "fip");
+            S.entry_back = 0;
             S.entry_ch = (int)strlen(SEARCH_CHARS);   /* the wheel on Search */
             S.rd_q = (rdir_query_t){.by = RDIR_NAME, .arg = "fip"};
             rd_ask(&S.rd_q);
@@ -8422,10 +8567,17 @@ void ui_show(const char *what)
         }
     } else if (!strcmp(what, "search")) {
         S.stack[0].sel = home_index(H_SEARCH);
-        snprintf(S.entry, sizeof S.entry, "bu");
+        const char *typed = getenv("FATHOM_SIM_SEARCH");   /* what's typed, else "bu" */
+        snprintf(S.entry, sizeof S.entry, "%s", typed ? typed : "bu");   /* (set and empty: nothing typed) */
+        S.entry_back = getenv("FATHOM_SIM_CURSOR_BACK") ? atoi(getenv("FATHOM_SIM_CURSOR_BACK")) : 0;   /* (the cursor that far from the end) */
         S.entry_ch = 'e' - 'a';
         search_run();
         push_ui(L_SEARCH, "Search", 0);
+        if (getenv("FATHOM_SIM_SEARCH_ROW")) {            /* the typing left for the results: that row selected */
+            level_t *sl = &S.stack[S.depth - 1];
+            sl->sel = atoi(getenv("FATHOM_SIM_SEARCH_ROW"));
+            sl->typed = 1;
+        }
     } else if (!strcmp(what, "artists") || !strcmp(what, "artist") || !strcmp(what, "artistsongs")) {
         S.stack[0].sel = home_index(H_ARTISTS);
         push_ui(L_ARTISTS, "Artists", 0);
@@ -8448,10 +8600,10 @@ void ui_show(const char *what)
         push_ui(L_ALBUM_ARTISTS, "Album artists", 0);
     } else if (!strcmp(what, "homeend")) {    /* Home, at its last items */
         S.stack[0].sel = S.home_n > 0 ? S.home_n - 2 : 0;
-    } else if (!strcmp(what, "homeall")) {    /* Settings > Home: every item, shown or not */
+    } else if (!strcmp(what, "homeall")) {    /* Settings > Interface > Home screen items: every item, shown or not */
         S.stack[0].sel = home_index(H_SETTINGS);
         push_ui(L_SETTINGS, "Settings", 0);
-        push_ui(L_HOME_EDIT, "Home", 0);
+        push_ui(L_HOME_EDIT, "Home screen items", 0);
         S.stack[S.depth - 1].sel = H_N - 2;
     } else if (!strcmp(what, "genres")) {
         S.stack[0].sel = home_index(H_GENRES);
@@ -8489,7 +8641,13 @@ void ui_show(const char *what)
         push_ui(L_SETTINGS, "Settings", 0);
         S.stack[S.depth - 1].sel = SET_SOUND;
         push_ui(L_SOUND, "Sound", 0);
-        S.stack[S.depth - 1].sel = 2;
+        {   /* on EQ, wherever it is among the rows there are */
+            setting_t r[sizeof SOUND_ROWS / sizeof SOUND_ROWS[0]];
+            int n = sound_rows(r), at = 0;
+            for (int i = 0; i < n; i++)
+                if (r[i] == ST_EQ) at = i;
+            S.stack[S.depth - 1].sel = at;
+        }
     } else if (!strcmp(what, "signal")) {
         S.stack[0].sel = home_index(H_SETTINGS);
         push_ui(L_SETTINGS, "Settings", 0);
@@ -8499,8 +8657,10 @@ void ui_show(const char *what)
     } else if (!strcmp(what, "homeedit")) {
         S.stack[0].sel = home_index(H_SETTINGS);
         push_ui(L_SETTINGS, "Settings", 0);
-        S.stack[S.depth - 1].sel = SET_HOME;
-        push_ui(L_HOME_EDIT, "Home", 0);
+        S.stack[S.depth - 1].sel = SET_INTERFACE;
+        push_ui(L_INTERFACE, "Interface", 0);
+        S.stack[S.depth - 1].sel = 1;                /* (Home screen items) */
+        push_ui(L_HOME_EDIT, "Home screen items", 0);
         S.stack[S.depth - 1].sel = 5;
     } else if (!strcmp(what, "songs")) {
         S.stack[0].sel = home_index(H_SONGS);
@@ -8692,7 +8852,7 @@ void ui_init(lv_obj_t *screen, const theme_t *themes, int n_themes,
 
     S.np = box(screen, 0, HEADER_H, UI_W, UI_H - HEADER_H);
     const int art_x = 12, tx = 160, tw = 150, ty = 8;
-    const int title_h = 64, artist_y = 74, album_y = NP_ALBUM_Y, chip_y = 122;
+    const int title_h = 64, artist_y = NP_ARTIST_Y, album_y = NP_ALBUM_Y, chip_y = 122;
     S.np_shadow = box(S.np, art_x + STEP, 6 + STEP, 136, 136);
     S.np_art = box(S.np, art_x, 6, 136, 136);
     lv_obj_set_style_clip_corner(S.np_art, true, 0);

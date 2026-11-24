@@ -37,3 +37,4 @@ endif()
 add_test(NAME ui_redraw COMMAND fathom-sim --bench 1 WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 # A station chosen while Wi-Fi is still joining is kept and starts once it has joined.
 add_test(NAME ui_wifi_wait COMMAND fathom-sim --wifi-wait)
+add_test(NAME ui_typing COMMAND fathom-sim --type-test)

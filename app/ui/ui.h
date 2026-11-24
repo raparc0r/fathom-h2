@@ -62,7 +62,7 @@ struct ui_fonts {
 #define UI_SHUF_INTERLUDES_DEFAULT 1   /* shuffle.skip_interludes */
 #define UI_SHUF_WORKS_DEFAULT      0   /* shuffle.keep_works: a work's movements together */
 #define UI_EXCLUDE_SPOKEN_DEFAULT  1   /* shuffle.exclude_spoken: audiobooks out of shuffle */
-#define UI_UPDATE_AUTO_DEFAULT     1   /* update.auto: ask GitHub once a day, never download */
+#define UI_UPDATE_AUTO_DEFAULT     1   /* update.auto: ask GitHub three times a day, never download */
 
 /* What the UI asks of the platform when a setting changes (either may be NULL). */
 typedef struct ui_fonts ui_fonts_t;
@@ -88,7 +88,7 @@ typedef struct { int state; char usb_ip[16]; char wifi_ip[16]; char password[32]
 enum { UI_SCAN_LOOKING, UI_SCAN_SONGS, UI_SCAN_ALBUMS, UI_SCAN_COVERS };
 typedef struct { int step, done, total; char file[96]; } ui_scan_t;
 enum { UI_SSH_TOGGLE, UI_SSH_NEW_PASSWORD };
-enum { UI_SOUND_BALANCE, UI_SOUND_LIMIT, UI_SOUND_CROSSFEED };
+enum { UI_SOUND_BALANCE, UI_SOUND_LIMIT, UI_SOUND_CROSSFEED, UI_SOUND_WIDTH };
 /* Updates (Settings > About > Check for updates): only ever when asked.
  * The state, the versions, the release's size and the work's progress
  * (bytes done of total, while downloading, checking and unpacking). */
@@ -342,5 +342,9 @@ void ui_show(const char *what);
  * shown), the open list's selected row and its number of rows; home_edit: 1
  * when it is Settings > Home (OK there changes Home's rows). */
 int ui_list_state(int *sel, int *n, int *home_edit);
+/* What's typed on a typing screen, and where the cursor is in it (tests). */
+const char *ui_test_entry(int *cursor);
+/* Whether the wheel is typing there (0: the typing row was left for the results). */
+int ui_test_typing(void);
 
 #endif
