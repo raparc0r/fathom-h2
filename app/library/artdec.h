@@ -26,7 +26,7 @@
 
 typedef struct {
     long jpeg_memory;       /* libjpeg's working memory for one image */
-    long long max_pixels;   /* an image decoded whole (or a PNG's shrunk result) */
+    long long max_pixels;   /* an image decoded whole (or a PNG's shrunk result, or a progressive JPEG's first pass) */
     long max_file;          /* encoded bytes read into memory for those */
     int matte;              /* 1: a PNG's transparent parts over white (0, as when left out: its colours as they are) */
 } art_limits_t;

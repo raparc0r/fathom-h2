@@ -176,6 +176,132 @@ static void *run(void *arg)
     return NULL;
 }
 
+/* ---- a radio stream (audio/decoder.h) and a server that isn't there ----
+ * A connection that fails must fail when it does: the player has its own
+ * tries, a minute of them (player.c), and FFmpeg trying each one again by
+ * itself (reconnect_on_network_error: 11 s for a refused connection, and
+ * nested in every reconnect of a stream that dropped) made a dead station
+ * take minutes to be given up. A stream whose connection closes is still
+ * picked up again (reconnect, reconnect_streamed). */
+#include <time.h>
+#include "audio/decoder.h"
+
+static volatile int rs_conns, rs_gone;
+
+static double mono_s(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+/* A WAV with no length (44.1 kHz, 16 bits, stereo, silent): the first
+ * connection gets a second of it and is closed; the ones after go on until
+ * rs_gone. */
+static void *radio_serve(void *arg)
+{
+    int c = (int)((long)arg & 0xffff), nth = (int)((long)arg >> 16);
+    char req[1024];
+    size_t n = 0;
+    while (n < sizeof req - 1) {
+        ssize_t k = read(c, req + n, sizeof req - 1 - n);
+        if (k <= 0) break;
+        n += (size_t)k;
+        req[n] = '\0';
+        if (strstr(req, "\r\n\r\n")) break;
+    }
+    static const unsigned char wav[44] = {
+        'R', 'I', 'F', 'F', 0xff, 0xff, 0xff, 0x7f, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ', 16, 0, 0, 0,
+        1, 0, 2, 0, 0x44, 0xac, 0, 0, 0x10, 0xb1, 2, 0, 4, 0, 16, 0, 'd', 'a', 't', 'a', 0, 0, 0, 0};
+    static const char head[] = "HTTP/1.0 200 OK\r\nContent-Type: audio/wav\r\n\r\n";
+    static const unsigned char quiet[4096];
+    long sent = 0;
+    if (write(c, head, sizeof head - 1) == (ssize_t)sizeof head - 1 && write(c, wav, sizeof wav) == (ssize_t)sizeof wav)
+        while (!rs_gone && !(nth == 1 && sent >= 44100 * 4)) {
+            ssize_t w = write(c, quiet, sizeof quiet);
+            if (w <= 0) break;
+            sent += w;
+        }
+    close(c);
+    return NULL;
+}
+
+static void *radio_server(void *arg)
+{
+    int s = (int)(long)arg;
+    for (;;) {
+        int c = accept(s, NULL, NULL);
+        if (c < 0) return NULL;
+        long a = (long)c | ((long)++rs_conns << 16);
+        pthread_t t;
+        if (pthread_create(&t, NULL, radio_serve, (void *)a) == 0) pthread_detach(t);
+        else close(c);
+    }
+}
+
+static int local_listener(int *port)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t al = sizeof a;
+    if (s < 0 || bind(s, (struct sockaddr *)&a, sizeof a) || listen(s, 8) || getsockname(s, (struct sockaddr *)&a, &al)) return -1;
+    *port = ntohs(a.sin_port);
+    return s;
+}
+
+static void test_stream(void)
+{
+    char url[100];
+    audio_format_t f;
+    volatile int stop = 0;
+    static int32_t pcm[4096 * 2];
+    /* nothing listening: it fails at once (it took 11 s) */
+    int port = 0, s = local_listener(&port);
+    CHECK(s >= 0, "a listener");
+    close(s);
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/radio.wav", port);
+    double t0 = mono_s();
+    decoder_t *d = decoder_open_ex(url, &f, &stop);
+    double took = mono_s() - t0;
+    CHECK(!d && took < 3, "a refused stream: %s after %.1f s", d ? "opened" : "failed", took);
+    if (d) decoder_close(d);
+
+    /* a stream whose connection is closed after a second: gone on with, on a
+     * new connection */
+    s = local_listener(&port);
+    CHECK(s >= 0, "a listener");
+    pthread_t st;
+    pthread_create(&st, NULL, radio_server, (void *)(long)s);
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/radio.wav", port);
+    d = decoder_open_ex(url, &f, &stop);
+    CHECK(d && f.rate == 44100 && f.channels == 2, "the stream opened (%u Hz, %u channels)", d ? f.rate : 0, d ? f.channels : 0);
+    if (!d) return;
+    long frames = 0, r = 1;
+    t0 = mono_s();
+    while (frames < 3 * 44100 && r > 0 && mono_s() - t0 < 60) {
+        r = decoder_read(d, pcm, 4096);
+        if (r > 0) frames += r;
+    }
+    CHECK(frames >= 3 * 44100 && rs_conns >= 2, "after its connection closed: %ld frames over %d connections", frames, rs_conns);
+
+    /* its server gone for good: the stream ends once FFmpeg's own reconnects
+     * are used up (11 s of waits; over a minute when each of them tried five
+     * times itself), for the player to take over */
+    rs_gone = 1;
+    shutdown(s, SHUT_RDWR);
+    close(s);
+    pthread_join(st, NULL);
+    t0 = mono_s();
+    while ((r = decoder_read(d, pcm, 4096)) > 0 && mono_s() - t0 < 180) ;
+    took = mono_s() - t0;
+    CHECK(r <= 0 && took < 30, "its server gone: the stream %s after %.1f s", r <= 0 ? "ended" : "still going", took);
+    printf("http: a refused stream fails at once; a dropped one reconnects; a dead one ends in %.1f s\n", took);
+    decoder_close(d);
+}
+
 #include "tmpdir.h"
 
 int main(void)
@@ -223,6 +349,7 @@ int main(void)
     }
     close(ls);
     rmdir(dir);
+    test_stream();
     fails += test_tries();
     if (fails) { printf("%d failed\n", fails); return 1; }
     printf("http: ok\n");

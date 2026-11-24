@@ -67,7 +67,7 @@ struct engine {
     uint32_t tag;              /* the current track's, as lined up (engine_queue_ahead) */
     uint32_t seq;
     uint64_t pos_frames;       /* frames of the current track written */
-    int ended, error, error_output;
+    int ended, error, error_output, error_memory;
     unsigned stop_seq;         /* +1 each time playback stops by itself (ended, or a track failed) */
     int rewind;                /* paused, and the output dropped what it had: at the resume, */
     uint64_t rewind_to;        /* ...the decoder goes back here (what was heard) */
@@ -298,6 +298,7 @@ static void failed(engine_t *e, int output)
     e->state = ENG_STOPPED;
     e->error = 1;
     e->error_output = output;
+    e->error_memory = 0;
     e->ended = 1;
     e->stop_seq++;
 }
@@ -311,6 +312,7 @@ static void track_failed(engine_t *e, const pending_t *p)
     e->tag = p->tag;
     e->seq++;
     failed(e, 0);
+    e->error_memory = decoder_open_why() == DECODER_WHY_MEMORY;   /* (the last open on this thread: this track's) */
 }
 
 /* Called with mu held. Opens `p` (or takes `d`, already opened, with its format
@@ -335,6 +337,7 @@ static int start_track(engine_t *e, const pending_t *p, int gapless, decoder_t *
             e->out_open && e->out_fmt.rate ? queued * 1000 / (long)e->out_fmt.rate : 0);
     }
     if (!d || f.channels == 0 || f.channels > MAX_CH) {
+        e->error_memory = !d && decoder_open_why() == DECODER_WHY_MEMORY;
         if (d && d != e->dec) decoder_close(d);
         e->error = 1;
         return -1;
@@ -357,7 +360,7 @@ static int start_track(engine_t *e, const pending_t *p, int gapless, decoder_t *
     e->rewind = 0;
     e->tempo_dirty = 1;
     e->seq++;
-    e->error = 0;
+    e->error = e->error_memory = 0;
     e->ended = 0;
 
     audio_format_t of = out_format(e, &f);
@@ -887,7 +890,7 @@ void engine_play_at(engine_t *e, const char *path, int64_t id, float gain, uint3
     e->cmd_play.start_ms = start_ms;
     unblock(e);        /* (paused: the thread may be waiting in a write) */
     cut_write(e);      /* (playing: it may be too, for a chunk's worth) */
-    e->ended = e->error = 0;   /* (they were the last track's) */
+    e->ended = e->error = e->error_memory = 0;   /* (they were the last track's) */
     e->start_paused = !!paused;   /* (with the command, under the one lock: the thread can't start it playing first) */
     e->n_next = 0;
     e->cmd_seek = 0;   /* (a seek still pending was for the old track; a resume seeks after this) */
@@ -1119,6 +1122,7 @@ void engine_status(engine_t *e, eng_status_t *st)
     st->ended = e->ended;
     st->error = e->error;
     st->error_output = e->error && e->error_output;
+    st->error_memory = e->error && e->error_memory;
     st->stop_seq = e->stop_seq;
     st->output_lost = e->out_lost;
     st->starting = e->cmd_play.valid || e->opening;

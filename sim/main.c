@@ -87,6 +87,7 @@ static long sim_dir_fetch(const char *url, char *buf, size_t cap, const volatile
         nanosleep(&t, NULL);
     }
     if (g_dir_fail || g_dir_slow) return -1;
+    if (strstr(url, "/byurl?")) return -1;            /* (a stream looked up for its logo: none here) */
     const char *name = strstr(url, "/json/countries") ? "countries"
                      : strstr(url, "tag=jazz") && strstr(url, "order=random") ? "stations-jazz-random"
                      : strstr(url, "tag=jazz") ? "stations-jazz"
@@ -234,6 +235,24 @@ static void sim_icon_seed(const char *dir)
     }
     library_list_free(&al);
 }
+/* Settings > Wi-Fi for the screenshots: connected, with a saved network, a new
+ * one with a password and an open one in range (made-up names) */
+static int shot_wifi_state(char *busy, size_t cap, ui_wifi_status_t *st)
+{
+    if (cap) busy[0] = '\0';
+    if (st) *st = (ui_wifi_status_t){.state = UI_WIFI_CONNECTED, .ssid = "Harbour House", .ip = "192.168.1.24", .dbm = -52};
+    return 1;
+}
+static int shot_wifi_networks(ui_wifi_net_t *out, int max)
+{
+    static const ui_wifi_net_t NET[] = {
+        {"Harbour House", -52, 1, 1, 1}, {"Cafe Upstairs", -61, 1, 0, 0}, {"Old Workshop", -70, 1, 1, 0}, {"Library Guest", -80, 0, 0, 0}};
+    int n = (int)(sizeof NET / sizeof NET[0]) < max ? (int)(sizeof NET / sizeof NET[0]) : max;
+    for (int i = 0; i < n; i++) out[i] = NET[i];
+    return n;
+}
+static void shot_wifi_do(int what, const char *ssid, const char *password) { (void)what; (void)ssid; (void)password; }
+
 /* What's new, as a release's whatsnew.txt gives it (the screenshots; About's row) */
 #define SIM_WHATS_NEW_VERSION "v0.14.1"
 #define SIM_WHATS_NEW "Hotfix: Eliminates clicking sound when you skip, go back or seek\n" \
@@ -617,7 +636,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                                           "uninstallnone", "uninstallpending", "homeupdate", "askupdate", "askignore", "askinstall", "askinstallwn", "eqedit", "eqband",
                                           "themesnew", "themeedit", "themecolours", "themecolour", "themesave",
                                           "podcasts", "podshow", "podsearch", "podnp", "podchapters", "podmenu", "podsettings",
-                                          "libsettings", "libhelp", "xfhelp", "whatsnew", "whatsnewend", "aboutwn", "covermenu", "covermenuown", "coverfind",
+                                          "settings", "wifi", "libsettings", "libhelp", "xfhelp", "whatsnew", "whatsnewend", "aboutwn", "covermenu", "covermenuown", "coverfind",
                                           "albummenu", "artistmenu", "aartistmenu", "homemove",
                                           "smartlists", "smartopen", "smartmenu",
                                           "cv-tracks", "cv-artist", "cv-artistsongs", "cv-playlist", "cv-queue",
@@ -626,6 +645,10 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
     for (int t = 0; t < 4 && t < g_n_themes; t++) {   /* the built-in themes */
         ui_set_theme(t);
         for (size_t s = 0; s < sizeof screens / sizeof screens[0]; s++) {
+            if (s > 0 && !strcmp(screens[s - 1], "wifi")) {   /* (its made-up networks: for that screen only) */
+                ui_set_hooks(&g_hooks);
+                ui_wifi_changed();
+            }
             lv_obj_t *sample = NULL;
             if (g_sim_scanning) { g_sim_scanning = 0; ui_show_scan(); }   /* (the last one's put away) */
             if (!strcmp(screens[s], "glyphs")) {    /* digits vs letters, and the fallback font */
@@ -729,6 +752,19 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 if (!strncmp(screens[s], "askinstall", 10)) ui_key(UI_KEY_OK);   /* Install: About > Updates */
                 ui_set_theme(t);                            /* (the slide finished) */
                 settings_set("update.found", "");
+            } else if (!strcmp(screens[s], "wifi")) {      /* Settings > Wi-Fi, with made-up networks in range */
+                ui_hooks_t h = g_hooks;
+                h.wifi_state = shot_wifi_state;
+                h.wifi_networks = shot_wifi_networks;
+                h.wifi_do = shot_wifi_do;
+                ui_set_hooks(&h);
+                ui_wifi_changed();
+                ui_show("wifi");
+                ui_key(UI_KEY_DOWN);
+                ui_key(UI_KEY_DOWN);
+                ui_key(UI_KEY_DOWN);
+                ui_key(UI_KEY_DOWN);                         /* on the new network: its arrow */
+                ui_set_theme(t);
             } else if (!strncmp(screens[s], "whatsnew", 8)) {   /* after an update: the release's points (and turned to the end) */
                 ui_show("home");
                 /* FATHOM_SIM_WHATSNEW: a release's whatsnew.txt instead (its version, then its points) */
@@ -1116,6 +1152,89 @@ static int ty_songs(void)
     return library_scan(g_lib, "ty-music", NULL, NULL) == 3 ? 0 : -1;
 }
 
+/* A name with a letter of two bytes (a playlist called "Caf\xc3\xa9" being
+ * renamed): the cursor steps over the whole letter and <Back> deletes the
+ * whole of it. (By bytes, <Prev> stopped inside the letter, and a letter
+ * typed or deleted there left a name that isn't text.) */
+static void ty_utf8(void)
+{
+    setenv("FATHOM_SIM_SEARCH", "caf\xc3\xa9s", 1);
+    ui_show("search");
+    advance(400);
+    TY(ty_is("caf\xc3\xa9s", 6));
+    ui_key(UI_KEY_PREV);
+    TY(ty_is("caf\xc3\xa9s", 5));
+    ui_key(UI_KEY_PREV);                          /* over the whole letter */
+    TY(ty_is("caf\xc3\xa9s", 3));
+    ui_key(UI_KEY_NEXT);
+    TY(ty_is("caf\xc3\xa9s", 5));
+    ui_key(UI_KEY_BACK);                          /* and the whole of it deleted */
+    TY(ty_is("cafs", 3));
+    ui_key(UI_KEY_NEXT);
+    ui_key(UI_KEY_NEXT);                          /* (no further than the end) */
+    TY(ty_is("cafs", 4));
+    for (int i = 0; i < 4; i++) ui_key(UI_KEY_BACK);
+    TY(ty_is("", 0));
+    ui_key(UI_KEY_BACK);
+    advance(400);
+}
+
+/* The highlight is drawn on the selected row, whatever happens to the list
+ * under it: Settings > Bluetooth loses its rows while Bluetooth starts again
+ * (Audio changed), and has them back. In 0.17.0 the highlight stayed on Audio
+ * with the selection on the first row, and <Play> turned Bluetooth off. */
+static int g_tb_on = 1, g_tb_toggled, g_tb_range;
+static int tb_state(char *busy, size_t cap)
+{
+    snprintf(busy, cap, "%s", g_tb_on ? "" : "Starting");
+    return g_tb_on;
+}
+static int tb_devices(ui_bt_dev_t *out, int max) { (void)out; (void)max; return 0; }
+static void tb_do(int what, const char *addr)
+{
+    (void)addr;
+    if (what == UI_BT_RANGE) g_tb_range++;         /* (it starts again a moment later, as on the H2: the test says when) */
+    if (what == UI_BT_TOGGLE) g_tb_toggled++;
+}
+static void ty_pill(void)
+{
+    ui_hooks_t hooks = g_hooks;
+    hooks.bt_state = tb_state;
+    hooks.bt_devices = tb_devices;
+    hooks.bt_do = tb_do;
+    ui_set_hooks(&hooks);
+    ui_show("bluetooth");
+    advance(400);
+    int sel = -1, n = 0;
+    ui_list_state(&sel, &n, NULL);
+    TY(sel == 0 && n == 3 && ui_test_pill_row() == 0);
+    ui_key(UI_KEY_DOWN);
+    ui_key(UI_KEY_DOWN);
+    advance(400);
+    ui_list_state(&sel, NULL, NULL);
+    TY(sel == 2 && ui_test_pill_row() == 2);
+    ui_key(UI_KEY_OK);                            /* Audio: Bluetooth starts again, */
+    ui_tick_1s();                                 /* a moment later (drawn once more with its rows still there), */
+    ui_list_state(&sel, &n, NULL);
+    TY(g_tb_range == 1 && n == 3 && sel == 2);
+    g_tb_on = 0;                                  /* one row left */
+    ui_bt_changed();
+    advance(400);
+    ui_list_state(&sel, &n, NULL);
+    TY(n == 1 && sel == 0 && ui_test_pill_row() == 0);
+    g_tb_on = 1;                                  /* back on (nothing says so: the page's next drawing sees it): */
+    ui_tick_1s();                                 /* Audio selected again, and shown so */
+    advance(400);
+    ui_list_state(&sel, &n, NULL);
+    TY(n == 3 && sel == 2 && ui_test_pill_row() == 2);
+    ui_key(UI_KEY_OK);                            /* <Play> there changes Audio again, not Bluetooth */
+    TY(g_tb_range == 2 && !g_tb_toggled);
+    g_tb_on = 1;
+    ui_bt_changed();
+    advance(400);
+    ui_set_hooks(&g_hooks);
+}
+
 static int type_check(theme_t *themes, const ui_fonts_t *fonts)
 {
     lv_tick_set_cb(fake_tick);
@@ -1229,6 +1348,8 @@ static int type_check(theme_t *themes, const ui_fonts_t *fonts)
     ui_key(UI_KEY_BACK);                          /* the second: out, with a letter typed */
     advance(400);
     TY(ui_list_state(NULL, NULL, NULL) < depth);
+    ty_utf8();
+    ty_pill();
     if (!g_ty_bad) printf("type-test: all checks passed\n");
     return g_ty_bad != 0;
 }

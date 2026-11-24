@@ -98,6 +98,7 @@ static void year_tests(void)
 #include <netinet/in.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/time.h>      /* (struct timeval: musl's sys/socket.h doesn't bring it) */
 #include <unistd.h>
 
 #include <mbedtls/ctr_drbg.h>

@@ -55,6 +55,50 @@ static int write_ramp(const char *path, unsigned rate, unsigned frames)
     return 0;
 }
 
+/* A mono 16-bit FLAC: frame i holds i & 0x7fff. */
+static int write_mono(const char *path, unsigned rate, unsigned frames)
+{
+    FLAC__StreamEncoder *e = FLAC__stream_encoder_new();
+    FLAC__stream_encoder_set_channels(e, 1);
+    FLAC__stream_encoder_set_bits_per_sample(e, 16);
+    FLAC__stream_encoder_set_sample_rate(e, rate);
+    if (FLAC__stream_encoder_init_file(e, path, NULL, NULL) != FLAC__STREAM_ENCODER_INIT_STATUS_OK) return -1;
+    static FLAC__int32 pcm[4096];
+    for (unsigned at = 0; at < frames;) {
+        unsigned n = frames - at < 4096 ? frames - at : 4096;
+        for (unsigned i = 0; i < n; i++) pcm[i] = (FLAC__int32)((at + i) & 0x7fff);
+        FLAC__stream_encoder_process_interleaved(e, pcm, n);
+        at += n;
+    }
+    FLAC__stream_encoder_finish(e);
+    FLAC__stream_encoder_delete(e);
+    return 0;
+}
+
+/* A mono file is given as two equal channels, sample for sample: the H2's DAC
+ * takes two channels only, and a mono song was "This output can't play". */
+static void test_mono(const char *dir)
+{
+    char a[512];
+    snprintf(a, sizeof a, "%s/mono.flac", dir);
+    CHECK(write_mono(a, 44100, 10000) == 0);
+    audio_format_t f;
+    decoder_t *d = decoder_open(a, &f);
+    CHECK(d && f.channels == 2 && f.rate == 44100 && f.bits == 16 && f.total_frames == 10000);
+    static int32_t buf[2 * 3000];
+    long n, at = 0;
+    int same = 1;
+    while (d && (n = decoder_read(d, buf, 3000)) > 0) {
+        for (long i = 0; i < n; i++)
+            same &= buf[2 * i] == buf[2 * i + 1] && buf[2 * i] == (int32_t)(((at + i) & 0x7fff) << 16);
+        at += n;
+    }
+    CHECK(at == 10000 && same);
+    CHECK(d && decoder_seek(d, 5000) == 0 && decoder_read(d, buf, 10) == 10 &&
+          buf[0] == (int32_t)(5000 << 16) && buf[1] == buf[0] && buf[19] == (int32_t)(5009 << 16));
+    if (d) decoder_close(d);
+}
+
 static eng_status_t status(engine_t *e)
 {
     eng_status_t s;
@@ -897,7 +941,13 @@ static void test_slow_open(const char *dir)
     snprintf(fifo, sizeof fifo, "%s/so-slow.flac", dir);
     CHECK(write_ramp(a, 44100, 44100 * 5) == 0 && write_ramp(b, 44100, 44100 * 5) == 0 &&
           write_ramp(c, 44100, 22050) == 0);
-    CHECK(mkfifo(fifo, 0600) == 0);
+    if (mkfifo(fifo, 0600) != 0) {
+        /* (the H2's card is FAT, which holds no FIFOs: in /tmp there, which
+         * is RAM, and a FIFO takes none of it) */
+        snprintf(fifo, sizeof fifo, "/tmp/fathom-test-so-slow-%d.flac", (int)getpid());
+        unlink(fifo);
+        CHECK(mkfifo(fifo, 0600) == 0);
+    }
     audio_output_t out;
     static alsa_like_t al;
     al_create(&out, &al);
@@ -1193,6 +1243,7 @@ int main(void)
     test_crossfeed(dir);
     test_crossfeed_keeps_place(dir);
     test_crossfeed_16bit_output(dir);
+    test_mono(dir);
     test_flush_soft(dir);
     test_deep_queue(dir);
     signal(SIGPIPE, SIG_IGN);                     /* (a pipe's reader gone: an error, not the test's end) */

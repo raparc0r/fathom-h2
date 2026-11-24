@@ -13,8 +13,20 @@
  *               server says it isn't there, it's over RICON_MAX_FILE, or it
  *               isn't a PNG or a JPEG), so it isn't asked for again.
  *
- * HASH is 12 hex digits of the icon address's SHA-256 (pod_hash), so stations
- * that share a logo share its file. Only the stations in your list get one:
+ * A station whose line names no icon, or one that's no use, but names its own
+ * site ("| site: URL") gets the icon that site's page names: the one phones
+ * put on their home screens (apple-touch-icon, big enough for Now Playing)
+ * or its favicon (.ico files are read too; small ones show in the list only).
+ * Kept the same way, under the site's own HASH.
+ *
+ * A station that names neither (one added before sites were kept, say) is
+ * looked up in the directory by its stream, once: the logo and the site the
+ * directory has for it are tried the same way, under the stream's HASH. A
+ * stream's address that looks private is never sent (ricon_stream_askable).
+ *
+ * HASH is 12 hex digits of the icon address's SHA-256 (pod_hash; a site's:
+ * of "site:" and its address; a stream's: of "stream:" and its address), so
+ * stations that share a logo share its file. Only the stations in your list get one:
  * ricon_sync is given that list, and removes the files of stations no longer
  * in it. A logo that couldn't be reached leaves nothing, and is tried again
  * the next time.
@@ -27,7 +39,7 @@
 
 #include "player/radio.h"
 
-#define RICON_MAX_FILE (512 * 1024)   /* a logo's encoded bytes */
+#define RICON_MAX_FILE (512 * 1024)   /* a logo's encoded bytes (a PNG, a JPEG or an .ico) */
 #define RICON_LARGE_MIN 68            /* its short side, to be shown at LIB_ART_LARGE */
 #define RICON_SMALL_MIN 16            /* ...and to be shown at all */
 
@@ -53,10 +65,44 @@ unsigned ricon_seq(void);
 
 /* The 12 hex digits an icon address's files are named by ("" for none) */
 void ricon_id(const char *icon_url, char id[13]);
+/* ...and a site's */
+void ricon_site_id(const char *site_url, char id[13]);
+/* ...and a stream's: what the directory led to, for a station that names
+ * neither ("" for a stream that isn't asked about: ricon_stream_askable) */
+void ricon_stream_id(const char *stream_url, char id[13]);
+/* A stream's address that may be given to the directory (radio-browser.info)
+ * to ask what it has for it: not one with a login or a query in it, nor one
+ * on a home's own network (a name with no dot, .local and the like, the
+ * private number ranges). */
+int  ricon_stream_askable(const char *url);
+/* The picture a station shows: its own logo's id, else its site's icon's,
+ * else its stream's; a later one when that's the one on the card ("" if it
+ * has none of them). */
+void ricon_station_id(const radio_station_t *st, char id[13]);
 /* Its picture file, there or not: 0, or -1 (no icon address, or not started) */
 int  ricon_path(const char *icon_url, char *out, size_t cap);
 /* An icon's pixels (size: LIB_ART_SMALL or LIB_ART_LARGE, size * size RGB565)
  * by its id: 1, or 0 if it has none of that size */
 int  ricon_read(const char *id, int size, uint16_t *px);
+
+/* An http(s) address whose host is out on the internet by its name or number
+ * (not one of a home network's own: no dot, .local, fritz.box, the private
+ * number ranges however written). What a station's page or the directory
+ * names is fetched only from such a host: the H2 isn't sent to an address on
+ * the home's network by a page. */
+int  ricon_host_public(const char *url);
+
+/* tests: the readers of what a server sends, each on its own (the fuzz test,
+ * tests/fuzz_radioicon.c, gives them damaged ones) */
+/* an .ico file's n bytes, decoded and thrown away: 0 and *side (its shorter
+ * side, may be NULL), or -1 */
+int  ricon_test_ico(const unsigned char *buf, size_t n, int *side);
+/* how many icons a page (n bytes, fetched from base) names, their addresses
+ * the biggest first, one a line, into urls (may be NULL) */
+int  ricon_test_site(const char *html, size_t n, const char *base, char *urls, size_t cap);
+/* href as the page at base names it: 0, or -1 */
+int  ricon_test_join(const char *base, const char *href, char *out, size_t cap);
+/* the servers not reached since the start: forgotten (a test's next part starts as a new session) */
+void ricon_test_forget_unreached(void);
 
 #endif

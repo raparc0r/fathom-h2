@@ -51,6 +51,7 @@ typedef struct {
     unsigned    fail_seq;
     int64_t     fail_track;   /* ...the last one */
     int         fail_output;  /* ...because the output can't take its format */
+    int         fail_memory;  /* ...because it needs more memory to open than there is (hours of AAC in one file) */
     int         fail_all;     /* ...and nothing in the queue could play: stopped */
     int         fail_end;     /* ...the last in the queue (others played): stopped there */
 } player_now_t;
@@ -139,6 +140,7 @@ const radio_station_t *player_radio_at(const player_t *p, int i);  /* station i 
  * stopped by hand, or given up with the network there, stays as it is. */
 void player_radio_net(player_t *p, int up);
 void player_radio_test_pace(int times);   /* tests: the radio's waits so many times shorter */
+void player_radio_test_new_ms(int ms);    /* tests: how long a station not heard yet may go on failing (0: as built) */
 /* What's playing, from somewhere other than the stream (radio_station_t.info):
  * used over what the stream says until the station changes; NULL = clear.
  * art_url: its cover ("" or NULL = none). */

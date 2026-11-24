@@ -25,6 +25,7 @@ cd "$(dirname "$0")/.."
 H2SSH=${H2SSH:-ssh root@10.42.0.1}
 DIR=/mnt/sd/fathom/test/unit
 VERBOSE=${H2_TESTS_VERBOSE:-0}   # 1: every test's output, not only a failure's
+TAIL=${H2_TESTS_TAIL:-40}         # how many of a test's last lines are shown
 want=$(for t in "$@"; do printf ' test_%s' "${t#test_}"; done)
 
 echo "== building for the H2, and copying to it ($DIR)"
@@ -72,9 +73,9 @@ docker/run.sh sh -c '
 
 echo "== running"
 $H2SSH "cd $DIR && fails=0 && for t in \$(cat run-list.txt); do
-        s=\$(date +%s); FATHOM_NO_RT=1 SQLITE_TMPDIR=$DIR/t LD_LIBRARY_PATH=$DIR/lib TMPDIR=$DIR/t nice -n 19 ./\$t > \$t.log 2>&1; rc=\$?
+        s=\$(date +%s); FATHOM_NO_RT=1 FATHOM_TEST_ON_H2=1 SQLITE_TMPDIR=$DIR/t LD_LIBRARY_PATH=$DIR/lib TMPDIR=$DIR/t nice -n 19 ./\$t > \$t.log 2>&1; rc=\$?
         printf '%-18s %s  %ss\n' \$t \$([ \$rc = 0 ] && echo ok || echo FAILED) \$((\$(date +%s) - s))
-        [ \$rc = 0 ] || { fails=\$((fails + 1)); grep -E '[.]c:[0-9]+: |FAIL|slow write|a write waited' \$t.log | head -20 | sed 's/^/    check: /'; sed 's/^/    /' \$t.log | tail -40; }
-        [ \$rc != 0 ] || [ $VERBOSE = 0 ] || sed 's/^/    /' \$t.log | tail -40
+        [ \$rc = 0 ] || { fails=\$((fails + 1)); grep -E '[.]c:[0-9]+: |FAIL|slow write|a write waited' \$t.log | head -20 | sed 's/^/    check: /'; sed 's/^/    /' \$t.log | tail -$TAIL; }
+        [ \$rc != 0 ] || [ $VERBOSE = 0 ] || sed 's/^/    /' \$t.log | tail -$TAIL
         rm -rf $DIR/t/*
     done; cd / && rm -rf $DIR; echo; [ \$fails = 0 ] && echo 'all passed on the H2' || { echo \"\$fails failed on the H2\"; exit 1; }"

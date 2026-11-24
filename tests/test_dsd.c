@@ -579,11 +579,13 @@ int main(int argc, char **argv)
         long mf;
         audio_format_t fm;
         int32_t *mp = decode_all(mono, 0, &fm, &mf);
-        CHECK(mp && fm.channels == 1 && mf == 88200, "mono: %ld frames, %u ch", mf, fm.channels);
+        CHECK(mp && fm.channels == 2 && mf == 88200, "mono: %ld frames, %u ch", mf, fm.channels);   /* (two equal channels: the DAC takes no fewer) */
+        for (long i = 0; mp && i < mf; i++)
+            if (mp[2 * i] != mp[2 * i + 1]) { CHECK(0, "mono: the channels differ at frame %ld", i); break; }
         if (mp && mf == 88200) {
             double in = bits_tone(mch[0], DSD64, 22050 * 16, 44100 * 16, 20000);
-            double t20 = 20 * log10(tone(mp, 1, 0, 22050, 44100, 20000, NULL) / in);
-            double t76 = 20 * log10(tone(mp, 1, 0, 22050, 44100, 76400, NULL) / 0.25 + 1e-12);
+            double t20 = 20 * log10(tone(mp, fm.channels, 0, 22050, 44100, 20000, NULL) / in);
+            double t76 = 20 * log10(tone(mp, fm.channels, 0, 22050, 44100, 76400, NULL) / 0.25 + 1e-12);
             printf("20 kHz at %+.5f dB (%.4f in the bits); 100 kHz at %.1f dB\n", t20, in, t76);
             CHECK(fabs(t20) < 0.001, "20 kHz at %+.5f dB", t20);
             CHECK(t76 < -110, "100 kHz through at %.1f dB", t76);
@@ -605,7 +607,7 @@ int main(int argc, char **argv)
         CHECK(dp && fd.rate == 176400 && df == 17640 && !strcmp(fd.codec, "DSD256"), "DSD256: %u Hz, %ld frames, %s",
               fd.rate, df, fd.codec);
         if (dp && df == 17640) {
-            double dbl = 20 * log10(tone(dp, 1, 0, 0, 17640, 1000, NULL));
+            double dbl = 20 * log10(tone(dp, fd.channels, 0, 0, 17640, 1000, NULL));
             printf("DSD256: 1 kHz %.3f dBFS\n", dbl);
             CHECK(fabs(dbl + 6.0206) < 0.02, "DSD256: %.4f dB", dbl);
         }

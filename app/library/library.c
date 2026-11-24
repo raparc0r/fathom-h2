@@ -2615,6 +2615,14 @@ int library_logo_decode(const unsigned char *enc, size_t len, uint16_t *large, u
     return r;
 }
 
+int library_logo_rgb(const unsigned char *rgb, int w, int h, uint16_t *large, uint16_t *small)
+{
+    if (!rgb || w < 1 || h < 1 || w > 1024 || h > 1024) return -1;
+    int r = art_fit(rgb, w, h, LIB_ART_SMALL, small);
+    if (r == 0 && large) r = art_fit(rgb, w, h, LIB_ART_LARGE, large);
+    return r;
+}
+
 int library_art_decode(const unsigned char *enc, size_t len, int size, uint16_t *pixels)
 {
     unsigned char *img;
@@ -4560,8 +4568,9 @@ int library_list(library_t *lib, lib_view_t view, int64_t parent, lib_list_t *ou
 
 const char *library_smart_name(int which)
 {
-    static const char *const N[LIB_SMART_N] = {"", "Never played", "On repeat", "Not heard in a while",
-                                               "Forgotten favourites", "Often skipped"};
+    /* (N_: listed for translators by tools/lang/strings.py; the UI translates the name it's given) */
+    static const char *const N[LIB_SMART_N] = {"", N_("Never played"), N_("On repeat"), N_("Not heard in a while"),
+                                               N_("Forgotten favourites"), N_("Often skipped")};
     return which > 0 && which < LIB_SMART_N ? N[which] : "";
 }
 

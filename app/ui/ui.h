@@ -321,8 +321,9 @@ void ui_set_pure(int pure, int bitperfect);
 void ui_set_awake(int on);
 /* Header battery indicator. percent < 0 hides it. */
 void ui_set_battery(int percent, int charging);
-/* The header's Bluetooth icon: UI_BT_LINK_NONE (hidden), _CONNECTING (dimmed),
- * _CONNECTED (headphones connected). */
+/* The header's Bluetooth icon: UI_BT_LINK_NONE (hidden: Bluetooth is off),
+ * _CONNECTING (dimmed: on, with no headphones connected yet), _CONNECTED
+ * (headphones connected). */
 enum { UI_BT_LINK_NONE, UI_BT_LINK_CONNECTING, UI_BT_LINK_CONNECTED };
 void ui_set_bt_link(int state);
 /* The EQ on the output playing now: its profile's name ("" = off) and the
@@ -340,11 +341,14 @@ void ui_show_scan(void);
 void ui_show(const char *what);
 /* For the simulator's checks: how deep the lists go (1: Home; 0: Now Playing
  * shown), the open list's selected row and its number of rows; home_edit: 1
- * when it is Settings > Home (OK there changes Home's rows). */
+ * when it is Settings > Interface > Home screen items (OK there changes Home's rows). */
 int ui_list_state(int *sel, int *n, int *home_edit);
 /* What's typed on a typing screen, and where the cursor is in it (tests). */
 const char *ui_test_entry(int *cursor);
 /* Whether the wheel is typing there (0: the typing row was left for the results). */
 int ui_test_typing(void);
+/* The row of the open list that the highlight is drawn on (tests: it is the
+ * selected row, whatever happened to the list). */
+int ui_test_pill_row(void);
 
 #endif

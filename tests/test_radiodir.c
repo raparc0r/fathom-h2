@@ -116,14 +116,17 @@ int main(void)
     n = rdir_parse_stations(t, len, st, meta, RDIR_MAX_STATIONS);
     CHECK(n == 30);
     CHECK(!strcmp(st[0].name, "FIP") && !strcmp(meta[0].detail, "AAC 107"));
-    int with = 0, without = 0;
+    int with = 0, without = 0, sites = 0;
     for (int i = 0; i < n; i++) {
         if (st[i].icon[0]) with++;
         else without++;
+        sites += st[i].site[0] != '\0';             /* its own web page, kept for the icon it names */
         CHECK(!st[i].icon[0] || radio_icon_ok(st[i].icon));
+        CHECK(!st[i].site[0] || radio_icon_ok(st[i].site));
         if (!strcmp(st[i].name, "FIP (hifi.aac)")) CHECK(!st[i].icon[0]);   /* none in the directory: none here */
         if (!strcmp(st[i].name, "FIP Jazz")) CHECK(!strcmp(st[i].icon, "https://www.fip.fr/dist/favicons/logo-120.png"));
     }
+    CHECK(sites > n / 2);
     CHECK(with > 20 && without > 0);
     free(t);
 
@@ -161,6 +164,18 @@ int main(void)
     CHECK(n > 2 && strlen(st[2].name) == 62 && (unsigned char)st[2].name[60] == 0xC3);   /* 31 whole É/é */
     CHECK(n > 2 && !strcmp(meta[2].detail, "OGG") && meta[2].uuid[0] == '\0');
     CHECK(n > 3 && !strcmp(st[3].name, "Opus") && !strcmp(meta[3].detail, "OPUS 96"));
+    {   /* a logo or a site on the home's own network (the directory's entries are anyone's): not kept */
+        static const char lan[] =
+            "[{\"name\":\"Lan\",\"url_resolved\":\"https://a.example/20\",\"codec\":\"MP3\","
+            "  \"favicon\":\"http://192.168.1.1/reboot\",\"homepage\":\"http://router.local/\"},"
+            " {\"name\":\"Fine\",\"url_resolved\":\"https://a.example/21\",\"codec\":\"MP3\","
+            "  \"favicon\":\"https://a.example/l.png\",\"homepage\":\"https://a.example/\"}]";
+        char site[256], icon[256];
+        CHECK(rdir_parse_stations(lan, strlen(lan), st, meta, 8) == 2 && !st[0].icon[0] && !st[0].site[0] &&
+              !strcmp(st[1].icon, "https://a.example/l.png") && !strcmp(st[1].site, "https://a.example/"));
+        CHECK(rdir_parse_stream(lan, strlen(lan), site, sizeof site, icon, sizeof icon) == 1 &&
+              !strcmp(icon, "https://a.example/l.png") && !strcmp(site, "https://a.example/"));
+    }
     CHECK(rdir_parse_stations("<html>Bad gateway</html>", 24, st, meta, 8) == -1);
     CHECK(rdir_parse_stations("[]", 2, st, meta, 8) == 0);
     CHECK(rdir_parse_stations("", 0, st, meta, 8) == -1);
@@ -201,6 +216,21 @@ int main(void)
     CHECK(!strcmp(url, "https://x/json/stations/search?hidebroken=true&order=clickcount&reverse=true&limit=80"));
     rdir_countries_url(url, sizeof url, "x");
     CHECK(!strcmp(url, "https://x/json/countries?order=name&hidebroken=true"));
+
+    /* one stream looked up (for its logo): the request, and what its answer gives */
+    char lurl[1800], site[256], icon[256];
+    rdir_stream_url(lurl, sizeof lurl, "x", "https://ehfm.out.airtime.pro/ehfm_a");
+    CHECK(!strcmp(lurl, "https://x/json/stations/byurl?url=https%3A%2F%2Fehfm.out.airtime.pro%2Fehfm_a"));
+    static const char one[] = "[{\"name\":\"EHFM\",\"url\":\"https://ehfm.out.airtime.pro/ehfm_a\","
+                              "\"homepage\":\"https://www.ehfm.live/\",\"favicon\":\"https://img.example/e.png\"}]";
+    CHECK(rdir_parse_stream(one, sizeof one - 1, site, sizeof site, icon, sizeof icon) == 1 &&
+          !strcmp(site, "https://www.ehfm.live/") && !strcmp(icon, "https://img.example/e.png"));
+    static const char two[] = "[{\"homepage\":\"not an address\",\"favicon\":\"\"},{\"homepage\":\"http://b.example/\",\"favicon\":null}]";
+    CHECK(rdir_parse_stream(two, sizeof two - 1, site, sizeof site, icon, sizeof icon) == 1 &&
+          !strcmp(site, "http://b.example/") && !icon[0]);
+    CHECK(rdir_parse_stream("[]", 2, site, sizeof site, icon, sizeof icon) == 0 && !site[0] && !icon[0]);
+    CHECK(rdir_parse_stream("<html>", 6, site, sizeof site, icon, sizeof icon) == -1);
+    CHECK(rdir_parse_stream(one, 40, site, sizeof site, icon, sizeof icon) == 0);      /* cut short: nothing whole */
     char tag[64];
     rdir_genre_tag(0, tag, sizeof tag);
     CHECK(!strcmp(RDIR_GENRES[0], "Pop") && !strcmp(tag, "pop"));

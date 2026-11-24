@@ -3,12 +3,15 @@
 /*
  * Internet radio stations: fathom/radio.txt on the card (assets/radio.txt is
  * an example). One station per line,
- *     Name = stream URL [| info: SOURCE] [| icon: IMAGE URL]
+ *     Name = stream URL [| info: SOURCE] [| icon: IMAGE URL] [| site: WEB PAGE]
  * '#' starts a note. SOURCE says where to ask what's playing when the stream
  * doesn't say: "radiofrance:N" (Radio France's live API, station N). IMAGE URL
  * is the station's logo (a PNG or a JPEG), shown beside its name; Find
- * stations writes it when the directory has one. (A build from before icons
- * reads such a line's name and stream as ever.)
+ * stations writes it when the directory has one. WEB PAGE is the station's
+ * own site: a station with no logo of its own, or one that can't be used,
+ * gets the icon its site names (net/radioicon.h); Find stations writes it
+ * too. (A build from before icons, or sites, reads such a line's name and
+ * stream as ever.)
  */
 #ifndef FATHOM_RADIO_H
 #define FATHOM_RADIO_H
@@ -22,6 +25,7 @@ typedef struct {
     char url[512];
     char info[64];     /* "" = what the stream says */
     char icon[256];    /* its logo's address (http or https), "" = none */
+    char site[256];    /* its own web page (http or https), "" = not known */
 } radio_station_t;
 
 /* An address that can be a station's icon: http or https, no spaces and no
@@ -33,9 +37,9 @@ int radio_parse(const char *text, radio_station_t *out, int max);
 /* The same from a file: -1 if it can't be read. */
 int radio_load(const char *path, radio_station_t *out, int max);
 /* Home > Radio's stations: your list (path), or until there is one the
- * example's (may be NULL). A station of yours with no icon that the example
- * also has (the same stream) takes the example's: lists made from the example
- * before it had icons. How many, -1 if neither can be read. */
+ * example's (may be NULL). A station of yours with no icon, or no site, that
+ * the example also has (the same stream) takes the example's: lists made from
+ * the example before it had them. How many, -1 if neither can be read. */
 int radio_load_list(const char *path, const char *example, radio_station_t *out, int max);
 
 /* Your list (fathom/radio.txt) changed from the H2 (Home > Radio > Find
@@ -48,8 +52,9 @@ int radio_load_list(const char *path, const char *example, radio_station_t *out,
 int radio_add(const char *path, const char *example, const radio_station_t *st);
 /* Removes the station(s) with this stream: 0 removed, 1 none had it, -1 couldn't write. */
 int radio_remove(const char *path, const char *example, const char *url);
-/* st as a line of the list ("Name = URL", then " | info: ..." and " | icon: ..."
- * if it has them), no line end. A full one is under 920 bytes. */
+/* st as a line of the list ("Name = URL", then " | info: ...", " | icon: ..."
+ * and " | site: ..." if it has them), no line end. A full one is under 1,200
+ * bytes. */
 void radio_line(const radio_station_t *st, char *out, size_t cap);
 
 /* Splits what a stream says is playing ("Artist - Title") into its parts;

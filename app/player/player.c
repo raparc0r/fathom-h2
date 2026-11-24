@@ -44,7 +44,7 @@ struct player {
     int      fails;        /* tracks in a row that couldn't be played */
     unsigned fail_seq;     /* player_now_t's: one more for each passed over */
     int64_t  fail_track;
-    int      fail_output, fail_all, fail_end;
+    int      fail_output, fail_memory, fail_all, fail_end;
     uint32_t seq;          /* our track-change counter (for the UI) */
     uint64_t saved_hash;   /* player_save: the queue as last written (0: not yet) */
     struct { int pos; uint32_t tag; } ahead[ENGINE_AHEAD];   /* lined up in the engine: order positions */
@@ -75,6 +75,9 @@ struct player {
     int      rn, ri;
     int      r_want;       /* it should be playing (reconnect if it stops) */
     int      r_tries;      /* reconnects since it last played steadily */
+    int      r_heard;      /* it has played since it was asked for: a drop gets all the tries (else: RADIO_TRIES_NEW) */
+    uint64_t r_asked_at;   /* when it was asked for (Play, Next, the network back) */
+    uint64_t r_sound_at;   /* since when it has been playing without a break, 0 = it isn't */
     int      r_failed;
     uint64_t r_retry_at;   /* monotonic ms of the next reconnect, 0 = none */
     uint64_t r_since;      /* when the stream last (re)started */
@@ -368,6 +371,7 @@ static void remember_position(player_t *p)
 
 /* Start the track at order_pos; a long file resumes where it was left (if `resume`). */
 static void radio_leave(player_t *p);
+static void radio_asked(player_t *p, int afresh);
 static void pod_leave(player_t *p);
 
 /* How a track is gone to: started, started paused, or only cued (the engine
@@ -597,6 +601,7 @@ void player_pause(player_t *p, int on)
             engine_stop(p->eng);
         } else if (!on && !p->r_want) {
             p->r_tries = 0;
+            radio_asked(p, 1);
             radio_connect(p);
         }
         return;
@@ -679,11 +684,14 @@ static int skip_how(player_t *p)
     return GO_PLAY;
 }
 
-/* Radio: the station before or after; paused (not connected), only chosen. */
+/* Radio: the station before or after; stopped by hand (not connected), only
+ * chosen. One that was given up ("Can't reach the station") was wanted: the
+ * next is played, as it would have been a moment before (it was only chosen,
+ * "Stopped", and Play had to follow: seen on the H2, 2026-11-24). */
 static void radio_skip(player_t *p, int by)
 {
     int i = (p->ri + p->rn + by) % p->rn;
-    if (p->r_want) { radio_station(p, i); return; }
+    if (p->r_want || p->r_failed) { radio_station(p, i); return; }
     p->ri = i;
     p->r_tries = 0;
     p->r_failed = 0;
@@ -1073,6 +1081,17 @@ int player_restore(player_t *p, const char *path)
 
 #define RADIO_STEADY_MS 30000   /* playing this long: a later drop starts the retries afresh */
 #define RADIO_TRIES 6
+/* A station that hasn't played yet since it was asked for (Play on it, Next,
+ * Play again after it was given up) is given up sooner: one that fails at
+ * once (its server refuses, its name doesn't exist) after the first
+ * connection and three more, 6.5 s; one that takes its time to fail (nothing
+ * answers: 10 s a connection) at the first failure 20 s or more after it was
+ * asked for. It said "Connecting..." for a minute, and two, before. A station
+ * that was playing and dropped keeps all its tries: that's where waiting
+ * helps. */
+#define RADIO_TRIES_NEW 3
+#define RADIO_NEW_MS 20000
+#define RADIO_HEARD_MS 5000     /* playing this long without a break: it has "played" */
 /* With the network gone (player_radio_net) a station that's wanted waits for
  * it without trying, this long: then it's given up, so that the player counts
  * as idle and can turn itself off. It comes back with the network all the
@@ -1083,7 +1102,19 @@ int player_restore(player_t *p, const char *path)
 #define RADIO_LAG_MS 120000
 static int radio_pace = 1;      /* tests: all these waits so many times shorter */
 
+static int radio_new_ms = RADIO_NEW_MS;   /* (not shortened with the waits: a test sets it) */
+
 void player_radio_test_pace(int times) { radio_pace = times > 0 ? times : 1; }
+void player_radio_test_new_ms(int ms) { radio_new_ms = ms > 0 ? ms : RADIO_NEW_MS; }
+
+/* The station is asked for afresh (by the listener, or by the network coming
+ * back to one not heard yet): its short patience starts now. */
+static void radio_asked(player_t *p, int afresh)
+{
+    if (afresh) p->r_heard = 0;
+    p->r_asked_at = mono_ms();
+    p->r_sound_at = 0;
+}
 
 static void radio_connect(player_t *p)
 {
@@ -1106,6 +1137,7 @@ static void radio_station(player_t *p, int i)
     if (i < 0 || i >= p->rn) return;
     p->ri = i;
     p->r_tries = 0;
+    radio_asked(p, 1);
     p->r_meta[0] = p->r_meta_url[0] = p->r_artist[0] = p->r_title[0] = p->r_art[0] = '\0';
     radio_connect(p);
 }
@@ -1162,6 +1194,7 @@ void player_radio_net(player_t *p, int up)
     if (!p->r_want && !p->r_lost) return;
     fprintf(stderr, "radio: the network is back%s\n", p->r_lost ? ": the station given up without it is tried again" : "");
     p->r_tries = 0;
+    radio_asked(p, 0);                  /* (one that was playing before it went keeps all its tries) */
     eng_status_t st;
     engine_status(p->eng, &st);
     int on_its_way = st.starting || (st.state != ENG_STOPPED && st.connecting);
@@ -1236,6 +1269,12 @@ static void radio_tick(player_t *p, const eng_status_t *st)
         return;
     }
     if (st->state == ENG_PLAYING && now - p->r_since > (uint64_t)(RADIO_STEADY_MS / radio_pace)) p->r_tries = 0;
+    if (st->state == ENG_PLAYING && !st->connecting && !st->starting) {
+        if (!p->r_sound_at) p->r_sound_at = now ? now : 1;
+        else if (now - p->r_sound_at >= (uint64_t)(RADIO_HEARD_MS / radio_pace)) p->r_heard = 1;
+    } else {
+        p->r_sound_at = 0;
+    }
     if (st->state != ENG_STOPPED || st->starting) return;
     /* the stream stopped (it dropped, or it couldn't connect) */
     if (p->r_down) {
@@ -1256,7 +1295,9 @@ static void radio_tick(player_t *p, const eng_status_t *st)
     /* try again, waiting longer each time */
     if (!p->r_retry_at) {
         static const int wait_ms[RADIO_TRIES] = {500, 2000, 4000, 8000, 15000, 30000};
-        if (p->r_tries >= RADIO_TRIES) {
+        int over = p->r_heard ? p->r_tries >= RADIO_TRIES
+                              : p->r_tries >= RADIO_TRIES_NEW || now - p->r_asked_at >= (uint64_t)radio_new_ms;
+        if (over) {
             p->r_want = 0;
             p->r_failed = 1;
             p->r_failed_at = now;
@@ -1393,6 +1434,7 @@ static void skip_failed(player_t *p)
     p->fail_seq++;                      /* (said on the screen) */
     p->fail_track = p->cur.id;
     p->fail_output = st.error_output;
+    p->fail_memory = st.error_memory;
     p->fail_all = p->fails >= p->n_order;   /* every one in the queue, in a row */
     p->fail_end = stop && !p->fail_all;     /* the last one, others before it played: stopped there */
     fprintf(stderr, "player: track %lld couldn't be played: %s\n", (long long)p->cur.id, stop ? "stopped" : "skipped");
@@ -1511,6 +1553,7 @@ void player_now(player_t *p, player_now_t *now)
     now->fail_seq = p->fail_seq;
     now->fail_track = p->fail_track;
     now->fail_output = p->fail_output;
+    now->fail_memory = p->fail_memory;
     now->fail_all = p->fail_all;
     now->fail_end = p->fail_end;
     /* The engine's figures are for what it plays: not yet this item while it

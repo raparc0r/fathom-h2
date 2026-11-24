@@ -2,6 +2,7 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 /* The station directory: radio-browser.info (radiodir.h). */
 #include "net/radiodir.h"
+#include "net/radioicon.h"
 
 #include <ctype.h>
 #include <pthread.h>
@@ -168,7 +169,10 @@ int rdir_parse_stations(const char *text, size_t len, radio_station_t *st, rdir_
         snprintf(s->url, sizeof s->url, "%s", url);
         char icon[512];                      /* its logo, when the directory has one that can be kept */
         member_str(o, "favicon", icon, sizeof icon);
-        if (radio_icon_ok(icon)) snprintf(s->icon, sizeof s->icon, "%s", icon);
+        if (radio_icon_ok(icon) && ricon_host_public(icon)) snprintf(s->icon, sizeof s->icon, "%s", icon);
+        char site[512];                      /* its own web page: where an icon is looked for when that logo is no use */
+        member_str(o, "homepage", site, sizeof site);
+        if (radio_icon_ok(site) && ricon_host_public(site)) snprintf(s->site, sizeof s->site, "%s", site);
         if (meta) {
             rdir_meta_t *m = &meta[n];
             memset(m, 0, sizeof *m);
@@ -311,6 +315,57 @@ static int first_server(void)
     pthread_mutex_unlock(&mu);
     /* none has answered yet: all.api (it shares the load across the servers itself) */
     return s >= 0 ? s : 0;
+}
+
+/* ---- one stream looked up (for its logo: net/radioicon.c) ---- */
+
+void rdir_stream_url(char *out, size_t cap, const char *server, const char *stream)
+{
+    char arg[1600];
+    encode(arg, sizeof arg, stream);
+    snprintf(out, cap, "https://%s/json/stations/byurl?url=%s", server, arg);
+}
+
+int rdir_parse_stream(const char *text, size_t len, char *site, size_t sn, char *icon, size_t in)
+{
+    walk_t w;
+    if (sn) site[0] = '\0';
+    if (in) icon[0] = '\0';
+    if (!text || walk_begin(&w, text, len)) return -1;
+    int n = 0;
+    json_t o;
+    char v[512];
+    while (walk_next(&w, &o)) {                    /* (a stream listed twice: the first of each that's an address) */
+        if (json_type(o) != JSON_OBJECT) continue;
+        n++;
+        member_str(o, "homepage", v, sizeof v);
+        if (sn && !site[0] && radio_icon_ok(v) && ricon_host_public(v) && strlen(v) < sn) snprintf(site, sn, "%s", v);
+        member_str(o, "favicon", v, sizeof v);
+        if (in && !icon[0] && radio_icon_ok(v) && ricon_host_public(v) && strlen(v) < in) snprintf(icon, in, "%s", v);
+    }
+    return n > 0;
+}
+
+int rdir_lookup_stream(const char *stream, char *site, size_t sn, char *icon, size_t in, const volatile int *abort)
+{
+    enum { ANSWER = 24 * 1024 };                   /* (an entry is about 1.5 KB) */
+    char *buf = malloc(ANSWER);
+    int r = -1, s0 = first_server();
+    for (int k = 0; buf && k < N_SERVERS && !(abort && *abort) && r < 0; k++) {
+        int s = (s0 + k) % N_SERVERS;
+        char url[1800];
+        rdir_stream_url(url, sizeof url, SERVERS[s], stream);
+        long len = g_fetch(url, buf, ANSWER, abort);
+        if (len == -2) len = (long)strlen(buf);
+        if (len < 0) continue;
+        r = rdir_parse_stream(buf, (size_t)len, site, sn, icon, in);
+        if (r < 0) continue;                       /* not the directory's answer (an error page) */
+        pthread_mutex_lock(&mu);
+        g_server = s;
+        pthread_mutex_unlock(&mu);
+    }
+    free(buf);
+    return r;
 }
 
 static void *job_run(void *arg)

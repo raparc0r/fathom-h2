@@ -64,12 +64,12 @@ int main(void)
     CHECK(!ic[7].icon[0] && !strcmp(ic[7].name, "H"));
     /* written and read back the same; without an icon, the line as it always was */
     for (int i = 0; i < 3; i++) {
-        char line[1024];
+        char line[1536];
         radio_station_t back;
         radio_line(&ic[i], line, sizeof line);
         CHECK(radio_parse(line, &back, 1) == 1 && !memcmp(&back, &ic[i], sizeof back));
     }
-    char one[1024];
+    char one[1536];
     radio_line(&ic[1], one, sizeof one);
     CHECK(!strcmp(one, "B = http://b.example/s | info: radiofrance:7 | icon: https://b.example/l.jpg"));
     radio_line(&ic[0], one, sizeof one);
@@ -83,17 +83,45 @@ int main(void)
     snprintf(odd.icon, sizeof odd.icon, "file:///etc/passwd");
     radio_line(&odd, one, sizeof one);
     CHECK(!strcmp(one, "Odd = http://o.example/s"));
+    {   /* a name that holds "= http://...": the line reads back with its own stream, not the name's */
+        radio_station_t tr = {.name = "X = http://other.example/s", .url = "http://real.example/s"}, back[2];
+        radio_line(&tr, one, sizeof one);
+        CHECK(radio_parse(one, back, 2) == 1 && !strcmp(back[0].url, "http://real.example/s") &&
+              !strcmp(back[0].name, "X - http://other.example/s"));
+        snprintf(tr.name, sizeof tr.name, "2 + 2 = 4, a=https://x");
+        radio_line(&tr, one, sizeof one);
+        CHECK(radio_parse(one, back, 2) == 1 && !strcmp(back[0].url, "http://real.example/s") &&
+              !strcmp(back[0].name, "2 + 2 = 4, a-https://x"));
+    }
     CHECK(radio_icon_ok("http://x.example/i.png") && radio_icon_ok("https://x.example/i") && !radio_icon_ok("") &&
           !radio_icon_ok(NULL) && !radio_icon_ok("//x.example/i.png") && !radio_icon_ok(long_icon));
     /* the longest line there can be fits the buffers that hold one */
     radio_station_t full;
     memset(&full, 'x', sizeof full);
     full.name[sizeof full.name - 1] = full.url[sizeof full.url - 1] = full.info[sizeof full.info - 1] = full.icon[sizeof full.icon - 1] = '\0';
+    full.site[sizeof full.site - 1] = '\0';
     memcpy(full.url, "http://", 7);
     memcpy(full.icon, "https://", 8);
+    memcpy(full.site, "https://", 8);
     radio_line(&full, one, sizeof one);
     radio_station_t back;
-    CHECK(strlen(one) < 920 && radio_parse(one, &back, 1) == 1 && !memcmp(&back, &full, sizeof back));
+    CHECK(strlen(one) < 1200 && radio_parse(one, &back, 1) == 1 && !memcmp(&back, &full, sizeof back));
+
+    /* a station's own site: read with or without an icon, in any order,
+     * written last, and left out when it isn't an address */
+    radio_station_t si[4];
+    n = radio_parse("A = http://a.example/s | site: https://a.example/\n"
+                    "B = http://b.example/s | site: https://b.example/radio | icon: https://b.example/l.png | info: x\n"
+                    "C = http://c.example/s | site: c.example\n"
+                    "D = http://d.example/s | icon: https://d.example/l.png\n", si, 4);
+    CHECK(n == 4 && !strcmp(si[0].site, "https://a.example/") && !si[0].icon[0]);
+    CHECK(n == 4 && !strcmp(si[1].site, "https://b.example/radio") && !strcmp(si[1].icon, "https://b.example/l.png") &&
+          !strcmp(si[1].info, "x"));
+    CHECK(n == 4 && !si[2].site[0] && !si[3].site[0]);
+    radio_line(&si[1], one, sizeof one);
+    CHECK(!strcmp(one, "B = http://b.example/s | info: x | icon: https://b.example/l.png | site: https://b.example/radio"));
+    radio_line(&si[0], one, sizeof one);
+    CHECK(!strcmp(one, "A = http://a.example/s | site: https://a.example/"));
 
     /* the example shipped for the card */
     n = radio_load("assets/radio.txt", r, 8);

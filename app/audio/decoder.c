@@ -28,6 +28,10 @@
 
 typedef enum { DEC_FLAC, DEC_MP3, DEC_FF, DEC_DSD, DEC_VORBIS } dec_kind_t;
 
+/* Why the last open on this thread gave nothing (decoder_open_why) */
+static _Thread_local int t_open_why;
+int decoder_open_why(void) { return t_open_why; }
+
 struct decoder {
     dec_kind_t kind;
     audio_format_t fmt;
@@ -275,6 +279,22 @@ static int ff_interrupted(void *opaque)
  * back on that connection, and the silence is heard for all of it. */
 #define NET_TIMEOUT "8000000"
 
+/* A stream that drops is picked up again by FFmpeg itself: a new connection
+ * at once, then after 1, 3 and 7 s (reconnect_delay_max 8), and after that
+ * the stream ends and the player takes over, with its own tries or its wait
+ * for the network (player.c). Not reconnect_on_network_error: with it every
+ * connection that failed was tried five times over 11 s before it counted
+ * as failed, the first one (a station whose server is down took 2 to 6
+ * minutes to be given up, where the player's tries take one) and each of
+ * those reconnects too (a stream whose server went ended after a minute,
+ * not 11 s). Measured on the H2, 2026-11-23; tests/test_http.c keeps it. */
+static void net_reconnects(AVDictionary **opt)
+{
+    av_dict_set(opt, "reconnect", "1", 0);
+    av_dict_set(opt, "reconnect_streamed", "1", 0);
+    av_dict_set(opt, "reconnect_delay_max", "8", 0);
+}
+
 /* The hls demuxer's own fetches (the playlist, its reloads, segments, keys):
  * with the certificates checked as for every other fetch (it passes on only
  * a few of the options it was opened with, and not the TLS ones), and only
@@ -323,15 +343,13 @@ static int open_ff(decoder_t *d, const char *path, int hls)
         } else {
             av_dict_set(&opt, "icy", "1", 0);   /* (HLS has none: titles come in ID3 tags, if at all) */
         }
-        av_dict_set(&opt, "reconnect", "1", 0);
-        av_dict_set(&opt, "reconnect_streamed", "1", 0);
-        av_dict_set(&opt, "reconnect_on_network_error", "1", 0);
-        av_dict_set(&opt, "reconnect_delay_max", "8", 0);
+        net_reconnects(&opt);
         av_dict_set(&opt, "rw_timeout", NET_TIMEOUT, 0);
         av_dict_set(&opt, "user_agent", NET_UA, 0);
         ff_tls_options(&opt);              /* https (and a redirect to it): certificates checked */
     }
     LAT("decoder: opening %s", path);
+    ff_mem_guard();                    /* (a file can't ask for more memory than there is) */
     int r = avformat_open_input(&d->fc, path, ifmt, &opt);
     av_dict_free(&opt);
     LAT("decoder: open_input %d (%s)", r, d->fc && d->fc->iformat ? d->fc->iformat->name : "-");
@@ -345,6 +363,13 @@ static int open_ff(decoder_t *d, const char *path, int hls)
         return d->net && !hls && s >= 0 && d->fc->streams[s]->codecpar->codec_id == AV_CODEC_ID_VORBIS ? -2 : -1;
     }
     AVStream *st = d->fc->streams[d->stream];
+    if (!d->net && ff_index_missing(d->fc, st)) {
+        /* too long for the memory there is now (ff_mem_guard): not played,
+         * where it used to take the player down with it */
+        fprintf(stderr, "decoder: %s: its table of frames needs more memory than there is\n", path);
+        t_open_why = DECODER_WHY_MEMORY;
+        return -1;
+    }
     if (d->net)                          /* the rest unread: video, ID3 timestamps, other variants */
         for (unsigned i = 0; i < d->fc->nb_streams; i++)
             if ((int)i != d->stream) d->fc->streams[i]->discard = AVDISCARD_ALL;
@@ -554,10 +579,7 @@ static int open_net_vorbis(decoder_t *d, const char *url)
 {
     AVIOInterruptCB icb = {ff_interrupted, d};
     AVDictionary *opt = NULL;
-    av_dict_set(&opt, "reconnect", "1", 0);
-    av_dict_set(&opt, "reconnect_streamed", "1", 0);
-    av_dict_set(&opt, "reconnect_on_network_error", "1", 0);
-    av_dict_set(&opt, "reconnect_delay_max", "8", 0);
+    net_reconnects(&opt);
     av_dict_set(&opt, "rw_timeout", NET_TIMEOUT, 0);
     av_dict_set(&opt, "user_agent", NET_UA, 0);
     ff_tls_options(&opt);
@@ -668,16 +690,30 @@ static int part_set(decoder_t *d, uint32_t cs, uint32_t ce)
     return 0;
 }
 
+/* What whoever opened it is told. A mono source is given as two equal
+ * channels (decoder_read doubles each sample): the H2's DAC takes two
+ * channels and nothing else, so a mono song, audiobook or station was "This
+ * output can't play". (Not DSD sent as DoP: its bytes are the DAC's.) */
+static int mono_doubled(const decoder_t *d) { return d->fmt.channels == 1 && !d->fmt.dop; }
+
+static audio_format_t told(const decoder_t *d)
+{
+    audio_format_t f = d->fmt;
+    if (mono_doubled(d)) f.channels = 2;
+    return f;
+}
+
 static decoder_t *decoder_open_any(const char *path, audio_format_t *fmt, const volatile int *abort, unsigned flags)
 {
     char file[1024];
     uint32_t cs, ce;
+    t_open_why = 0;
     if (cue_part_parse(path, file, sizeof file, &cs, &ce) > 0) {   /* a CUE track */
         decoder_t *d = decoder_open_any(file, NULL, abort, flags);
         if (!d) return NULL;
         d->file = strdup(file);
         if (!d->file || part_set(d, cs, ce)) { decoder_close(d); return NULL; }
-        if (fmt) *fmt = d->fmt;
+        if (fmt) *fmt = told(d);
         return d;
     }
     const char *dot = strrchr(path, '.');
@@ -691,7 +727,7 @@ static decoder_t *decoder_open_any(const char *path, audio_format_t *fmt, const 
         d->abort = abort;
         r = open_net(d, path);
         if (r) { decoder_close(d); return NULL; }
-        if (fmt) *fmt = d->fmt;
+        if (fmt) *fmt = told(d);
         return d;
     }
 #else
@@ -717,7 +753,7 @@ static decoder_t *decoder_open_any(const char *path, audio_format_t *fmt, const 
 #endif
     if (r) { decoder_close(d); return NULL; }
     d->file_frames = d->fmt.total_frames;
-    if (fmt) *fmt = d->fmt;
+    if (fmt) *fmt = told(d);
     return d;
 }
 
@@ -728,7 +764,7 @@ int decoder_continue(decoder_t *d, const char *path, audio_format_t *fmt)
     if (!d->part || !d->file || cue_part_parse(path, file, sizeof file, &cs, &ce) <= 0 || strcmp(file, d->file) ||
         (uint64_t)cs * d->fmt.rate / CUE_FPS != d->at || part_set(d, cs, ce))
         return -1;
-    if (fmt) *fmt = d->fmt;
+    if (fmt) *fmt = told(d);
     return 0;
 }
 
@@ -768,6 +804,8 @@ long decoder_read(decoder_t *d, int32_t *out, long max_frames)
 #endif
     } else
     n = d->kind == DEC_FLAC ? read_flac(d, out, max_frames) : read_mp3(d, out, max_frames);
+    if (n > 0 && mono_doubled(d))        /* (in place, from the end: out has room for two channels) */
+        for (long i = n - 1; i >= 0; i--) out[2 * i] = out[2 * i + 1] = out[i];
     if (n > 0) d->at += (uint64_t)n;
     return n;
 }

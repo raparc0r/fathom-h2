@@ -83,22 +83,35 @@ def for_people(s, translated=False):
 
 
 def code_of(line):
-    """The line without a // comment (one outside the string literals)."""
+    """The line without its comments: a // one, and /* ... */ ones (outside
+    the string literals; a comment's own "quoted words" were listed as texts)."""
     q = None
     i = 0
+    out = []
     while i < len(line):
         c = line[i]
         if q:
-            if c == '\\':
+            out.append(c)
+            if c == '\\' and i + 1 < len(line):
+                out.append(line[i + 1])
                 i += 1
             elif c == q:
                 q = None
         elif c in '"\'':
             q = c
+            out.append(c)
         elif line.startswith('//', i):
-            return line[:i]
+            break
+        elif line.startswith('/*', i):
+            end = line.find('*/', i + 2)
+            if end < 0:
+                break
+            i = end + 1
+            out.append(' ')
+        else:
+            out.append(c)
         i += 1
-    return line
+    return ''.join(out)
 
 
 def texts():
@@ -116,6 +129,8 @@ def texts():
                 continue
             for m in LITERAL.finditer(code):
                 s = decode(m.group(1))
+                if s.endswith('\\n'):       # one line of a text of several (Tips): looked up without its line break
+                    s = s[:-2]
                 if for_people(s, translated) and s not in seen:
                     seen.append(s)
     return seen

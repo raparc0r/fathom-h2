@@ -20,7 +20,7 @@ On the H2's microSD card, in `fathom/themes/`:
 | `fathom/themes/My Theme/theme.ini` | A theme with its own font: put the font files next to it, e.g. `fathom/themes/My Theme/fonts/MyFont.ttf` |
 
 The player reads this folder when it starts, so restart the H2 (hold Power to turn it off, then
-turn it on) and the theme appears in Settings → Theme. The built-in themes always come first.
+turn it on) and the theme appears in Settings → Interface → Theme. The built-in themes always come first.
 
 The example below is a complete theme, and the built-in ones in `fathom/assets/themes/` are
 good starting points: copy one into `fathom/themes/`, give it a new `name`, and change it.
@@ -46,7 +46,7 @@ select_bg   = #F2C46D        ; required: the selection pill or bar
 select_fg   = #1A1300        ; required: text on the selection
 signal      = #7FD8BE        ; required: playing indicator, progress, "Bit+"
 info        = #A9BBCD        ; optional: format chip, output name (default: signal)
-mode        = #7FD8BE        ; optional: shuffle/repeat/play icons (default: signal)
+mode        = #7FD8BE        ; optional: the top bar's play/pause/stop icon (default: signal); the other status icons use text
 battery     = #A9BBCD        ; optional (default: text_muted)
 warning     = #FFC845        ; optional
 danger      = #FF6B6B        ; optional
@@ -62,8 +62,8 @@ file       = fonts/MyFont.ttf
 file_title = fonts/MyFont-Medium.ttf   ; optional, for titles and the header
 ; pixel sizes per role (optional; defaults 15, 20, 18, 22, 16):
 meta  = 15                   ; times, counts, the header's battery
-body  = 20                   ; list rows
-sub   = 18                   ; the artist line on Now Playing
+body  = 20                   ; list rows, and the artist on Now Playing
+sub   = 18                   ; the help Menu shows on a setting, and Find cover's artist
 title = 22                   ; the title on Now Playing (two lines)
 head  = 16                   ; the header
 
@@ -85,13 +85,15 @@ repeat     = icons/repeat.png
 repeat_one = icons/repeat-one.png
 charging   = icons/charging.png
 stop       = icons/stop.png       ; nothing playing
-bluetooth  = icons/bluetooth.png  ; headphones connected (drawn faded while connecting)
+bluetooth  = icons/bluetooth.png  ; Bluetooth on (drawn faded until headphones are connected)
+wifi       = icons/wifi.png       ; Wi-Fi on (drawn faded until a network is joined)
 
 [decor]
 icons = line                 ; line | pixel (Home's icons; pixel by default with arkpixel)
 ```
 
-Any icon you leave out is drawn with the built-in symbol, in your `mode` colour. Your icons are
+Any icon you leave out is drawn with the built-in symbol: the play state in your `mode` colour,
+the others in `text`. Your icons are
 drawn as they are (their own colours).
 
 Keys this firmware doesn't know are ignored (the theme list says so), so a theme written for a
@@ -133,5 +135,5 @@ build/theme-check "path/to/My Theme"
 
 It reports errors and warnings as the player would (contrast ratios included). To see the theme,
 put it in `build/sim-data/themes/` and run the simulator: `build/sim/fathom-sim`, then
-Settings → Theme, or `T` to cycle themes. `fathom-sim --screenshots DIR` also writes a picture
+Settings → Interface → Theme, or `T` to cycle themes. `fathom-sim --screenshots DIR` also writes a picture
 of each contributed theme's home screen.

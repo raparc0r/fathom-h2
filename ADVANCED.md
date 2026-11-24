@@ -115,8 +115,10 @@ the keys, are kept on the card, readable by anyone holding it.
 ## Logs
 
 The card keeps the last five start-ups: `fathom/boot-1.log` is the latest, `boot-5.log`
-the oldest, and after a crash they also hold what the kernel recorded. Please attach them
-when you report a bug.
+the oldest, and after a crash they also hold what the kernel recorded. When the player
+can't stay up (it stops within seconds of starting, five times running), the end of its
+own log is kept as `fathom/player-crash.log`: it names the file it stopped on, if it was
+reading one. Please attach them when you report a bug.
 
 ## AAC for Bluetooth headphones
 

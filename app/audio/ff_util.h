@@ -12,6 +12,19 @@
 
 /* FFmpeg logs nothing (a library scan opens thousands of files). */
 void ff_quiet(void);
+/* Before FFmpeg opens anything (a file's tags, its picture, a file or a stream
+ * to play): it may take no single piece of memory bigger than what the H2 can
+ * spare now. FFmpeg allocates what a file's header asks for: an MP4's table
+ * of its frames is 24 bytes a frame, 3.7 MB for an hour of AAC, 18 MB for a
+ * five-hour audiobook, on a player with some 10 MB to spare. Taken, the
+ * system killed the player (and with the memory merely nearly gone, stalled
+ * until the watchdog restarted the H2). Refused, FFmpeg carries on without
+ * the table (the file's tags are read all the same) or gives the file up.
+ * Returns the limit set, in bytes (0: none, where /proc/meminfo isn't). */
+long ff_mem_guard(void);
+/* An MP4 opened without that table (refused, above): it has frames and no
+ * way to them, so it can't be played now. */
+int ff_index_missing(const AVFormatContext *fc, const AVStream *st);
 /* The source's bit depth for a lossless codec (16, 24...), 0 for a lossy one. */
 int ff_bits(const AVCodecParameters *par);
 /* The stream's length in sample frames, 0 if unknown. */

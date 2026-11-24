@@ -816,6 +816,7 @@ static int picture_ogg_vorbis(const char *path, unsigned char **data, size_t *le
 static int ff_open(const char *path, AVFormatContext **fc)
 {
     ff_quiet();
+    ff_mem_guard();                    /* (a file can't ask for more memory than there is) */
     *fc = NULL;
     if (avformat_open_input(fc, path, NULL, NULL) < 0) return -1;
     int s = av_find_best_stream(*fc, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
@@ -890,6 +891,7 @@ static int picture_ff(const char *path, unsigned char **data, size_t *len, size_
 {
     AVFormatContext *fc = NULL;
     ff_quiet();
+    ff_mem_guard();
     if (avformat_open_input(&fc, path, NULL, NULL) < 0) return -1;
     int found = -1;
     for (unsigned i = 0; i < fc->nb_streams && found; i++) {

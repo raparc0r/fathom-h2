@@ -1900,9 +1900,10 @@ static void bt_poll(lv_timer_t *t)
     char pcm[200], name[64], last[18], busy[32];
     int have = bt_pcm(pcm, sizeof pcm, name, sizeof name);
     int on = bt_ui_state(busy, sizeof busy);
-    ui_set_bt_link(have ? UI_BT_LINK_CONNECTED
-                   : on && (!strcmp(busy, "Connecting") || !strcmp(busy, "Pairing"))
-                   ? UI_BT_LINK_CONNECTING : UI_BT_LINK_NONE);
+    /* (on with no headphones yet: the icon dimmed, as Wi-Fi's while it has
+     * no network; it was hidden until headphones were connecting, and
+     * Bluetooth just turned on looked as if it hadn't been) */
+    ui_set_bt_link(have ? UI_BT_LINK_CONNECTED : on ? UI_BT_LINK_CONNECTING : UI_BT_LINK_NONE);
     if (have && strcmp(pcm, g_bt_routed)) {            /* headphones connected */
         snprintf(g_bt_routed, sizeof g_bt_routed, "%s", pcm);
         if (bt_last(last, sizeof last) && strcmp(last, settings_get("bluetooth.last", "")))
@@ -2709,7 +2710,7 @@ static int about(int i, char *label, size_t lc, char *value, size_t vc)
     case 3: {                    /* the percentage used up, counted by Fathom */
         int used = settings_get_int("battery.used", 0);
         snprintf(label, lc, "Charge cycles");
-        snprintf(value, vc, "%d.%d", used / 100, used % 100 / 10);
+        snprintf(value, vc, "%d", (used + 50) / 100);    /* (a whole number: "0.0" read oddly) */
         return 0;
     }
     case 4: {

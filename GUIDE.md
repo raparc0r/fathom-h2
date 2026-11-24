@@ -11,7 +11,7 @@ does.
 | Wheel | move through a list | |
 | Play | choose; on Now Playing, play or pause | |
 | Back | go back | jump to Now Playing, and back |
-| Menu | options for what's selected (shuffle an album or an artist, play next, add to a playlist, go to the album...) | quick settings: brightness, shuffle, repeat, EQ, stereo width, Bluetooth, Wi-Fi, sleep timer |
+| Menu | options for what's selected (shuffle an album or an artist, play next, add to a playlist, go to the album...) | quick settings: brightness, shuffle, repeat, EQ, stereo width, Bluetooth, Wi-Fi, sleep timer, stop after this track |
 | Menu + wheel | | brightness: hold Menu and turn the wheel |
 | Prev / Next | previous or next track | seek |
 | Power | screen off or on | switch off (2 seconds) |
@@ -26,6 +26,11 @@ connection → USB drive mode). The card appears on the computer: copy your musi
 MP3, ALAC, AAC, WAV, AIFF, WavPack, APE, TTA, Opus, Ogg Vorbis and DSD, and albums ripped
 as one file with a CUE sheet.
 
+One limit: a single AAC file (`.m4a`, `.m4b`) that runs for hours, an audiobook or a long
+mix, can need more memory to open than the H2 has. Fathom lists it all the same, and says
+"too long for the H2's memory" if it can't play it then; about two hours is where that
+starts. Cut into shorter files, it plays. Other formats have no such limit.
+
 You can also take the card out and put it back: Fathom stops, shows "No/bad card", and
 starts again with your new music when the card is back. Over Wi-Fi, the network drive
 (below) lets you copy music while the H2 plays.
@@ -34,7 +39,7 @@ starts again with your new music when the card is back. Over Wi-Fi, the network 
 
 Home → **Search**: turn the wheel to a letter and press Play to type it (Back takes one
 away; Prev and Next move the cursor back into what you've typed, to put a letter right
-without deleting the rest); the results change as you type, and **Results** on the wheel (or Play twice) takes
+without deleting the rest); the results change as you type, and **Results** on the wheel (or Play twice quickly) takes
 you down to them. From then on the wheel moves through the list, the row with what you
 typed included: Back takes you up to that row, where Play types again and Back once more
 leaves Search. Artists, albums and songs come in one list, each with its icon, the
@@ -62,7 +67,7 @@ playlists as it is now.
 
 ## The H2 as your computer's sound card
 
-Plug it in and choose **Use as a USB DAC** (or Settings → Sound → USB DAC mode). The
+Plug it in and choose **Use as a USB DAC** (or Settings → USB connection → USB DAC mode). The
 computer then plays through the H2's headphone or line out, at the H2's volume. On a Mac,
 the first time, allow the accessory to connect when macOS asks, then choose "Fathom H2"
 as the output. Play, Prev and Next on the H2 control the computer's player; Back ends it.
@@ -72,8 +77,10 @@ Settings → USB connection → On a computer chooses what happens when you plug
 
 ## Covers, artists and themes
 
-Settings → Interface holds the look: the theme, album covers in the lists, artist names
-in Albums, and the language. Your own themes go in the card's `fathom/themes/` folder
+Settings → Interface holds the look: the theme, the Home screen's items, album covers in
+the lists, artist names in Albums, and the language. **Home screen items** lists everything
+Home can show: Play shows or hides an item, and Menu → Move, then the wheel, puts it
+somewhere else (Settings always stays). Your own themes go in the card's `fathom/themes/` folder
 ([THEMES.md](THEMES.md) explains every option); restart the H2 to see a new one.
 To make your own theme on the H2: Settings → Interface → Theme → **New theme**, or
 **Menu** on a theme to change it (a built-in one opens as a copy). Choose dark or light and
@@ -100,6 +107,8 @@ players still show their own covers. Finding covers needs Wi-Fi, and sends the a
 artist and title.
 
 Translations go in `fathom/lang/`, one `English text = translation` per line.
+`python3 tools/lang/strings.py` in the source lists every text, and
+`--update YourFile.txt` adds the ones a new version brought.
 
 ## EQ
 
@@ -162,7 +171,9 @@ next to the AirPods → Connect to This iPhone → When Last Connected to This i
 
 Settings → Wi-Fi, turn it on, choose your network and type its password with the wheel:
 Play adds the letter shown, Menu switches between lower case, capitals, digits and
-symbols, Back deletes, and **Join** at the end of the letters joins. Saved networks are
+symbols, Back deletes, Prev and Next move the cursor, and **Join** at the end of the
+letters (or Play twice quickly) joins. For a doubled letter, leave a moment between the
+two presses. Saved networks are
 joined by themselves next time; Menu on one forgets it. If you use something that needs
 Wi-Fi while it's off, the H2 offers to turn it on.
 
@@ -188,10 +199,31 @@ running while it's off.
 Home → Radio plays stations over Wi-Fi. Fathom comes with a few, and **Find stations**
 searches a directory of thousands: by name, by genre or country, the most popular, or a
 random one. Menu on a station adds it to your stations. Play stops and starts the stream;
-Prev and Next change station.
+Prev and Next change station. A station played from Find stations is counted at the
+directory, as one more play of it.
 
 A station added from Find stations shows its logo beside its name when the directory has
-one (a PNG or JPEG picture), and on Now Playing when the song has no cover of its own.
+one (not in the list while Settings → Interface → Covers in lists is Off), and on Now
+Playing when the song has no cover of its own. When the directory has
+none that can be used, Fathom looks on the station's own website for its icon (the one a
+phone would put on its home screen, or its favicon; a small favicon shows in the list
+only).
+
+A station with no logo and no website icon that can be used (one you typed into
+`radio.txt` yourself, say, or added before Fathom kept websites) is looked up in the
+station directory, radio-browser.info: Fathom sends it the station's stream address, and
+keeps the answer, so each station is asked about once. It does this by itself when it
+reads your stations with Wi-Fi connected: when you open Radio, or add or remove a station.
+No setting turns it off. A stream address that looks private is never sent: one with a
+login, a `?`, a `#` or an `=` in it; one on your home network (a name with no dot, or one
+ending in `.local`, `.lan`, `.home`, `.internal`, `fritz.box` and the like); one under a
+dynamic-DNS name (`duckdns.org`, `ddns.net`, `myfritz.net` and the like), as a server at
+home has; one given as a number, unless it's a plain public one of four parts; or one
+with a long random-looking part (24 letters and digits or more), which is likely a
+personal key. Fathom can't recognise a server of your own under a name of your own: to
+keep one to yourself, end its line with an ` | icon: ` or a ` | site: ` (below). The
+directory is asked only once a station's own logo and website have answered and had
+nothing that can be shown, never because one of them couldn't be reached.
 
 Your stations are kept in the card's `fathom/radio.txt`, one per line, which you can also
 edit on a computer:
@@ -202,7 +234,8 @@ Radio Paradise = https://stream.radioparadise.com/flacm
 
 The address can be the stream itself (MP3, AAC, FLAC, Ogg, over http or https) or the
 station's playlist link (`.m3u`, `.pls`, `.m3u8`). To give a station a logo yourself, end
-its line with ` | icon: ` and the address of a PNG or JPEG picture.
+its line with ` | icon: ` and the address of a PNG or JPEG picture, or with ` | site: ` and
+the address of the station's website, and Fathom finds the icon there.
 
 ## Podcasts
 
@@ -269,11 +302,16 @@ Three times a day, while the H2 rests on a Wi-Fi network it has joined before, F
 whether there's a newer version, tells you the next time you wake the H2, and puts
 **Update available!** at the top of Home. Choose it, then **Install new version** to get
 it, or **Ignore** to hide it until a newer one comes out. Turn it off in Settings → About
-→ Check automatically. Besides that, Fathom only contacts a time server when Wi-Fi
-connects, and, if you've added podcasts, their feeds and new episodes (Settings →
-Podcasts).
+→ Check automatically. Besides that, Fathom contacts by itself only: a time server when
+Wi-Fi connects (GitHub's server for the time instead, when the time server doesn't
+answer); if you've added podcasts, their feeds and new episodes (Settings → Podcasts);
+and, when you open Radio, your stations' logos, from the address each station has, from
+its website, or by asking the station directory (see Internet radio). Everything else goes
+out when you ask for it: Find stations, Find podcasts, Find cover, playing a station.
+Every request says it comes from Fathom, and most say which version.
 
-To update: Settings → About → **Check for updates**, then **Update to vX.Y.Z**. It
+To update: Settings → About → **Check for updates** (it reads **Update available** once
+Fathom has seen one), then **Update to vX.Y.Z**. It
 downloads (about 14 MB) while the music plays on, checks every file, then asks: **Play**
 installs it and restarts the H2, **Back** cancels. It needs about 65 MB free on the card
 while it works. Your music, settings, library, playlists, EQs, themes and Wi-Fi networks
@@ -321,7 +359,7 @@ Update** as in [INSTALL.md](INSTALL.md). Your settings and library are where you
 Fathom keeps its settings, library and cover cache in the card's `fathom` folder, and
 that's where you add things of your own: `radio.txt`, `eq/`, `themes/` and `lang/` (all
 above). `podcasts/` holds your shows, their episodes' downloads and where you left each;
-`radio-icons/` your stations' logos, fetched again if you delete them. Wi-Fi passwords and the network drive's password are kept there too, so anyone
+`radio-icons/` your stations' logos and what the station directory said about them, fetched and asked again if you delete them. Wi-Fi passwords and the network drive's password are kept there too, so anyone
 holding the card can read them.
 
 More for the technically minded (SSH, logs, recovery): [ADVANCED.md](ADVANCED.md).

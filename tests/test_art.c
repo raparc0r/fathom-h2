@@ -176,6 +176,33 @@ static void compare(const unsigned char *a, const unsigned char *b, size_t n, do
     *mean = (double)sum / (double)n;
 }
 
+/* A progressive JPEG written by hand, side x side at 4:4:4 and all one grey,
+ * as small as one can be (a bit a block, for "as the block before"): its
+ * tables and its header; with ac_first, a scan of what the first pass has no
+ * use for; with twice, its header once more; then the first pass's scan,
+ * whole. Its length (o: room for side * side / 170 + 200 bytes). */
+static size_t hand_progressive(unsigned char *o, int side, int ac_first, int twice)
+{
+    static const unsigned char dqt[5] = {0xff, 0xdb, 0, 67, 0};
+    static const unsigned char dht[22] = {0xff, 0xc4, 0, 20, 0x00, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00};   /* one code, of 1 bit */
+    static const unsigned char ac_scan[10] = {0xff, 0xda, 0, 8, 1, 1, 0x00, 1, 63, 0};
+    static const unsigned char dc_scan[14] = {0xff, 0xda, 0, 12, 3, 1, 0, 2, 0, 3, 0, 0, 0, 0};
+    const unsigned char sof[19] = {0xff, 0xc2, 0, 17, 8, (unsigned char)(side >> 8), (unsigned char)side, (unsigned char)(side >> 8),
+                                   (unsigned char)side, 3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0};
+    size_t n = 0, blocks = (size_t)((side + 7) / 8) * (size_t)((side + 7) / 8), bytes = (3 * blocks + 7) / 8;
+    o[n++] = 0xff, o[n++] = 0xd8;
+    memcpy(o + n, dqt, sizeof dqt), n += sizeof dqt;
+    memset(o + n, 1, 64), n += 64;
+    memcpy(o + n, sof, sizeof sof), n += sizeof sof;
+    memcpy(o + n, dht, sizeof dht), n += sizeof dht;
+    if (ac_first) memcpy(o + n, ac_scan, sizeof ac_scan), n += sizeof ac_scan;
+    if (twice) memcpy(o + n, sof, sizeof sof), n += sizeof sof;
+    memcpy(o + n, dc_scan, sizeof dc_scan), n += sizeof dc_scan;
+    memset(o + n, 0, bytes), n += bytes;
+    o[n++] = 0xff, o[n++] = 0xd9;
+    return n;
+}
+
 static void test_jpeg(void)
 {
     char path[600];
@@ -242,6 +269,33 @@ static void test_jpeg(void)
     static const unsigned char zero_depth[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 13, 'I', 'H', 'D', 'R',
                                                0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'I', 'E', 'N', 'D'};
     CHECK(art_decode_mem(zero_depth, sizeof zero_depth, 204, &H2, &img, &w, &h) == -1);
+    /* a progressive JPEG's first pass keeps to the limit on a picture's
+     * pixels too: 8000 x 8000 is 1000 x 1000 of them, which a cover may be
+     * and a station's logo (400,000) may not. (Its 2 bytes a block were
+     * allocated whatever it said: 80 MB for a file of 126 bytes that said
+     * 30,000 x 30,000.) */
+    unsigned char *hand = malloc(9000 * 9000 / 170 + 200);
+    static uint16_t large[LIB_ART_LARGE * LIB_ART_LARGE], small[LIB_ART_SMALL * LIB_ART_SMALL];
+    int side = 0;
+    size_t hn = hand_progressive(hand, 8000, 0, 0);
+    CHECK(art_decode_mem(hand, hn, 204, &H2, &img, &w, &h) == 0 && w == 1000 && h == 1000 && img[0] == 128 && img[3 * 1000 * 1000 - 1] == 128);
+    free(img);
+    CHECK(library_logo_decode(hand, hn, large, small, &side) == -1);
+    hn = hand_progressive(hand, 4800, 0, 0);            /* (600 x 600: a logo still) */
+    CHECK(library_logo_decode(hand, hn, large, small, &side) == 0 && side == 600);
+    hn = hand_progressive(hand, 9000, 0, 0);            /* (1125 x 1125: over a cover's 1,200,000 on the H2) */
+    CHECK(art_decode_mem(hand, hn, 204, &H2, &img, &w, &h) == -1);
+    hn = hand_progressive(hand, 8, 0, 0);               /* (that file: one block's, its header saying 30,000 each way) */
+    hand[76] = hand[78] = 30000 >> 8, hand[77] = hand[79] = 30000 & 255;
+    CHECK(hn < 130 && art_decode_mem(hand, hn, 204, &H2, &img, &w, &h) == -1);
+    /* its header twice (after a scan, where libjpeg doesn't look): damaged.
+     * Each one's blocks were allocated again, the ones before never freed. */
+    hn = hand_progressive(hand, 1600, 1, 0);
+    CHECK(art_decode_mem(hand, hn, 204, &H2, &img, &w, &h) == 0 && w == 200 && h == 200);
+    free(img);
+    hn = hand_progressive(hand, 1600, 1, 1);
+    CHECK(art_decode_mem(hand, hn, 204, &H2, &img, &w, &h) == -1);
+    free(hand);
     free(head);
     free(src);
 }

@@ -49,11 +49,16 @@ computer.
 
 ## 3. Install
 
-Put the card in the H2 and turn it on (the stock firmware, as usual; if your H2 runs
-Rockbox, hold **Play** while turning it on to start the stock firmware). Go to
+Put the card in the H2 and turn it on (the stock firmware, as usual). Go to
 **System Settings → Firmware Update**. The H2 restarts into its updater, installs Fathom's
 bootloader, and restarts into Fathom, which reads your library (a few minutes the first
 time for a big one; later checks take seconds).
+
+**If your H2 has Rockbox:** Firmware Update won't work from the stock firmware, because
+Rockbox's bootloader starts Rockbox where the updater should start. Instead, turn the H2
+off, hold **Vol+** while turning it on to open Rockbox's bootloader menu, and choose
+**Boot select → HibyOS Recovery**. The stock updater runs from there and installs Fathom
+as above. Fathom's bootloader takes the place of Rockbox's.
 
 At that first start, Fathom also copies the Bluetooth and Wi-Fi firmware from the stock
 firmware into its own folder, and says so. Fathom can't distribute those files, but every
@@ -68,6 +73,12 @@ You can delete `update.upt` from the card afterwards.
   bootloader's menu. [ADVANCED.md](ADVANCED.md) explains how.
 - **Using Fathom**, from adding music to EQ, Bluetooth headphones, radio and updates:
   [GUIDE.md](GUIDE.md).
-- **To remove Fathom** and go back to HiBy's firmware: Settings → About → Uninstall
-  Fathom ([GUIDE.md](GUIDE.md)).
+- **To remove Fathom** and go back to HiBy's firmware: in Fathom (not in the stock
+  firmware), Settings → About → Uninstall Fathom ([GUIDE.md](GUIDE.md)). If Fathom won't
+  start, [ADVANCED.md](ADVANCED.md) has the way by hand, under "Removing Fathom".
 - **If the installer won't run** or the H2 doesn't start: [ADVANCED.md](ADVANCED.md).
+- **If Fathom keeps starting again while it reads your library:** a file in the library
+  is stopping the player. Fathom sets such a file aside by itself once it has stopped on
+  it twice, so a few minutes may get it through. If not, start with a few albums in
+  `Music` and add the rest in parts, and please report it with the logs
+  ([ADVANCED.md](ADVANCED.md), "Logs").

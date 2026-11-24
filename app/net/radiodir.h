@@ -3,7 +3,10 @@
 /*
  * The station directory (Home > Radio > Find stations): radio-browser.info's
  * public API, https://api.radio-browser.info. Asked only when someone opens a
- * list or searches: nothing at start-up, nothing in the background.
+ * list or searches: nothing at start-up, nothing in the background. The one
+ * exception: a station of yours with no logo and no site of its own is looked
+ * up once, by its stream, when Radio is opened (rdir_lookup_stream, for
+ * net/radioicon.c, which never sends an address that looks private).
  *
  * One request at a time runs on its own worker thread (rdir_start); the UI
  * polls for the answer (rdir_poll) and drops one it no longer wants
@@ -74,6 +77,12 @@ int  rdir_parse_countries(const char *text, size_t len, rdir_country_t *out, int
 /* The request for q on server (e.g. "de1.api.radio-browser.info"). */
 void rdir_stations_url(char *out, size_t cap, const char *server, const rdir_query_t *q);
 void rdir_countries_url(char *out, size_t cap, const char *server);
+/* The request for the station(s) with this stream, and what its answer says
+ * of them: the station's own web page and its logo's address ("" for one it
+ * doesn't give, or that isn't an address). 1, 0 if the directory has no
+ * station with that stream, -1 if it isn't an answer at all. */
+void rdir_stream_url(char *out, size_t cap, const char *server, const char *stream);
+int  rdir_parse_stream(const char *text, size_t len, char *site, size_t sn, char *icon, size_t in);
 
 /* ---- requests (a worker thread) ---- */
 
@@ -90,6 +99,11 @@ int  rdir_poll(rdir_result_t *out);
 int  rdir_busy(void);
 void rdir_cancel(void);
 void rdir_result_free(rdir_result_t *r);
+
+/* A stream looked up there and then, on the caller's thread (the servers in
+ * turn, as a request): as rdir_parse_stream, or -1 if none answered (or
+ * *abort was set). */
+int  rdir_lookup_stream(const char *stream, char *site, size_t sn, char *icon, size_t in, const volatile int *abort);
 
 /* radio-browser counts a station's plays when a client asks for
  * /json/url/{uuid}: once when one is played from the directory (on its own

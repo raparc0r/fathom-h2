@@ -13,6 +13,36 @@ void ff_quiet(void)
     done = 1;
 }
 
+/* What's kept back from what the system says is available (the player's own
+ * code is among what "available" counts: with under 2 MB of it left the H2
+ * crawls), and the least FFmpeg is ever allowed (its own probing takes 1 MB;
+ * and "available" has read low on the H2 with nothing wrong). */
+#define FF_MEM_RESERVE (3L * 1024 * 1024)
+#define FF_MEM_FLOOR   (4L * 1024 * 1024)
+
+long ff_mem_guard(void)
+{
+    FILE *f = fopen("/proc/meminfo", "re");
+    if (!f) return 0;
+    long kb = -1;
+    char line[128];
+    while (kb < 0 && fgets(line, sizeof line, f))
+        if (sscanf(line, "MemAvailable: %ld kB", &kb) != 1) kb = -1;
+    fclose(f);
+    if (kb < 0) return 0;
+    long long cap = (long long)kb * 1024 - FF_MEM_RESERVE;
+    if (cap < FF_MEM_FLOOR) cap = FF_MEM_FLOOR;
+    if (cap > INT32_MAX) cap = INT32_MAX;             /* (FFmpeg's own limit) */
+    av_max_alloc((size_t)cap);
+    return (long)cap;
+}
+
+int ff_index_missing(const AVFormatContext *fc, const AVStream *st)
+{
+    return fc && fc->iformat && fc->iformat->name && strstr(fc->iformat->name, "mov") != NULL &&
+           st->nb_frames > 0 && avformat_index_get_entries_count(st) == 0;
+}
+
 int ff_bits(const AVCodecParameters *par)
 {
     const AVCodecDescriptor *desc = avcodec_descriptor_get(par->codec_id);

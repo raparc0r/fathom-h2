@@ -67,6 +67,10 @@ int radio_parse(const char *text, radio_station_t *out, int max)
                         char icon[sizeof r->icon + 8];   /* (room to see one that's too long: left out, not cut) */
                         trim_copy(icon, sizeof icon, i + 5, e);
                         if (radio_icon_ok(icon)) memcpy(r->icon, icon, strlen(icon) + 1);
+                    } else if (!strncmp(i, "site:", 5)) {
+                        char site[sizeof r->site + 8];
+                        trim_copy(site, sizeof site, i + 5, e);
+                        if (radio_icon_ok(site)) memcpy(r->site, site, strlen(site) + 1);
                     }
                     bar = next;
                 }
@@ -102,12 +106,15 @@ int radio_load_list(const char *path, const char *example, radio_station_t *out,
     int n = radio_load(path, out, max);
     if (n < 0) return example ? radio_load(example, out, max) : -1;
     int missing = 0;
-    for (int i = 0; i < n; i++) missing |= !out[i].icon[0];
+    for (int i = 0; i < n; i++) missing |= !out[i].icon[0] || !out[i].site[0];
     radio_station_t *ex = missing && example ? malloc(RADIO_MAX * sizeof *ex) : NULL;
     int nex = ex ? radio_load(example, ex, RADIO_MAX) : 0;
     for (int i = 0; i < n; i++)
-        for (int k = 0; k < nex && !out[i].icon[0]; k++)
-            if (ex[k].icon[0] && !strcmp(ex[k].url, out[i].url)) memcpy(out[i].icon, ex[k].icon, sizeof out[i].icon);
+        for (int k = 0; k < nex && (!out[i].icon[0] || !out[i].site[0]); k++) {
+            if (strcmp(ex[k].url, out[i].url)) continue;
+            if (!out[i].icon[0] && ex[k].icon[0]) memcpy(out[i].icon, ex[k].icon, sizeof out[i].icon);
+            if (!out[i].site[0] && ex[k].site[0]) memcpy(out[i].site, ex[k].site, sizeof out[i].site);
+        }
     free(ex);
     return n;
 }
@@ -134,7 +141,7 @@ static char *read_text(const char *path)
 /* The station on one line of the list (a, up to b), if it is one. */
 static int line_station(const char *a, const char *b, radio_station_t *st)
 {
-    char line[1280];                 /* (a full line is under 920: radio_line) */
+    char line[1536];                 /* (a full line is under 1,200: radio_line) */
     size_t n = (size_t)(b - a);
     if (n >= sizeof line) n = sizeof line - 1;
     memcpy(line, a, n);
@@ -198,6 +205,14 @@ void radio_line(const radio_station_t *st, char *out, size_t cap)
     for (const char *c = st->name; *c && n + 1 < sizeof name; c++)
         name[n++] = (unsigned char)*c < 0x20 ? ' ' : *c;
     name[n] = '\0';
+    /* ...and no "= http://" in it: read back, the line's stream would be the
+     * one in the name (a directory's station can be named anything) */
+    for (char *c = name; *c; c++) {
+        if (*c != '=') continue;
+        const char *u = c + 1;
+        while (isspace((unsigned char)*u)) u++;
+        if (!strncmp(u, "http://", 7) || !strncmp(u, "https://", 8)) *c = '-';
+    }
     char *s = name;
     while (*s == '#' || isspace((unsigned char)*s)) s++;
     for (char *e = s + strlen(s); e > s && isspace((unsigned char)e[-1]);) *--e = '\0';
@@ -206,7 +221,8 @@ void radio_line(const radio_station_t *st, char *out, size_t cap)
      * the line's end, and takes "radiofrance:7 | icon: ..." for station 7 still) */
     int len = snprintf(out, cap, "%s = %s", s, st->url);
     if (st->info[0] && len >= 0 && (size_t)len < cap) len += snprintf(out + len, cap - (size_t)len, " | info: %s", st->info);
-    if (radio_icon_ok(st->icon) && len >= 0 && (size_t)len < cap) snprintf(out + len, cap - (size_t)len, " | icon: %s", st->icon);
+    if (radio_icon_ok(st->icon) && len >= 0 && (size_t)len < cap) len += snprintf(out + len, cap - (size_t)len, " | icon: %s", st->icon);
+    if (radio_icon_ok(st->site) && len >= 0 && (size_t)len < cap) snprintf(out + len, cap - (size_t)len, " | site: %s", st->site);
 }
 
 int radio_add(const char *path, const char *example, const radio_station_t *st)
@@ -224,7 +240,7 @@ int radio_add(const char *path, const char *example, const radio_station_t *st)
         if (!end) break;
         line = end + 1;
     }
-    char add[1024];
+    char add[1536];
     radio_line(st, add, sizeof add);
     size_t n = strlen(t), k = strlen(add);
     int r;

@@ -86,36 +86,42 @@ check "... and the waits go on growing" '[ "$(lines $T/st/sleeps)" = "60 300 900
 spid=$(cat $T/st/sleep.pid)
 # 5. The address lost: the loop ends, its wait with it, the count cleared
 interface=wlan0 $T/hook deconfig
-until_ '[ ! -d $LOCK ] && ! kill -0 $pid 2>/dev/null'
+until_ '[ ! -d $LOCK ] && ! kill -0 $pid 2>/dev/null && ! kill -0 $spid 2>/dev/null'
 check "deconfig: the loop gone" '! kill -0 $pid 2>/dev/null && [ ! -d $LOCK ]'
 check "... its wait too" '! kill -0 $spid 2>/dev/null'
 check "... and the count" '[ ! -f $T/run/fathom-ntp-fails ]'
 rm -f $T/st/hold
 
-# 6. Wi-Fi gone while waiting: no more tries, the loop ends
-fresh; echo 1 > $T/carrier
+# 6. Wi-Fi gone while waiting: no more tries, the loop ends. The wait is held, and ended
+# here once the carrier is down: one left to end by itself (0.02 s) could be over, and
+# the next try made, before the carrier was written
+fresh; echo 1 > $T/carrier; touch $T/st/hold
 interface=wlan0 ntpsrv=10.0.0.1 $T/hook bound
-until_ '[ -f $T/st/sleeps ]'
+until_ '[ -s $T/st/sleep.pid ]'
+pid=$(cat $LOCK/pid)
 echo 0 > $T/carrier
+kill $(cat $T/st/sleep.pid)
 until_ '[ ! -d $LOCK ] && ! kill -0 $pid 2>/dev/null'
 check "Wi-Fi gone: the loop ends" '[ ! -d $LOCK ] && [ $(wc -l < $T/st/calls) -eq 1 ]'
 
-# 7. Not joined at all: no try
+# 7. Not joined at all: no try. Such a loop leaves nothing to wait for, so it is given a
+# pipe to hold open (descriptor 9, which the hook hands on to it): cat ends when it has
 fresh; echo 0 > $T/carrier; echo 0 > $T/st/answer_after
-interface=wlan0 $T/hook bound
-until_ '[ ! -d $LOCK ]'; $SLEEP 0.1
+interface=wlan0 $T/hook bound 9>&1 | cat
 check "no network joined: no try" '[ ! -f $T/st/calls ] && [ ! -d $LOCK ]'
 
-# 8. Another interface (the USB link): nothing
-fresh; echo 1 > $T/carrier
-interface=usb0 $T/hook bound; $SLEEP 0.1
+# 8. Another interface (the USB link): nothing (waited for as in 7: a loop started all
+# the same would get its answer, so that it ends and its try is seen)
+fresh; echo 1 > $T/carrier; echo 0 > $T/st/answer_after
+interface=usb0 $T/hook bound 9>&1 | cat
 check "usb0: nothing" '[ ! -f $T/st/calls ] && [ ! -d $LOCK ]'
 
-# 9. A loop that died without tidying up doesn't stop the next
+# 9. A loop that died without tidying up doesn't stop the next (the new loop waited for:
+# the file is there, empty, a moment before date has written the time in it)
 fresh; echo 1 > $T/carrier; echo 0 > $T/st/answer_after
 mkdir $LOCK; echo 999999 > $LOCK/pid
 interface=wlan0 ntpsrv=10.0.0.1 $T/hook bound
-until_ '[ -f $T/run/fathom-clock ]'
+until_ '[ -f $T/run/fathom-clock ] && [ ! -d $LOCK ]'
 check "a stale lock: tried anyway" '[ -s $T/run/fathom-clock ]'
 
 until_ '[ ! -d $LOCK ] && ! kill -0 $pid 2>/dev/null'

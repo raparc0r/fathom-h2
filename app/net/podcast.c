@@ -20,6 +20,7 @@
 
 #ifdef FATHOM_HAVE_FFMPEG
 #include <libavformat/avformat.h>
+#include "audio/ff_util.h"
 #endif
 
 /* ---------- reading XML, tolerantly ----------
@@ -528,6 +529,7 @@ int pod_file_chapters(const char *path, pod_chapter_t *out, int max)
 {
 #ifdef FATHOM_HAVE_FFMPEG
     AVFormatContext *fc = NULL;
+    ff_mem_guard();                    /* (a long episode's table of frames isn't taken if it won't fit) */
     if (avformat_open_input(&fc, path, NULL, NULL) < 0) return 0;   /* (the header only: chapters come with it) */
     int n = 0;
     for (unsigned i = 0; i < fc->nb_chapters && n < max; i++) {

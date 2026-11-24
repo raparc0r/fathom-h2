@@ -292,6 +292,12 @@ target_link_libraries(test_radioicon PRIVATE fathom_player pthread)
 target_include_directories(test_radioicon PRIVATE tests)
 target_compile_options(test_radioicon PRIVATE ${FATHOM_WARNINGS})
 add_test(NAME radioicon COMMAND test_radioicon WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# What a server sends for a station's icon (an .ico, a page, the directory's answer), damaged
+# at random, the same way every time; longer, and under the sanitizers: see the file's head
+add_executable(test_fuzz_radioicon tests/fuzz_radioicon.c)
+target_link_libraries(test_fuzz_radioicon PRIVATE fathom_player)
+target_compile_options(test_fuzz_radioicon PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME fuzz_radioicon COMMAND test_fuzz_radioicon)
 add_executable(test_update tests/test_update.c)
 target_link_libraries(test_update PRIVATE fathom_player)
 target_compile_options(test_update PRIVATE ${FATHOM_WARNINGS})

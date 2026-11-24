@@ -24,6 +24,12 @@ typedef struct {
 
 typedef struct decoder decoder_t;
 
+/* Why the last decoder_open* on this thread gave no decoder: 0 (the file, its
+ * format), or DECODER_WHY_MEMORY: the file needs more memory to open than
+ * there is now (an MP4 hours long: its table of frames). */
+#define DECODER_WHY_MEMORY 1
+int decoder_open_why(void);
+
 /* A CUE track's path (library/cue.h) opens its file and plays just that
  * track: total_frames, reads and seeks are the track's own. */
 decoder_t *decoder_open(const char *path, audio_format_t *fmt);
@@ -35,7 +41,8 @@ decoder_t *decoder_open_ex(const char *path, audio_format_t *fmt, const volatile
  * output that takes it to a DAC that knows it. Other files: as decoder_open. */
 #define DECODER_DOP 1u
 decoder_t *decoder_open_flags(const char *path, audio_format_t *fmt, unsigned flags);
-/* Up to max_frames frames into out (max_frames * channels samples).
+/* A mono file or stream is given as two equal channels (fmt.channels says 2).
+ * Up to max_frames frames into out (max_frames * channels samples).
  * Returns frames decoded, 0 at end of stream, -1 on error. */
 long decoder_read(decoder_t *d, int32_t *out, long max_frames);
 int  decoder_seek(decoder_t *d, uint64_t frame);

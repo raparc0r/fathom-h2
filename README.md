@@ -2,7 +2,7 @@
 
 # Fathom
 
-Latest version: [0.17.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.17.0) released November 23rd 2026
+Latest version: [0.18.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.18.0) released November 24th 2026
 
 [Features](#features) · [Compatibility](#compatibility) · [Installing](#installing) · [Navigation](#navigation) · [Licence](#licence) · [How it was made](#how-it-was-made)
 
@@ -78,11 +78,13 @@ unzipped.
 1. Put your music in a folder called `Music` at the top of the card.
 2. Copy everything inside the release's `sd/` folder to the top of the card.
 3. Put the card in the H2 and, in the stock firmware, choose **System Settings → Firmware
-   Update**. The H2 restarts into Fathom, which reads your library. (If your H2 runs
-   Rockbox, hold **Play** while turning it on to start the stock firmware first.)
+   Update**. The H2 restarts into Fathom, which reads your library. (If your H2 has
+   Rockbox, hold **Vol+** while turning it on and choose **Boot select → HibyOS Recovery**
+   instead: [INSTALL.md](INSTALL.md) says why.)
 
-To start the stock firmware instead, hold **Play** while turning the H2 on. To remove
-Fathom, bootloader included: Settings → About → **Uninstall Fathom** ([GUIDE.md](GUIDE.md)).
+Once Fathom is installed, hold **Play** while turning the H2 on to start the stock
+firmware instead. To remove Fathom, bootloader included: in Fathom, Settings → About →
+**Uninstall Fathom** ([GUIDE.md](GUIDE.md)).
 
 More: [INSTALL.md](INSTALL.md) (the full steps, and a recommended backup),
 [GUIDE.md](GUIDE.md) (using Fathom, and uninstalling it), [ADVANCED.md](ADVANCED.md)

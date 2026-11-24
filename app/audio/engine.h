@@ -30,6 +30,7 @@ typedef struct {
     int            error;        /* the track couldn't be played (unreadable, or the output can't
                                   * take its format); track_id is that track's */
     int            error_output; /* ...because the output can't take its format (not the file) */
+    int            error_memory; /* ...because opening it needs more memory than there is (an MP4 hours long) */
     unsigned       stop_seq;     /* +1 each time playback stops by itself (ended or error) */
     int            output_lost;  /* a write or open failed (device gone); the engine paused */
     int            starting;     /* a track is about to start (engine_play not yet taken up) */

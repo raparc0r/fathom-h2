@@ -279,6 +279,9 @@ int library_art_decode(const unsigned char *enc, size_t len, int size, uint16_t 
  * further than that), so the caller can tell one too small to show large.
  * Stricter limits than a cover's: 512 KB, 400,000 pixels decoded. 0 if decoded. */
 int library_logo_decode(const unsigned char *enc, size_t len, uint16_t *large, uint16_t *small, int *short_side);
+/* The same from pixels already decoded (w x h, 3 bytes each: red, green, blue;
+ * 1,024 a side at most): an icon out of an .ico file (net/radioicon.c). 0, -1 */
+int library_logo_rgb(const unsigned char *rgb, int w, int h, uint16_t *large, uint16_t *small);
 /* The same from an image file, at both sizes (LIB_ART_LARGE and LIB_ART_SMALL
  * squares): read from where it is, a JPEG or a PNG of any size without its
  * encoded bytes held in memory (a podcast's cover). 0 if decoded. */

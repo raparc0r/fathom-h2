@@ -207,7 +207,11 @@ static int png_stream(FILE *f, long off, int min_side, const art_limits_t *lim, 
             continue;
         }
         if (!memcmp(hd + 4, "IEND", 4)) break;
-        if (fseek(f, (long)len + 4, SEEK_CUR)) goto out;   /* anything else, and its CRC */
+        /* anything else, and its CRC. (A chunk is 2^31 - 1 bytes at most. One
+         * that says more is damaged, or made to be: as the H2's 32-bit long
+         * it's a step backwards, and 0xFFFFFFF4 is a step of 8, back to this
+         * same chunk, read again for ever.) */
+        if (len > 0x7fffffffu - 4 || fseek(f, (long)len + 4, SEEK_CUR)) goto out;
     }
     if (p.y >= (uint32_t)(p.oh * p.k)) {              /* (the rows past the last whole k aren't needed) */
         *rgb = p.out, *w = p.ow, *h = p.oh;
@@ -303,7 +307,7 @@ static int next_marker(FILE *f)
     }
 }
 
-static int jpeg_dc(FILE *f, long off, unsigned char **rgb, int *w, int *h)
+static int jpeg_dc(FILE *f, long off, const art_limits_t *lim, unsigned char **rgb, int *w, int *h)
 {
     jcomp_t c[4];
     huff_t dct[4];
@@ -336,9 +340,15 @@ static int jpeg_dc(FILE *f, long off, unsigned char **rgb, int *w, int *h)
                 if (fseek(f, big ? 126 : 63, SEEK_CUR)) goto out;
             }
         } else if (marker == 0xC2) {                   /* SOF2: progressive, Huffman */
-            if (getc(f) != 8) goto out;
+            if (nf || getc(f) != 8) goto out;          /* (a second one: damaged; it would allocate all again, the first's never freed) */
             Y = rd16(f), X = rd16(f), nf = getc(f);
             if (X <= 0 || Y <= 0 || (nf != 1 && nf != 3)) goto out;
+            /* what's made of it is within the limit, as any other picture
+             * (and with it what's kept to make it: 2 bytes for each of its
+             * pixels, in each component). 126 bytes that said 30,000 x
+             * 30,000 had 80 MB allocated and gone through before the file's
+             * end was met, and a station's logo comes from anywhere. */
+            if ((long long)((X + 7) / 8) * ((Y + 7) / 8) > lim->max_pixels) goto out;
             for (int i = 0; i < nf; i++) {
                 c[i].id = getc(f);
                 int s = getc(f);
@@ -552,7 +562,7 @@ int art_decode(FILE *f, long off, long len, int min_side, const art_limits_t *li
 #ifdef FATHOM_HAVE_LIBJPEG
     if (m[0] == 0xFF && m[1] == 0xD8) {
         int r = jpeg_scaled(f, off, min_side, lim, rgb, w, h);
-        if (r == JPEG_TOO_BIG) r = jpeg_dc(f, off, rgb, w, h);
+        if (r == JPEG_TOO_BIG) r = jpeg_dc(f, off, lim, rgb, w, h);
         return r == JPEG_OK ? 0 : -1;
     }
 #endif

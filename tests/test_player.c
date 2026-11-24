@@ -713,25 +713,29 @@ static void test_warm_next(const char *dir)
 }
 
 /* The radio and the network (player_radio_net). The station's address is one
- * nothing answers at, so every connection fails at once, as with the network
- * gone. Connections are counted by player_seq: one more for each connection
- * begun, and one for giving up. */
-static void test_radio_net(player_t *p)
+ * no decoder takes, so every connection fails at once, as with the network
+ * gone. (Not an http one nothing answers at: where the build has FFmpeg, as
+ * on the H2, a refused connection is tried again inside it and takes 11 s to
+ * fail, and the waits here ran out: measured 2026-11-23.) Connections are
+ * counted by player_seq: one more for each connection begun, and one for
+ * giving up. */
+static void test_radio_net(player_t *p, const char *music)
 {
-    radio_station_t rs = {.name = "A station", .url = "http://127.0.0.1:9/none"};
+    radio_station_t rs = {.name = "A station", .url = "nothing://127.0.0.1/none"};
     player_now_t n;
     uint32_t a;
     #define SEQ(from) ((int)(player_seq(p) - (from)))
 
-    /* the network there: the first connection and six more tries, then given
-     * up, as before (the waits 50 times shorter: 1.2 s in all, not a minute) */
+    /* the network there, a station not heard yet: the first connection and
+     * three more tries, then given up (the waits 50 times shorter: 0.13 s in
+     * all, not 6.5 s) */
     player_radio_test_pace(50);
     player_radio_net(p, 1);
     a = player_seq(p);
     player_radio_play(p, &rs, 1, 0);
     WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
     CHECK(n.radio_failed && !n.playing && !n.connecting);
-    CHECK(SEQ(a) == 7 + 1);
+    CHECK(SEQ(a) == 4 + 1);
     /* ...and so it stays when the network goes and comes back some time later */
     player_radio_test_pace(2000);                 /* ("some time": over 60 ms) */
     sleep_ms(150);
@@ -740,7 +744,7 @@ static void test_radio_net(player_t *p)
     player_radio_net(p, 1);
     WAIT_FOR(p, 0, 200);
     player_now(p, &n);
-    CHECK(n.radio_failed && !n.playing && SEQ(a) == 7 + 1);
+    CHECK(n.radio_failed && !n.playing && SEQ(a) == 4 + 1);
 
     /* the network gone: the station waits, and no tries are used up */
     player_radio_test_pace(50);
@@ -755,7 +759,7 @@ static void test_radio_net(player_t *p)
     player_radio_net(p, 1);
     CHECK(SEQ(a) == 2);
     WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
-    CHECK(n.radio_failed && SEQ(a) == 1 + 7 + 1);
+    CHECK(n.radio_failed && SEQ(a) == 1 + 4 + 1);
 
     /* given up, and the network seen to go just after: it was the network
      * (noticed late), so the station comes back with it */
@@ -768,7 +772,7 @@ static void test_radio_net(player_t *p)
     player_now(p, &n);
     CHECK(!n.radio_failed && n.playing && n.connecting && SEQ(a) == 1);
     WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
-    CHECK(n.radio_failed && SEQ(a) == 7 + 1);
+    CHECK(n.radio_failed && SEQ(a) == 4 + 1);
 
     /* waiting isn't for ever: given up after a while (0.3 s here, ten minutes
      * really), so the player can count as idle; back with the network still */
@@ -804,7 +808,7 @@ static void test_radio_net(player_t *p)
     CHECK(!n.playing && !n.radio_failed && SEQ(a) == 0);
 
     /* Next while the network is gone: the other station waits too, and has its tries when it's back */
-    radio_station_t two[2] = {rs, {.name = "Another", .url = "http://127.0.0.1:9/other"}};
+    radio_station_t two[2] = {rs, {.name = "Another", .url = "nothing://127.0.0.1/other"}};
     player_radio_play(p, two, 2, 0);
     player_radio_net(p, 0);
     player_next(p);
@@ -814,7 +818,79 @@ static void test_radio_net(player_t *p)
     CHECK(!n.radio_failed && n.playing && n.connecting && n.index == 1 && SEQ(a) == 0);
     player_radio_net(p, 1);
     WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
-    CHECK(n.radio_failed && n.index == 1 && SEQ(a) == 7 + 1);
+    CHECK(n.radio_failed && n.index == 1 && SEQ(a) == 4 + 1);
+    /* Next on a station that was given up: the next one is played (it was
+     * wanted), not only chosen; Prev the same */
+    a = player_seq(p);
+    player_next(p);
+    player_now(p, &n);
+    CHECK(!n.radio_failed && n.playing && n.connecting && n.index == 0 && SEQ(a) == 1);
+    WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
+    CHECK(n.radio_failed && n.index == 0 && SEQ(a) == 4 + 1);
+    a = player_seq(p);
+    player_prev(p);
+    player_now(p, &n);
+    CHECK(!n.radio_failed && n.playing && n.connecting && n.index == 1 && SEQ(a) == 1);
+    /* ...but on one stopped by hand it is only chosen, as ever: nothing connects */
+    player_pause(p, 1);
+    a = player_seq(p);
+    player_next(p);
+    WAIT_FOR(p, 0, 200);
+    player_now(p, &n);
+    CHECK(!n.playing && !n.connecting && !n.radio_failed && n.index == 0 && SEQ(a) == 1);   /* (1: the choosing) */
+
+    /* a station whose server refuses the connection (an http address nothing
+     * listens at), not heard yet: given up after its first connection and
+     * three more, 6.5 s of waits, at the real pace. (A minute before, the
+     * screen saying "Connecting..." all the while; and where the build has
+     * FFmpeg, the H2, 11 s more a connection until 2026-11-23.) */
+    player_radio_test_pace(1);
+    radio_station_t dead = {.name = "Nobody home", .url = "http://127.0.0.1:9/none"};
+    uint64_t t0 = mono_ms_now();
+    a = player_seq(p);
+    player_radio_play(p, &dead, 1, 0);
+    WAIT_FOR(p, (player_now(p, &n), n.radio_failed), 40000);
+    double took = (double)(mono_ms_now() - t0) / 1000.0;
+    CHECK(n.radio_failed && SEQ(a) == 4 + 1);
+    CHECK(took > 6.0 && took < 12);
+    if (!(took > 6.0 && took < 12)) fprintf(stderr, "a station that refuses: given up after %.1f s\n", took);
+    /* Play again on it: asked for afresh, the same short patience */
+    player_radio_test_pace(50);
+    a = player_seq(p);
+    player_toggle_pause(p);
+    WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
+    CHECK(n.radio_failed && SEQ(a) == 4 + 1);
+
+    /* ...and one that takes its time to fail (nothing answers: 10 s a
+     * connection on the H2) isn't tried again once it has been asked for
+     * that long: here "that long" is no time at all, so the first failure
+     * is the last */
+    player_radio_test_new_ms(1);
+    sleep_ms(5);
+    a = player_seq(p);
+    player_toggle_pause(p);
+    WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
+    CHECK(n.radio_failed && SEQ(a) == 1 + 1);
+    player_radio_test_new_ms(0);
+
+    /* A station that has played keeps all its tries when it drops: the first
+     * connection and six more (a file stands in for the stream: it plays for
+     * 2 s, is gone from the folder meanwhile, and every connection after its
+     * end fails) */
+    {
+        radio_station_t was = {.name = "It was on"};
+        snprintf(was.url, sizeof was.url, "%s/station.flac", music);
+        CHECK(write_flac_long(was.url, 2) == 0);
+        a = player_seq(p);
+        player_radio_play(p, &was, 1, 0);
+        WAIT_FOR(p, (player_now(p, &n), n.playing && !n.connecting), SLOW);
+        CHECK(n.playing && !n.connecting && !n.radio_failed);
+        WAIT_FOR(p, 0, 400);                          /* (heard: 0.1 s at this pace is enough) */
+        unlink(was.url);
+        WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
+        CHECK(n.radio_failed && SEQ(a) == 7 + 1);
+        if (SEQ(a) != 7 + 1) fprintf(stderr, "a station that had played: %d connections and the giving up\n", SEQ(a) - 1);
+    }
 
     player_radio_test_pace(1);
     #undef SEQ
@@ -1213,7 +1289,7 @@ int main(void)
         player_set_speed(p, 100);
         /* the radio leaves an episode too, and an episode the radio */
         player_episode_play(p, &ep);
-        radio_station_t rs = {"A station", "http://127.0.0.1:9/none", "", ""};
+        radio_station_t rs = {"A station", "http://127.0.0.1:9/none", "", "", ""};
         player_radio_play(p, &rs, 1, 0);
         CHECK(!player_episode(p, NULL, NULL) && player_radio(p));
         player_episode_play(p, &ep);
@@ -1221,7 +1297,7 @@ int main(void)
         player_play(p, t, N, 0);
     }
 
-    test_radio_net(p);
+    test_radio_net(p, music);
 
     /* very short tracks and no tick from the UI meanwhile (busy): the engine
      * goes on through all of them by itself, gapless, and stops once, at the
@@ -1622,8 +1698,13 @@ int main(void)
         player_next(p);                                   /* (before any tick) */
         CHECK(cur_id(p) != first && idx_of_id(t, N, cur_id(p)) >= 0 && player_queue_len(p) == N - 2);
         player_shuffle_all(p);
-        player_set_shuffle(p, 0);                         /* shuffle off at once: all the songs, in order */
-        CHECK(!player_shuffle(p) && player_queue_len(p) > 0);
+        player_set_shuffle(p, 0);                         /* shuffle off at once: all the songs, in order: */
+        {                                                 /* those after the one that's on (none, when it's the last:
+                                                           * one start in six, and "> 0" failed then) */
+            int at = idx_of_id(t, N, cur_id(p));
+            CHECK(!player_shuffle(p) && at >= 0 && player_queue_len(p) == N - 1 - at);
+            if (at < N - 1) CHECK(player_queue_at(p, 0) == t[at + 1]);
+        }
         player_shuffle_all(p);
         player_play(p, t, 3, 0);                          /* an album started instead: it stays */
         player_tick(p);

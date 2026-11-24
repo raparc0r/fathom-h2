@@ -42,6 +42,9 @@
 #define ROWS       5
 #define ROW_Y0     ((ROW_H - 38) / 2)   /* the playing-bars marker, centred in a row */
 #define ROW_MARGIN 6
+#define POSBAR_W   3     /* the position bar, in the right margin (clear of the pill) */
+#define POSBAR_PAD 4
+#define POSBAR_MIN 16
 #define SLOTS      (ROWS + 2)   /* one spare row above and below for scrolling */
 /* The EQ editor's curve, over the top of the list as Battery's graph is: 20 Hz
  * to 20 kHz on a log scale across the plot, +-12 dB top to bottom, worked out
@@ -327,6 +330,7 @@ static struct {
     /* widgets */
     lv_obj_t *scr, *header, *h_left, *h_right;
     lv_obj_t *list, *rows_box, *pill, *pill_notch[4], *pill_cursor;
+    lv_obj_t *posbar; int posbar_y, posbar_h;   /* where the selection is in a list longer than the screen */
     lv_obj_t *row[SLOTS], *row_lbl[SLOTS], *row_meta[SLOTS], *row_dot[SLOTS], *row_eq[SLOTS][3];
     lv_obj_t *row_line[SLOTS], *row_lt[SLOTS], *row_la[SLOTS];   /* album rows: title and artist, one line */
     lv_obj_t *row_icon[SLOTS], *row_picon[SLOTS];   /* Home: an icon glyph, or a pixel icon */
@@ -382,6 +386,8 @@ static struct {
     ui_bt_dev_t bt[16];
     int bt_n, bt_on, bt_link, wifi_link;
     char bt_busy[32], ctx_bt[18];
+    int bt_back_to, bt_back_gone;   /* Settings > Bluetooth: the row to select again once Bluetooth is back on (0: none), and
+                                     * that its rows have been seen to go (the H2 takes a moment to stop it) */
     /* Settings > Wi-Fi, as of the last look */
     ui_wifi_status_t wifi_st;
     ui_wifi_net_t wifi[24];
@@ -406,7 +412,7 @@ static struct {
     int64_t radio_key[RADIO_MAX];   /* each one's picture in the list's cache (COV_RADIO | its icon's id; -1: no icon) */
     int radio_art;          /* art_px holds the radio's cover */
     int radio_logo;         /* ...or, the song having none, the station's logo: */
-    char logo_id[13];       /* the icon read for it, or tried ("?": to be read again) */
+    char logo_url[520];     /* the station whose icon was read for it, or tried ("?": to be read again) */
     unsigned logo_seq, ricon_seq;   /* the icons on the card as last looked at (ricon_seq), for it and for the list */
     /* Find stations (net/radiodir.h): the request running (RD_JOB_*) for the
      * level at rd_job_depth; the open list's stations (Results, Search) and its
@@ -1465,6 +1471,23 @@ static int entry_cur(void)
     return len - S.entry_back;
 }
 
+/* A name being changed can have letters of several bytes (the é of "Café"):
+ * the cursor steps over a whole one, and <Back> deletes a whole one. Where
+ * the letter before byte `i` starts, and where the one at `i` ends. */
+static int entry_before(const char *s, int i)
+{
+    if (i > 0) i--;
+    while (i > 0 && ((unsigned char)s[i] & 0xC0) == 0x80) i--;
+    return i;
+}
+
+static int entry_after(const char *s, int i)
+{
+    if (s[i]) i++;
+    while (((unsigned char)s[i] & 0xC0) == 0x80) i++;
+    return i;
+}
+
 const char *ui_test_entry(int *cursor)
 {
     if (cursor) *cursor = entry_cur();
@@ -1508,6 +1531,7 @@ static int typing_on(level_t *l)
 }
 
 int ui_test_typing(void) { return typing_on(&S.stack[S.depth - 1]); }
+int ui_test_pill_row(void) { return S.stack[S.depth - 1].top + S.pill_target / ROW_PITCH; }
 
 /* Search result r (the closest names first, whatever they are): 0 an artist,
  * 1 an album, 2 a song, and its id (-1: none). */
@@ -1526,7 +1550,14 @@ static void search_row(int r, char *main, size_t mn, char *meta, size_t tn)
     /* (what each is, its icon says: render(); at the right, as in its own
      * list: an artist's albums, an album's artist or year, a song's length.
      * A song's artist goes after its title, smaller: render()) */
-    if (kind == 0) library_row(S.lib, LIB_ARTISTS, id, main, mn, meta, tn);
+    if (kind == 0) {
+        library_row(S.lib, LIB_ARTISTS, id, main, mn, meta, tn);
+        /* the albums opening it shows (push_artist): those it's credited on,
+         * or its own where there are none (an album artist only: it said 0) */
+        int own = 0, credited = 0;
+        library_artist_counts(S.lib, id, &own, &credited);
+        snprintf(meta, tn, "%d", credited > 0 ? credited : own);
+    }
     else if (kind == 1) library_row(S.lib, LIB_ALBUMS, id, main, mn, meta, tn);
     else library_row(S.lib, LIB_SONGS, id, main, mn, meta, tn);
 }
@@ -1546,14 +1577,24 @@ static void search_run(void)
 #define COV_RADIO (1LL << 61)   /* (with COV_POD, below) */
 #define COV_KEY_BITS 0xFFFFFFFFFFFFLL
 static void thumbs_reset(int64_t tag);
+/* Which picture each station's row shows: its own logo's, its site's icon's
+ * or the directory's, whichever the card has. Asked again whenever an icon
+ * arrives: a station whose logo was no use gets its site's icon then, under
+ * another name (the row kept waiting for the logo's file until Radio was
+ * left and opened again). */
+static void radio_keys(void)
+{
+    for (int i = 0; i < S.radio_n && i < RADIO_MAX; i++) {
+        char id[13];
+        ricon_station_id(&S.radio[i], id);       /* (its own logo, or its site's icon) */
+        S.radio_key[i] = id[0] ? COV_RADIO | (int64_t)(strtoull(id, NULL, 16) & COV_KEY_BITS) : -1;
+    }
+}
+
 static void radio_read(void)
 {
     S.radio_n = S.hooks.radio_stations ? S.hooks.radio_stations(S.radio, RADIO_MAX) : -1;
-    for (int i = 0; i < S.radio_n && i < RADIO_MAX; i++) {
-        char id[13];
-        ricon_id(S.radio[i].icon, id);
-        S.radio_key[i] = id[0] ? COV_RADIO | (int64_t)(strtoull(id, NULL, 16) & COV_KEY_BITS) : -1;
-    }
+    radio_keys();
     char why[96];
     int net = !S.hooks.radio_ready || S.hooks.radio_ready(why, sizeof why) == 0;
     ricon_sync(S.radio, S.radio_n, net);
@@ -2951,11 +2992,13 @@ static void style_label(lv_obj_t *l, const lv_font_t *font, uint32_t color)
 }
 
 static void covers_reset(int forget);
+static void covers_shape(void);
 
 static void apply_theme(void)
 {
     const theme_t *t = T();
     covers_reset(0);                       /* (the no-cover square takes the theme's colour) */
+    covers_shape();                        /* (and the pictures in lists its corners) */
     S.f = &S.fonts[0];
     for (int i = 0; i < S.n_fonts; i++)
         if (!strcmp(S.fonts[i].family, t->font)) S.f = &S.fonts[i];
@@ -2988,6 +3031,9 @@ static void apply_theme(void)
     }
     show(S.pill_cursor, t->cursor_arrow);
     style_label(S.pill_cursor, &lv_font_montserrat_14, t->select_fg);
+    fill(S.posbar, t->text_muted);
+    lv_obj_set_style_bg_opa(S.posbar, LV_OPA_60, 0);
+    lv_obj_set_style_radius(S.posbar, t->corner == THEME_CORNER_ROUND ? 2 : 0, 0);
     S.text_x0 = t->cursor_arrow ? 24 : 10;
 
     for (int r = 0; r < SLOTS; r++) {
@@ -3395,19 +3441,50 @@ static int thumbs_in(list_kind_t k)
 #define COV_CACHE 12
 static struct covers {
     struct cov { int64_t id; uint32_t used; int ok; uint16_t px[LIB_ART_SMALL * LIB_ART_SMALL]; } cache[COV_CACHE];
-    uint16_t slot[SLOTS][LIB_ART_SMALL * LIB_ART_SMALL];
+    /* a row's picture as LVGL draws it: its pixels, then how much of each
+     * shows (RGB565A8's alpha plane: the corners rounded off, covers_shape) */
+    struct cov_slot { uint16_t px[LIB_ART_SMALL * LIB_ART_SMALL]; uint8_t show[LIB_ART_SMALL * LIB_ART_SMALL]; } slot[SLOTS];
     uint32_t tick;
 } *g_cov;
+
+/* The pictures in lists have the theme's corners: rounded (COVER_RADIUS, with
+ * the pill, the chip and Now Playing's cover) or square. Rounded, each is
+ * drawn through a mask of its own (no layer, nothing to clip: the corner
+ * pixels are simply let through less); square, as plain pixels. */
+#define COVER_RADIUS 5
+static void covers_shape(void)
+{
+    if (!g_cov) return;
+    int round = T()->corner == THEME_CORNER_ROUND, n = LIB_ART_SMALL, r = COVER_RADIUS;
+    uint8_t mask[LIB_ART_SMALL * LIB_ART_SMALL];
+    memset(mask, 255, sizeof mask);
+    for (int y = 0; round && y < r; y++)
+        for (int x = 0; x < r; x++) {
+            int in = 0;                            /* of 16 points in the pixel, those inside the corner's circle */
+            for (int sy = 0; sy < 4; sy++)
+                for (int sx = 0; sx < 4; sx++) {
+                    int dx = 8 * r - (8 * x + 2 * sx + 1), dy = 8 * r - (8 * y + 2 * sy + 1);   /* (in eighths of a pixel) */
+                    in += dx * dx + dy * dy <= 64 * r * r;
+                }
+            uint8_t a = (uint8_t)(in * 255 / 16);
+            mask[y * n + x] = mask[y * n + (n - 1 - x)] = mask[(n - 1 - y) * n + x] = mask[(n - 1 - y) * n + (n - 1 - x)] = a;
+        }
+    for (int j = 0; j < SLOTS; j++) {
+        memcpy(g_cov->slot[j].show, mask, sizeof mask);
+        S.cov_dsc[j].header.cf = round ? LV_COLOR_FORMAT_RGB565A8 : LV_COLOR_FORMAT_RGB565;
+        S.cov_dsc[j].data = (const uint8_t *)&g_cov->slot[j];
+        S.cov_dsc[j].data_size = round ? sizeof g_cov->slot[j] : sizeof g_cov->slot[j].px;
+        lv_image_cache_drop(&S.cov_dsc[j]);
+        lv_obj_invalidate(S.row_cov[j]);
+    }
+}
 
 static int covers_take(void)
 {
     if (g_cov) return 1;
     if (!(g_cov = calloc(1, sizeof *g_cov))) return 0;
-    for (int j = 0; j < SLOTS; j++) {
-        S.cov_dsc[j].data = (const uint8_t *)g_cov->slot[j];
-        S.cov_dsc[j].data_size = sizeof g_cov->slot[j];
-        S.cov_id[j] = -1;
-    }
+    for (int j = 0; j < SLOTS; j++) S.cov_id[j] = -1;
+    covers_shape();
     return 1;
 }
 
@@ -3564,8 +3641,61 @@ static int text_is(lv_obj_t *l, const char *s)
     return had && !strcmp(had, s);
 }
 
+/* Settings: a row that opens a page or a list of its own (where Play on the
+ * others changes them in place): it ends in an arrow. */
+static int row_opens(const level_t *l, int i)
+{
+    switch (l->kind) {
+    case L_SETTINGS: return 1;
+    case L_QUICK: case L_DISPLAY: case L_SOUND: case L_PLAYBACK: case L_POWER: case L_LIBRARY: case L_USB: case L_POD_SETTINGS:
+    case L_INTERFACE:
+        switch (setting_at(l, i)) {
+        case ST_THEME: case ST_HOME_SCREEN: case ST_EQ: case ST_BT: case ST_WIFI: return 1;
+        case ST_BATTERY: return S.hooks.battery_report != NULL;
+        case ST_OUTPUT: return S.hooks.signal_path != NULL;
+        default: return 0;
+        }
+    case L_ABOUT: {
+        int r = about_row(i);
+        return r == AB_WHATSNEW || r == AB_TIPS || r == AB_CHECK || r == AB_UNINSTALL ||
+               (r == AB_INFO && !strcmp(S.about_lbl[i], "Clock") && S.hooks.clock_set != NULL);
+    }
+    /* Wi-Fi: a network that's new and has a password opens the screen to
+     * type it (a saved or an open one is joined where it is). Nothing on
+     * Bluetooth's, the network drive's or SSH's pages opens anything: their
+     * rows act in place (Find headphones lists what it finds on its page). */
+    case L_WIFI: {
+        int net;
+        if (!S.hooks.wifi_do || wifi_row(i, &net) != WR_NET || net >= S.wifi_n) return 0;
+        return S.wifi[net].secured && !S.wifi[net].saved && !S.wifi[net].connected;
+    }
+    default: return 0;
+    }
+}
+
+/* A page with such rows: the arrow has a column of its own there, kept free
+ * on the other rows, so their values end where the arrowed rows' do ("Off"
+ * over "Off >", not under its arrow). */
+static int arrow_page(const level_t *l, int n)
+{
+    switch (l->kind) {
+    case L_SETTINGS: case L_QUICK: case L_DISPLAY: case L_SOUND: case L_PLAYBACK: case L_POWER: case L_LIBRARY: case L_USB:
+    case L_POD_SETTINGS: case L_INTERFACE: case L_ABOUT: case L_WIFI:
+        for (int i = 0; i < n; i++)
+            if (row_opens(l, i)) return 1;
+        return 0;
+    default: return 0;
+    }
+}
+
 static void fill_slots(const level_t *l, int n)
 {
+    int arrow_w = 0;                               /* the arrow's column on this page (0: none) */
+    if (arrow_page(l, n)) {
+        lv_point_t az;
+        lv_text_get_size(&az, " \xE2\x80\xBA", S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        arrow_w = az.x;
+    }
     for (int j = 0; j < SLOTS; j++) {
         int i = l->top + j - 1;
         int visible = i >= 0 && i < n;
@@ -3587,6 +3717,12 @@ static void fill_slots(const level_t *l, int n)
             if (tm != main) snprintf(main, sizeof main, "%s", tm);
             if (tt != meta) snprintf(meta, sizeof meta, "%s", tt);
         }
+        int opens = row_opens(l, i);
+        if (opens) {                               /* "Studio Mint >", or the arrow alone */
+            size_t k = strlen(meta);
+            snprintf(meta + k, sizeof meta - k, "%s\xE2\x80\xBA", k ? " " : "");
+        }
+        int meta_in = arrow_w && !opens ? arrow_w : 0;   /* a value on a page with arrows: clear of their column */
 
         int x = S.text_x0;
         int eq = playing && T()->playing_equalizer;
@@ -3606,11 +3742,11 @@ static void fill_slots(const level_t *l, int n)
         if (cover || (thumbs && id >= 0)) {
             if (S.cov_id[j] != id) {
                 const uint16_t *px = cover_px(id);
-                uint16_t *to = g_cov->slot[j];
-                if (px) memcpy(to, px, sizeof g_cov->slot[j]);
+                uint16_t *to = g_cov->slot[j].px;
+                if (px) memcpy(to, px, sizeof g_cov->slot[j].px);
                 else if (cover) {
                     uint16_t c = (uint16_t)theme_rgb565(T()->surface);
-                    for (size_t k = 0; k < sizeof g_cov->slot[j] / 2; k++) to[k] = c;
+                    for (size_t k = 0; k < sizeof g_cov->slot[j].px / 2; k++) to[k] = c;
                 }
                 S.cov_id[j] = id;
                 S.cov_has[j] = px != NULL;
@@ -3676,6 +3812,9 @@ static void fill_slots(const level_t *l, int n)
         if (col) x += colw + ICON_GAP;
         else if (eq) x += 18;
         else if (playing) x += 14;
+        /* a list to pick one from (themes, EQs): the mark's room on every row,
+         * so the one marked doesn't stand in from the others */
+        else if (l->kind == L_THEMES || l->kind == L_EQ) x += T()->playing_equalizer ? 18 : 14;
         int swatch = (l->kind == L_THEMES && i < S.n_themes) || l->kind == L_THEME_COLOURS;
         show(S.row_sw[j], swatch);
         if (swatch && l->kind == L_THEME_COLOURS) {   /* a colour of the theme being made */
@@ -3719,12 +3858,17 @@ static void fill_slots(const level_t *l, int n)
             }
             meta[0] = '\0';
         }
-        int meta_w = 70;                           /* room for the meta: a wide one ("MP3 320" in a pixel font) gets more */
+        /* room for the meta: only what it takes. (A column 70 px wide was
+         * kept on every row, whatever the meta: a name was cut short beside a
+         * count of one digit, a setting's name beside "Off".) */
+        int meta_w = 0;
         lv_point_t sz = {0, 0};
         if (meta[0] && !typing) {
             lv_text_get_size(&sz, meta, S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
             if (sz.x + 18 > meta_w) meta_w = sz.x + 18;
+            if (sz.x + 18 + meta_in > meta_w) meta_w = sz.x + 18 + meta_in;
         }
+        if (lv_obj_get_style_translate_x(S.row_meta[j], 0) != -meta_in) lv_obj_set_style_translate_x(S.row_meta[j], -meta_in, 0);
         if (S.slot_mark[j] && !typing) {          /* on the card: the mark, just before the meta */
             int mx = UI_W - 2 * ROW_MARGIN - 10 - (meta[0] ? sz.x + MARK_GAP : 0) - MARK_PX;
             if (lv_image_get_src(S.row_mark[j]) != on_card_mark()) lv_image_set_src(S.row_mark[j], on_card_mark());
@@ -3751,6 +3895,12 @@ static void fill_slots(const level_t *l, int n)
                 keep_meta = meta[0] != '\0';
                 line = 1;
             }
+        }
+        /* Home: the song (station, episode) that's on after "Now playing" */
+        if (l->kind == L_HOME && S.home[i] == H_NOWPLAYING && S.now.active && S.now.track.title[0]) {
+            snprintf(by, sizeof by, "%s", S.now.track.title);
+            after = by;
+            line = 1;
         }
         S.line_on[j] = line;
         show(S.row_line[j], line);
@@ -3787,6 +3937,16 @@ static void render_list(render_mode_t mode)
 {
     level_t *l = &S.stack[S.depth - 1];
     int n = list_count(l);
+    /* Settings > Bluetooth, Audio changed: Bluetooth started again and its
+     * rows are back, so the selection goes back to Audio (it was on the one
+     * row left meanwhile). Here, where the page is drawn every second: the
+     * H2 doesn't always say "changed" at the moment the rows return. */
+    if (l->kind != L_BLUETOOTH) S.bt_back_to = S.bt_back_gone = 0;
+    else if (S.bt_back_to && n <= S.bt_back_to) S.bt_back_gone = 1;     /* (its rows have gone: only then are they "back") */
+    else if (S.bt_back_to && S.bt_back_gone) {
+        l->sel = S.bt_back_to;
+        S.bt_back_to = S.bt_back_gone = 0;
+    }
     if (l->sel < l->top) l->top = l->sel;
     int rows = rows_shown(l->kind);
     if (l->sel >= l->top + rows) l->top = l->sel - rows + 1;
@@ -3829,6 +3989,23 @@ static void render_list(render_mode_t mode)
     if (!same) fill_slots(l, n);
     S.fill_sig = sig;
     show(S.pill, n > 0);
+    /* A list longer than the screen: a thin bar in the right margin, as long
+     * as the part that shows and as far down as the selection is (so every
+     * turn of the wheel moves it). Not on the pages with a graph over their
+     * rows. Moved only when it changes: an idle list isn't redrawn. */
+    int long_list = rows == ROWS && n > rows;
+    show(S.posbar, long_list);
+    if (long_list) {
+        int track = UI_H - HEADER_H - 2 * POSBAR_PAD, h = track * rows / n;
+        if (h < POSBAR_MIN) h = POSBAR_MIN;
+        int y = POSBAR_PAD + (int)((int64_t)(track - h) * l->sel / (n - 1));
+        if (y != S.posbar_y || h != S.posbar_h) {
+            lv_obj_set_y(S.posbar, y);
+            lv_obj_set_height(S.posbar, h);
+            S.posbar_y = y;
+            S.posbar_h = h;
+        }
+    }
     /* A typing screen with nothing under its row (nothing typed yet, nothing
      * found, a name or a password being typed): how the wheel types, where
      * the results would be */
@@ -3870,9 +4047,15 @@ static void render_list(render_mode_t mode)
         set_text(S.empty, tr(msg));
     }
 
-    if (mode == R_CONTENT && !new_level) {
+    /* A page that only wanted its contents drawn again, with the selection
+     * somewhere else since it was last drawn (its list got shorter under the
+     * selection, say): the highlight goes where the selection is. Left where
+     * it was, <Play> acted on a row other than the one shown (Bluetooth
+     * turned off from its Audio row, 0.17.0). */
+    int moved = mode == R_CONTENT && !new_level && (target != S.pill_target || top_delta != 0);
+    if (mode == R_CONTENT && !new_level && !moved) {
         color_slots(slot_under_pill());
-    } else if (mode == R_SNAP || new_level) {
+    } else if (mode == R_SNAP || new_level || moved) {
         stop_list_anims();
         S.pill_y = S.pill_target = target;
         S.rows_off = 0;
@@ -3924,7 +4107,7 @@ static void fmt_rate(char *b, size_t n, uint32_t rate)
 static void logo_forget(void)
 {
     S.radio_logo = 0;
-    snprintf(S.logo_id, sizeof S.logo_id, "?");
+    snprintf(S.logo_url, sizeof S.logo_url, "?");
 }
 
 /* On the radio with no cover for the song: the station's own logo, if it's on
@@ -3934,11 +4117,12 @@ static void logo_forget(void)
 static int radio_logo(void)
 {
     const radio_station_t *st = S.player ? player_radio_station(S.player) : NULL;
-    char id[13] = "";
     unsigned seq = ricon_seq();
-    if (st) ricon_id(st->icon, id);
-    if (strcmp(id, S.logo_id) || seq != S.logo_seq) {
-        snprintf(S.logo_id, sizeof S.logo_id, "%s", id);
+    const char *url = st ? st->url : "";
+    if (strcmp(url, S.logo_url) || seq != S.logo_seq) {
+        char id[13] = "";
+        if (st) ricon_station_id(st, id);          /* (its own logo, or its site's icon) */
+        snprintf(S.logo_url, sizeof S.logo_url, "%s", url);
         S.logo_seq = seq;
         S.radio_logo = id[0] && ricon_read(id, LIB_ART_LARGE, S.art_px);
         if (S.radio_logo) {
@@ -4044,7 +4228,14 @@ static void render_np_radio(void)
     set_text_color(S.np_t1, C(S.now.playing && !S.now.connecting ? T()->signal : T()->text_muted));
     show(S.np_marker, 0);
     show(S.np_pause, 0);
-    set_text(S.np_out, tr(S.output));
+    /* The output's name is in the middle of that line: a long word on the
+     * right ("Can't reach the station") ran into it, one drawn over the
+     * other. The output gives way then. */
+    const char *out = tr(S.output);
+    lv_point_t ow, sw;
+    lv_text_get_size(&ow, out, S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    lv_text_get_size(&sw, state, S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    set_text(S.np_out, UI_W / 2 + ow.x / 2 + 6 > UI_W - 12 - sw.x ? "" : out);
     set_text_color(S.np_out, C(T()->info));
     char nx[300] = "";
     const radio_station_t *after = S.now.count > 1 && S.player ? player_radio_at(S.player, (S.now.index + 1) % S.now.count) : NULL;
@@ -4059,7 +4250,7 @@ static void render_np(void)
     /* (the header's title is set once per render: setting it to one text and
      * then another redraws it, every second) */
     if (!S.now.active || S.now.radio || !(S.now.count > 1 && S.now.index >= 0 && S.now.index < S.now.count))
-        set_text(S.h_left, tr(S.now.active && S.now.radio ? "Radio" : S.now.active && S.now.podcast ? "Podcast" : "Now playing"));
+        set_text(S.h_left, tr(S.now.active && S.now.radio ? "Radio" : S.now.active && S.now.podcast ? "Podcast" : "Playing"));
     if (!S.now.active) {
         set_text(S.np_title, tr("Nothing playing"));
         set_text(S.np_artist, tr("Choose an album, or Shuffle all songs"));
@@ -4081,10 +4272,13 @@ static void render_np(void)
     if (S.now.radio) { render_np_radio(); return; }
     if (S.now.count > 1 && S.now.index >= 0 && S.now.index < S.now.count) {   /* where in the queue */
         char h[48];
-        snprintf(h, sizeof h, "%s \xC2\xB7 %d/%d", tr("Now playing"), S.now.index + 1, S.now.count);
-        lv_point_t sz;     /* too wide beside the status icons (a big queue, a wide font): the numbers alone */
+        /* "Playing" (it said "Now playing": the status icons need the room) */
+        snprintf(h, sizeof h, "%s \xC2\xB7 %d/%d", tr("Playing"), S.now.index + 1, S.now.count);
+        lv_point_t sz;     /* too wide beside the status icons (a big queue, a wide font, five icons): the numbers alone */
         lv_text_get_size(&sz, h, S.f->head, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-        if (sz.x > UI_W / 2 + 30) snprintf(h, sizeof h, "%d/%d", S.now.index + 1, S.now.count);
+        int room = lv_obj_get_style_width(S.h_left, 0);          /* (as the header's status last left it) */
+        if (room <= 0 || room > UI_W / 2 + 30) room = UI_W / 2 + 30;
+        if (sz.x > room) snprintf(h, sizeof h, "%d/%d", S.now.index + 1, S.now.count);
         set_text(S.h_left, h);
     }
     const lib_track_t *t = &S.now.track;
@@ -4209,7 +4403,9 @@ static void charge_pulse(lv_obj_t *o)
 }
 
 /* Right side of the header: [play/pause/stop] [shuffle] [repeat] [Bluetooth] [charging]
- * battery %. The Bluetooth icon is dimmed while it connects. */
+ * battery %. The Bluetooth icon is dimmed while Bluetooth is on with no
+ * headphones connected. */
+#define HDR_DIM_OPA LV_OPA_60   /* a dimmed icon: this much of the muted colour */
 typedef struct { int icon; const char *sym; const lv_image_dsc_t *own; int dim; } hdr_want_t;
 typedef struct {
     hdr_want_t want[HDR_SLOTS];
@@ -4266,9 +4462,16 @@ static void render_header_status(void)
         show(S.h_slot_img[i], i < n && img);
         int dim = i < n && want[i].dim;
         lv_obj_set_style_image_recolor_opa(S.h_slot_img[i], tint ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
-        lv_obj_set_style_image_recolor(S.h_slot_img[i], C(dim ? T()->text_muted : T()->mode), 0);
-        lv_obj_set_style_image_opa(S.h_slot_img[i], dim && !tint ? LV_OPA_40 : LV_OPA_COVER, 0);
-        lv_obj_set_style_text_color(S.h_slot_sym[i], C(dim ? T()->text_muted : T()->mode), 0);
+        /* the accent for the first, what's playing; the others (shuffle,
+         * repeat, Bluetooth, Wi-Fi, charging) in the text's colour: all in
+         * the accent, none stood out */
+        uint32_t ink = dim ? T()->text_muted : i == 0 ? T()->mode : T()->text;
+        lv_obj_set_style_image_recolor(S.h_slot_img[i], C(ink), 0);
+        /* dimmed (Bluetooth or Wi-Fi on, with nothing connected): the muted
+         * colour, and fainter still, so it's plainly not the connected one */
+        lv_obj_set_style_image_opa(S.h_slot_img[i], !dim ? LV_OPA_COVER : tint ? HDR_DIM_OPA : LV_OPA_30, 0);
+        lv_obj_set_style_text_color(S.h_slot_sym[i], C(ink), 0);
+        lv_obj_set_style_text_opa(S.h_slot_sym[i], dim ? HDR_DIM_OPA : LV_OPA_COVER, 0);
         if (i < n && !img) lv_label_set_text(S.h_slot_sym[i], want[i].sym);
         show(S.h_slot_sym[i], i < n && !img);
     }
@@ -4965,7 +5168,7 @@ static const char *setting_help(setting_t st)
     case ST_ON_CHARGING: return "Keeps the screen on while the H2 is plugged in.";
     case ST_LANGUAGE: return "Interface language. More in fathom/lang.";
     case ST_OUTPUT: return "Where the sound goes. <Play> shows each step in the path.";
-    case ST_PURE: return "Skips EQ, balance and levelling, for bit-perfect sound.";
+    case ST_PURE: return "Skips EQ, crossfeed, stereo width, balance and levelling, for bit-perfect sound.";
     case ST_EQ: return "Shape the sound with an equaliser. Each output keeps its own.";
     case ST_BALANCE: return "Left/right balance. Press <Play>, then turn the wheel.";
     case ST_CROSSFEED: return "Each ear hears a little of the other side, as with speakers.";
@@ -5070,7 +5273,7 @@ static const char *row_help(const level_t *l)
             return NULL;
         }
     case L_UPD_ASK:
-        return i == 0 ? "Download and install it: Settings > About > Updates."
+        return i == 0 ? "Download and install it. Also in Settings > About."
                       : "Hide it from Home until a newer version is out.";
     case L_UNINSTALL:
         if (i >= n) return NULL;
@@ -5236,6 +5439,9 @@ static void say_failed(void)
         snprintf(msg, sizeof msg, "%s", tr(bt ? "Bluetooth can't play these songs' format" : "This output can't play these songs' format"));
     else if (S.now.fail_all)
         snprintf(msg, sizeof msg, "%s", tr("None of these songs could be played"));
+    else if (S.now.fail_memory)                     /* hours of AAC in one file: its table of frames won't fit */
+        tr_fill(msg, sizeof msg, S.now.fail_end ? "\u201C%s\u201D is too long for the H2's memory"
+                                                : "\u201C%s\u201D is too long for the H2's memory: skipped", title, NULL);
     else if (S.now.fail_output && S.now.fail_end)   /* (the last: nothing after it to skip to) */
         tr_fill(msg, sizeof msg, bt ? "Bluetooth can't play \u201C%s\u201D" : "This output can't play \u201C%s\u201D", title, NULL);
     else if (S.now.fail_output)
@@ -6717,6 +6923,7 @@ static void run_context(ctx_action_t a)
         S.rename_id = S.ctx_playlist;
         pop_level(1);
         library_playlist_name(S.lib, S.rename_id, S.entry, sizeof S.entry);
+        S.entry_back = 0;                          /* (the cursor at the end, wherever the last typing left it) */
         S.entry_ch = 0;
         push_ui(L_RENAME, "Rename playlist", 0);
         break;
@@ -7417,10 +7624,12 @@ static void open_selected(void)
         break;
     case L_BLUETOOTH:
         if (!S.hooks.bt_do) break;
+        S.bt_back_to = S.bt_back_gone = 0;
         if (l->sel == 0) S.hooks.bt_do(UI_BT_TOGGLE, NULL);
         else if (l->sel == 1) S.hooks.bt_do(UI_BT_SCAN, NULL);
         else if (l->sel == 2) {
             S.hooks.bt_do(UI_BT_RANGE, NULL);
+            S.bt_back_to = l->sel;                 /* Bluetooth starts again: its rows go, and come back */
             ui_toast(settings_get_int("bluetooth.range", UI_BT_RANGE_DEFAULT) ? "Longer range: lower bitrate, no aptX. Reconnecting"
                                                             : "Best sound. Reconnecting", 2500);
         }
@@ -7818,7 +8027,10 @@ void ui_wifi_changed(void)
     ui_wifi_status_t st = {0};
     char busy[32];
     int on = S.hooks.wifi_state ? S.hooks.wifi_state(busy, sizeof busy, &st) : 0;
-    int link = !on ? 0 : st.state == UI_WIFI_CONNECTED ? 2 : busy[0] || st.state == UI_WIFI_CONNECTING ? 1 : 0;
+    /* the header's icon: hidden with Wi-Fi off, dimmed while it's on with no
+     * network (it showed only while one was being joined: Wi-Fi on and out of
+     * range looked off), full once connected */
+    int link = !on ? 0 : st.state == UI_WIFI_CONNECTED ? 2 : 1;
     if (link != S.wifi_link) {
         S.wifi_link = link;
         if (S.h_right) render_header_status();
@@ -7921,8 +8133,9 @@ void ui_key(ui_key_t k)
      * track: a letter wrong at the start no longer means deleting the rest) */
     if (!S.now_playing_view && typing_on(l) && (k == UI_KEY_PREV || k == UI_KEY_NEXT)) {
         int cur = entry_cur();
-        if (k == UI_KEY_PREV && cur > 0) S.entry_back++;
-        if (k == UI_KEY_NEXT && S.entry_back > 0) S.entry_back--;
+        int len = (int)strlen(S.entry);
+        if (k == UI_KEY_PREV && cur > 0) S.entry_back = len - entry_before(S.entry, cur);
+        if (k == UI_KEY_NEXT && S.entry_back > 0) S.entry_back = len - entry_after(S.entry, cur);
         S.ok_added = 0;
         render(R_CONTENT);
         return;
@@ -8089,7 +8302,7 @@ void ui_key(ui_key_t k)
         case UI_KEY_BACK:                                  /* delete the letter before the cursor; nothing typed: leave */
             S.ok_added = 0;
             if (cur > 0) {
-                memmove(S.entry + cur - 1, S.entry + cur, len - cur + 1);
+                memmove(S.entry + entry_before(S.entry, (int)cur), S.entry + cur, len - cur + 1);
                 if (l->kind == L_SEARCH) search_run();
             } else if (!len) {
                 pop();
@@ -8245,6 +8458,7 @@ void ui_tick_1s(void)
     unsigned icons = ricon_seq();          /* a station's icon arrived: Radio's list reads its pictures again */
     if (icons != S.ricon_seq) {
         S.ricon_seq = icons;
+        radio_keys();
         thumbs_reset(COV_RADIO);
     }
     S.ticking = 1;
@@ -8383,6 +8597,19 @@ void ui_show(const char *what)
         push_ui(L_SETTINGS, "Settings", 0);
         S.stack[S.depth - 1].sel = SET_PODCASTS;
         push_ui(L_POD_SETTINGS, "Podcasts", 0);
+    } else if (!strcmp(what, "wifi")) {             /* Settings > Wi-Fi */
+        S.stack[0].sel = home_index(H_SETTINGS);
+        push_ui(L_SETTINGS, "Settings", 0);
+        S.stack[S.depth - 1].sel = SET_WIFI;
+        push_ui(L_WIFI, "Wi-Fi", 0);
+    } else if (!strcmp(what, "bluetooth")) {        /* Settings > Bluetooth */
+        S.stack[0].sel = home_index(H_SETTINGS);
+        push_ui(L_SETTINGS, "Settings", 0);
+        S.stack[S.depth - 1].sel = SET_BLUETOOTH;
+        push_ui(L_BLUETOOTH, "Bluetooth", 0);
+    } else if (!strcmp(what, "settings")) {         /* Settings: its pages */
+        S.stack[0].sel = home_index(H_SETTINGS);
+        push_ui(L_SETTINGS, "Settings", 0);
     } else if (!strcmp(what, "libsettings")) {      /* Settings > Library, on Find missing covers */
         S.stack[0].sel = home_index(H_SETTINGS);
         push_ui(L_SETTINGS, "Settings", 0);
@@ -8753,6 +8980,8 @@ void ui_init(lv_obj_t *screen, const theme_t *themes, int n_themes,
     lv_label_set_text(S.pill_cursor, LV_SYMBOL_PLAY);
     lv_obj_align(S.pill_cursor, LV_ALIGN_LEFT_MID, 8, 0);
 
+    S.posbar = box(S.list, UI_W - POSBAR_W - 1, POSBAR_PAD, POSBAR_W, POSBAR_MIN);
+    show(S.posbar, 0);
     S.rows_box = box(S.list, 0, -ROW_PITCH, UI_W, SLOTS * ROW_PITCH);
     for (int j = 0; j < SLOTS; j++) {
         lv_obj_t *row = box(S.rows_box, ROW_MARGIN, j * ROW_PITCH, pw, ROW_H);
