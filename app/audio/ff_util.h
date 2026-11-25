@@ -35,6 +35,12 @@ void ff_codec_name(const AVFormatContext *fc, const AVCodecParameters *par, char
  * a sample format we don't take. Integer formats are exact; float is clipped. */
 int ff_to_s32(const AVFrame *f, int channels, int32_t *out);
 
+/* A file opened to be played has no use for its pictures: with this bit in
+ * AVFormatContext.flags (one FFmpeg doesn't use), the patched demuxers read
+ * none (board/h2/package-patches/ffmpeg: mov's covers, ID3's pictures).
+ * Unpatched, the bit does nothing. */
+#define FATHOM_AVFMT_NO_PICTURES 0x40000000
+
 /* HTTPS: certificates are checked against the authorities in path (a PEM
  * bundle) for every network fetch that gets ff_tls_options(), redirects
  * included. NULL or a missing file: not checked (the simulator, a card without it). */

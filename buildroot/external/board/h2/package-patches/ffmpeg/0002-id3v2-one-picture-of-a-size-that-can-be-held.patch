@@ -6,13 +6,15 @@ read whole and kept with the others for as long as the file was open:
 front, back and booklet pages of a few MB each add up to more than a small
 player has. Only the first picture is read now, and only up to 4 MB (as
 mov.c's FATHOM_COVER_MAX); the others are skipped, which read_apic() already
-does for a picture it can't use.
+does for a picture it can't use. None is read for a context flagged
+FATHOM_AVFMT_NO_PICTURES (see the mov patch), where read_apic() is given the
+context.
 
 Upstream-Status: Inappropriate [a small player's limits]
 
 --- a/libavformat/id3v2.c
 +++ b/libavformat/id3v2.c
-@@ -607,7 +607,17 @@
+@@ -607,7 +607,19 @@
      int64_t end               = avio_tell(pb) + taglen;
  
      if (taglen <= 4 || (!isv34 && taglen <= 6))
@@ -24,6 +26,8 @@ Upstream-Status: Inappropriate [a small player's limits]
 +     * long as the file was open. */
 +    if (taglen > 4 * 1024 * 1024 + 256)
          goto fail;
++    if (s && (s->flags & 0x40000000))   /* (FATHOM_AVFMT_NO_PICTURES, as mov.c: a file opened to be played) */
++        goto fail;
 +    for (const ID3v2ExtraMeta *e = extra_meta->head; e; e = e->next)
 +        if (!strcmp(e->tag, "APIC"))
 +            goto fail;

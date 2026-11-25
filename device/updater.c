@@ -34,6 +34,7 @@
 #include "net/netclock.h"
 #include "net/update.h"
 
+#define INSTALL_AGAIN N_("Couldn't install it: restart the H2 to try again")
 #define ANSWER_MAX (64 << 10)        /* GitHub's answer for 0.7.0: 8 KB, most of it the notes */
 
 static struct {
@@ -45,6 +46,7 @@ static struct {
     volatile int abort;
     int running;                     /* a worker is out */
     int installed;
+    int ready_kept;                  /* the install failed before anything moved: the stage is still ready */
     int quiet;                       /* the check out is the automatic one: nothing on the screen */
     int quiet_result;                /* its answer, until read: 1 answered, -1 none */
     char quiet_tag[32];              /* a newer release it found, or "" */
@@ -160,6 +162,16 @@ static void *download_thread(void *arg)
     const char *why = NULL;             /* (said in place of err's own words) */
     int err = UPDATE_OK, nospace = 0;
     long cluster = 32768;
+    /* An install that began and failed: its stage is what finishes it at the
+     * next start, and mustn't go for a new download (updater_do doesn't let
+     * one start; this is the same rule where the stage is removed). */
+    if (update_install_begun(U.stage)) {
+        pthread_mutex_lock(&U.mu);
+        fail_locked(UPDATE_ERR_INSTALL, INSTALL_AGAIN);
+        U.running = 0;
+        pthread_mutex_unlock(&U.mu);
+        return NULL;
+    }
     int64_t free_now = update_free_space(U.card, &cluster);
     /* The zip, then its sd/ (about twice the zip) beside it, and the kernel's
      * copy: an estimate here, exact once the zip is in */
@@ -219,10 +231,26 @@ static void *install_thread(void *arg)
 {
     (void)arg;
     int err = update_install(U.card, U.stage);
-    fprintf(stderr, "update: install %s: %s\n", U.rel.tag, err ? "failed" : "done");
+    int begun = err && update_install_begun(U.stage);
+    int64_t need = 0;
+    if (err == UPDATE_ERR_SPACE) {       /* the old kernel's copy, and the modules' beside it */
+        char kernel[300];
+        struct stat st;
+        snprintf(kernel, sizeof kernel, "%s/uImage", U.card);
+        need = (stat(kernel, &st) == 0 ? (int64_t)st.st_size : 0) + (2 << 20);
+    }
+    fprintf(stderr, "update: install %s: %s\n", U.rel.tag, !err ? "done" : begun ? "failed, begun" : "failed, nothing moved");
     pthread_mutex_lock(&U.mu);
-    /* A failed install keeps its marker: the next start tries again */
-    if (err) fail_locked(err, "Couldn't install it: restart the H2 to try again");
+    /* A failed install that had begun keeps its marker: the next start tries
+     * again (and nothing here may remove the stage meanwhile). One that
+     * failed before anything moved leaves the update ready: Install again,
+     * once there's room. */
+    if (err && begun) fail_locked(err, INSTALL_AGAIN);
+    else if (err) {
+        if (err == UPDATE_ERR_SPACE) no_space_locked(need);
+        else fail_locked(err, NULL);
+        U.ready_kept = 1;
+    }
     else { U.st.state = UI_UPD_RESTARTING; U.installed = 1; }
     U.running = 0;
     changed_locked();
@@ -284,6 +312,16 @@ void updater_do(int what)
             U.quiet = 0;
             U.st.state = UI_UPD_CHECKING;
             U.st.message[0] = '\0';
+        } else if (s == UI_UPD_FAILED && !U.running && update_install_begun(U.stage)) {
+            /* An install that began: only the restart finishes it. A check
+             * here led to a new download, which removed its stage: the new
+             * player left with the old kernel, and "up to date". */
+            fail_locked(UPDATE_ERR_INSTALL, INSTALL_AGAIN);
+        } else if (s == UI_UPD_FAILED && !U.running && U.ready_kept) {
+            U.ready_kept = 0;            /* nothing moved, the stage as it was: ready again */
+            U.st.state = UI_UPD_READY;
+            U.st.message[0] = '\0';
+            U.st.need_mb = 0;
         } else if (s <= UI_UPD_AVAILABLE || s == UI_UPD_FAILED) {
             if (run_locked(check_thread)) { U.st.state = UI_UPD_CHECKING; U.st.message[0] = '\0'; }
         }
@@ -318,7 +356,9 @@ int updater_check_quiet(void)
 {
     pthread_mutex_lock(&U.mu);
     int s = U.st.state, ok = 0;
-    if (s == UI_UPD_IDLE || s == UI_UPD_LATEST || s == UI_UPD_FAILED) {
+    /* (not over a failed install: its stage waits for the restart, or for Try again) */
+    int waits = s == UI_UPD_FAILED && (U.ready_kept || update_install_begun(U.stage));
+    if (!waits && (s == UI_UPD_IDLE || s == UI_UPD_LATEST || s == UI_UPD_FAILED)) {
         U.quiet = 1;                     /* (the worker reads it under the lock, after this) */
         ok = run_locked(check_thread);
         if (!ok) U.quiet = 0;

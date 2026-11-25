@@ -11,8 +11,10 @@ for its tags or to play it.
 
 While a stream is still reading its headers, once OGG_HEADER_KEEP bytes of
 a packet are buffered, a page that is only the middle of that packet (every
-segment 255: it neither starts nor ends in the page) is dropped after its
-checksum is verified. The packet's last page is read as ever, so the packet
+segment 255: it neither starts nor ends in the page) is skipped where it is,
+without being read (so without its checksum: it is thrown away, and a file
+with megabytes of them opens in the time of a seek). The packet's last page
+is read as ever, so the packet
 ends where it should, cut short in the middle. The comment parser already
 stops at a comment longer than what is left ("truncated comment header"):
 the comments before the cut are read, the cut one is left out.
@@ -30,29 +32,32 @@ Upstream-Status: Inappropriate [a small player's limits]
  
  static int buf_realloc(struct ogg_stream *os, int size)
  {
-@@ -427,6 +429,25 @@
-         return 0;
-     }
- 
-+    /* Fathom: a header packet is kept up to OGG_HEADER_KEEP and no more.
-+     * A comment header can carry a cover as text, megabytes of it, and the
-+     * whole packet was gathered in a buffer that doubled as it grew: more
-+     * memory than a small player has, and the end of the file when there
-+     * wasn't enough. Past that size, a page that is nothing but the middle
-+     * of such a packet (it neither starts nor ends in it) is let go as if
-+     * it had never been read. The packet's last page still comes, so it
-+     * ends where it should, short: its comments up to the one cut are read
-+     * as ever, and that one is left out as truncated. */
-+    if (idx >= 0 && os->header && os->incomplete && (flags & OGG_FLAG_CONT) &&
-+        nsegs > 0 && os->bufpos - os->pstart >= OGG_HEADER_KEEP) {
-+        for (i = 0; i < nsegs && segments[i] == 255; i++)
-+            ;
-+        if (i == nsegs) {
-+            *sid = -1;
-+            return 0;
-+        }
-+    }
+@@ -390,6 +392,28 @@
+     idx = ogg_find_stream(ogg, serial);
+     if (idx >= 0) {
+         os = ogg->streams + idx;
 +
-     /* CRC is correct so we can be 99% sure there's an actual change here */
-     if (idx < 0) {
-         if (data_packets_seen(ogg))
++        /* Fathom: a header packet is kept up to OGG_HEADER_KEEP and no more.
++         * A comment header can carry a cover as text, megabytes of it, and
++         * the whole packet was gathered in a buffer that doubled as it grew:
++         * more memory than a small player has, and the end of the file when
++         * there wasn't enough. Past that size, a page that is nothing but
++         * the middle of such a packet (it neither starts nor ends in it) is
++         * passed over where it is, unread (and so unchecked: it is thrown
++         * away). The packet's last page still comes, so it ends where it
++         * should, short: its comments up to the one cut are read as ever,
++         * and that one is left out as truncated. */
++        if (os->header && os->incomplete && (flags & OGG_FLAG_CONT) &&
++            nsegs > 0 && os->bufpos - os->pstart >= OGG_HEADER_KEEP) {
++            for (i = 0; i < nsegs && segments[i] == 255; i++)
++                ;
++            if (i == nsegs) {
++                ffio_get_checksum(bc);
++                avio_skip(bc, size);
++                *sid = -1;
++                return 0;
++            }
++        }
+ 
+         ret = buf_realloc(os, size);
+         if (ret < 0)

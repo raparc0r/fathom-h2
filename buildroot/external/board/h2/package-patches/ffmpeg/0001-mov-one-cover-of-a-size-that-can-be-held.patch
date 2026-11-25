@@ -13,15 +13,21 @@ FATHOM_COVER_MAX (4 MB: the most the player's own cover reader takes). Any
 other is skipped where it is in the file, as is one that can't be allocated
 or comes back short. The file opens either way.
 
+A caller that wants no pictures at all (a file opened to be played: the
+cover was read, megabytes of it, each time a song began) says so with a bit
+of AVFormatContext.flags that FFmpeg doesn't use, FATHOM_AVFMT_NO_PICTURES
+(0x40000000): every cover is then skipped.
+
 Upstream-Status: Inappropriate [a small player's limits]
 
 --- a/libavformat/mov.c
 +++ b/libavformat/mov.c
-@@ -184,12 +184,15 @@
+@@ -184,12 +184,16 @@
      return p - dst;
  }
  
 +#define FATHOM_COVER_MAX (4 * 1024 * 1024)
++#define FATHOM_AVFMT_NO_PICTURES 0x40000000   /* (a bit of AVFormatContext.flags FFmpeg doesn't use) */
 +
  static int mov_read_covr(MOVContext *c, AVIOContext *pb, int type, int len)
  {
@@ -33,17 +39,18 @@ Upstream-Status: Inappropriate [a small player's limits]
  
      switch (type) {
      case 0xd:  id = AV_CODEC_ID_MJPEG; break;
-@@ -200,6 +203,22 @@
-         avio_skip(pb, len);
+@@ -201,16 +205,43 @@
          return 0;
      }
-+
+ 
 +    /* Fathom: one cover is all that is used, and never one over
 +     * FATHOM_COVER_MAX. A second or a bigger one is passed over where it
 +     * is in the file, and so is one there is no memory for: each used to
 +     * be read whole and held for as long as the file was open, and one
-+     * that couldn't be was the end of the whole file. */
-+    if (len > FATHOM_COVER_MAX) {
++     * that couldn't be was the end of the whole file. And none at all for
++     * a caller that wants none (FATHOM_AVFMT_NO_PICTURES in the context's
++     * flags: a file opened to be played). */
++    if (len > FATHOM_COVER_MAX || (c->fc->flags & FATHOM_AVFMT_NO_PICTURES)) {
 +        avio_skip(pb, len);
 +        return 0;
 +    }
@@ -53,10 +60,10 @@ Upstream-Status: Inappropriate [a small player's limits]
 +            return 0;
 +        }
 +    covr_pos = avio_tell(pb);
- 
++
      sc = av_mallocz(sizeof(*sc));
      if (!sc)
-@@ -207,10 +226,19 @@
+         return AVERROR(ENOMEM);
      ret = ff_add_attached_pic(c->fc, NULL, pb, NULL, len);
      if (ret < 0) {
          av_free(sc);

@@ -111,15 +111,16 @@ FFMPEG_POST_CONFIGURE_HOOKS += FATHOM_FFMPEG_HOT_O3
 # The player's SQLite: the amalgamation compiled again after the package's
 # own build, as code for an executable, one function per section, and without
 # what the player's SQL never asks for: JSON, date and math functions,
-# extensions, UTF-16, shared cache, tracing, progress callbacks and the
+# extensions, UTF-16, shared cache, tracing and the
 # deprecated or introspection APIs (only options that leave the amalgamation's
-# parser alone). No memory statistics either: nothing reads them, and they
+# parser alone). Progress callbacks are kept: a scan's "Sorting albums and
+# artists" step says it is at work through one (library.c, grp_busy). No memory statistics either: nothing reads them, and they
 # cost a lock around every allocation. It replaces the staged libsqlite3.a,
 # which only the player and its tools link; lighttpd's shared library is
 # SQLite as built by the package. 250 KB of the player's code less.
 FATHOM_SQLITE_PLAYER_OPTS = -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_JSON \
 	-DSQLITE_OMIT_LOAD_EXTENSION=1 -DSQLITE_OMIT_DATETIME_FUNCS -DSQLITE_OMIT_UTF16 \
-	-DSQLITE_OMIT_SHARED_CACHE -DSQLITE_OMIT_TRACE -DSQLITE_OMIT_PROGRESS_CALLBACK \
+	-DSQLITE_OMIT_SHARED_CACHE -DSQLITE_OMIT_TRACE \
 	-DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_DECLTYPE \
 	-DSQLITE_OMIT_GET_TABLE -DSQLITE_OMIT_DESERIALIZE \
 	-DSQLITE_OMIT_COMPILEOPTION_DIAGS -DSQLITE_OMIT_INTROSPECTION_PRAGMAS \

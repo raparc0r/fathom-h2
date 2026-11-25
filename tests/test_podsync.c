@@ -17,10 +17,21 @@ static int fails;
 static int fetches, slow, cut_off;   /* cut_off: the feed arrives cut off (Wi-Fi gone mid-transfer) */
 static char alt_image[6];            /* the feed's image named this instead of "cover" (5 letters) */
 
+static int offline;                  /* no server answers (Wi-Fi up, no internet) */
+static char fetched[32][200];        /* the addresses asked for, in order (the first 32) */
+static int in_log(const char *url)
+{
+    for (int i = 0; i < fetches && i < 32; i++)
+        if (!strcmp(fetched[i], url)) return 1;
+    return 0;
+}
+
 static long fake_fetch(const char *url, char *buf, size_t cap, const volatile int *abort)
 {
     (void)abort;
+    if (fetches < 32) snprintf(fetched[fetches], sizeof fetched[0], "%s", url);
     fetches++;
+    if (offline) return -1;
     const char *file = strstr(url, "itunes.apple.com") ? "tests/data/podcasts/search.json"
                      : strstr(url, "chapters.json") ? "tests/data/podcasts/chapters.json"
                      : strstr(url, "broken") ? NULL : "tests/data/podcasts/feed.xml";
@@ -73,10 +84,20 @@ static int64_t fake_image(const char *url, const char *path, http_progress_fn pr
     return n;
 }
 
+static int dl_calls;
+static int64_t dl_answer = 1;                        /* what an episode's download answers (1: it works) */
+
 static int64_t fake_download(const char *url, const char *path, http_progress_fn progress, void *ctx,
                              const volatile int *abort)
 {
     if (strstr(url, ".jpg")) return fake_image(url, path, progress, ctx, abort);
+    dl_calls++;
+    if (dl_answer == 0) {                            /* an empty answer: an empty file, as http_download leaves */
+        FILE *z = fopen(path, "wb");
+        if (z) fclose(z);
+        return 0;
+    }
+    if (dl_answer < 0) return dl_answer;
     for (int i = 0; i < (slow ? 200 : 2); i++) {
         if (*abort) return -1;
         if (progress) progress((uint64_t)i * 1000, 200000, ctx);
@@ -346,6 +367,40 @@ int main(void)
         podsync_auto((int64_t)time(NULL) + 7 * 3600 + 60, 1, 0, 6 * 3600, 2, 7);
         settle();
         CHECK(fetches == before, "not again a minute later");
+        /* an automatic download the card stops: tried once (not three times,
+         * filling it again), and not at the next call ten minutes later, nor
+         * the one after: after an hour */
+        int64_t t0 = (int64_t)time(NULL);
+        dl_calls = 0;
+        dl_answer = HTTP_ERR_FULL;
+        podsync_auto(t0, 1, 1, 0, 2, 7);
+        settle();
+        settle();
+        CHECK(dl_calls == 1 && !pod_downloaded(dir, shows[0].id, &e[2]), "the card full: one try (%d)", dl_calls);
+        podsync_auto(t0 + 600, 1, 1, 0, 2, 7);
+        settle();
+        settle();
+        CHECK(dl_calls == 1, "not again ten minutes later (%d)", dl_calls);
+        dl_answer = 0;
+        podsync_auto(t0 + 3700, 1, 1, 0, 2, 7);
+        settle();
+        settle();
+        CHECK(dl_calls == 2 && !pod_downloaded(dir, shows[0].id, &e[2]), "after an hour: once; an empty answer isn't an episode (%d)", dl_calls);
+        podsync_auto(t0 + 2 * 3700, 1, 1, 0, 2, 7);
+        settle();
+        settle();
+        CHECK(dl_calls == 2, "a second failure: longer than an hour (%d)", dl_calls);
+        /* asked for by hand: tried whatever failed before; and once it's had, forgotten */
+        dl_answer = 1;
+        podsync_download(shows[0].id, &e[2]);
+        settle();
+        CHECK(dl_calls == 3 && pod_downloaded(dir, shows[0].id, &e[2]), "by hand: tried, and there (%d)", dl_calls);
+        pod_delete_download(dir, shows[0].id, &e[2]);
+        podsync_auto(t0 + 2 * 3700, 1, 1, 0, 2, 7);
+        settle();
+        settle();
+        CHECK(dl_calls == 4 && pod_downloaded(dir, shows[0].id, &e[2]), "no longer held back (%d)", dl_calls);
+        pod_delete_download(dir, shows[0].id, &e[2]);
     }
 
     /* OPML import: the shows added, each read */
@@ -362,6 +417,31 @@ int main(void)
     podsync_status(&st);
     CHECK(st.imported == 2, "imported: %d", st.imported);
     CHECK(pod_shows_load(dir, shows, 4) == 4, "four shows now");
+
+    /* Wi-Fi up with no internet behind it: a refresh of every show stops
+     * after three in a row have reached no server (each took its three tries
+     * and their waits: 64 shows held the worker for many minutes), and the
+     * next one starts with the shows it left */
+    {
+        podsync_set_retry_waits(0, 0);
+        offline = 1;
+        fetches = 0;
+        podsync_refresh("");
+        settle();
+        CHECK(fetches == 9, "offline: three shows tried, three times each (%d)", fetches);
+        CHECK(in_log(shows[0].url) && in_log(shows[2].url) && !in_log(shows[3].url), "offline: the fourth left");
+        offline = 0;
+        fetches = 0;
+        podsync_refresh("");
+        settle();
+        CHECK(!strcmp(fetched[0], shows[3].url), "back: the one left comes first [%s]", fetched[0]);
+        CHECK(in_log(shows[0].url) && in_log(shows[1].url) && in_log(shows[2].url), "back: and every other show");
+        fetches = 0;
+        podsync_refresh("");                          /* (a whole round: the next starts at the top again) */
+        settle();
+        CHECK(!strcmp(fetched[0], shows[0].url), "then from the top [%s]", fetched[0]);
+        podsync_set_retry_waits(2000, 5000);
+    }
 
     /* unsubscribe */
     podsync_unsubscribe(b.url);

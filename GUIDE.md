@@ -205,15 +205,18 @@ running while it's off.
 Home → Radio plays stations over Wi-Fi. Fathom comes with a few, and **Find stations**
 searches a directory of thousands: by name, by genre or country, the most popular, or a
 random one. Menu on a station adds it to your stations. Play stops and starts the stream;
-Prev and Next change station. A station played from Find stations is counted at the
-directory, as one more play of it.
+Prev and Next change station: through your stations, or, for a station played from a list
+in Find stations, through that list while it is open. Once you leave the list, they go
+through your stations if the station is one of yours; if it isn't, it plays on by itself
+and there is no next. A station played from Find stations is counted at the directory, as
+one more play of it.
 
 A station added from Find stations shows its logo beside its name when the directory has
 one (not in the list while Settings → Interface → Covers in lists is Off), and on Now
 Playing when the song has no cover of its own. When the directory has
 none that can be used, Fathom looks on the station's own website for its icon (the one a
-phone would put on its home screen, or its favicon; a small favicon shows in the list
-only).
+phone would put on its home screen, or its favicon; a small favicon is shown on Now Playing
+at its own size, in the middle of the cover's square).
 
 A station with no logo and no website icon that can be used (one you typed into
 `radio.txt` yourself, say, or added before Fathom kept websites) is looked up in the
@@ -325,10 +328,11 @@ stay as they are. The first time the new version starts, it shows **What's new**
 wheel to read it all, and press Play or Back to carry on. Settings → About → **What's new**
 shows it again.
 
-Don't turn the H2 off while it says "Installing" (a few seconds); if it loses power anyway,
-it finishes at the next start. If a new version ever fails to start, the H2 goes back to
-the previous one by itself (with the bootloader from Fathom 0.9.0 or later: see
-[ADVANCED.md](ADVANCED.md)).
+Install needs at least 15 % of battery, or the H2 plugged in. Don't turn the H2 off while it
+says "Installing" (a few seconds); if it loses power anyway,
+it finishes at the next start. If a new version's system ever fails to start, the H2 goes
+back to the one it had before by itself and tells you; Fathom itself stays at the new
+version (with the bootloader from Fathom 0.9.0 or later: see [ADVANCED.md](ADVANCED.md)).
 
 Without Wi-Fi, copy the new release's `sd/` folder over the old files on the card (USB
 drive mode works). Each release's notes say if anything else is needed.

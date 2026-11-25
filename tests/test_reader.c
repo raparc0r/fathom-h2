@@ -9,11 +9,13 @@
  * come through it; and with no helper to be had the scan does the work
  * itself. Run from the repo root (tests/data/covers/cover.jpg). */
 #include <limits.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <FLAC/metadata.h>
@@ -96,6 +98,118 @@ static int64_t db_int(const char *db, const char *sql)
     return v;
 }
 
+/* A long request given up when its caller's stop is set: the helper, in the
+ * middle of the work, is killed, nobody is blamed, and the next request
+ * finds a new one. (Levelling, stopped when music starts.) */
+static volatile int g_stop;
+
+static void *stop_soon(void *arg)
+{
+    (void)arg;
+    usleep(400 * 1000);
+    g_stop = 1;
+    return NULL;
+}
+
+static void test_stopped(const char *music)
+{
+    char hang[700], good[700];
+    snprintf(hang, sizeof hang, "%s/Slow/01 HANG.flac", music);
+    snprintf(good, sizeof good, "%s/Good One/01.flac", music);
+    int st = 0, deaths = reader_deaths(), starts = reader_starts();
+    unsigned char *b = NULL;
+    size_t n = 0;
+    pthread_t th;
+    struct timespec t0, t1;
+    g_stop = 0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    pthread_create(&th, NULL, stop_soon, NULL);
+    int r = reader_call_long(1, hang, 0, 60000, &g_stop, &st, &b, &n);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    pthread_join(th, NULL);
+    double took = (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    CHECK(r == READER_STOPPED && b == NULL);
+    CHECK(took > 0.3 && took < 2.0);                             /* (not the minute it was given) */
+    CHECK(reader_deaths() == deaths);                            /* (nobody's fault) */
+    /* a stop already set: given up at once, the file not even judged */
+    r = reader_call_long(1, good, 0, 60000, &g_stop, &st, &b, &n);
+    CHECK(r == READER_STOPPED);
+    /* and the next request is answered, by a new helper */
+    g_stop = 0;
+    r = reader_call_long(1, good, 0, 60000, &g_stop, &st, &b, &n);
+    CHECK(r == 0 && st == 0 && b != NULL && reader_starts() > starts);
+    free(b);
+    reader_close();
+}
+
+/* "Remove cover" on a picked cover (the album goes back to its own, made
+ * again on the thread the screen is drawn on): not behind a helper that is
+ * at work for someone else (a song being measured for the levelling:
+ * minutes), and with little memory to spare a cover that couldn't be made
+ * isn't "this album has none" (marked so, no scan looked again). */
+static volatile int g_busy_stop;
+static char g_busy_path[700];
+static void *keep_busy(void *arg)
+{
+    (void)arg;
+    int st;
+    unsigned char *b;
+    size_t n;
+    reader_call_long(1, g_busy_path, 0, 60000, &g_busy_stop, &st, &b, &n);
+    return NULL;
+}
+
+static void test_remove_cover(const char *dir, const char *music)
+{
+    char db[700], art[700], found[700], p[700], q[700];
+    snprintf(db, sizeof db, "%s/remove.db", dir);
+    snprintf(art, sizeof art, "%s/art-remove", dir);
+    snprintf(found, sizeof found, "%s/found", dir);
+    mkdir(found, 0755);
+    library_set_found_covers(found);
+    reader_set_timeout_ms(1500);
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) > 0);
+    int64_t id = db_int(db, "SELECT id FROM albums WHERE title='Good Two'");
+    CHECK(library_album_cover(lib, id) == LIB_COVER_OWN);
+    uint16_t *lg = calloc((size_t)LIB_ART_LARGE * LIB_ART_LARGE, 2), *sm = calloc((size_t)LIB_ART_SMALL * LIB_ART_SMALL, 2);
+    CHECK(lg && sm && library_store_found_cover(lib, id, lg, sm) == 0 && library_album_cover(lib, id) == LIB_COVER_PICKED);
+    /* the helper busy with a file it never answers for */
+    snprintf(g_busy_path, sizeof g_busy_path, "%s/Slow/01 HANG.flac", music);
+    g_busy_stop = 0;
+    pthread_t th;
+    pthread_create(&th, NULL, keep_busy, NULL);
+    usleep(300 * 1000);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    CHECK(library_remove_found_cover(lib, id) == 0);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double took = (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    CHECK(took < 1.0);                                           /* (not when the helper is free again) */
+    if (took >= 1.0) fprintf(stderr, "Remove cover waited %.1f s for the helper\n", took);
+    CHECK(library_album_cover(lib, id) == LIB_COVER_OWN);        /* its own, made here */
+    g_busy_stop = 1;
+    pthread_join(th, NULL);
+    /* its own can't be made with little memory to spare (the helper dies on
+     * it, and wasn't given much): no cover for now, and not "it has none" */
+    CHECK(library_store_found_cover(lib, id, lg, sm) == 0 && library_album_cover(lib, id) == LIB_COVER_PICKED);
+    snprintf(p, sizeof p, "%s/Good Two/cover.jpg", music);
+    snprintf(q, sizeof q, "%s/Good Two/KILL.jpg", music);
+    CHECK(rename(p, q) == 0);
+    library_test_reader_budget(1000);
+    CHECK(library_remove_found_cover(lib, id) == 0);
+    CHECK(library_album_cover(lib, id) == LIB_COVER_UNKNOWN);
+    CHECK(db_int(db, "SELECT art_sig FROM albums WHERE title='Good Two'") == 0);
+    library_test_reader_budget(-1);
+    CHECK(rename(q, p) == 0);
+    CHECK(library_scan(lib, music, NULL, NULL) > 0 && library_album_cover(lib, id) == LIB_COVER_OWN);   /* the next scan makes it */
+    free(lg);
+    free(sm);
+    library_close(lib);
+    library_set_found_covers(NULL);
+    reader_close();
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && !strcmp(argv[1], "--reader")) return reader_serve(helper_do);
@@ -149,11 +263,23 @@ int main(int argc, char **argv)
     CHECK(db_int(db, "SELECT art FROM albums WHERE title='Good Two'") == LIB_COVER_OWN);
     CHECK(db_int(db, "SELECT art FROM albums WHERE title='Cover Trouble'") == LIB_COVER_NONE);
     CHECK(library_unread_count(lib) == 4);
+    /* A scan asked to try the unread files again (Rescan), with a helper to
+     * do the reading: those a reader stopped on are tried too. They stop it
+     * again (two deaths each, one hang), and are set aside as before. */
+    int deaths = reader_deaths();
+    library_scan_retry_unread(lib, 1);
+    CHECK(library_scan(lib, music, NULL, NULL) == n);
+    CHECK(reader_deaths() == deaths + 3 * 2 + 1);
+    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped'") == 4);
     /* nothing more to do at the next scan, and no helper started for it */
     int starts = reader_starts();
     CHECK(library_scan(lib, music, NULL, NULL) == n && library_scan_changes(lib) == 0);
     CHECK(reader_starts() == starts);
     library_close(lib);
+
+    test_stopped(music);
+    test_remove_cover(dir, music);
+    reader_set_timeout_ms(1500);
 
     /* the same music read in this process (no file kills this test: the
      * helper's whims aren't the reader's): what the helper read, it read
@@ -198,6 +324,30 @@ int main(int argc, char **argv)
     CHECK(library_scan(lib, music, NULL, NULL) == 6 + 4 + 2 + 1 + 1);
     CHECK(db_int(db4, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped'") == 4);
     CHECK(db_int(db4, "SELECT art FROM albums WHERE title='Cover Trouble'") == LIB_COVER_NONE);
+    /* An album that has its answer already (no cover), then an image in its
+     * folder, looked at while memory is short: left for later, and the next
+     * scan does look (it took the listing being as it was for "nothing to
+     * do", and the cover never came) */
+    snprintf(p, sizeof p, "%s/Good One/KILL.jpg", music);
+    copy_file("tests/data/covers/cover.jpg", p);
+    CHECK(db_int(db4, "SELECT art FROM albums WHERE title='Good One'") == LIB_COVER_NONE);
+    library_test_reader_budget(1000);
+    CHECK(library_scan(lib, music, NULL, NULL) == 6 + 4 + 2 + 1 + 1);
+    deaths = reader_deaths();
+    library_test_reader_budget(8000);
+    CHECK(library_scan(lib, music, NULL, NULL) == 6 + 4 + 2 + 1 + 1);
+    CHECK(reader_deaths() == deaths + 2);                  /* looked at again (and it kills the helper: twice) */
+    deaths = reader_deaths();
+    CHECK(library_scan(lib, music, NULL, NULL) == 6 + 4 + 2 + 1 + 1 && reader_deaths() == deaths);   /* settled now */
+    /* A Rescan (the files not read tried again) while memory is short: what
+     * was set aside stays set aside (it was dropped from the list, and read
+     * again at every scan) */
+    CHECK(library_unread_count(lib) == 4);
+    library_test_reader_budget(1000);
+    library_scan_retry_unread(lib, 1);
+    CHECK(library_scan(lib, music, NULL, NULL) == 6 + 4 + 2 + 1 + 1);
+    CHECK(library_unread_count(lib) == 4);
+    CHECK(db_int(db4, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped'") == 4);
     library_close(lib);
     library_test_reader_budget(-1);
     reader_set_helper(NULL);

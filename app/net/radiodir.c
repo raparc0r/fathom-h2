@@ -105,7 +105,7 @@ static int stream_url(const char *u)
 {
     if (strncmp(u, "http://", 7) && strncmp(u, "https://", 8)) return 0;
     for (const char *c = u; *c; c++)
-        if ((unsigned char)*c <= ' ') return 0;
+        if ((unsigned char)*c <= ' ' || *c == '|') return 0;   /* ('|' ends the address in radio.txt) */
     return 1;
 }
 

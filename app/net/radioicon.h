@@ -40,7 +40,7 @@
 #include "player/radio.h"
 
 #define RICON_MAX_FILE (512 * 1024)   /* a logo's encoded bytes (a PNG, a JPEG or an .ico) */
-#define RICON_LARGE_MIN 68            /* its short side, to be shown at LIB_ART_LARGE */
+#define RICON_LARGE_MIN LIB_LOGO_SHARP_MIN   /* its short side, to fill Now Playing's square (a smaller one sits in its middle) */
 #define RICON_SMALL_MIN 16            /* ...and to be shown at all */
 
 /* What fetches: http_get (net/http.h) unless replaced (the tests and the

@@ -36,6 +36,8 @@ typedef enum {
 struct ui_fonts {
     const char *family;      /* matches theme_t.font */
     const lv_font_t *meta;   /* 15 px: status bar, metadata */
+    const lv_font_t *value;  /* a row's value at its right, and what follows a name on its line (an album's
+                              * artist): meta, or 1 px bigger where the family has room (16 px in Atkinson) */
     const lv_font_t *body;   /* 20 px: list rows */
     const lv_font_t *sub;    /* 18 px: artist line */
     const lv_font_t *title;  /* 22 px medium: Now Playing title */
@@ -86,7 +88,7 @@ typedef struct { int state; char usb_ip[16]; char wifi_ip[16]; char password[32]
 /* How far a scan has got (ui_hooks_t.scan_progress): its step; songs read or
  * albums looked at, done of total; the file it's reading (a song's name) */
 enum { UI_SCAN_LOOKING, UI_SCAN_SONGS, UI_SCAN_ALBUMS, UI_SCAN_COVERS };
-typedef struct { int step, done, total; char file[96]; } ui_scan_t;
+typedef struct { int step, done, total; char file[96]; } ui_scan_t;   /* (UI_SCAN_LOOKING: done songs found; total -1: done files checked) */
 enum { UI_SSH_TOGGLE, UI_SSH_NEW_PASSWORD };
 enum { UI_SOUND_BALANCE, UI_SOUND_LIMIT, UI_SOUND_CROSSFEED, UI_SOUND_WIDTH };
 /* Updates (Settings > About > Check for updates): only ever when asked.

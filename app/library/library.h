@@ -63,8 +63,13 @@ typedef struct {
     uint8_t  bits, channels;
 } lib_track_t;
 
-/* A scan's progress: done of total songs read (path: the one now); path
- * "albums": the albums and artists being sorted (no count); "indexes": a
+/* A scan's progress. First, while the music folder is listed: path "looking",
+ * done songs found so far (total 0), then perhaps path "checking", done files
+ * looked up one by one (total 0); both a few times a second at most. Then
+ * done of total songs read (path: the one now); path
+ * "albums": the albums and artists being sorted; "sorting": done of total
+ * songs gone through in that step; "working": the rest of it, done a number
+ * that goes up while the database is at work (total 0); "indexes": a
  * first scan's indexes being built (no count); then, for covers,
  * total < 0: done albums looked at of -total - 1 (0: not known); path "done":
  * finished. */
@@ -118,10 +123,24 @@ int  library_trying_left(const char *what, char *out, size_t cap);
  * the one request it serves (for a helper that wraps it: a test's). */
 int library_reader_main(void);
 int library_reader_do(int op, const char *path, unsigned char **out, size_t *len);
+/* (the library's own requests are numbered below this: a program that wraps
+ * library_reader_do to add its own starts here) */
+#define LIBRARY_READER_OPS_END 100
+/* What a helper may take for one file now (kB over what it has; 0: no limit),
+ * and whether that is too little to conclude anything from a failure (see
+ * rd_budget in library.c) */
+long library_reader_budget(int *is_short);
+/* (tests: seconds between two reports of "looking", "checking", "sorting" and "working"; 0.25) */
+void library_test_progress_every(double s);
 /* (tests: the memory the helper is given for a file, in kB; -1: what the system has) */
 void library_test_reader_budget(long kb);
 /* Tracks the last scan added, changed or dropped (0: the library is as it was). */
 int library_scan_changes(const library_t *lib);
+/* The next scan reads again the files none could read (library_unread): a
+ * scan otherwise leaves such a file alone until it changes. For a scan the
+ * user asks for (Rescan). Those a reader stopped on are tried again only when
+ * a helper does the reading (reader.h). */
+void library_scan_retry_unread(library_t *lib, int on);
 /* The music files the scans couldn't read (damaged ones, and those set aside
  * because the player stopped while reading them): how many, and the i-th's
  * path, in order (0; -1: no such one). */
@@ -290,11 +309,15 @@ int64_t library_track_album(library_t *lib, int64_t track_id);
 int library_art_decode(const unsigned char *enc, size_t len, int size, uint16_t *pixels);
 /* A radio station's logo (JPEG, PNG) at both sizes, whole inside each square
  * with white around it and under its transparent parts, not cropped: small
- * (LIB_ART_SMALL) always, large (LIB_ART_LARGE) too unless it's NULL.
+ * (LIB_ART_SMALL) always, large (LIB_ART_LARGE) too unless it's NULL. A
+ * picture under LIB_LOGO_SHARP_MIN on its short side (a favicon) isn't blown
+ * up for the large one: it is drawn sharp in the middle, at a whole number of
+ * times its size (up to half the square), on its own corners' colour.
  * *short_side (may be NULL): the picture's shorter side as decoded, which is
  * its own when that's under LIB_ART_LARGE * 3 / 2 (a bigger one is shrunk no
  * further than that), so the caller can tell one too small to show large.
  * Stricter limits than a cover's: 512 KB, 400,000 pixels decoded. 0 if decoded. */
+#define LIB_LOGO_SHARP_MIN 68
 int library_logo_decode(const unsigned char *enc, size_t len, uint16_t *large, uint16_t *small, int *short_side);
 /* The same from pixels already decoded (w x h, 3 bytes each: red, green, blue;
  * 1,024 a side at most): an icon out of an .ico file (net/radioicon.c). 0, -1 */

@@ -151,6 +151,7 @@ int main(void)
         " {\"name\":\"Opus\",\"url_resolved\":\"https://a.example/10\",\"codec\":\"OPUS\",\"bitrate\":96,"
         "  \"favicon\":\"data:image/png;base64,iVBORw0KGgo=\"},"
         " {\"name\":\"Bar\",\"url_resolved\":\"https://a.example/11\",\"codec\":\"MP3\",\"favicon\":\"https://a.example/a|b.png\"},"
+        " {\"name\":\"Barred\",\"url_resolved\":\"http://a.example/13|icon:http://192.168.1.1/x\",\"codec\":\"MP3\"},"
         " {\"name\":\"Null\",\"url_resolved\":\"https://a.example/12\",\"codec\":\"MP3\",\"favicon\":null},"
         " \"not an object\", 3]";
     n = rdir_parse_stations(odd, strlen(odd), st, meta, RDIR_MAX_STATIONS);

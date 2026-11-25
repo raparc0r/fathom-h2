@@ -276,9 +276,9 @@ static void *warm(void *arg)
         c->next = chains;
         chains = cur = c;
         c = NULL;
-        idle();                          /* unused: kept for the grace period */
         int n = 0;
         for (const mbedtls_x509_crt *x = &cur->crt; x; x = x->next) n++;
+        idle();                          /* unused: kept for the grace period (or, with no thread to wait, freed: cur is NULL then) */
         fprintf(stderr, "tls: %d certificates parsed ahead in %ld ms\n", n, ms_to(&t0, &t1));
     }
     warming = warm_parsing = 0;

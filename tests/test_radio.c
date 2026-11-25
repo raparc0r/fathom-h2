@@ -234,6 +234,37 @@ int main(void)
     CHECK(n == 3 && !strcmp(big[2].name, "Only here") && !strcmp(big[2].icon, "https://only.example/o.png"));
     CHECK(radio_load_list(path3, NULL, big, RADIO_MAX) == -1);
     remove(ex);
+    /* an address with a '|' in it (a directory's station is anyone's): the
+     * line ends its address there, and what followed isn't read back as the
+     * station's logo and site */
+    {
+        radio_station_t bar = {.name = "Bar", .url = "http://radio.example/live|icon:http://192.168.1.1/x|site:http://192.168.1.1/"};
+        char bline[1536];
+        radio_line(&bar, bline, sizeof bline);
+        CHECK(!strcmp(bline, "Bar = http://radio.example/live"));
+        radio_station_t rb;
+        CHECK(radio_parse(bline, &rb, 1) == 1 && !rb.icon[0] && !rb.site[0] && !strcmp(rb.url, "http://radio.example/live"));
+    }
+    /* a list longer than is read here: not changed (it was written back cut
+     * off at 64 KB), and whole afterwards */
+    {
+        f = fopen(path3, "wb");
+        size_t wrote = 0;
+        if (f) {
+            wrote += (size_t)fprintf(f, "First = http://first.example/s\n");
+            for (int i = 0; i < 1400; i++) wrote += (size_t)fprintf(f, "# a note of mine, line %04d, some fifty bytes long ..\n", i);
+            wrote += (size_t)fprintf(f, "Last = http://last.example/s\n");
+            fclose(f);
+        }
+        CHECK(wrote > 70000);
+        CHECK(radio_remove(path3, NULL, "http://first.example/s") == -1);
+        CHECK(radio_add(path3, NULL, &more) == -1);
+        f = fopen(path3, "rb");
+        long size = -1;
+        if (f) { fseek(f, 0, SEEK_END); size = ftell(f); fclose(f); }
+        CHECK(size == (long)wrote);
+        remove(path3);
+    }
     /* nowhere to write */
     CHECK(radio_add("/nonexistent-dir/radio.txt", "assets/radio.txt", &more) == -1);
     remove(path);

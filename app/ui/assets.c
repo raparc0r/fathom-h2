@@ -69,17 +69,20 @@ static const lv_font_t *ttf(const char *path, int px, const lv_font_t *fallback)
 #define MAX_SETS 12
 static struct { char key[900]; ui_fonts_t fonts; } g_sets[MAX_SETS];
 
-/* Built-in families: files and default sizes per role (meta, body, sub, title, head). */
+/* Built-in families: files and default sizes per role (meta, body, sub, title, head),
+ * and how much bigger than meta a row's value is drawn (ui.h: value). The pixel
+ * families stay on their grid; a theme's own font is its maker's to size. */
 static const struct {
     const char *family, *file, *file_title;
     int px[THEME_PX_N];
+    int value_add;
 } FAMILIES[] = {
-    {"atkinson", "AtkinsonHyperlegibleNext-Regular.ttf", "AtkinsonHyperlegibleNext-Medium.ttf", {15, 20, 18, 22, 16}},
+    {"atkinson", "AtkinsonHyperlegibleNext-Regular.ttf", "AtkinsonHyperlegibleNext-Medium.ttf", {15, 20, 18, 22, 16}, 1},
     /* Ark Pixel (10 px proportional) is drawn on a 100-unit grid: 20 px = 2 screen
      * pixels per font pixel, 30 px = 3. Only these sizes stay crisp. */
-    {"arkpixel", "ArkPixel-10px-Proportional.ttf", "ArkPixel-10px-Proportional.ttf", {20, 20, 20, 30, 20}},
+    {"arkpixel", "ArkPixel-10px-Proportional.ttf", "ArkPixel-10px-Proportional.ttf", {20, 20, 20, 30, 20}, 0},
     /* VT323 is drawn small for its pixel size: these match Atkinson's cap height */
-    {"vt323", "VT323-Regular.ttf", "VT323-Regular.ttf", {20, 26, 24, 30, 22}},
+    {"vt323", "VT323-Regular.ttf", "VT323-Regular.ttf", {20, 26, 24, 30, 22}, 0},
 };
 
 /* Behind every font: Noto Sans (a subset: Latin Extended-A and B, Greek,
@@ -89,10 +92,10 @@ static const char *const FALLBACK_FILE = "NotoSans-Subset.ttf";
 static const char *const ICON_FILE = "TablerIcons-Home.ttf";
 
 static const ui_fonts_t *load_set(const char *family, const char *file, const char *file_title,
-                                  const int *px, const ui_fonts_t *fallback)
+                                  const int *px, int value_add, const ui_fonts_t *fallback)
 {
     char key[900];
-    snprintf(key, sizeof key, "%s|%s|%d,%d,%d,%d,%d", file, file_title, px[0], px[1], px[2], px[3], px[4]);
+    snprintf(key, sizeof key, "%s|%s|%d,%d,%d,%d,%d+%d", file, file_title, px[0], px[1], px[2], px[3], px[4], value_add);
     int free_slot = -1;
     for (int i = 0; i < MAX_SETS; i++) {
         if (!strcmp(g_sets[i].key, key)) return &g_sets[i].fonts;
@@ -107,7 +110,8 @@ static const ui_fonts_t *load_set(const char *family, const char *file, const ch
         .title = ttf(file_title, px[THEME_PX_TITLE], fallback ? fallback->title : NULL),
         .head  = ttf(file_title, px[THEME_PX_HEAD], fallback ? fallback->head : NULL),
     };
-    if (!f.meta || !f.body || !f.sub || !f.title || !f.head) return NULL;
+    f.value = value_add ? ttf(file, px[THEME_PX_META] + value_add, fallback ? fallback->value : NULL) : f.meta;
+    if (!f.meta || !f.body || !f.sub || !f.title || !f.head || !f.value) return NULL;
     /* Home's icons, the same for every family (Pixel Pastel draws its own) */
     char icons[600];
     snprintf(icons, sizeof icons, "%s/fonts/%s", g_assets, ICON_FILE);
@@ -119,17 +123,18 @@ static const ui_fonts_t *load_set(const char *family, const char *file, const ch
 }
 
 /* The last-resort fallback at the sizes of a set (NULL if the file is missing). */
-static const ui_fonts_t *fallback_set(const int *px)
+static const ui_fonts_t *fallback_set(const int *px, int value_add)
 {
     char f[640];
     snprintf(f, sizeof f, "%s/fonts/%s", g_assets, FALLBACK_FILE);
     FILE *probe = fopen(f, "rbe");
     if (!probe) return NULL;
     fclose(probe);
-    return load_set("noto", f, f, px, NULL);
+    return load_set("noto", f, f, px, value_add, NULL);
 }
 
-static const ui_fonts_t *builtin_family(const char *family, const int *override_px)
+/* value_add: the family's own (-1), or the one of the set this is the fallback of. */
+static const ui_fonts_t *builtin_family(const char *family, const int *override_px, int value_add)
 {
     for (size_t i = 0; i < sizeof FAMILIES / sizeof FAMILIES[0]; i++) {
         if (strcmp(FAMILIES[i].family, family)) continue;
@@ -140,8 +145,9 @@ static const ui_fonts_t *builtin_family(const char *family, const int *override_
         for (int r = 0; r < THEME_PX_N; r++) px[r] = override_px && override_px[r] ? override_px[r] : FAMILIES[i].px[r];
         /* Atkinson falls back to Noto; the other families to Atkinson first (punctuation
          * like "‹" that pixel fonts lack), then Noto */
-        const ui_fonts_t *fb = i == 0 ? fallback_set(px) : builtin_family("atkinson", px);
-        return load_set(FAMILIES[i].family, f, ft, px, fb);
+        int add = value_add < 0 ? FAMILIES[i].value_add : value_add;
+        const ui_fonts_t *fb = i == 0 ? fallback_set(px, add) : builtin_family("atkinson", px, add);
+        return load_set(FAMILIES[i].family, f, ft, px, add, fb);
     }
     return NULL;
 }
@@ -149,15 +155,15 @@ static const ui_fonts_t *builtin_family(const char *family, const int *override_
 const ui_fonts_t *ui_theme_fonts(const theme_t *t)
 {
     if (!t) return NULL;
-    if (!t->font_file[0]) return builtin_family(t->font, t->font_px);
+    if (!t->font_file[0]) return builtin_family(t->font, t->font_px, -1);
     /* the theme's own font, with Atkinson (and Noto behind that) for anything it lacks */
     int px[THEME_PX_N];
     for (int r = 0; r < THEME_PX_N; r++) px[r] = t->font_px[r] ? t->font_px[r] : FAMILIES[0].px[r];
-    const ui_fonts_t *fallback = builtin_family("atkinson", px);
+    const ui_fonts_t *fallback = builtin_family("atkinson", px, 0);
     char f[640], ft[640];
     snprintf(f, sizeof f, "%s/%s", t->dir, t->font_file);
     snprintf(ft, sizeof ft, "%s/%s", t->dir, t->font_file_title[0] ? t->font_file_title : t->font_file);
-    return load_set("theme", f, ft, px, fallback);
+    return load_set("theme", f, ft, px, 0, fallback);
 }
 
 /* ---------- icons ---------- */

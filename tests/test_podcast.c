@@ -333,6 +333,30 @@ static void card(void)
           "an older show keeps its folder: [%s] %s", n ? got[0].url : "", n ? got[0].id : "");
     CHECK(pod_shows_remove(dir, "https://a.example/f?u=http://b.example/r") == 0 && stat(od, &sb) != 0,
           "...and an unsubscribe removes it");
+    /* a show named by its address (an OPML outline without a name), and one
+     * whose address ends with another's: each unsubscribe takes its own line */
+    w = fopen(path, "w");
+    if (w) {
+        fputs("# mine\n"
+              "https://c.example/feed = https://c.example/feed\n"
+              "Longer = https://d.example/x?next=https://e.example/feed\n"
+              "Short = https://e.example/feed  \r\n", w);
+        fclose(w);
+    }
+    CHECK(pod_shows_load(dir, got, 8) == 3, "three shows");
+    CHECK(pod_shows_remove(dir, "https://e.example/feed") == 0, "the short one removed");
+    n = pod_shows_load(dir, got, 8);
+    CHECK(n == 2 && !strcmp(got[1].url, "https://d.example/x?next=https://e.example/feed"),
+          "the longer address keeps its line: %d [%s]", n, n > 1 ? got[1].url : "");
+    CHECK(pod_shows_remove(dir, "https://c.example/feed") == 0, "the one named by its address removed");
+    n = pod_shows_load(dir, got, 8);
+    CHECK(n == 1 && !strcmp(got[0].title, "Longer"), "its line gone: %d [%s]", n, n ? got[0].title : "");
+    char *left = NULL;
+    size_t cap = 0;
+    w = fopen(path, "r");
+    CHECK(w && getline(&left, &cap, w) > 0 && !strcmp(left, "# mine\n"), "the note kept");
+    if (w) fclose(w);
+    free(left);
 }
 
 /* An MP3 with chapters in its ID3 tag (CHAP frames, as podcast tools write

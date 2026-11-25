@@ -83,6 +83,12 @@ static FLAC__StreamDecoderWriteStatus flac_write(const FLAC__StreamDecoder *dec,
     (void)dec;
     decoder_t *d = client;
     unsigned ch = frame->header.channels, n = frame->header.blocksize;
+    /* A frame that isn't what the file's header said (its channels above
+     * all: the buffer is sized by the frame's count when it grows, and read
+     * out by the header's): damage, or a file made to do harm. The track
+     * ends there. */
+    if (!ch || ch != d->fmt.channels || !frame->header.bits_per_sample || frame->header.bits_per_sample > 32)
+        return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
     unsigned shift = 32 - frame->header.bits_per_sample;
     if ((long)n > d->buf_cap) {
         int32_t *nb = realloc(d->buf, (size_t)n * ch * sizeof *nb);
@@ -378,6 +384,12 @@ static int open_ff(decoder_t *d, const char *path, int hls)
     }
     LAT("decoder: opening %s", path);
     ff_mem_guard();                    /* (a file can't ask for more memory than there is) */
+    /* No pictures: a song's cover (megabytes, in some) was read each time
+     * the song was opened to be played, which took longer than the sound
+     * queued for the change of song lasts (dropouts, on the H2). */
+    if (!d->fc) d->fc = avformat_alloc_context();
+    if (!d->fc) { av_dict_free(&opt); return -1; }
+    d->fc->flags |= FATHOM_AVFMT_NO_PICTURES;
     int r = avformat_open_input(&d->fc, path, ifmt, &opt);
     av_dict_free(&opt);
     LAT("decoder: open_input %d (%s)", r, d->fc && d->fc->iformat ? d->fc->iformat->name : "-");
@@ -808,13 +820,19 @@ decoder_t *decoder_open(const char *path, audio_format_t *fmt)
     return decoder_open_ex(path, fmt, NULL);
 }
 
+static int g_test_open_delay_ms;
+void decoder_test_open_delay(int ms) { g_test_open_delay_ms = ms; }
+
 decoder_t *decoder_open_ex(const char *path, audio_format_t *fmt, const volatile int *abort)
 {
+    /* (a test's slow connection: given up when *abort is set, as a real one) */
+    for (int t = 0; t < g_test_open_delay_ms && !(abort && *abort); t += 10) usleep(10000);
     return decoder_open_any(path, fmt, abort, 0);
 }
 
 decoder_t *decoder_open_flags(const char *path, audio_format_t *fmt, unsigned flags)
 {
+    if (g_test_open_delay_ms) usleep((useconds_t)g_test_open_delay_ms * 1000);   /* (a test's slow file) */
     return decoder_open_any(path, fmt, NULL, flags);
 }
 

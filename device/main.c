@@ -1581,8 +1581,18 @@ static void net_poll(lv_timer_t *t)
 
 static int g_update_asked;          /* a check from the screen: what it finds is seen there */
 
+/* An install cut short by the battery going is the one that can leave the
+ * card's files half moved (finished at the next start, but a cut inside one
+ * of the card's writes can damage a file).
+ * It takes seconds, and then a restart: not below this, unless on power. */
+#define UPDATE_MIN_BATTERY 15       /* % */
+
 static void hook_update_do(int what)
 {
+    if (what == UI_UPD_INSTALL && !g_charging && g_bat_pct >= 0 && g_bat_pct < UPDATE_MIN_BATTERY) {
+        ui_toast("Charge the H2 to 15 % or plug it in first", 3000);   /* (the update stays ready) */
+        return;
+    }
     if (what == UI_UPD_CHECK && !wifi_connected() && !getenv("http_proxy")) {
         updater_refuse(!wifi_on() ? "Wi-Fi is off: Settings > Wi-Fi" : "Not connected yet: Settings > Wi-Fi");
         return;
@@ -1660,7 +1670,8 @@ static void boot_markers(void)
     snprintf(p, sizeof p, CARD_DIR "/fathom/boot-fell-back");
     if (!access(p, F_OK)) {
         fprintf(stderr, "update: the new system didn't start twice: h2boot went back to the one before\n");
-        ui_toast("The update didn't start, so the H2 went back to the previous version", 6000);
+        /* (only the kernel and its Wi-Fi modules went back: the player is the new one) */
+        ui_toast("The new system didn't start, so the H2 kept the one before. Fathom itself is up to date.", 8000);
         unlink(p);
     }
 }
@@ -2402,6 +2413,7 @@ static void free_space_warm(void)
 static pthread_mutex_t g_bg_mu = PTHREAD_MUTEX_INITIALIZER;
 static ui_scan_t g_bg;
 static int g_rescan_asked;   /* (Rescan: its end says so even when nothing changed) */
+static int g_scan_retry;     /* (Rescan: the scan it starts reads again the files none could read) */
 static int g_scan_covers;    /* the background scan made covers: the screen shows them */
 static int g_scan_check;     /* the next background scan checks the database first (the last stop wasn't clean) */
 static volatile int g_db_damaged;   /* ...and found it damaged */
@@ -2410,7 +2422,17 @@ static void bg_progress(int done, int total, const char *path, void *ctx)
     (void)ctx;
     if (path && !strcmp(path, "done")) return;
     pthread_mutex_lock(&g_bg_mu);
-    if (path && (!strcmp(path, "albums") || !strcmp(path, "indexes"))) {
+    if (path && (!strcmp(path, "looking") || !strcmp(path, "checking"))) {
+        g_bg.step = UI_SCAN_LOOKING;               /* (total -1: files looked up, not songs found) */
+        g_bg.done = done;
+        g_bg.total = path[0] == 'c' ? -1 : 0;
+        g_bg.file[0] = '\0';
+    } else if (path && (!strcmp(path, "sorting") || !strcmp(path, "working"))) {
+        g_bg.step = UI_SCAN_ALBUMS;                /* (total -1: at work, done only a number that goes up) */
+        g_bg.done = done;
+        g_bg.total = path[0] == 'w' ? -1 : total;
+        g_bg.file[0] = '\0';
+    } else if (path && (!strcmp(path, "albums") || !strcmp(path, "indexes"))) {
         g_bg.step = UI_SCAN_ALBUMS;
         g_bg.done = g_bg.total = 0;
         g_bg.file[0] = '\0';
@@ -2463,6 +2485,8 @@ static void *scan_thread(void *arg)
             return NULL;
         }
     }
+    if (g_scan_lib && g_scan_retry) library_scan_retry_unread(g_scan_lib, 1);
+    g_scan_retry = 0;
     g_scan_result = g_scan_lib ? library_scan(g_scan_lib, g_music, bg_progress, NULL) : -1;
     g_scan_changes = g_scan_lib && g_scan_result >= 0 ? library_scan_changes(g_scan_lib) : 0;
     g_scan_state = 2;
@@ -2588,6 +2612,40 @@ static int rg_measure(const char *path, lib_rg_t *rg)
     return 0;
 }
 
+/* One song levelled, as rg_thread does it: from its tags if it has them
+ * since the last scan (tagged: 1), else measured. 0, 1 stopped half way
+ * (g_rg_stop), -1 it couldn't be. */
+static int rg_one(const char *path, lib_rg_t *rg, int *tagged)
+{
+    tags_t t;
+    *tagged = 0;
+    if (tags_read(path, &t) == 0 && t.has_rg_track) {
+        *rg = (lib_rg_t){1, t.rg_track_gain, t.rg_track_peak, t.has_rg_album, t.rg_album_gain, t.rg_album_peak};
+        *tagged = 1;
+        return 0;
+    }
+    return rg_measure(path, rg);
+}
+
+/* The same done by the player's helper (library/reader.h), which is what a
+ * song that crashes the decoder or wants more memory than there is takes
+ * with it: the last work on files of unknown kind that the player still did
+ * itself. RD_LEVEL's answer. */
+#define RD_LEVEL LIBRARY_READER_OPS_END
+#define RG_HELPER_MS (30 * 60 * 1000)        /* (an hour-long file is some minutes of decoding) */
+typedef struct { lib_rg_t rg; int tagged, rc; } rg_reply_t;
+
+static int player_reader_do(int op, const char *path, unsigned char **out, size_t *len)
+{
+    if (op != RD_LEVEL) return library_reader_do(op, path, out, len);
+    rg_reply_t *r = calloc(1, sizeof *r);
+    if (!r) return -1;
+    r->rc = rg_one(path, &r->rg, &r->tagged);
+    *out = (unsigned char *)r;
+    *len = sizeof *r;
+    return 0;
+}
+
 static void *rg_thread(void *arg)
 {
     (void)arg;
@@ -2608,19 +2666,43 @@ static void *rg_thread(void *arg)
     int trying = -1;
     while (!g_rg_stop && library_rg_next(g_rg_lib, &id, path, sizeof path) == 0) {
         lib_rg_t rg = {0};
-        tags_t t;
         char note[32];
         snprintf(note, sizeof note, "%lld", (long long)id);
         library_trying("level", &trying, note);
-        if (tags_read(path, &t) == 0 && t.has_rg_track) {    /* tagged since the last scan */
-            rg = (lib_rg_t){1, t.rg_track_gain, t.rg_track_peak, t.has_rg_album, t.rg_album_gain, t.rg_album_peak};
-            tagged++;
-        } else {
-            int r = rg_measure(path, &rg);
-            if (r > 0) break;                            /* stopped half way */
-            if (r < 0) rg.state = 3;
-            else measured++;
+        int was_tagged = 0, r = -2;
+        if (reader_on()) {
+            /* by the helper; not while memory is short (a failure then would
+             * say nothing about the song, and it would be left unmeasured
+             * for good): a few seconds, and looked at again */
+            int is_short = 0, st = -1;
+            long budget = library_reader_budget(&is_short);
+            if (is_short) {
+                for (int k = 0; k < 25 && !g_rg_stop; k++) usleep(200 * 1000);
+                continue;
+            }
+            unsigned char *b = NULL;
+            size_t n = 0;
+            int c = reader_call_long(RD_LEVEL, path, budget, RG_HELPER_MS, &g_rg_stop, &st, &b, &n);
+            if (c == READER_STOPPED) { free(b); break; }
+            if (c == READER_DIED) {
+                fprintf(stderr, "levelling: the reader stopped on %s: left unmeasured\n", path);
+                r = -1;
+            } else if (c == 0) {
+                if (st == 0 && n == sizeof(rg_reply_t)) {
+                    rg_reply_t a;
+                    memcpy(&a, b, sizeof a);
+                    rg = a.rg;
+                    was_tagged = a.tagged;
+                    r = a.rc;
+                } else r = -1;
+            }
+            free(b);
         }
+        if (r == -2) r = rg_one(path, &rg, &was_tagged);     /* (no helper: here, as before) */
+        if (r > 0) break;                                /* stopped half way */
+        if (r < 0) rg = (lib_rg_t){.state = 3};
+        else if (was_tagged) tagged++;
+        else measured++;
         library_rg_store(g_rg_lib, id, &rg);
         if ((measured + tagged) % 50 == 0) {
             clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -2629,6 +2711,10 @@ static void *rg_thread(void *arg)
         }
     }
     library_trying_done("level", &trying);
+    /* (the helper and its memory given back, as at a scan's end: it stayed
+     * until the next scan otherwise, started from this thread's low
+     * priority. Not one a scan has just taken over.) */
+    reader_close_nowait();
     clock_gettime(CLOCK_MONOTONIC, &t1);
     fprintf(stderr, "levelling: %d measured, %d from tags in %.0f s\n", measured, tagged,
             (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
@@ -2694,6 +2780,7 @@ static void rescan(void)
         pthread_mutex_lock(&g_bg_mu);
         memset(&g_bg, 0, sizeof g_bg);               /* (no last scan's numbers for a moment) */
         pthread_mutex_unlock(&g_bg_mu);
+        g_scan_retry = 1;                            /* (asked for: the files left out get another try) */
         scan_start();
     }
     g_rescan_asked = 1;
@@ -2898,7 +2985,7 @@ static void polls(lv_timer_t *t)
  * Each step named, how far, and once it can tell (10 s in, 2 % done), about how
  * long that step has left; and that only the first scan takes this long. */
 
-typedef struct { lv_obj_t *step, *count, *left, *path; uint32_t last, t0, left_at; int covers; } scan_ui_t;
+typedef struct { lv_obj_t *step, *count, *left, *path; uint32_t last, t0, left_at; int covers, sorting; } scan_ui_t;
 
 /* Power held on one of the screens that come before the player proper (the
  * first scan, a library being brought up to date, one that can't be opened):
@@ -2959,8 +3046,39 @@ static void scan_progress(int done, int total, const char *path, void *ctx)
     scan_ui_t *s = ctx;
     early_keys();                                        /* (Power held: the scan stops) */
     if (path && !strcmp(path, "done")) return;           /* (the screen goes) */
+    if (path && (!strcmp(path, "looking") || !strcmp(path, "checking"))) {   /* the folder being listed: how many so far */
+        char n[16], t[64];
+        snprintf(n, sizeof n, "%d", done);
+        tr_fill(t, sizeof t, path[0] == 'c' ? "%s songs checked" : "%s songs found", n, NULL);
+        lv_label_set_text(s->step, tr("Looking for music"));
+        lv_label_set_text(s->count, t);
+        lv_label_set_text(s->left, "");
+        lv_label_set_text(s->path, "");
+        s->covers = -1;                                  /* (the songs' step says its own name when it comes) */
+        lv_refr_now(NULL);
+        if (g_shot) { g_shot = 0; screen_shot(); }
+        return;
+    }
+    if (path && (!strcmp(path, "sorting") || !strcmp(path, "working"))) {   /* that step, at work */
+        char a[16], b[16], t[64];
+        snprintf(a, sizeof a, "%d", done);
+        snprintf(b, sizeof b, "%d", total);
+        if (path[0] == 's') tr_fill(t, sizeof t, "%s of %s songs", a, b);
+        else snprintf(t, sizeof t, "%s%s", tr("Working"), &"..."[2 - done % 3]);
+        if (!s->sorting) {                               /* (a first scan groups as it reads: this step wasn't named yet) */
+            s->sorting = 1;
+            lv_label_set_text(s->step, tr("Sorting albums and artists"));
+            lv_label_set_text(s->left, "");
+            lv_label_set_text(s->path, "");
+        }
+        lv_label_set_text(s->count, t);
+        lv_refr_now(NULL);
+        if (g_shot) { g_shot = 0; screen_shot(); }
+        return;
+    }
     if (path && (!strcmp(path, "albums") || !strcmp(path, "indexes"))) {   /* no count: steps of their own */
         lv_label_set_text(s->step, tr(path[0] == 'a' ? "Sorting albums and artists" : "Getting your lists ready"));
+        s->sorting = 1;
         lv_label_set_text(s->count, "");
         lv_label_set_text(s->left, "");
         lv_label_set_text(s->path, "");
@@ -3231,7 +3349,7 @@ int main(int argc, char **argv)
          * same limits as its own readers (below). */
         tags_set_exact_mp3_length(0);
         tags_set_max_picture(FATHOM_ART_MAX_FILE);
-        return library_reader_main();
+        return reader_serve(player_reader_do);
     }
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--music") && i + 1 < argc) music = argv[++i];

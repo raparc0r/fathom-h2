@@ -56,6 +56,10 @@
 #define EQG_RANGE 12.0
 #define EQG_PTS 100
 #define ABOUT_MAX  16           /* Settings > About: the device's rows at most */
+/* A row's value at its right, and what follows a name on its line (an album's
+ * artist, the song after "Now playing"): 16 px in Atkinson, where meta is 15
+ * (the owner, 2026-11-25); meta itself in the pixel families and a theme's own font. */
+#define VALUE_FONT (S.f->value ? S.f->value : S.f->meta)
 #define STEP       4            /* stepped-corner notch and hard-shadow offset (Pixel Pastel) */
 #define SEGMENTS   24
 
@@ -422,6 +426,11 @@ static struct {
      * query; the countries; how the last request for the list went; the
      * station a context menu is for */
     int rd_job, rd_job_depth;
+    /* Where the station on air was started from: a list of the directory still
+     * open (its level's depth: Next and Previous go through that list), such
+     * a list since left with the station not one of the user's (-1: it plays
+     * alone, no Next), or anything else (0: the user's stations, Random). */
+    int radio_from;
     int rd_state;           /* RD_IDLE, RD_FAILED (rd_msg says why) */
     char rd_msg[96];
     rdir_query_t rd_q;
@@ -1789,7 +1798,7 @@ static void bat_meta(const char *main, char *meta, size_t tn, const char *const 
     lv_text_get_size(&a, tr(main), S.f->body, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
     int i = 0;
     for (; alts[i + 1]; i++) {
-        lv_text_get_size(&b, alts[i], S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        lv_text_get_size(&b, alts[i], VALUE_FONT, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
         if (a.x + b.x <= room) break;
     }
     snprintf(meta, tn, "%s", alts[i]);
@@ -3059,16 +3068,16 @@ static void apply_theme(void)
         lv_obj_set_style_radius(S.row_dot[r], LV_RADIUS_CIRCLE, 0);
         fill(S.row_dot[r], t->signal);
         style_label(S.row_lbl[r], S.f->body, t->text);
-        style_label(S.row_meta[r], S.f->meta, t->text_muted);
+        style_label(S.row_meta[r], VALUE_FONT, t->text_muted);
         style_label(S.row_lt[r], S.f->body, t->text);
-        style_label(S.row_la[r], S.f->meta, t->text_muted);
+        style_label(S.row_la[r], VALUE_FONT, t->text_muted);
         /* one line each (cut with "...", never wrapped), on one baseline */
-        int lt = lv_font_get_line_height(S.f->body), la = lv_font_get_line_height(S.f->meta);
+        int lt = lv_font_get_line_height(S.f->body), la = lv_font_get_line_height(VALUE_FONT);
         int yt = (ROW_H - lt) / 2, base = yt + lt - S.f->body->base_line;
         lv_obj_set_height(S.row_lt[r], lt);
         lv_obj_set_height(S.row_la[r], la);
         lv_obj_set_y(S.row_lt[r], yt);
-        lv_obj_set_y(S.row_la[r], base - (la - S.f->meta->base_line));
+        lv_obj_set_y(S.row_la[r], base - (la - VALUE_FONT->base_line));
         S.line_on[r] = 0;          /* (laid out again with the new fonts) */
         style_label(S.row_icon[r], S.f->icon ? S.f->icon : S.f->body, t->text_muted);
         for (int w = 0; w < 3; w++) style_label(S.row_ch[r][w], w == 1 ? S.f->title : S.f->meta, t->text_muted);
@@ -3602,7 +3611,7 @@ static void set_x_if(lv_obj_t *o, int x)
 static void line_layout(int j)
 {
     int bw = line_width(j), tw = S.line_tw[j], aw = S.line_aw[j];
-    int min_a = lv_font_get_line_height(S.f->meta) * 2;   /* less room than this: no artist */
+    int min_a = lv_font_get_line_height(VALUE_FONT) * 2;   /* less room than this: no artist */
     set_x_if(S.row_lt[j], 0);
     if (tw + LINE_GAP + aw <= bw) {                          /* both in full */
         set_width_if(S.row_lt[j], tw);
@@ -3712,7 +3721,7 @@ static void fill_slots(const level_t *l, int n)
     int arrow_w = 0;                               /* the arrow's column on this page (0: none) */
     if (arrow_page(l, n)) {
         lv_point_t az;
-        lv_text_get_size(&az, " \xE2\x80\xBA", S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        lv_text_get_size(&az, " \xE2\x80\xBA", VALUE_FONT, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
         arrow_w = az.x;
     }
     for (int j = 0; j < SLOTS; j++) {
@@ -3883,7 +3892,7 @@ static void fill_slots(const level_t *l, int n)
         int meta_w = 0;
         lv_point_t sz = {0, 0};
         if (meta[0] && !typing) {
-            lv_text_get_size(&sz, meta, S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+            lv_text_get_size(&sz, meta, VALUE_FONT, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
             if (sz.x + 18 > meta_w) meta_w = sz.x + 18;
             if (sz.x + 18 + meta_in > meta_w) meta_w = sz.x + 18 + meta_in;
         }
@@ -3921,6 +3930,15 @@ static void fill_slots(const level_t *l, int n)
             after = by;
             line = 1;
         }
+        /* About: a value that leaves the row's name no room (a wide font:
+         * Pixel Pastel showed "Ve..." beside a version, "..." beside the
+         * clock). The name in full and the value after it on one line, cut
+         * at its end; the selected row scrolls, as an album's does. */
+        if (!line && !typing && l->kind == L_ABOUT && meta[0] && !S.slot_mark[j]) {
+            lv_point_t nz;
+            lv_text_get_size(&nz, main, S.f->body, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+            if (nz.x > UI_W - 2 * ROW_MARGIN - x - meta_w) line = 1;
+        }
         S.line_on[j] = line;
         show(S.row_line[j], line);
         show(S.row_lbl[j], !line);
@@ -3933,7 +3951,7 @@ static void fill_slots(const level_t *l, int n)
             if (!same || !lv_anim_get(S.row_line[j], line_scroll_cb)) {   /* (a scrolling one left to scroll) */
                 lv_point_t tz, az = {0, 0};
                 lv_text_get_size(&tz, main, S.f->body, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-                if (after[0]) lv_text_get_size(&az, after, S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+                if (after[0]) lv_text_get_size(&az, after, VALUE_FONT, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
                 S.line_tw[j] = tz.x;
                 S.line_aw[j] = az.x;
                 set_pos_width(S.row_line[j], x, 0, lw);
@@ -4734,6 +4752,11 @@ static void scan_overlay_update(void)
     snprintf(b, sizeof b, "%d", p.total);
     int counted = (p.step == UI_SCAN_SONGS || p.step == UI_SCAN_COVERS) && p.total > 0 && p.done <= p.total;
     if (counted) tr_fill(t, sizeof t, p.step == UI_SCAN_COVERS ? "%s of %s albums" : "%s of %s songs", a, b);
+    /* albums and artists: the songs it goes through, then the database's own work (a word, its dots moving) */
+    else if (p.step == UI_SCAN_ALBUMS && p.total > 0 && p.done <= p.total) tr_fill(t, sizeof t, "%s of %s songs", a, b);
+    else if (p.step == UI_SCAN_ALBUMS && p.total < 0) snprintf(t, sizeof t, "%s%s", tr("Working"), &"..."[2 - p.done % 3]);
+    /* the folder being listed: how many so far (then, for files it looks up one by one, how many of those) */
+    else if (p.step == UI_SCAN_LOOKING && p.done > 0) tr_fill(t, sizeof t, p.total < 0 ? "%s songs checked" : "%s songs found", a, NULL);
     lv_label_set_text(S.scan_count, t);
     /* about how long this step has left, once it can tell (10 s in, 2 % done) */
     uint32_t el = now - S.scan_t0;
@@ -5157,6 +5180,9 @@ static void toast_show(const char *text, int ms, const lv_font_t *font)
     lv_obj_set_width(S.toast_lbl, sz.x > maxw ? maxw : LV_SIZE_CONTENT);
     lv_label_set_text(S.toast_lbl, text);
     lv_obj_remove_flag(S.toast, LV_OBJ_FLAG_HIDDEN);
+    /* (over the update's screen, which is on the same layer and made after it:
+     * "Charge the H2 to 15 %" at Install was drawn underneath) */
+    if (S.upd_ov) lv_obj_move_foreground(S.toast);
     lv_obj_align(S.toast, LV_ALIGN_BOTTOM_MID, 0, -16);
     if (S.toast_timer) lv_timer_reset(S.toast_timer);
     else {
@@ -5212,10 +5238,10 @@ static const char *setting_help(setting_t st)
     case ST_POD_CLEAN: return "A played episode's download is deleted after this long.";
     case ST_POD_SPEED: return "Episodes faster, without the voices going up. Music always plays as it is.";
     case ST_SLEEP: return "Stops the music after a set time or at the end of the album.";
-    case ST_RESCAN: return "Read the music folder again, showing how far it has got. <Back> lets it carry on while you listen.";
+    case ST_RESCAN: return "Read the music folder again, showing how far it has got. Files not read before are tried again. <Back> lets it carry on while you listen.";
     case ST_FIND_COVERS: return "Finds covers online for albums without one. Keeps only sure matches.";
     case ST_N_SONGS: case ST_N_ALBUMS: case ST_N_ARTISTS: case ST_N_PLAYLISTS: return "Library counts.";
-    case ST_N_UNREAD: return "Music files Fathom couldn't read: damaged, or ones that stopped it. They aren't in the library.";
+    case ST_N_UNREAD: return "Music files Fathom couldn't read: damaged, or ones that stopped it. They aren't in the library. Rescan tries them again.";
     case ST_USB_COMPUTER: return "What to do when plugged into a computer.";
     case ST_USB_DRIVE: return "Use the H2 as a USB drive, to copy music.";
     default: return NULL;
@@ -5593,8 +5619,13 @@ static void push_artist(int64_t id, const char *name)
 /* Asked only when a list is opened, a search is made or Random station is
  * chosen; the answers come in on ui_tick (rd_poll). */
 
+static void radio_list_left(void);
+
+/* The open list's stations go (its level closed, or another search asked in
+ * it): a station on air that was started from them has lost its list. */
 static void rd_free_list(void)
 {
+    if (S.radio_from > 0) radio_list_left();
     free(S.rd_st);
     free(S.rd_meta);
     S.rd_st = NULL;
@@ -5676,6 +5707,7 @@ static void rd_play(const radio_station_t *st, const rdir_meta_t *meta, int n, i
     if (!rd_ready(why, sizeof why)) { if (!wifi_ask_if_off(WT_OK)) ui_toast(why, 2500); return; }
     if (rd_on_air(&st[i])) { S.now_playing_view = 1; return; }
     player_radio_play(S.player, st, n, i);
+    S.radio_from = S.depth;                    /* (the list's level is the one on top) */
     if (meta) rdir_count_click(meta[i].uuid);
     S.now_playing_view = 1;
 }
@@ -5707,6 +5739,7 @@ static void rd_random_done(rdir_result_t *r)
 {
     if (r->n > 0) {
         player_radio_play(S.player, r->st, r->n, 0);
+        S.radio_from = 0;
         rdir_count_click(r->meta[0].uuid);
         rd_to_np();
         return;
@@ -5727,6 +5760,7 @@ static void rd_random_done(rdir_result_t *r)
         mix[j] = t;
     }
     player_radio_play(S.player, mix, S.radio_n, 0);
+    S.radio_from = 0;
     free(mix);
     ui_toast(netclock_why("Couldn't reach the directory: one of your stations"), 3000);
     rd_to_np();
@@ -5774,6 +5808,35 @@ static int rd_poll(void)
     }
     render(R_ANIMATE);
     return 0;
+}
+
+/* The station on air is one of the user's (as last read from the card): Next
+ * and Previous go through theirs from it. 1 if it is. */
+static int radio_to_yours(void)
+{
+    const radio_station_t *cur = S.player ? player_radio_station(S.player) : NULL;
+    for (int i = 0; cur && i < S.radio_n; i++)
+        if (!strcmp(S.radio[i].url, cur->url)) {
+            player_radio_relist(S.player, S.radio, S.radio_n, i);
+            return 1;
+        }
+    return 0;
+}
+
+/* The list of the directory a station was started from has been left (Back
+ * out of it, or another search typed in its place: rd_free_list; the screen
+ * going dark, or Now Playing over it, isn't that). Next
+ * and Previous went on through a search no longer there to be seen: now the
+ * user's own stations if the one on air is theirs, and else nothing, the
+ * station playing on by itself (the owner's rule, 2026-11-25). */
+static void radio_list_left(void)
+{
+    S.radio_from = 0;
+    const radio_station_t *cur = S.player ? player_radio_station(S.player) : NULL;
+    if (!cur || radio_to_yours()) return;
+    radio_station_t one = *cur;
+    player_radio_relist(S.player, &one, 1, 0);
+    S.radio_from = -1;
 }
 
 /* Close the top level. If it was opened from Now Playing, go back there
@@ -6835,6 +6898,8 @@ static void run_context(ctx_action_t a)
         ui_toast(r == 1 ? "Added to your stations" : r == 0 ? "Already in your stations"
                  : r == -2 ? "Your stations are full: remove one first" : "Couldn't save fathom/radio.txt", 2000);
         radio_read();
+        /* (the one playing by itself, its search left: one of theirs from now) */
+        if (S.radio_from == -1 && radio_to_yours()) S.radio_from = 0;
         break;
     }
     case CTX_RADIO_REMOVE: {
@@ -7441,6 +7506,7 @@ static void open_selected(void)
         }
         if (rd_on_air(&S.radio[i])) { S.now_playing_view = 1; break; }
         player_radio_play(S.player, S.radio, S.radio_n, i);
+        S.radio_from = 0;
         S.now_playing_view = 1;
         break;
     }

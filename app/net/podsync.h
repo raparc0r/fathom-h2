@@ -32,6 +32,8 @@ typedef int64_t (*podsync_download_fn)(const char *url, const char *path, http_p
                                        const volatile int *abort);
 void podsync_set_fetch(podsync_fetch_fn fn);
 void podsync_set_download(podsync_download_fn fn);
+/* The waits before a second and a third try (2 s and 5 s; the tests': 0). */
+void podsync_set_retry_waits(int first_ms, int second_ms);
 
 /* Start the worker for the podcasts in dir (fathom/podcasts). 0, -1. */
 int  podsync_start(const char *dir);

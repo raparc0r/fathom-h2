@@ -32,7 +32,8 @@ struct player {
     int     *order;        /* play order: indices into ctx */
     int      n_order, cap_order;
     int      pos;          /* index into order */
-    int      user_end;     /* order positions pos+1 .. user_end-1 were queued by hand */
+    int      user_start;   /* order positions user_start .. user_end-1 were queued by hand and */
+    int      user_end;     /*   are still to come (none: both pos+1); only user_end is saved */
     int      shuffle;
     repeat_t repeat;
     int      stop_after;
@@ -73,6 +74,8 @@ struct player {
     int      radio;        /* on: the engine plays rst[ri] */
     radio_station_t *rst;
     int      rn, ri;
+    int64_t  r_eid;        /* the engine's id for the station it was last asked to play (its place in
+                            * the list then: the list can change under it, player_radio_relist) */
     int      r_want;       /* it should be playing (reconnect if it stops) */
     int      r_tries;      /* reconnects since it last played steadily */
     int      r_heard;      /* it has played since it was asked for: a drop gets all the tries (else: RADIO_TRIES_NEW) */
@@ -347,10 +350,23 @@ static void warm_next(player_t *p, const eng_status_t *st)
     warm_file(next, level == 2 ? WARM_END_BYTES : WARM_START_BYTES);
 }
 
+/* The songs queued by hand, after the place moved or the order changed: the
+ * ones played aren't to come any more, and with none left "Add to queue" is
+ * right after the current song again. (user_end was only ever raised: after
+ * Previous, or repeat all starting the queue over, it stayed where the
+ * player had been, and a song added to the queue went there, any number of
+ * songs away.) */
+static void user_norm(player_t *p)
+{
+    int next = p->pos + 1;
+    if (p->user_start < next) p->user_start = next;
+    if (p->user_end <= p->user_start) p->user_start = p->user_end = next;
+}
+
 static void set_pos(player_t *p, int order_pos)
 {
     p->pos = order_pos;
-    if (p->user_end < p->pos + 1) p->user_end = p->pos + 1;
+    user_norm(p);
 }
 
 /* Leaving a long file: keep its position for next time. */
@@ -428,7 +444,7 @@ void player_play(player_t *p, const int64_t *ids, int n, int start)
     p->all_pending = 0;
     set_ctx(p, ids, n);
     build_order(p, p->shuffle ? start : -1, NULL, 0);
-    p->user_end = 0;
+    p->user_start = p->user_end = 0;
     start_at(p, p->shuffle ? 0 : start);   /* shuffled: the chosen track is first */
 }
 
@@ -439,7 +455,7 @@ void player_cue(player_t *p, const int64_t *ids, int n, int start)
     if (p->pod) { engine_stop(p->eng); pod_leave(p); }
     set_ctx(p, ids, n);
     build_order(p, p->shuffle ? start : -1, NULL, 0);
-    p->user_end = 0;
+    p->user_start = p->user_end = 0;
     set_pos(p, p->shuffle ? 0 : start);
     if (library_track(p->lib, id_at(p, p->pos), &p->cur) == 0) {
         p->have_cur = 1;
@@ -517,7 +533,7 @@ static void shuffle_all_rest(player_t *p)
         build_order(p, 0, NULL, 0);
     }
     p->pos = 0;
-    p->user_end = 0;
+    p->user_start = p->user_end = 0;
     p->seq++;
     queue_next(p);
 }
@@ -531,7 +547,7 @@ void player_shuffle_all(player_t *p)
         set_ctx(p, &first, 1);
         build_order(p, 0, NULL, 0);
         if (p->n_order == 1) {
-            p->user_end = 0;
+            p->user_start = p->user_end = 0;
             start_at(p, 0);
             p->all_pending = 1;
             return;
@@ -543,7 +559,7 @@ void player_shuffle_all(player_t *p)
     set_ctx(p, l.ids, l.n);
     library_list_free(&l);
     build_order(p, -1, NULL, 0);
-    p->user_end = 0;
+    p->user_start = p->user_end = 0;
     start_at(p, 0);
 }
 
@@ -561,7 +577,7 @@ int player_shuffle_these(player_t *p, const int64_t *ids, int n, int songs)
         build_order(p, -1, NULL, 0);
     }
     if (p->n_order == 0) return 0;
-    p->user_end = 0;
+    p->user_start = p->user_end = 0;
     start_at(p, 0);
     return p->n_order;
 }
@@ -665,7 +681,7 @@ static int new_cycle(player_t *p)
     for (int i = p->n_order - SEAM < 0 ? 0 : p->n_order - SEAM; i < p->n_order; i++)
         tail[tn++] = (uint32_t)id_at(p, i);
     build_order(p, -1, tail, tn);
-    p->user_end = 0;
+    p->user_start = p->user_end = 0;
     return 0;
 }
 
@@ -690,6 +706,10 @@ static int skip_how(player_t *p)
  * "Stopped", and Play had to follow: seen on the H2, 2026-11-24). */
 static void radio_skip(player_t *p, int by)
 {
+    /* The only one (a station from a search that has been left, a list of
+     * one): nothing to go to. It was connected again, a break in the sound
+     * for nothing. One that was given up is still tried again. */
+    if (p->rn == 1 && !p->r_failed) return;
     int i = (p->ri + p->rn + by) % p->rn;
     if (p->r_want || p->r_failed) { radio_station(p, i); return; }
     p->ri = i;
@@ -726,7 +746,10 @@ void player_prev(player_t *p)
     int how = skip_how(p);
     eng_status_t st;
     engine_status(p->eng, &st);
-    uint32_t in = how == GO_CUE ? p->resume_ms : st.pos_ms;
+    /* (a track still being opened, just after Next: where it will start, not
+     * where the one before it had got to, which read as "well into this one:
+     * back to its top") */
+    uint32_t in = how == GO_CUE ? p->resume_ms : st.starting ? st.start_ms : st.pos_ms;
     if (in > RESTART_MS || p->pos == 0) go_to(p, p->pos, 0, 0, how);   /* restart: from the top */
     else go_to(p, p->pos - 1, 1, 0, how);
 }
@@ -736,6 +759,7 @@ void player_seek_by(player_t *p, int delta_ms)
     eng_status_t st;
     engine_status(p->eng, &st);
     if (st.state == ENG_STOPPED || !st.len_ms || p->radio || (p->pod && st.stream)) return;
+    if (st.starting) return;            /* (the position and length are still the last track's: no jump worked out from those) */
     int64_t to = (int64_t)st.pos_ms + delta_ms;
     if (to < 0) to = 0;
     if (to > (int64_t)st.len_ms - 500) to = (int64_t)st.len_ms - 500;
@@ -762,7 +786,7 @@ void player_set_shuffle(player_t *p, int on)
     if (!on)
         for (int i = 0; i < p->n_order; i++)
             if (p->order[i] == cur_ctx) { p->pos = i; break; }
-    p->user_end = p->pos + 1;   /* what was queued by hand is now part of the order */
+    p->user_start = p->user_end = p->pos + 1;   /* what was queued by hand is now part of the order */
     queue_next(p);
 }
 
@@ -836,7 +860,9 @@ void player_play_next(player_t *p, const int64_t *ids, int n)
     shuffle_all_rest(p);
     if (start_queue_if_empty(p, ids, n)) return;
     catch_up(p);                        /* (after what plays now) */
+    user_norm(p);
     if (insert_at(p, p->pos + 1, ids, n)) return;
+    p->user_start = p->pos + 1;         /* (with the ones queued before, wherever they are) */
     p->user_end += n;
     queue_next(p);
 }
@@ -846,6 +872,7 @@ void player_add_to_queue(player_t *p, const int64_t *ids, int n)
     shuffle_all_rest(p);
     if (start_queue_if_empty(p, ids, n)) return;
     catch_up(p);
+    user_norm(p);
     int at = p->user_end > p->pos + 1 ? p->user_end : p->pos + 1;
     if (at > p->n_order) at = p->n_order;
     if (insert_at(p, at, ids, n)) return;
@@ -882,6 +909,8 @@ void player_queue_remove(player_t *p, int i)
     memmove(&p->order[a], &p->order[a + 1], (size_t)(p->n_order - a - 1) * sizeof *p->order);
     p->n_order--;
     if (p->user_end > a) p->user_end--;
+    if (p->user_start > a) p->user_start--;
+    user_norm(p);
     queue_next(p);
 }
 
@@ -891,7 +920,7 @@ void player_queue_clear(player_t *p)
     if (!p->have_cur) return;
     catch_up(p);
     p->n_order = p->pos + 1;
-    p->user_end = p->pos + 1;
+    p->user_start = p->user_end = p->pos + 1;
     queue_next(p);
 }
 
@@ -1069,6 +1098,7 @@ int player_restore(player_t *p, const char *path)
     p->repeat = repeat >= REPEAT_OFF && repeat <= REPEAT_ONE ? (repeat_t)repeat : REPEAT_OFF;
     p->pos = pos;
     p->user_end = user_end;
+    p->user_start = pos + 1;
     p->cur = t;
     p->have_cur = 1;
     p->resume_ms = at;
@@ -1128,7 +1158,8 @@ static void radio_connect(player_t *p)
     p->r_retry_at = 0;
     p->r_since = mono_ms();
     p->own_start = 1;
-    engine_play(p->eng, s->url, -2 - p->ri);
+    p->r_eid = -2 - p->ri;
+    engine_play(p->eng, s->url, p->r_eid);
     p->seq++;
 }
 
@@ -1165,6 +1196,24 @@ void player_radio_play(player_t *p, const radio_station_t *st, int n, int i)
     p->rn = n;
     p->radio = 1;
     radio_station(p, i);
+}
+
+/* The list Next and Previous go through changes under the station that's on
+ * (the search it was found in has been left: the user's own stations if it is
+ * one of them, else that station alone). st[i] must be that station; nothing
+ * is stopped or connected again, and what's known of the song stays. */
+void player_radio_relist(player_t *p, const radio_station_t *st, int n, int i)
+{
+    if (!p->radio || !st || n <= 0 || n > RADIO_MAX || i < 0 || i >= n) return;
+    if (strcmp(st[i].url, p->rst[p->ri].url)) return;
+    radio_station_t *copy = malloc((size_t)n * sizeof *copy);
+    if (!copy) return;
+    memcpy(copy, st, (size_t)n * sizeof *copy);     /* (st may be in the list that goes) */
+    free(p->rst);
+    p->rst = copy;
+    p->rn = n;
+    p->ri = i;
+    p->seq++;
 }
 
 static void radio_leave(player_t *p)
@@ -1496,7 +1545,7 @@ void player_tick(player_t *p)
     if (p->radio) { radio_tick(p, &st); return; }
     if (p->pod) { pod_tick(p, &st); return; }
     if (st.starting) return;            /* (what it says is still about the last track) */
-    if (st.state == ENG_PLAYING) p->fails = 0;
+    if (st.state == ENG_PLAYING && st.pos_ms) p->fails = 0;   /* (something of it heard: a file with nothing in it "plays" too) */
     follow(p, &st);
     warm_next(p, &st);
     /* playback stopped by itself: once for each time */
@@ -1559,7 +1608,7 @@ void player_now(player_t *p, player_now_t *now)
     /* The engine's figures are for what it plays: not yet this item while it
      * starts, or another one (from a radio station to an album, the station's
      * time showed against the track's length until the album began). */
-    int64_t want = p->radio ? -2 - p->ri : p->pod ? POD_ENGINE_ID : p->cur.id;
+    int64_t want = p->radio ? p->r_eid : p->pod ? POD_ENGINE_ID : p->cur.id;
     int theirs = st.state != ENG_STOPPED && !st.starting && st.track_id == want;
     /* not started yet (or stopped): where it starts; an episode's own place, not the music's */
     uint32_t parked = st.starting && st.start_ms ? st.start_ms : p->pod ? p->ep_pos : p->resume_ms;

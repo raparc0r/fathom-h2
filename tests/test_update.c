@@ -155,7 +155,7 @@ static void hex_of(const void *data, size_t n, char hex[65])
 }
 
 /* A release as make-release.sh lays it out. What can go wrong with it: */
-enum { Z_GOOD, Z_BAD_HASH, Z_UNLISTED, Z_MISSING, Z_BAD_CRC, Z_ESCAPE, Z_NO_KERNEL };
+enum { Z_GOOD, Z_BAD_HASH, Z_UNLISTED, Z_MISSING, Z_BAD_CRC, Z_ESCAPE, Z_NO_KERNEL, Z_EMPTY_SUMS };
 
 static unsigned char g_big[300000];     /* "the player": several inflate rounds */
 
@@ -191,6 +191,7 @@ static void make_release(const char *path, const char *kernel, int how)
         zip_add(name, f[i].data, f[i].n, how == Z_BAD_CRC && i == 3);
     }
     if (how == Z_ESCAPE) zip_add("fathom-h2-0.8.0/sd/../../evil", "x", 1, 0);
+    if (how == Z_EMPTY_SUMS) sums[0] = '\0';         /* (the file there, with nothing in it) */
     zip_add("fathom-h2-0.8.0/about/SHA256SUMS", sums, strlen(sums), 0);
     zip_end();
 }
@@ -447,9 +448,9 @@ static void test_stage_and_install(void)
 
 static void test_damaged(void)
 {
-    static const int kinds[] = {Z_BAD_HASH, Z_UNLISTED, Z_MISSING, Z_BAD_CRC, Z_ESCAPE, Z_NO_KERNEL};
+    static const int kinds[] = {Z_BAD_HASH, Z_UNLISTED, Z_MISSING, Z_BAD_CRC, Z_ESCAPE, Z_NO_KERNEL, Z_EMPTY_SUMS};
     static const int want[] = {UPDATE_ERR_DAMAGED, UPDATE_ERR_DAMAGED, UPDATE_ERR_DAMAGED, UPDATE_ERR_DAMAGED,
-                               UPDATE_ERR_ZIP, UPDATE_ERR_DAMAGED};
+                               UPDATE_ERR_ZIP, UPDATE_ERR_DAMAGED, UPDATE_ERR_DAMAGED};
     char stage[1024];
     snprintf(stage, sizeof stage, "%s", at("card/fathom/update"));
     for (size_t i = 0; i < sizeof kinds / sizeof kinds[0]; i++) {
@@ -522,6 +523,19 @@ static void test_resume(void)
     CHECK(update_resume(at("card"), stage) == 1);
     CHECK(!exists(stage) && is(at("card/uImage"), "old kernel"));
 
+    /* 5. the same on a card that can't be written any more: not "finished,
+     * restart" (the player restarted the H2 at every start, for ever) */
+    make_card();
+    mkdir(stage, 0755);
+    put(at("card/fathom/update/INSTALLING"), "installing\n");
+    CHECK(chmod(stage, 0555) == 0);
+    if (access(at("card/fathom/update/INSTALLING"), W_OK) == 0 && geteuid() != 0) {
+        CHECK(update_resume(at("card"), stage) == -1);
+        CHECK(exists(at("card/fathom/update/INSTALLING")));
+    }
+    CHECK(chmod(stage, 0755) == 0);
+    CHECK(update_resume(at("card"), stage) == 1 && !exists(stage));
+
     /* A download left unfinished (no INSTALLING): removed, nothing installed */
     make_card();
     mkdir(stage, 0755);
@@ -529,6 +543,63 @@ static void test_resume(void)
     put(at("card/fathom/update/fathom-h2-0.8.0.zip.part"), "half");
     CHECK(update_resume(at("card"), stage) == 0);
     CHECK(!exists(stage) && is(at("card/uImage"), "old kernel"));
+}
+
+/* The old kernel's copy is made before anything moves (a card that filled
+ * since the download fails with nothing installed), and the marker says so. */
+static void test_kept_first(void)
+{
+    char stage[1024];
+    snprintf(stage, sizeof stage, "%s", at("card/fathom/update"));
+    /* 1. the copy can't be made: refused, nothing moved, the update still ready */
+    make_card();
+    make_release(at("r.zip"), "new kernel", Z_GOOD);
+    mkdir(stage, 0755);
+    CHECK(update_stage(at("r.zip"), stage, NULL, NULL, NULL) == UPDATE_OK);
+    CHECK(mkdir(at("card/uImage.prev.part"), 0755) == 0);          /* (in the copy's way) */
+    CHECK(update_install(at("card"), stage) != UPDATE_OK);
+    CHECK(!update_install_begun(stage) && exists(at("card/fathom/update/READY")));
+    CHECK(is(at("card/uImage"), "old kernel") && is(at("card/fathom/bin/fathom-player"), "old player"));
+    CHECK(is(at("card/fathom/wifi/modules/brcmfmac.ko"), "old module"));
+    CHECK(is(at("card/fathom/update/sd/uImage"), "new kernel"));
+    CHECK(rmdir(at("card/uImage.prev.part")) == 0);                /* room made: Install again */
+    CHECK(update_install(at("card"), stage) == UPDATE_OK);
+    check_installed("new kernel");
+    CHECK(is(at("card/uImage.prev"), "old kernel"));
+
+    /* 2. an install that fails once it has begun: the marker says the copy
+     * is made, and finishing it doesn't make it again (here it couldn't) */
+    make_card();
+    mkdir(stage, 0755);
+    CHECK(update_stage(at("r.zip"), stage, NULL, NULL, NULL) == UPDATE_OK);
+    CHECK(chmod(at("card/fathom/bin"), 0555) == 0);
+    if (access(at("card/fathom/bin"), W_OK) != 0) {
+        CHECK(update_install(at("card"), stage) == UPDATE_ERR_INSTALL);
+        CHECK(update_install_begun(stage));
+        CHECK(is(at("card/fathom/update/INSTALLING"), "installing\nkept\n"));
+        CHECK(is(at("card/uImage.prev"), "old kernel") && is(at("card/uImage"), "old kernel"));
+        CHECK(chmod(at("card/fathom/bin"), 0755) == 0);
+        CHECK(mkdir(at("card/uImage.prev.part"), 0755) == 0);
+        CHECK(update_resume(at("card"), stage) == 1);
+        check_installed("new kernel");
+        CHECK(is(at("card/uImage.prev"), "old kernel"));
+        CHECK(rmdir(at("card/uImage.prev.part")) == 0);
+    }
+    CHECK(chmod(at("card/fathom/bin"), 0755) == 0);
+
+    /* 3. begun by a player from before (its marker has no "kept"), the copy
+     * not made yet and not possible now: not finished, the kernel not touched */
+    make_card();
+    mkdir(stage, 0755);
+    CHECK(update_stage(at("r.zip"), stage, NULL, NULL, NULL) == UPDATE_OK);
+    put(at("card/fathom/update/INSTALLING"), "installing\n");
+    CHECK(mkdir(at("card/uImage.prev.part"), 0755) == 0);
+    CHECK(update_resume(at("card"), stage) == -1);
+    CHECK(is(at("card/uImage"), "old kernel") && update_install_begun(stage));
+    CHECK(rmdir(at("card/uImage.prev.part")) == 0);
+    CHECK(update_resume(at("card"), stage) == 1);
+    check_installed("new kernel");
+    CHECK(is(at("card/uImage.prev"), "old kernel"));
 }
 
 /* A real release, when one is given: every file of its sd/ checks out. */
@@ -559,6 +630,7 @@ int main(void)
     test_stage_and_install();
     test_damaged();
     test_resume();
+    test_kept_first();
     test_real_release();
     update_remove_tree(g_tmp);
     if (failures) { fprintf(stderr, "%d failures\n", failures); return 1; }

@@ -129,6 +129,9 @@ int  player_restore(player_t *p, const char *path);
  * the radio. On the radio, Play/pause stops (the stream is live) and Play
  * connects again; Next and Previous change station. */
 void player_radio_play(player_t *p, const radio_station_t *st, int n, int i);
+/* Another list under the station that's on, which must be st[i] (else nothing):
+ * Next and Previous go through it from there. The sound isn't interrupted. */
+void player_radio_relist(player_t *p, const radio_station_t *st, int n, int i);
 int  player_radio(const player_t *p);
 const radio_station_t *player_radio_station(const player_t *p);   /* NULL off the radio */
 const radio_station_t *player_radio_at(const player_t *p, int i);  /* station i of those playing (NULL: none) */

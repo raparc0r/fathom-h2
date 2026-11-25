@@ -618,6 +618,31 @@ static void show_details(const char *dir, pod_show_t *s)
     free(t);
 }
 
+/* Where the feed's address starts on a line of shows.txt (one line, its
+ * leading blanks passed), or NULL for a line with none; *first: the line's
+ * first http(s)://.
+ * "Title = URL": the last " = " before an address (titles can have one, or
+ * be the address itself: an OPML outline without a name); a hand-written
+ * "Title=URL" at an '=' before the line's first address; else a bare address
+ * from its start (an address has no spaces, but can have "=http" in its
+ * query) */
+static char *line_address(char *l, char **first_out)
+{
+    char *h1 = strstr(l, "http://"), *h2 = strstr(l, "https://");
+    char *first = !h1 ? h2 : !h2 ? h1 : h1 < h2 ? h1 : h2;
+    if (first_out) *first_out = first;
+    if (!first) return NULL;
+    char *u = NULL;
+    for (char *q = strstr(l, " = "); q; q = strstr(q + 1, " = "))
+        if (is_http(q + 3)) u = q + 3;
+    for (char *q = strchr(l, '='); !u && q && q < first; q = strchr(q + 1, '=')) {
+        char *v = q + 1;
+        while (*v == ' ' || *v == '\t') v++;
+        if (is_http(v)) u = v;
+    }
+    return u ? u : first;
+}
+
 int pod_shows_load(const char *dir, pod_show_t *out, int max)
 {
     char path[700];
@@ -628,23 +653,8 @@ int pod_shows_load(const char *dir, pod_show_t *out, int max)
     for (char *save = NULL, *l = strtok_r(t, "\n", &save); l && n < max; l = strtok_r(NULL, "\n", &save)) {
         while (*l == ' ' || *l == '\t') l++;
         if (*l == '#' || !*l) continue;
-        /* "Title = URL": the last " = " before an address (titles can have
-         * one, or be the address itself: an OPML outline without a name); a
-         * hand-written "Title=URL" at an '=' before the line's first address;
-         * else a bare address from its start (an address has no spaces, but
-         * can have "=http" in its query) */
-        char *h1 = strstr(l, "http://"), *h2 = strstr(l, "https://");
-        char *first = !h1 ? h2 : !h2 ? h1 : h1 < h2 ? h1 : h2;
-        if (!first) continue;
-        char *u = NULL;
-        for (char *q = strstr(l, " = "); q; q = strstr(q + 1, " = "))
-            if (is_http(q + 3)) u = q + 3;
-        for (char *q = strchr(l, '='); !u && q && q < first; q = strchr(q + 1, '=')) {
-            char *v = q + 1;
-            while (*v == ' ' || *v == '\t') v++;
-            if (is_http(v)) u = v;
-        }
-        if (!u) u = first;
+        char *first, *u = line_address(l, &first);
+        if (!u) continue;
         pod_show_t s;
         memset(&s, 0, sizeof s);
         char *e = u + strlen(u);
@@ -660,7 +670,8 @@ int pod_shows_load(const char *dir, pod_show_t *out, int max)
         /* Before 0.13 the line's first http:// was taken for the address (an
          * address with another inside it: the inner one) and the show's
          * folder named after that: kept if it's the one there */
-        const char *old = h1 ? h1 : h2;
+        const char *old = strstr(l, "http://");
+        if (!old) old = first;
         if (strcmp(old, s.url)) {
             char oid[13], od[700], nd[700];
             struct stat sb;
@@ -749,13 +760,26 @@ int pod_shows_remove(const char *dir, const char *url)
     for (char *l = t; *l;) {
         char *nl = strchr(l, '\n');
         size_t ll = nl ? (size_t)(nl - l + 1) : strlen(l);
-        /* this line's address is url (to its end, but for trailing spaces) */
+        /* this line's address is url: the address as the list is read
+         * (pod_shows_load), not the first place url's text is found in the
+         * line (a show named by its address has it twice, and another's
+         * address can end with this one) */
         int match = 0;
-        char *u = memmem(l, ll, url, strlen(url));
-        if (u && *l != '#') {
-            const char *after = u + strlen(url);
-            while (after < l + ll && (*after == ' ' || *after == '\r' || *after == '\t' || *after == '\n')) after++;
-            match = after == l + ll;
+        char *copy = malloc(ll + 1);
+        if (copy) {
+            memcpy(copy, l, ll);
+            copy[ll] = '\0';
+            char *c = copy;
+            while (*c == ' ' || *c == '\t') c++;
+            char *u = *c == '#' ? NULL : line_address(c, NULL);
+            if (u) {
+                char lu[sizeof ((pod_show_t *)0)->url];
+                char *e = u + strlen(u);
+                while (e > u && isspace((unsigned char)e[-1])) *--e = '\0';
+                snprintf(lu, sizeof lu, "%s", u);
+                match = !strcmp(lu, url);
+            }
+            free(copy);
         }
         if (match) found = 1;
         else { memcpy(out + w, l, ll); w += ll; }

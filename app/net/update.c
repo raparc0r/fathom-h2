@@ -442,6 +442,7 @@ int update_stage(const char *zip_path, const char *stage, update_progress_fn pro
     sum_t *sums = NULL;
     int nsums = 0;
     if (!m.buf) goto out;
+    m.buf[0] = '\0';                                /* (an empty SHA256SUMS writes nothing: it was read as it came from malloc) */
     while (zip_next(&z, &e) == 1) {
         if (!strncmp(e.name, sd, sl) && !e.dir) total += e.usize;
         if (!strcmp(e.name, name) && !found) {
@@ -544,22 +545,29 @@ static int move_tree(const char *from, const char *card, const char *rel)
     return bad ? -1 : 0;
 }
 
-/* from copied to to, by way of to.part (so to is whole or as it was). */
+/* from copied to to, by way of to.part (so to is whole or as it was).
+ * errno is the failure's (ENOSPC for a full card). */
 static int copy_file(const char *from, const char *to)
 {
     char part[1024];
     snprintf(part, sizeof part, "%s.part", to);
     int in = open(from, O_RDONLY | O_CLOEXEC), out = in < 0 ? -1 : open(part, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (out < 0) { if (in >= 0) close(in); return -1; }
+    if (out < 0) { int e = errno; if (in >= 0) close(in); errno = e; return -1; }
     char *b = malloc(32768);
     ssize_t k = -1;
-    int ok = b != NULL;
-    while (ok && (k = read(in, b, 32768)) > 0) ok = write(out, b, (size_t)k) == k;
-    ok = ok && k == 0 && fsync(out) == 0;
+    int ok = b != NULL, why = b ? 0 : ENOMEM;
+    while (ok && (k = read(in, b, 32768)) > 0) {
+        ssize_t w = write(out, b, (size_t)k);
+        ok = w == k;
+        if (!ok) why = w < 0 ? errno : ENOSPC;      /* (a short write: the card is full) */
+    }
+    if (ok && k < 0) { ok = 0; why = errno; }
+    if (ok && fsync(out)) { ok = 0; why = errno; }
     free(b);
     close(in);
-    if (close(out)) ok = 0;
-    if (!ok || rename(part, to)) { unlink(part); return -1; }
+    if (close(out) && ok) { ok = 0; why = errno; }
+    if (ok && rename(part, to)) { ok = 0; why = errno; }
+    if (!ok) { unlink(part); errno = why; return -1; }
     return 0;
 }
 
@@ -582,6 +590,20 @@ static int keep_modules(const char *mods, const char *prev)
     return bad ? -1 : 0;
 }
 
+/* Whether the INSTALLING marker has this word as one of its lines. */
+static int marker_has(const char *path, const char *word)
+{
+    char buf[128];
+    FILE *f = fopen(path, "re");
+    int has = 0;
+    while (f && !has && fgets(buf, sizeof buf, f)) {
+        buf[strcspn(buf, "\r\n")] = '\0';
+        has = !strcmp(buf, word);
+    }
+    if (f) fclose(f);
+    return has;
+}
+
 int update_install(const char *card, const char *stage)
 {
     char sd[1024], mark[1024], kernel[1024], now[1024], prev[1024];
@@ -595,13 +617,34 @@ int update_install(const char *card, const char *stage)
     snprintf(mods_prev, sizeof mods_prev, "%s/fathom/wifi/modules.prev", card);
     snprintf(new_mods, sizeof new_mods, "%s/sd/fathom/wifi/modules", stage);
     snprintf(boot_new, sizeof boot_new, "%s/fathom/boot-new", card);
+    int kept = 0;
     if (!exists(mark)) {
         char ready[1024];
         snprintf(ready, sizeof ready, "%s/READY", stage);
         if (!exists(ready)) return UPDATE_ERR_INSTALL;
+        /* The old kernel kept for h2boot's way back, and for a person to go
+         * back to by hand (the bootloader always starts uImage). Copied, not
+         * moved: uImage never goes missing. Before anything moves: a card
+         * that filled since the download (music copied over USB) fails here,
+         * with nothing installed, where the copy made after the files had
+         * moved left the new player with the old kernel for good. */
+        if (exists(kernel) && exists(now)) {
+            if (copy_file(now, prev)) {
+                int full = errno == ENOSPC || errno == EDQUOT;
+                fprintf(stderr, "update: can't keep the old kernel: %s\n", strerror(errno));
+                return full ? UPDATE_ERR_SPACE : UPDATE_ERR_INSTALL;
+            }
+            kept = 1;
+        }
         /* (once, before anything moves: cut short, the card's are the new ones) */
-        if (exists(kernel) && exists(new_mods) && exists(mods) && keep_modules(mods, mods_prev)) return UPDATE_ERR_INSTALL;
-        if (write_marker(mark, "installing\n")) return UPDATE_ERR_INSTALL;
+        if (exists(kernel) && exists(new_mods) && exists(mods) && keep_modules(mods, mods_prev)) {
+            int full = errno == ENOSPC || errno == EDQUOT;
+            fprintf(stderr, "update: can't keep the old modules: %s\n", strerror(errno));
+            return full ? UPDATE_ERR_SPACE : UPDATE_ERR_INSTALL;
+        }
+        if (write_marker(mark, kept ? "installing\nkept\n" : "installing\n")) return UPDATE_ERR_INSTALL;
+    } else {
+        kept = marker_has(mark, "kept");
     }
     sync();
     /* Everything but the kernel: the new modules can't be loaded by the old
@@ -609,20 +652,18 @@ int update_install(const char *card, const char *stage)
      * install is finished at the next start (update_resume). (No sd/ left:
      * cut short while the stage was being removed, all of it installed.) */
     if (exists(sd) && move_tree(sd, card, "")) return UPDATE_ERR_INSTALL;
-    sync();                                         /* (the files moved in, before the kernel's copy pushes anything out) */
+    sync();
     if (exists(kernel)) {
-        /* The old kernel kept for a person to go back to by hand (the
-         * bootloader always starts uImage). Copied, not moved: uImage never
-         * goes missing. */
-        if (exists(now) && copy_file(now, prev)) return UPDATE_ERR_INSTALL;
+        /* An install begun by a player from before the copy moved up (its
+         * marker doesn't say "kept"): made here, as that player would have. */
+        if (!kept && exists(now) && copy_file(now, prev)) return UPDATE_ERR_INSTALL;
         sync();
-        if (file_replace(kernel, now)) {            /* (its entry on the card before the marker is) */
-            fprintf(stderr, "update: can't install uImage: %s\n", strerror(errno));
-            return UPDATE_ERR_INSTALL;
-        }
         /* h2boot starts it twice at most without the player getting up (which
          * deletes this), then goes back to uImage.prev and modules.prev. What
-         * an earlier fallback left goes. */
+         * an earlier fallback left goes. The marker before the kernel: the
+         * power cut between the two then leaves the old kernel marked (it
+         * starts, and the install is finished from here), where the other
+         * way round it left a new kernel with nothing to go back from. */
         char failed[1024];
         snprintf(failed, sizeof failed, "%s/uImage.failed", card);
         unlink(failed);
@@ -630,12 +671,31 @@ int update_install(const char *card, const char *stage)
         update_remove_tree(failed);
         if (write_marker(boot_new, "a new kernel: h2boot tries it twice, then the one before\n"))
             fprintf(stderr, "update: can't mark the new kernel: %s\n", strerror(errno));
+        if (file_replace(kernel, now)) {
+            fprintf(stderr, "update: can't install uImage: %s\n", strerror(errno));
+            return UPDATE_ERR_INSTALL;
+        }
     }
     sync();
     update_remove_tree(sd);
     update_remove_tree(stage);                      /* (INSTALLING with it, last: done) */
     sync();
+    /* A card that can't be written any more (made read-only after an error):
+     * the marker still there isn't "installed, restart". The player restarts
+     * the H2 after an install finished at its start, and with the marker
+     * left it did so at every start, for ever. */
+    if (exists(mark)) {
+        fprintf(stderr, "update: the stage can't be removed: %s\n", strerror(errno));
+        return UPDATE_ERR_INSTALL;
+    }
     return UPDATE_OK;
+}
+
+int update_install_begun(const char *stage)
+{
+    char mark[1024];
+    snprintf(mark, sizeof mark, "%s/INSTALLING", stage);
+    return exists(mark);
 }
 
 int update_resume(const char *card, const char *stage)

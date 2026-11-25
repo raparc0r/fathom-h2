@@ -35,8 +35,9 @@
 
 #include <stddef.h>
 
-#define READER_DIED (-2)   /* the helper died on this file twice running, or hung on it */
+#define READER_DIED (-2)   /* the helper died on this file twice running, or hung on it (or its answer couldn't be taken: too long, no memory for it) */
 #define READER_NONE (-3)   /* no helper could be started: do it here */
+#define READER_STOPPED (-4) /* the caller's stop was set while the helper worked (reader_call_long) */
 
 /* The program to run as the helper (it gets the one argument --reader);
  * NULL or "": none. */
@@ -49,8 +50,24 @@ int  reader_on(void);
  * One at a time (others wait). */
 int reader_call(int op, const char *path, long budget_kb, int *status, unsigned char **out, size_t *len);
 
-/* The helper sent away (the end of a scan): the next call starts another. */
+/* The same for work that takes minutes (a whole song decoded to measure
+ * it): up to timeout_ms for the answer, and given up the moment *stop is
+ * set (looked at 5 times a second): the helper, in the middle of it, is
+ * killed, and READER_STOPPED returned. Others wait meanwhile, so the
+ * caller sets *stop when they should have their turn. */
+int reader_call_long(int op, const char *path, long budget_kb, int timeout_ms, const volatile int *stop,
+                     int *status, unsigned char **out, size_t *len);
+
+/* reader_call for the thread the screen is drawn on (one cover made at a
+ * key press): READER_NONE, at once, while the helper is at work for someone
+ * else, where reader_call would wait its turn (behind a song being measured:
+ * minutes). The caller does the work itself then. */
+int reader_call_nowait(int op, const char *path, long budget_kb, int *status, unsigned char **out, size_t *len);
+
+/* The helper sent away (the end of a scan): the next call starts another.
+ * _nowait: not if it is at work for someone else (theirs to send away). */
 void reader_close(void);
+void reader_close_nowait(void);
 
 /* The helper's side: serves requests from stdin with fn until the player
  * closes the pipe or is gone. fn does `op` on `path` and returns its status,

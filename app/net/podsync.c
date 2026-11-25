@@ -66,6 +66,9 @@ static podsync_download_fn g_download_once = http_download;
 /* A name lookup or a connection fails now and then (a home router slow to
  * answer for a name it hasn't cached: "Try again"), and a download goes
  * through several hosts' redirects: up to 3 tries, 2 s and 5 s apart. */
+static int g_wait[2] = {2000, 5000};
+void podsync_set_retry_waits(int first_ms, int second_ms) { g_wait[0] = first_ms; g_wait[1] = second_ms; }
+
 static int wait_abortable(int ms)
 {
     for (int t = 0; t < ms && !P.abort && !P.stop; t += 100) {
@@ -77,11 +80,10 @@ static int wait_abortable(int ms)
 
 static long g_fetch(const char *url, char *buf, size_t cap, const volatile int *abort)
 {
-    static const int WAIT[] = {2000, 5000};
     long n = -1;
     for (int i = 0; i < 3; i++) {
         n = g_fetch_once(url, buf, cap, abort);
-        if (n >= 0 || n == -2 || n == -3 || i == 2 || wait_abortable(WAIT[i])) break;   /* (-3: not there) */
+        if (n >= 0 || n == -2 || n == -3 || i == 2 || wait_abortable(g_wait[i])) break;   /* (-3: not there) */
     }
     return n;
 }
@@ -89,13 +91,61 @@ static long g_fetch(const char *url, char *buf, size_t cap, const volatile int *
 static int64_t g_download(const char *url, const char *path, http_progress_fn progress, void *ctx,
                           const volatile int *abort)
 {
-    static const int WAIT[] = {2000, 5000};
     int64_t n = -1;
     for (int i = 0; i < 3; i++) {
         n = g_download_once(url, path, progress, ctx, abort);
-        if (n > 0 || n == -3 || i == 2 || wait_abortable(WAIT[i])) break;
+        /* (again only for want of the network: not when the server answered,
+         * with nothing or that it isn't there, nor when the card stopped it:
+         * HTTP_ERR_FULL had a second and a third go fill it again) */
+        if (n != -1 || i == 2 || wait_abortable(g_wait[i])) break;
     }
     return n;
+}
+
+/* Episodes whose download failed, remembered until the player restarts, for
+ * the automatic downloads: podsync_auto is called every ten minutes, and one
+ * that can't be had (not there any more, a "file" that is a live stream and
+ * fills the card, 4 GB on a card that takes no file that long) was started
+ * again each time, with its notice. Left for an hour after the first
+ * failure, then 4, 16, and a day at a time. One asked for by hand is always
+ * tried. (The worker's own: no lock.) */
+#define BAD_MAX 32
+static struct { char id[13], key[13]; int fails; int64_t at; } g_bad[BAD_MAX];
+static unsigned g_bad_next;
+
+static int bad_find(const char *id, const char *key)
+{
+    for (int i = 0; i < BAD_MAX; i++)
+        if (g_bad[i].fails && !strcmp(g_bad[i].id, id) && !strcmp(g_bad[i].key, key)) return i;
+    return -1;
+}
+
+static void bad_note(const char *id, const char *key, int failed_now)
+{
+    int i = bad_find(id, key);
+    if (!failed_now) {
+        if (i >= 0) g_bad[i].fails = 0;
+        return;
+    }
+    if (i < 0) {
+        i = (int)(g_bad_next++ % BAD_MAX);
+        snprintf(g_bad[i].id, sizeof g_bad[i].id, "%s", id);
+        snprintf(g_bad[i].key, sizeof g_bad[i].key, "%s", key);
+        g_bad[i].fails = 0;
+    }
+    g_bad[i].fails++;
+    g_bad[i].at = (int64_t)time(NULL);
+}
+
+/* 1 while an automatic download of it should wait (now: the caller's clock) */
+static int bad_wait(const char *id, const char *key, int64_t now)
+{
+    int i = bad_find(id, key);
+    if (i < 0) return 0;
+    int64_t wait = 3600;
+    for (int k = 1; k < g_bad[i].fails && wait < 86400; k++) wait *= 4;
+    if (wait > 86400) wait = 86400;
+    return now >= g_bad[i].at && now - g_bad[i].at < wait;   /* (a clock set back: tried) */
 }
 void podsync_set_fetch(podsync_fetch_fn fn) { g_fetch_once = fn ? fn : http_get; }
 void podsync_set_download(podsync_download_fn fn) { g_download_once = fn ? fn : http_download; }
@@ -258,7 +308,8 @@ static void cover(const pod_show_t *s, const char *old_image)
     if (written) touched();
 }
 
-/* Read a show's feed: its details and newest episodes onto the card. 0, -1. */
+/* Read a show's feed: its details and newest episodes onto the card. 0, -1,
+ * or -2: no server was reached (the network, as far as can be told). */
 static int refresh_one(const char *url)
 {
     pod_show_t *shows = calloc(POD_MAX_SHOWS, sizeof *shows);
@@ -271,6 +322,7 @@ static int refresh_one(const char *url)
         if (!strcmp(shows[i].url, url)) at = i;
     if (at < 0) goto out;                            /* unsubscribed meanwhile */
     long n = g_fetch(url, buf, POD_FEED_MAX, &P.abort);
+    if (n == -1) r = -2;
     if (n == -2) n = (long)strlen(buf);              /* too big: the episodes before the cut */
     else if (n > 0 && !pod_feed_complete(buf, (size_t)n)) n = -1;   /* cut off: the list stays as it was */
     if (n <= 0) { failed(shows[at].title); goto out; }
@@ -296,12 +348,30 @@ out:
     return r;
 }
 
+/* Every show's feed. Wi-Fi up with no internet behind it: each show took its
+ * three tries and their waits, 64 shows held the one worker (downloads,
+ * searches) for many minutes. So the round stops once OFFLINE_RUN shows in a
+ * row have reached no server, and the next one starts after those: shows
+ * whose servers have gone, at the top of the list, don't keep the rest from
+ * ever being read. */
+#define OFFLINE_RUN 3
 static void refresh_all(void)
 {
+    static int from;                    /* (the worker's own) where the next round starts */
     pod_show_t *shows = calloc(POD_MAX_SHOWS, sizeof *shows);
     if (!shows) return;
-    int n = pod_shows_load(P.dir, shows, POD_MAX_SHOWS);
-    for (int i = 0; i < n && !P.abort && !P.stop; i++) refresh_one(shows[i].url);
+    int n = pod_shows_load(P.dir, shows, POD_MAX_SHOWS), run = 0, start = n > 0 ? from % n : 0;
+    from = 0;
+    for (int k = 0; k < n && !P.abort && !P.stop; k++) {
+        int i = (start + k) % n;
+        run = refresh_one(shows[i].url) == -2 ? run + 1 : 0;
+        if (run >= OFFLINE_RUN && k + 1 < n) {
+            fprintf(stderr, "podcasts: no server reached for %d shows running: the other %d left for the next time\n",
+                    run, n - k - 1);
+            from = i + 1;
+            break;
+        }
+    }
     free(shows);
 }
 
@@ -339,6 +409,7 @@ static void download(job_t *j)
     /* (the size is the feed's word: a huge or negative one mustn't wrap the sum) */
     if (free_b >= 0 && (free_b < MIN_FREE || (j->ep.size > 0 && free_b - MIN_FREE < j->ep.size))) {
         failed("The card is nearly full");
+        bad_note(j->id, j->ep.key, 1);           /* (the automatic downloads don't ask again, and say so again, every ten minutes) */
         touched();
         return;
     }
@@ -360,7 +431,9 @@ static void download(job_t *j)
         char part[820];
         snprintf(part, sizeof part, "%s.part", path);
         remove(part);
+        if (got == 0) remove(path);              /* (a server's empty answer: not an episode on the card) */
     }
+    if (got > 0 || !P.abort) bad_note(j->id, j->ep.key, got <= 0);
     touched();
 }
 
@@ -408,11 +481,12 @@ static void import(job_t *j)
         t[n] = '\0';
         int k = pod_parse_opml(t, (size_t)n, s, POD_MAX_SHOWS);
         added = 0;
+        int run = 0;                     /* (as refresh_all: added all the same, read at the next refresh) */
         for (int i = 0; i < k; i++)
             if (pod_shows_add(P.dir, &s[i]) == 1) {
                 added++;
                 touched();
-                refresh_one(s[i].url);
+                if (run < OFFLINE_RUN) run = refresh_one(s[i].url) == -2 ? run + 1 : 0;
             }
     }
     free(t);
@@ -452,7 +526,7 @@ static void auto_job(job_t *j)
                 pthread_mutex_lock(&P.mu);
                 int dup = queued_download(shows[i].id, eps[e].key);
                 pthread_mutex_unlock(&P.mu);
-                if (!on_card && !dup) {
+                if (!on_card && !dup && !bad_wait(shows[i].id, eps[e].key, j->now)) {
                     job_t *d = calloc(1, sizeof *d);
                     if (!d) continue;
                     d->kind = J_DOWNLOAD;

@@ -290,6 +290,7 @@ static void job_progress(int done, int total, const char *path, void *ctx)
 {
     scan_job_t *j = ctx;
     (void)done;
+    if (path && (!strcmp(path, "looking") || !strcmp(path, "checking") || !strcmp(path, "sorting") || !strcmp(path, "working"))) return;   /* (the folder being listed) */
     const char *base = path ? strrchr(path, '/') : NULL;
     snprintf(j->where, sizeof j->where, "%s", total < 0 ? "covers" : base ? base + 1 : path ? path : "?");
     if (total < 0) return;                         /* (covers) */
@@ -1234,8 +1235,9 @@ typedef struct { const char *db; const char *sql; int seen, calls; } at_start_t;
 
 static void at_start(int done, int total, const char *path, void *ctx)
 {
-    (void)total; (void)path;
+    (void)total;
     at_start_t *a = ctx;
+    if (path && (!strcmp(path, "looking") || !strcmp(path, "checking") || !strcmp(path, "sorting") || !strcmp(path, "working"))) return;
     if (done == 1 && !a->calls++) a->seen = db_int(a->db, a->sql);   /* (before the first file is read) */
 }
 
@@ -1298,6 +1300,133 @@ static void test_died_side_by_side(const char *dir)
     library_set_trying_dir(NULL);
 }
 
+/* ---- files that couldn't be read, tried again when a scan is asked to ----
+ * A file left out stays out while it's the same file (its date and size):
+ * an ordinary scan doesn't read it again. A scan asked to (Rescan) does: one
+ * that reads now comes in. One a reader stopped on is tried again only when
+ * a helper does the reading (not here: tests/test_reader.c). */
+/* `from`'s bytes as `path`, dated `when` (a file replaced by one of the same size and date) */
+static void same_size_file(const char *path, const char *from, time_t when)
+{
+    FILE *in = fopen(from, "rb"), *out = fopen(path, "wb");
+    char b[65536];
+    size_t n = in ? fread(b, 1, sizeof b, in) : 0;
+    if (in) fclose(in);
+    if (out) { fwrite(b, 1, n, out); fclose(out); }
+    struct timeval tv[2] = {{when, 0}, {when, 0}};
+    utimes(path, tv);
+}
+
+static void test_retry_unread(const char *dir)
+{
+    char music[300], db[300], art[300], good[400], later[400], stopped[400];
+    snprintf(music, sizeof music, "%s/tmusic", dir);
+    mkdir(music, 0755);
+    snprintf(db, sizeof db, "%s/retry.db", dir);
+    snprintf(art, sizeof art, "%s/retry-art", dir);
+    make_album(music, "Retry", 3);
+    snprintf(good, sizeof good, "%s/good.flac.tmp", dir);
+    if (write_flac(good, "Late One", "Some Artist", "Retry", 9)) exit(1);
+    snprintf(later, sizeof later, "%s/Retry/later.flac", music);
+    snprintf(stopped, sizeof stopped, "%s/Retry/stopped.flac", music);
+    const time_t when = 1700000000;
+    struct stat sb;
+    stat(good, &sb);
+    char junk[65536];
+    memset(junk, 'j', sizeof junk);
+    for (int k = 0; k < 2; k++) {                                /* two files of junk, the good one's size */
+        FILE *f = fopen(k ? stopped : later, "wb");
+        if (f) { fwrite(junk, 1, (size_t)sb.st_size < sizeof junk ? (size_t)sb.st_size : sizeof junk, f); fclose(f); }
+        struct timeval tv[2] = {{when, 0}, {when, 0}};
+        utimes(k ? stopped : later, tv);
+    }
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 3);
+    CHECK(library_unread_count(lib) == 2);
+    /* one of them as a file a reader stopped on */
+    CHECK(db_exec(db, "UPDATE cues SET sheet='stopped' WHERE path LIKE '%stopped.flac'") == SQLITE_OK);
+    /* both now good files, of the same date and size: an ordinary scan leaves them out still */
+    same_size_file(later, good, when);
+    same_size_file(stopped, good, when);
+    CHECK(library_scan(lib, music, NULL, NULL) == 3 && library_scan_changes(lib) == 0);
+    CHECK(library_unread_count(lib) == 2);
+    /* asked to try again: the damaged one is read and comes in; the one a reader
+     * stopped on stays out (no helper here to take its place) */
+    library_scan_retry_unread(lib, 1);
+    CHECK(library_scan(lib, music, NULL, NULL) == 4);
+    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%Retry/later.flac' AND title='Late One'") == 1);
+    CHECK(library_unread_count(lib) == 1);
+    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped' AND path LIKE '%stopped.flac'") == 1);
+    /* asked of that one scan only: the next is an ordinary one, and writes nothing */
+    CHECK(library_scan(lib, music, NULL, NULL) == 4 && library_scan_changes(lib) == 0);
+    /* and with nothing to try again, a scan asked to is as quick as any (nothing changed) */
+    CHECK(db_exec(db, "DELETE FROM cues WHERE kind=3") == SQLITE_OK);
+    unlink(stopped);
+    CHECK(library_scan(lib, music, NULL, NULL) == 4);
+    library_scan_retry_unread(lib, 1);
+    CHECK(library_scan(lib, music, NULL, NULL) == 4 && library_scan_changes(lib) == 0);
+    library_close(lib);
+    unlink(good);
+}
+
+/* ---- a scan says how far it has got at every step ----
+ * While it lists the folder: the songs found, going up to all of them. While
+ * it sorts albums and artists: the songs gone through, of all of them, and
+ * for the rest of that step a number that only goes up. (Sent a few times a
+ * second; at every chance here.) */
+typedef struct { int looking, look_last, look_down, sorting, sort_last, sort_total, sort_bad, working, work_last, work_down, order_bad, phase, mixed; } told_t;
+
+static void told(int done, int total, const char *path, void *ctx)
+{
+    told_t *t = ctx;
+    if (!path) return;
+    if (!strcmp(path, "looking")) {
+        t->looking++;
+        if (done < t->look_last) t->look_down = 1;
+        t->look_last = done;
+        if (t->phase > 0) t->order_bad = 1;                      /* (before any song is read) */
+    } else if (!strcmp(path, "sorting")) {
+        t->sorting++;
+        if (done < t->sort_last || done > total) t->sort_bad = 1;
+        t->sort_last = done;
+        t->sort_total = total;
+        if (t->phase < 1) t->order_bad = 1;                      /* (after the songs) */
+    } else if (!strcmp(path, "working")) {
+        t->working++;
+        if (t->sorting && t->sort_last < t->sort_total) t->mixed = 1;   /* (in the middle of the songs' count: the two took turns) */
+        if (done <= t->work_last) t->work_down = 1;
+        t->work_last = done;
+    } else if (strcmp(path, "checking") && strcmp(path, "albums") && strcmp(path, "indexes") && strcmp(path, "done") && total > 0) {
+        t->phase = 1;                                            /* a song being read */
+    }
+}
+
+static void test_progress_told(const char *dir)
+{
+    char music[300], db[300], art[300], name[32];
+    snprintf(music, sizeof music, "%s/pmusic", dir);
+    mkdir(music, 0755);
+    snprintf(db, sizeof db, "%s/told.db", dir);
+    snprintf(art, sizeof art, "%s/told-art", dir);
+    for (int a = 0; a < 4; a++) {
+        snprintf(name, sizeof name, "Told %d", a);
+        make_album(music, name, 10);
+    }
+    library_test_progress_every(0);
+    library_t *lib = library_open(db, art);
+    told_t t = {0};
+    CHECK(lib && library_scan(lib, music, told, &t) == 40);
+    CHECK(t.looking >= 40 && t.look_last == 40 && !t.look_down);
+    CHECK(t.sorting >= 1 && t.sort_total == 40 && t.sort_last == 40 && !t.sort_bad);
+    CHECK(!t.work_down && !t.order_bad && !t.mixed);
+    /* nothing new: the folder is listed again (and says so), no step after it */
+    told_t u = {0};
+    CHECK(library_scan(lib, music, told, &u) == 40 && library_scan_changes(lib) == 0);
+    CHECK(u.looking >= 40 && u.sorting == 0 && u.working == 0);
+    library_close(lib);
+    library_test_progress_every(0.25);
+}
+
 /* ---- a file the H2 itself goes down on (a reset: the RAM's notes lost) ----
  * A run leaves an empty mark on the card while it reads; one found at the
  * next start makes that run note each item in it; and what such a run's mark
@@ -1306,9 +1435,10 @@ typedef struct { const char *mark; long size_at_25; int exists_at_25; } mark_loo
 
 static void mark_look(int done, int total, const char *path, void *ctx)
 {
-    (void)total; (void)path;
+    (void)total;
     mark_look_t *m = ctx;
     struct stat sb;
+    if (path && (!strcmp(path, "looking") || !strcmp(path, "checking") || !strcmp(path, "sorting") || !strcmp(path, "working"))) return;
     if (done != 26) return;                                      /* (25 files read) */
     m->exists_at_25 = stat(m->mark, &sb) == 0;
     m->size_at_25 = m->exists_at_25 ? (long)sb.st_size : -1;
@@ -1480,6 +1610,8 @@ int main(void)
     test_known_files(dir);
     test_died_on(dir);
     test_died_side_by_side(dir);
+    test_retry_unread(dir);
+    test_progress_told(dir);
     test_reset_on(dir);
     test_check_and_import(dir);
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }

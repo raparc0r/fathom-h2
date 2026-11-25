@@ -541,6 +541,7 @@ typedef struct {
     long lost;                    /* ...what was queued then, reported as the delay (as out_bt) */
     long heard_at_stall;
     unsigned flushes;
+    int draining;                 /* bl_drain is waiting for the queue to play out */
 } bt_like_t;
 
 static long bl_played(bt_like_t *b)
@@ -622,6 +623,20 @@ static void bl_pause(void *ctx, int on)
 }
 
 static void bl_nop(void *ctx) { (void)ctx; }
+/* As ALSA's drain: back once what's queued has played, or has been dropped
+ * (a pause, a flush). */
+static void bl_drain(void *ctx)
+{
+    bt_like_t *b = ctx;
+    for (;;) {
+        pthread_mutex_lock(&b->mu);
+        long q = (long)b->written - (b->paused ? 0 : bl_played(b));
+        b->draining = q > 0;
+        pthread_mutex_unlock(&b->mu);
+        if (q <= 0) return;
+        sleep_ms(5);
+    }
+}
 static void bl_describe(void *ctx, char *o, int cap) { (void)ctx; snprintf(o, (size_t)cap, "bt-like"); }
 
 /* Paused on Bluetooth and resumed: it carries on from what was heard, not
@@ -650,6 +665,41 @@ static void test_pause_drops(const char *dir)
     CHECK(bl.first_after >= 0 && labs(bl.first_after - heard) < 44100 / 20);   /* on from there */
     if (labs(bl.first_after - heard) >= 44100 / 20)
         fprintf(stderr, "heard %ld at the pause, resumed at %ld\n", heard, bl.first_after);
+    engine_free(e);
+    unlink(a);
+}
+
+/* Paused in the last half second of the last track, while the output plays
+ * out its queue, on an output that drops the queue at a pause (ALSA can't
+ * pause while draining): the track isn't over (it ended, paused, and Play
+ * started the song again); the resume plays the rest from what was heard,
+ * and then it ends. */
+static void test_pause_at_the_end(const char *dir)
+{
+    char a[300];
+    snprintf(a, sizeof a, "%s/tail.flac", dir);
+    CHECK(write_ramp(a, 44100, 44100 * 2) == 0);
+    bt_like_t bl;
+    memset(&bl, 0, sizeof bl);
+    pthread_mutex_init(&bl.mu, NULL);
+    audio_output_t out = {bl_open, bl_write, bl_delay, bl_drain, bl_flush, bl_pause, bl_nop, bl_describe, &bl, NULL, NULL, NULL, NULL};
+    engine_t *e = engine_new(&out);
+    engine_play(e, a, 1);
+    WAIT(bl.draining, 4000);
+    CHECK(bl.draining);
+    sleep_ms(100);                                       /* (some 0.3 s of it still to be heard) */
+    engine_pause(e, 1);
+    long heard = bl.heard_at_pause;
+    sleep_ms(300);
+    eng_status_t s = status(e);
+    CHECK(s.state == ENG_PAUSED && s.track_id == 1);
+    CHECK(heard > 44100 && heard < 44100 * 2 && labs((long)s.pos_ms - heard * 1000 / 44100) < 60);
+    if (s.state != ENG_PAUSED) fprintf(stderr, "paused at the end: state %d, heard %ld, shown %u ms\n", s.state, heard, s.pos_ms);
+    engine_pause(e, 0);
+    WAIT(bl.first_after >= 0, 1000);
+    CHECK(bl.first_after >= 0 && labs(bl.first_after - heard) < 44100 / 20);   /* the rest, from there */
+    WAIT(status(e).state == ENG_STOPPED, 3000);
+    CHECK(status(e).state == ENG_STOPPED);                                       /* and then its end */
     engine_free(e);
     unlink(a);
 }
@@ -1227,15 +1277,167 @@ static void test_deep_queue(const char *dir)
     unlink(b);
 }
 
+/* A file that is slow to open (a big picture to pass over, a busy card), as
+ * the one to follow: it is opened while the second queued for the track
+ * that's on plays out, not when only a fifth of a second is left, so the
+ * sound doesn't run dry at the change. (Opened at the change, 0.6 s of
+ * opening ran the queue dry.) And what was opened ahead is let go when the
+ * queue changes or playback is replaced. */
+static void test_open_ahead(const char *dir)
+{
+    char a[300], b[300], c[300];
+    snprintf(a, sizeof a, "%s/slow-a.flac", dir);
+    snprintf(b, sizeof b, "%s/slow-b.flac", dir);
+    snprintf(c, sizeof c, "%s/slow-c.flac", dir);
+    CHECK(write_ramp(a, 44100, 44100 * 2) == 0 && write_ramp(b, 44100, 44100 * 3) == 0 &&
+          write_ramp(c, 44100, 44100 * 3) == 0);
+    deep_like_t dl = {.mu = PTHREAD_MUTEX_INITIALIZER, .last = -1, .q_at_join = -1};
+    audio_output_t out = {dl_open, dl_write, dl_delay, dl_drain, dl_flush, dl_pause, dl_nop, dl_describe, &dl, NULL, NULL,
+                          NULL, dl_join_depth};
+    engine_t *e = engine_new(&out);
+    engine_play(e, a, 1);
+    WAIT(status(e).track_id == 1 && dl_delay(&dl) > dl.deep / 2, 1500);
+    decoder_test_open_delay(600);                            /* from here on, a file takes 0.6 s to open */
+    engine_queue_next(e, b, 2);
+    WAIT(status(e).track_id == 2, 4000);
+    CHECK(status(e).track_id == 2);
+    WAIT(dl.q_at_join >= 0, 500);
+    pthread_mutex_lock(&dl.mu);
+    long qj = dl.q_at_join;
+    int dry = dl.ran_dry;
+    pthread_mutex_unlock(&dl.mu);
+    CHECK(dry == 0);                                         /* no gap at the change */
+    CHECK(qj > 0 && qj <= dl.enough);                        /* and the change itself as late as ever */
+    /* the one opened ahead isn't used for another file: the queue changed
+     * to c while b's successor was being waited for */
+    engine_queue_next(e, c, 3);
+    WAIT(status(e).track_id == 3, 6000);
+    CHECK(status(e).track_id == 3);
+    pthread_mutex_lock(&dl.mu);
+    CHECK(dl.ran_dry == 0);
+    pthread_mutex_unlock(&dl.mu);
+    /* a play command while a file opens ahead: the new one plays, nothing leaks or hangs */
+    engine_queue_next(e, a, 4);
+    sleep_ms(2200);                                          /* (c decoded to its end by now: a is being opened ahead) */
+    decoder_test_open_delay(0);
+    engine_play(e, b, 5);
+    WAIT(status(e).track_id == 5, 3000);
+    CHECK(status(e).track_id == 5);
+    engine_stop(e);
+    engine_free(e);
+    unlink(a);
+    unlink(b);
+    unlink(c);
+}
+
+/* ---- a FLAC whose frames aren't what its header says: stereo in the
+ * header and its first frames, six channels after. The decoder's buffer is
+ * sized by a frame's channels when it grows and read out by the header's:
+ * six channels written into room for two. The track ends at the first such
+ * frame. (A stereo file with a six-channel file's frames put after its own,
+ * its length taken out of the header so they are reached.) ---- */
+static long flac_frames_at(const unsigned char *b, long n)
+{
+    long at = 4;
+    for (;;) {
+        if (at + 4 > n) return -1;
+        int last = b[at] & 0x80;
+        at += 4 + ((long)b[at + 1] << 16 | (long)b[at + 2] << 8 | b[at + 3]);
+        if (last) return at;
+    }
+}
+
+static void test_flac_frame_lies(const char *dir)
+{
+    char a[300], six[300];
+    snprintf(a, sizeof a, "%s/lies.flac", dir);
+    snprintf(six, sizeof six, "%s/six.flac", dir);
+    CHECK(write_ramp(a, 44100, 8192) == 0);
+    FLAC__StreamEncoder *enc = FLAC__stream_encoder_new();
+    FLAC__stream_encoder_set_channels(enc, 6);
+    FLAC__stream_encoder_set_bits_per_sample(enc, 16);
+    FLAC__stream_encoder_set_sample_rate(enc, 44100);
+    CHECK(FLAC__stream_encoder_init_file(enc, six, NULL, NULL) == FLAC__STREAM_ENCODER_INIT_STATUS_OK);
+    static FLAC__int32 pcm6[6 * 4096];
+    for (unsigned i = 0; i < 6 * 4096; i++) pcm6[i] = (FLAC__int32)(i * 31 % 20000) - 10000;
+    for (int k = 0; k < 4; k++) FLAC__stream_encoder_process_interleaved(enc, pcm6, 4096);
+    FLAC__stream_encoder_finish(enc);
+    FLAC__stream_encoder_delete(enc);
+    static unsigned char fa[1 << 20], fb[1 << 20];
+    FILE *f = fopen(a, "rb");
+    long na = f ? (long)fread(fa, 1, sizeof fa, f) : 0;
+    if (f) fclose(f);
+    f = fopen(six, "rb");
+    long nb = f ? (long)fread(fb, 1, sizeof fb, f) : 0;
+    if (f) fclose(f);
+    long fr = flac_frames_at(fb, nb);
+    CHECK(na > 42 && nb > 42 && fr > 0 && fr < nb);
+    fa[8 + 13] &= 0xF0;                                      /* STREAMINFO's total samples: unknown */
+    memset(fa + 8 + 14, 0, 4);
+    f = fopen(a, "wb");
+    if (f) {
+        fwrite(fa, 1, (size_t)na, f);
+        if (fr > 0) fwrite(fb + fr, 1, (size_t)(nb - fr), f);
+        fclose(f);
+    }
+    audio_format_t fmt;
+    decoder_t *d = decoder_open_flags(a, &fmt, 0);
+    CHECK(d != NULL && fmt.channels == 2);
+    static int32_t out[4096 * 8];
+    long total = 0, n = 0;
+    for (int i = 0; d && i < 64 && (n = decoder_read(d, out, 4096)) > 0; i++) total += n;
+    CHECK(total == 8192);                                    /* its own two frames, and no more */
+    if (total != 8192) fprintf(stderr, "frames that lie: %ld frames read (last answer %ld)\n", total, n);
+    if (d) decoder_close(d);
+    unlink(a);
+    unlink(six);
+}
+
+/* ---- a pause while a stream connects (an episode streamed, Play pressed
+ * again before it sounds): it starts paused. The state is STOPPED all
+ * through a connection, and the pause was dropped. (A connection that takes
+ * 3 s: the decoder's test delay, given up when it's told to, as a real one.) ---- */
+static void test_pause_while_connecting(const char *dir)
+{
+    char f[300];
+    snprintf(f, sizeof f, "%s/conn.flac", dir);
+    CHECK(write_ramp(f, 44100, 44100) == 0);
+    deep_like_t dl = {.mu = PTHREAD_MUTEX_INITIALIZER, .last = -1, .q_at_join = -1};
+    audio_output_t out = {dl_open, dl_write, dl_delay, dl_drain, dl_flush, dl_pause, dl_nop, dl_describe, &dl, NULL, NULL,
+                          NULL, dl_join_depth};
+    engine_t *e = engine_new(&out);
+    decoder_test_open_delay(3000);
+    engine_play(e, "http://127.0.0.1:9/episode.mp3", 1);
+    WAIT(status(e).connecting, 2000);
+    CHECK(status(e).connecting && status(e).starting && !status(e).start_paused);
+    engine_pause(e, 1);
+    CHECK(status(e).start_paused == 1);
+    engine_pause(e, 0);
+    CHECK(status(e).start_paused == 0);
+    /* another asked for, to start paused, while this one connects: the
+     * connection given up doesn't take that with it */
+    engine_play_at(e, f, 2, 1.0f, 0, 1);
+    decoder_test_open_delay(0);
+    WAIT(status(e).track_id == 2 && status(e).state != ENG_STOPPED, 3000);
+    CHECK(status(e).track_id == 2 && status(e).state == ENG_PAUSED);
+    engine_stop(e);
+    engine_free(e);
+    unlink(f);
+}
+
 int main(void)
 {
     char dir[200];
     test_tmp(dir, sizeof dir, "fathom-test-engine");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     test_paused_write(dir);
+    test_open_ahead(dir);
+    test_pause_while_connecting(dir);
+    test_flac_frame_lies(dir);
     test_paused_stop_late(dir);
     test_open_fails(dir);
     test_pause_drops(dir);
+    test_pause_at_the_end(dir);
     test_stall_drops(dir);
     test_play_at(dir);
     test_play_paused(dir);

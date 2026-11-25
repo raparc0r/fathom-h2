@@ -230,6 +230,17 @@ static void sim_icon_seed(const char *dir)
         for (at += 3; at < al.n; at++)             /* (not the ones the podcasts took) */
             if (library_art(g_lib, al.ids[at], LIB_ART_LARGE, px) == 0 && library_art(g_lib, al.ids[at], LIB_ART_SMALL, small) == 0) break;
         if (at >= al.n) break;
+        /* FATHOM_SIM_FAVICON=file.png: the stations' logos are that picture (a
+         * small one: how a site's favicon looks as Now Playing's cover; the
+         * "radionp" screen then plays the first station that has a logo) */
+        const char *fav = getenv("FATHOM_SIM_FAVICON");
+        FILE *ff = fav ? fopen(fav, "rb") : NULL;
+        if (ff) {
+            static unsigned char enc[64 * 1024];
+            size_t en = fread(enc, 1, sizeof enc, ff);
+            fclose(ff);
+            if (library_logo_decode(enc, en, px, small, NULL)) continue;
+        }
         FILE *f = fopen(p, "wb");
         if (f) { fwrite(small, 1, sizeof small, f); fwrite(px, 1, sizeof px, f); fclose(f); }
     }
@@ -640,7 +651,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                                           "albummenu", "artistmenu", "aartistmenu", "homemove",
                                           "smartlists", "smartopen", "smartmenu",
                                           "cv-tracks", "cv-artist", "cv-artistsongs", "cv-playlist", "cv-queue",
-                                          "welcome", "welcomeend", "abouttips", "rescan", "rescanalbums", "rescancovers"};
+                                          "welcome", "welcomeend", "abouttips", "rescanlooking", "rescanchecking", "rescan", "rescanalbums", "rescanworking", "rescancovers"};
     static const char *const slug[] = {"studio-mint", "studio-ember", "studio-pastel", "pixel-pastel"};
     for (int t = 0; t < 4 && t < g_n_themes; t++) {   /* the built-in themes */
         ui_set_theme(t);
@@ -670,7 +681,10 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 radio_station_t st[4];
                 int n = radio_load("assets/radio.txt", st, 4);
                 if (g_player && n > 0) {
-                    player_radio_play(g_player, st, n, 0);
+                    int at = 0;
+                    for (int i = 0; getenv("FATHOM_SIM_FAVICON") && i < n; i++)
+                        if (st[i].icon[0]) { at = i; break; }
+                    player_radio_play(g_player, st, n, at);
                     player_radio_set_info(g_player, "Some Artist", "A song on the radio", NULL);
                 }
                 ui_show("nowplaying");
@@ -692,10 +706,13 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
             } else if (!strncmp(screens[s], "rescan", 6)) {   /* Settings > Library > Rescan, at each step */
                 ui_show("libsettings");
                 memset(&g_sim_scan, 0, sizeof g_sim_scan);
-                if (!strcmp(screens[s], "rescan")) {
+                if (!strcmp(screens[s], "rescanlooking")) g_sim_scan = (ui_scan_t){.step = UI_SCAN_LOOKING, .done = 3204};
+                else if (!strcmp(screens[s], "rescanchecking")) g_sim_scan = (ui_scan_t){.step = UI_SCAN_LOOKING, .done = 118, .total = -1};
+                else if (!strcmp(screens[s], "rescan")) {
                     g_sim_scan = (ui_scan_t){.step = UI_SCAN_SONGS, .done = 1225, .total = 9812};
                     snprintf(g_sim_scan.file, sizeof g_sim_scan.file, "%s", "07 - The Long Way Round (Live at the Roundhouse).flac");
-                } else if (!strcmp(screens[s], "rescanalbums")) g_sim_scan.step = UI_SCAN_ALBUMS;
+                } else if (!strcmp(screens[s], "rescanalbums")) g_sim_scan = (ui_scan_t){.step = UI_SCAN_ALBUMS, .done = 6120, .total = 9812};
+                else if (!strcmp(screens[s], "rescanworking")) g_sim_scan = (ui_scan_t){.step = UI_SCAN_ALBUMS, .done = 7, .total = -1};
                 else g_sim_scan = (ui_scan_t){.step = UI_SCAN_COVERS, .done = 12, .total = 31};
                 g_sim_scanning = 1;
                 ui_show_scan();

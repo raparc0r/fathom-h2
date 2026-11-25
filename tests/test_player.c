@@ -620,6 +620,121 @@ static void test_save_starting(const char *dir)
     unlink(queue);
 }
 
+/* Previous, or a jump, while the next track is still being opened (just after
+ * Next): the engine's figures are the last track's until it starts. Previous
+ * goes back to that one (it read its 3 s and more as "well into this one" and
+ * started the new one again); a jump isn't worked out from them. */
+static void test_keys_while_starting(const char *dir)
+{
+    char music[300], path[400], db[300], art[300];
+    snprintf(music, sizeof music, "%s/keys", dir);
+    snprintf(db, sizeof db, "%s/keys.db", dir);
+    snprintf(art, sizeof art, "%s/keys-art", dir);
+    mkdir(music, 0755);
+    for (int i = 0; i < 3; i++) {
+        snprintf(path, sizeof path, "%s/%02d.flac", music, i + 1);
+        CHECK(write_flac_long(path, 8) == 0);
+    }
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 3);
+    lib_list_t tr;
+    CHECK(library_list(lib, LIB_SONGS, 0, &tr) == 3);
+    int64_t *t = tr.ids;
+    audio_output_t out;
+    out_clock_create(&out);
+    g_clock_out = out;
+    out.write = gated_write;
+    engine_t *eng = engine_new(&out);
+    player_t *p = player_new(lib, eng);
+    eng_status_t es;
+
+    player_play(p, t, 3, 1);
+    WAIT_FOR(p, now_pos(p) >= 3400, SLOW);
+    __atomic_store_n(&g_gate, 1, __ATOMIC_SEQ_CST);              /* the thread held in its write */
+    sleep_ms(100);
+    player_next(p);
+    engine_status(eng, &es);
+    CHECK(es.starting && cur_id(p) == t[2]);
+    player_prev(p);
+    CHECK(cur_id(p) == t[1]);                                    /* back to the one it came from */
+    engine_status(eng, &es);
+    CHECK(es.starting && es.pos_ms >= 3400);                     /* (still the old figures) */
+    player_seek_by(p, 2000);
+    __atomic_store_n(&g_gate, 0, __ATOMIC_SEQ_CST);
+    WAIT_FOR(p, (engine_status(eng, &es), !es.starting && es.track_id == t[1] && es.state == ENG_PLAYING), SLOW);
+    sleep_ms(150);
+    engine_status(eng, &es);
+    CHECK(es.track_id == t[1] && es.pos_ms < 2000);              /* from its top: no jump from the old position */
+    if (es.pos_ms >= 2000) fprintf(stderr, "a jump while starting: at %u ms\n", es.pos_ms);
+
+    player_free(p);
+    engine_free(eng);
+    library_list_free(&tr);
+    library_close(lib);
+}
+
+/* A file that opens and has nothing in it to play (a header and no more),
+ * with repeat one: taken as played to its end, it was lined up again and
+ * "played" some 300 times a second, for ever. It is a track that couldn't be
+ * played (the engine says so), and with nothing else in the queue it stops. */
+static void test_empty_repeat(const char *dir)
+{
+    char music[300], path[400], db[300], art[300];
+    snprintf(music, sizeof music, "%s/empty", dir);
+    snprintf(db, sizeof db, "%s/empty.db", dir);
+    snprintf(art, sizeof art, "%s/empty-art", dir);
+    mkdir(music, 0755);
+    snprintf(path, sizeof path, "%s/01.flac", music);
+    CHECK(write_flac_long(path, 2) == 0);
+    {   /* its frames cut off: what's left is the "fLaC" mark and STREAMINFO (4 + 4 + 34 bytes) */
+        CHECK(truncate(path, 42) == 0);
+        FILE *f = fopen(path, "r+b");
+        CHECK(f != NULL);
+        if (f) {
+            fseek(f, 4, SEEK_SET);
+            fputc(0x80, f);                                      /* (STREAMINFO, and the last block) */
+            fclose(f);
+        }
+    }
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 1);
+    lib_list_t tr;
+    CHECK(library_list(lib, LIB_SONGS, 0, &tr) == 1);
+    audio_output_t out;
+    out_null_stats_t ns;
+    out_null_create(&out, &ns);
+    engine_t *eng = engine_new(&out);
+    player_t *p = player_new(lib, eng);
+    eng_status_t es;
+    player_set_repeat(p, REPEAT_ONE);
+    player_play(p, tr.ids, 1, 0);
+    WAIT_FOR(p, 0, 1500);
+    engine_status(eng, &es);
+    unsigned seq = es.seq;
+    WAIT_FOR(p, 0, 1000);
+    engine_status(eng, &es);
+    fprintf(stderr, "empty repeat: seq %u then %u, state %d error %d\n", seq, es.seq, es.state, es.error);
+    CHECK(es.seq == seq && es.state == ENG_STOPPED);             /* given up: not started again and again */
+    player_now_t now;
+    player_now(p, &now);
+    CHECK(!now.playing && now.fail_seq > 0 && now.fail_track == tr.ids[0]);   /* and said: it couldn't be played */
+    /* two of them, with repeat all: each given up in turn, then the queue */
+    int64_t two[2] = {tr.ids[0], tr.ids[0]};
+    player_set_repeat(p, REPEAT_ALL);
+    player_play(p, two, 2, 0);
+    WAIT_FOR(p, 0, 1500);
+    engine_status(eng, &es);
+    seq = es.seq;
+    WAIT_FOR(p, 0, 700);
+    engine_status(eng, &es);
+    CHECK(es.seq == seq && es.state == ENG_STOPPED);
+
+    player_free(p);
+    engine_free(eng);
+    library_list_free(&tr);
+    library_close(lib);
+}
+
 /* The next track's file is asked for ahead of its turn: 128 KB as a track
  * starts (Next starts from memory), 512 KB once it has under 10 s left (the
  * gapless join), each once for a track and its successor; nothing with no
@@ -839,6 +954,54 @@ static void test_radio_net(player_t *p, const char *music)
     player_now(p, &n);
     CHECK(!n.playing && !n.connecting && !n.radio_failed && n.index == 0 && SEQ(a) == 1);   /* (1: the choosing) */
 
+    /* Another list under the station that's on (the search it was found in
+     * has been left): its place and the list's length change, nothing is
+     * connected again (it is given up as soon as it would have been), and one
+     * that isn't the station on air changes nothing */
+    {
+        radio_station_t mine[3] = {{.name = "Mine", .url = "nothing://127.0.0.1/mine"}, two[1], two[0]};
+        player_radio_play(p, two, 2, 0);
+        a = player_seq(p);
+        WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
+        int plain = SEQ(a);                               /* what giving up takes, from here */
+        player_radio_play(p, two, 2, 0);
+        a = player_seq(p);
+        player_radio_relist(p, mine, 3, 0);               /* (mine[0] isn't the one on air) */
+        player_now(p, &n);
+        CHECK(SEQ(a) == 0 && n.index == 0 && n.count == 2);
+        player_radio_relist(p, mine, 3, 2);
+        player_now(p, &n);
+        const radio_station_t *on = player_radio_station(p);
+        CHECK(SEQ(a) == 1 && n.index == 2 && n.count == 3 && on && !strcmp(on->url, two[0].url));
+        CHECK(n.playing && n.connecting && !n.radio_failed);
+        CHECK(player_radio_at(p, 0) && !strcmp(player_radio_at(p, 0)->name, "Mine"));
+        WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
+        CHECK(n.radio_failed && n.index == 2 && SEQ(a) == plain + 1);
+        if (SEQ(a) != plain + 1) fprintf(stderr, "relist: %d steps to give up, %d without it\n", SEQ(a), plain);
+        /* Next goes through the new list */
+        player_next(p);
+        player_now(p, &n);
+        CHECK(n.index == 0 && n.count == 3 && !strcmp(player_radio_station(p)->name, "Mine"));
+        /* A station by itself (not one of the user's, its search left): Next
+         * and Previous do nothing while it's wanted (it was connected again:
+         * a break in the sound); given up, they try it again */
+        radio_station_t one = *player_radio_station(p);
+        player_radio_relist(p, &one, 1, 0);
+        player_now(p, &n);
+        CHECK(n.count == 1 && n.index == 0 && n.playing && n.connecting);
+        a = player_seq(p);
+        player_next(p);
+        player_prev(p);
+        player_now(p, &n);
+        CHECK(SEQ(a) == 0 && n.count == 1 && n.playing && n.connecting);
+        WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
+        CHECK(n.radio_failed);
+        a = player_seq(p);
+        player_next(p);
+        player_now(p, &n);
+        CHECK(SEQ(a) == 1 && !n.radio_failed && n.playing && n.connecting);
+    }
+
     /* a station whose server refuses the connection (an http address nothing
      * listens at), not heard yet: given up after its first connection and
      * three more, 6.5 s of waits, at the real pace. (A minute before, the
@@ -915,6 +1078,8 @@ int main(void)
     test_long_cued(dir);
     test_phantom_plays(dir);
     test_save_starting(dir);
+    test_keys_while_starting(dir);
+    test_empty_repeat(dir);
     test_warm_next(dir);
     char db[300], art[300], queue[300];
     snprintf(db, sizeof db, "%s/lib.db", dir);
@@ -1145,6 +1310,51 @@ int main(void)
     CHECK(player_queue_at(p, 1) == t[4]);
     player_queue_clear(p);
     CHECK(player_queue_len(p) == 0);
+
+    /* Add to queue after Previous: right after the current song when nothing
+     * queued by hand is still to come (it went to where the player had been,
+     * two songs on) */
+    player_play(p, t, N, 0);
+    player_next(p);
+    player_next(p);
+    player_next(p);
+    CHECK(cur_id(p) == t[3]);
+    player_prev(p);
+    player_prev(p);
+    CHECK(cur_id(p) == t[1]);
+    player_add_to_queue(p, &t[5], 1);                   /* 2 | 6 3 4 5 6 */
+    CHECK(player_queue_at(p, 0) == t[5] && player_queue_at(p, 1) == t[2]);
+    /* with one queued by hand still to come: after it, as before */
+    player_play(p, t, N, 2);
+    player_add_to_queue(p, &t[0], 1);                   /* 3 | 1 4 5 6 */
+    player_prev(p);
+    CHECK(cur_id(p) == t[1]);
+    player_add_to_queue(p, &t[5], 1);                   /* 2 | 3 1 6 4 5 6 */
+    CHECK(player_queue_at(p, 0) == t[2] && player_queue_at(p, 1) == t[0] && player_queue_at(p, 2) == t[5] &&
+          player_queue_at(p, 3) == t[3]);
+    /* once those have played, going back before them: after the current song */
+    player_next(p);
+    player_next(p);
+    player_next(p);
+    CHECK(cur_id(p) == t[5]);
+    player_prev(p);
+    player_prev(p);
+    CHECK(cur_id(p) == t[2]);
+    player_add_to_queue(p, &t[4], 1);
+    CHECK(player_queue_at(p, 0) == t[4] && player_queue_at(p, 1) == t[0]);
+    /* and after repeat all has started the queue over */
+    player_set_repeat(p, REPEAT_ALL);
+    player_play(p, t, N, 4);
+    player_add_to_queue(p, &t[0], 1);                   /* 5 | 1 6 */
+    player_next(p);
+    player_next(p);
+    CHECK(cur_id(p) == t[5]);
+    player_next(p);                                     /* (the last one: round to the first) */
+    CHECK(cur_id(p) == t[0]);
+    player_add_to_queue(p, &t[3], 1);
+    CHECK(player_queue_at(p, 0) == t[3] && player_queue_at(p, 1) == t[1]);
+    player_set_repeat(p, REPEAT_OFF);
+    player_queue_clear(p);
 
     /* stop after this track: stops, and the next track is cued */
     player_play(p, t, N, 0);

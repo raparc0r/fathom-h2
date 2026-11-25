@@ -72,6 +72,8 @@ struct library {
     int fw_bad;             /* ...and named a new file that isn't there: the scan stops, and walks the folder instead */
     int bulk;               /* a first scan in progress with the tracks' indexes set aside (bulk_begin) */
     int defer_art;          /* library_scan_defer_art: the next scan leaves the covers to the one after */
+    int art_later;          /* this scan left a cover unmade for want of memory: the next looks again */
+    int retry_unread;       /* library_scan_retry_unread: the next scan reads again the files none could read */
     int groups_how;         /* library_scan_groups() */
 };
 
@@ -1190,6 +1192,27 @@ static void meta_set(sqlite3 *db, const char *key, int v)
 
 /* A folder or file that's there but couldn't be looked at (the card's
  * reads failing, out of memory or file handles), not one that's gone. */
+/* Listing the music folder says how far it has got, a few times a second:
+ * cb(songs found so far, 0, "looking"), and for the files it then looks up
+ * one by one (those the quick listing has otherwise than the library),
+ * cb(files looked up, 0, "checking"). Without it the screen said "Looking
+ * for music" and nothing more for as long as that took: 16 s on the owner's
+ * library with every file to look up, minutes on a big one. */
+static double g_tell_every = 0.25;             /* (seconds between two reports; tests: 0) */
+void library_test_progress_every(double s) { g_tell_every = s; }
+
+static _Thread_local struct { lib_progress_cb cb; void *ctx; int found, checked; double at; } t_look;
+
+static void look_tell(int checking)
+{
+    if (!t_look.cb) return;
+    double now = now_s();
+    if (now - t_look.at < g_tell_every) return;
+    t_look.at = now;
+    if (checking) t_look.cb(t_look.checked, 0, "checking", t_look.ctx);
+    else t_look.cb(t_look.found, 0, "looking", t_look.ctx);
+}
+
 static int walk_error(int e)
 {
     return e == EIO || e == ENOMEM || e == EMFILE || e == ENFILE;
@@ -1224,7 +1247,11 @@ static void walk(const char *dir, pathvec_t *pv, pathvec_t *plv, pathvec_t *cv, 
             continue;
         }
         if (S_ISDIR(st.st_mode)) walk(path, pv, plv, cv, iv, depth + 1, cancel);
-        else if (S_ISREG(st.st_mode) && music) pv_push(pv, path, &st);
+        else if (S_ISREG(st.st_mode) && music) {
+            pv_push(pv, path, &st);
+            t_look.found++;
+            look_tell(0);
+        }
         else if (S_ISREG(st.st_mode) && list) pv_push(plv, path, &st);
         else if (S_ISREG(st.st_mode) && cue) pv_push(cv, path, &st);
         else if (S_ISREG(st.st_mode) && image) pv_push(iv, path, &st);
@@ -1252,7 +1279,11 @@ static int fw_file(const char *path, int64_t mtime, int64_t size, void *ctx)
     struct stat st = {0};
     st.st_mtime = (time_t)mtime;
     st.st_size = (off_t)size;
-    if (tags_supported(path)) pv_push(c->pv, path, &st);
+    if (tags_supported(path)) {
+        pv_push(c->pv, path, &st);
+        t_look.found++;
+        look_tell(0);
+    }
     else if (m3u_supported(path)) pv_push(c->plv, path, &st);
     else if (cue_supported(path)) pv_push(c->cv, path, &st);
     else if (art_image(path)) pv_push(c->iv, path, &st);
@@ -1288,6 +1319,8 @@ static int fw_differs(const char *what, const char *path)
 static int fw_check(pent_t *e, int64_t lib_mtime, int64_t lib_size)
 {
     struct stat st;
+    t_look.checked++;
+    look_tell(1);
     if (stat(e->p, &st) || !S_ISREG(st.st_mode)) return fw_differs("not found by the kernel:", e->p);
     if ((int64_t)st.st_mtime == lib_mtime && (int64_t)st.st_size == lib_size)
         return fw_differs("date or size read otherwise:", e->p);   /* (it hasn't changed after all) */
@@ -1891,6 +1924,51 @@ static void grp_track(grp_t *g, sqlite3_stmt *q)
 
 static void groups_counts(library_t *lib, double *t_folders, int as_added);
 
+/* The albums-and-artists step says it is at work, a few times a second:
+ * cb(done, total, "sorting") while it goes through the songs one by one
+ * (rebuild_groups), and for the rest, which is the database's own work on
+ * whole tables, cb(a number that goes up, 0, "working"), from SQLite's
+ * progress handler: sent only while statements are really running. The
+ * step's screen said "Sorting albums and artists" and nothing more: 3 s on
+ * 2,400 songs, four minutes on 50,000. */
+static _Thread_local struct { lib_progress_cb cb; void *ctx; int tick; double at; int counting; } t_grp;
+
+static void grp_tell(int done, int total)
+{
+    if (!t_grp.cb) return;
+    double now = now_s();
+    if (now - t_grp.at < g_tell_every) return;
+    t_grp.at = now;
+    if (total > 0) t_grp.cb(done, total, "sorting", t_grp.ctx);
+    else t_grp.cb(++t_grp.tick, 0, "working", t_grp.ctx);
+}
+
+static int grp_busy(void *arg)
+{
+    (void)arg;
+    /* (not while the songs are counted off: the two took turns on the screen,
+     * "1,200 of 2,400 songs" then "Working.." and back) */
+    if (!t_grp.counting) grp_tell(0, 0);
+    return 0;
+}
+
+static void grp_watch(sqlite3 *db, lib_progress_cb cb, void *ctx)
+{
+    if (!cb || t_grp.cb) return;
+    t_grp.cb = cb;
+    t_grp.ctx = ctx;
+    t_grp.tick = 0;
+    t_grp.at = now_s();
+    sqlite3_progress_handler(db, 20000, grp_busy, NULL);
+}
+
+static void grp_unwatch(sqlite3 *db)
+{
+    if (!t_grp.cb) return;
+    sqlite3_progress_handler(db, 0, NULL, NULL);
+    t_grp.cb = NULL;
+}
+
 static void rebuild_groups(library_t *lib)
 {
     sqlite3 *db = lib->db;
@@ -1909,7 +1987,13 @@ static void rebuild_groups(library_t *lib)
      * library would): a retag from "the beatles" to "The Beatles" kept the
      * old spelling while any track matched */
     sqlite3_exec(db, "UPDATE artists SET name=NULL", NULL, NULL, NULL);
-    while (sqlite3_step(q) == SQLITE_ROW) grp_track(&g, q);
+    int total = t_grp.cb ? (int)get_int_col(lib, "SELECT COUNT(*) FROM tracks", 0) : 0, at = 0;
+    t_grp.counting = total > 0;
+    while (sqlite3_step(q) == SQLITE_ROW) {
+        grp_track(&g, q);
+        if (total > 0) grp_tell(++at, total);
+    }
+    t_grp.counting = 0;
     t1 = now_s();
     sqlite3_finalize(q);
     grp_close(&g);
@@ -2723,6 +2807,46 @@ static int art_fit(const unsigned char *img, int w, int h, int size, uint16_t *p
     return 0;
 }
 
+/* A small picture (a site's favicon: under LIB_LOGO_SHARP_MIN on its short
+ * side) as a cover: blown up to the square it was a blur, so it was kept for
+ * the list alone and Now Playing showed the radio's sign. Drawn sharp instead,
+ * each of its pixels a whole number of the screen's (up to half the square's
+ * width), in the middle of a square of its own corners' colour when the four
+ * agree (an icon on a ground of its own) and white when they don't (what a
+ * logo's transparent parts are laid over). One too wide or tall for that is
+ * fitted as any logo. 0, -1 */
+static int art_pad(const unsigned char *img, int w, int h, int size, uint16_t *pixels)
+{
+    int big = w > h ? w : h;
+    if (big >= size) return art_fit(img, w, h, size, pixels);
+    int k = LIB_LOGO_SHARP_MIN / big;
+    if (k < 1) k = 1;
+    unsigned char *rs = malloc((size_t)size * (size_t)size * 3);
+    if (!rs) return -1;
+    const unsigned char *c[4] = {img, img + 3 * (size_t)(w - 1), img + 3 * (size_t)(h - 1) * (size_t)w,
+                                 img + 3 * ((size_t)(h - 1) * (size_t)w + (size_t)(w - 1))};
+    int same = 1;
+    for (int i = 1; i < 4 && same; i++)
+        for (int ch = 0; ch < 3; ch++) same &= abs((int)c[i][ch] - (int)c[0][ch]) <= 8;
+    unsigned char bg[3] = {255, 255, 255};
+    if (same) memcpy(bg, c[0], 3);
+    for (size_t i = 0; i < (size_t)size * (size_t)size; i++) memcpy(rs + 3 * i, bg, 3);
+    int dw = w * k, dh = h * k, ox = (size - dw) / 2, oy = (size - dh) / 2;
+    for (int y = 0; y < dh; y++)
+        for (int x = 0; x < dw; x++)
+            memcpy(rs + 3 * ((size_t)(oy + y) * size + (size_t)(ox + x)), img + 3 * ((size_t)(y / k) * (size_t)w + (size_t)(x / k)), 3);
+    to_rgb565(rs, size, pixels);
+    free(rs);
+    return 0;
+}
+
+/* (the large one of a logo: fitted, or a small picture kept sharp) */
+static int logo_large(const unsigned char *img, int w, int h, uint16_t *large)
+{
+    return (w < h ? w : h) < LIB_LOGO_SHARP_MIN ? art_pad(img, w, h, LIB_ART_LARGE, large)
+                                                 : art_fit(img, w, h, LIB_ART_LARGE, large);
+}
+
 /* A station's logo comes from anywhere: less of everything than a cover gets */
 static const art_limits_t LOGO_LIMITS = {1024L * 1024, 400000LL, 512L * 1024, 1};
 
@@ -2733,7 +2857,7 @@ int library_logo_decode(const unsigned char *enc, size_t len, uint16_t *large, u
     if (art_decode_mem(enc, len, LIB_ART_LARGE * 3 / 2, &LOGO_LIMITS, &img, &w, &h)) return -1;
     if (short_side) *short_side = w < h ? w : h;
     int r = art_fit(img, w, h, LIB_ART_SMALL, small);
-    if (r == 0 && large) r = art_fit(img, w, h, LIB_ART_LARGE, large);
+    if (r == 0 && large) r = logo_large(img, w, h, large);
     free(img);
     return r;
 }
@@ -2742,7 +2866,7 @@ int library_logo_rgb(const unsigned char *rgb, int w, int h, uint16_t *large, ui
 {
     if (!rgb || w < 1 || h < 1 || w > 1024 || h > 1024) return -1;
     int r = art_fit(rgb, w, h, LIB_ART_SMALL, small);
-    if (r == 0 && large) r = art_fit(rgb, w, h, LIB_ART_LARGE, large);
+    if (r == 0 && large) r = logo_large(rgb, w, h, large);
     return r;
 }
 
@@ -2864,8 +2988,11 @@ int library_reader_main(void) { return reader_serve(library_reader_do); }
 #define RD_LEAST_KB   1024
 #define RD_FULL_KB    4096
 static long g_test_budget = -1;
+static long rd_budget(int *is_short);
 
 void library_test_reader_budget(long kb) { g_test_budget = kb; }
+
+long library_reader_budget(int *is_short) { return rd_budget(is_short); }
 
 static long rd_budget(int *is_short)
 {
@@ -2938,6 +3065,9 @@ static int rd_sheet(const char *path, char **text, size_t *len)
  * helper died on it, and the album's cover is looked for elsewhere.
  * g_art_later: one wasn't made while the helper was short of memory. */
 static _Thread_local int g_art_later;
+/* g_rd_nowait: this thread doesn't wait for a helper that's busy (the
+ * screen's: library_remove_found_cover) */
+static _Thread_local int g_rd_nowait;
 
 static unsigned char *rd_art(int op, const char *path, int *w, int *h)
 {
@@ -2945,7 +3075,8 @@ static unsigned char *rd_art(int op, const char *path, int *w, int *h)
         int st, is_short;
         unsigned char *b;
         size_t n;
-        int r = reader_call(op, path, rd_budget(&is_short), &st, &b, &n);
+        long budget = rd_budget(&is_short);
+        int r = g_rd_nowait ? reader_call_nowait(op, path, budget, &st, &b, &n) : reader_call(op, path, budget, &st, &b, &n);
         if (r == READER_DIED || (r == 0 && st)) g_art_later |= is_short;
         if (r == READER_DIED) {
             fprintf(stderr, "library: the reader stopped on %s: no cover from it\n", path);
@@ -3163,6 +3294,7 @@ static void build_art(library_t *lib, const pathvec_t *iv, batch_t *b, lib_progr
                 g_art_later = 0;
                 r = id == poison ? -1 : make_art(lib, others, id, dir, page[k].first, page[k].key);
                 if (r < 0 && g_art_later) {         /* (not made with little memory to spare: looked for again next scan) */
+                    lib->art_later = 1;             /* (...which mustn't settle for the listing being as it was) */
                     made++;
                     continue;
                 }
@@ -3575,6 +3707,8 @@ typedef struct {
     sqlite3_stmt *look, *parts;                /* a split music file, unchanged */
     sqlite3_stmt *put_file, *up, *id;          /* ...or written again */
     idset_t *seen;                             /* the tracks found (library_scan) */
+    int retry;                                 /* files that couldn't be read are read again (library_scan_retry_unread):
+                                                * 1 the damaged ones, 2 those the reader stopped on as well */
 } cue_stmts_t;
 
 static int cue_stmts_prep(sqlite3 *db, cue_stmts_t *c)
@@ -3713,6 +3847,18 @@ static void cue_found(cue_stmts_t *c, const char *path)
     sqlite3_reset(c->id);
 }
 
+/* A file that was set aside as unreadable (kind 3) and couldn't be read
+ * again just now for want of memory or of the card: it stays set aside as it
+ * was. (Tried again because a Rescan asked, it had its row dropped as "no
+ * longer true": gone from Files not read, and read again at every scan.) */
+static void cue_keep_unread(cue_stmts_t *c, pent_t *f)
+{
+    sqlite3_reset(c->look);
+    sqlite3_bind_text(c->look, 1, f->p, -1, SQLITE_STATIC);
+    if (sqlite3_step(c->look) == SQLITE_ROW && sqlite3_column_int(c->look, 2) == 3) f->kept = 1;
+    sqlite3_reset(c->look);
+}
+
 /* A split music file (or one that can't be read: kind 3) as it was at the
  * last scan (`kind` and `sheet` as then): its tracks and its row are kept,
  * nothing written. 1 if so. */
@@ -3726,6 +3872,7 @@ static int cue_unchanged(cue_stmts_t *c, pent_t *f, int kind, const char *sheet)
         const char *was = (const char *)sqlite3_column_text(c->look, 3);
         same = kind == 3 ? 1 : sheet ? was && !strcmp(was, sheet) : was == NULL;   /* (kind 3: `sheet` is why) */
         if (kind == 3 && sqlite3_column_int(c->look, 4) < TAGS_READER) same = 0;   /* (a newer reader may manage) */
+        if (kind == 3 && c->retry && (c->retry == 2 || !was)) same = 0;           /* (asked to try again) */
     }
     sqlite3_reset(c->look);
     if (!same) return 0;
@@ -4274,6 +4421,7 @@ static int bulk_end(library_t *lib)
 }
 
 void library_scan_defer_art(library_t *lib, int on) { lib->defer_art = !!on; }
+void library_scan_retry_unread(library_t *lib, int on) { lib->retry_unread = !!on; }
 
 static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void *ctx, int allow_fast);
 
@@ -4286,6 +4434,9 @@ int library_scan(library_t *lib, const char *root, lib_progress_cb cb, void *ctx
         lib->fw_bad = 0;
         n = scan_once(lib, root, cb, ctx, 0);
     }
+    t_look.cb = NULL;                              /* (however the listing ended: nothing of this scan's is called later) */
+    grp_unwatch(lib->db);
+    lib->retry_unread = 0;                         /* (asked of one scan) */
     /* (stopped before its indexes were built, and carrying on: now. On the
      * way out, library_open does it at the next start.) */
     if (lib->bulk && !lib->cancel) bulk_end(lib);
@@ -4309,6 +4460,10 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
     if (plmax && sqlite3_step(plmax) == SQLITE_ROW) pl_before = sqlite3_column_int64(plmax, 0);
     sqlite3_finalize(plmax);
     lib->groups_how = 0;
+    t_look.cb = cb;                                /* (the listing's own count: look_tell) */
+    t_look.ctx = ctx;
+    t_look.found = t_look.checked = 0;
+    t_look.at = now_s();
     /* the library's files as they are aren't held by name (known_build) */
     known_t *known = known_build(lib->db);
     pv.known = known;
@@ -4348,7 +4503,17 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
      * 15 s of looking every file up and every album's cover over). */
     const pathvec_t *const lists[4] = {&pv, &cv, &iv, &plv};
     uint64_t sig = pv.failed || cv.failed || iv.failed || plv.failed ? 0 : listing_sig(lists, 4);
-    if (sig && (int64_t)sig == meta_get64(lib->db, "scan_sig") && !meta_get(lib->db, "scan_pending") &&
+    /* A scan asked to try the unread files again (library_scan_retry_unread:
+     * Rescan): those that are simply damaged, and, when a helper does the
+     * reading (reader.h), those a reader stopped on as well: one that dies
+     * again costs a helper, where it used to cost the player. With any to
+     * try, the listing being as it was settles nothing. */
+    int retry_unread = !lib->retry_unread ? 0 : reader_on() ? 2 : 1;
+    if (retry_unread && !get_int_col(lib, retry_unread == 2 ? "SELECT EXISTS(SELECT 1 FROM cues WHERE kind=3)"
+                                                            : "SELECT EXISTS(SELECT 1 FROM cues WHERE kind=3 AND sheet IS NULL)", 0))
+        retry_unread = 0;
+    if (retry_unread) fprintf(stderr, "library: reading again the files that couldn't be read\n");
+    if (sig && !retry_unread && (int64_t)sig == meta_get64(lib->db, "scan_sig") && !meta_get(lib->db, "scan_pending") &&
         !library_needs_tags(lib) && !library_needs_art(lib) &&
         !get_int_col(lib, "SELECT EXISTS(SELECT 1 FROM albums WHERE art_sig=0)", 0) &&   /* (every cover's source noted) */
         get_int_col(lib, "SELECT COUNT(*) FROM playlists", 0) == plv.n) {   /* (none of the player's left without its file) */
@@ -4377,6 +4542,7 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
         known = NULL;
         pv.known = NULL;
     }
+    t_look.cb = NULL;                              /* (listed: the songs' own count from here) */
     int first = 0;                                 /* a first scan, its indexes set aside just now */
     if (!lib->bulk && pv.n >= g_bulk_min && library_empty(lib)) { bulk_begin(lib); first = lib->bulk; }
     t_walk = now_s();
@@ -4408,6 +4574,7 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
         " composer=excluded.composer, tags_v=2, sort=excluded.sort, search=NULL");
     cue_sheet_t *sheet = NULL;
     int ok = look && sc.later && sc.up && sc.pend && cue_stmts_prep(db, &sc.cs) == 0;
+    sc.cs.retry = retry_unread;
     if (ok && first) direct_open(&sc, &pv);        /* (each song's groups as it's added) */
     sc.d_free = sc.direct == 1 && !cv.n;           /* (with sheets, files are looked for by name to the end) */
     int n_listed = pv.n;
@@ -4530,6 +4697,7 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
             }
             sc.retry++;
             idset_add(&sc.seen, id);           /* (a track's row stays as it was) */
+            if (!row) cue_keep_unread(&sc.cs, f);
             continue;
         }
         if (e->t.has_cuesheet) {
@@ -4631,6 +4799,7 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
      * that grouped each song as it was added: its indexes are next) */
     if (cb && groups && sc.direct != 1) cb(n_files, n_files, "albums", ctx);
     if (ngone || ncgone || sheets || groups || composers) {
+        grp_watch(db, cb, ctx);                /* (the step says it is at work: grp_tell) */
         sqlite3_stmt *del = prep(db, "DELETE FROM tracks WHERE id=?");
         sqlite3_stmt *delc = prep(db, "DELETE FROM cues WHERE path=?");
         batch_write(&sc.b);                    /* one batch: the groups end as the tracks are */
@@ -4753,8 +4922,10 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
     pv_free(&cv);
     if (lib->bulk && !lib->cancel) {               /* the songs and their groups are in: the indexes, once */
         if (cb) cb(n_files, n_files, "indexes", ctx);
+        grp_watch(db, cb, ctx);
         bulk_end(lib);
     }
+    grp_unwatch(db);
     t_groups = now_s();
     scan_playlists(lib, &plv, groups, &sc.b, pl_before);
     pv_free(&plv);
@@ -4767,6 +4938,7 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
 
     /* every scan: new albums, and any whose folder's images or tracks changed
      * (an image added or replaced doesn't change any track) */
+    lib->art_later = 0;
     if (!lib->cancel && !lib->defer_art) build_art(lib, &iv, &sc.b, cb, ctx);
     pv_free(&iv);
     t_art = now_s();
@@ -4775,7 +4947,7 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
             t_pl - t_groups, t_art - t_pl);
     /* the listing this scan made the library match (none: files still to be read) */
     if (!lib->cancel) {
-        int64_t keep = sc.retry || lib->defer_art || !groups_ok ? 0 : (int64_t)sig;   /* (covers or groups still to make: not as it should be yet) */
+        int64_t keep = sc.retry || lib->defer_art || lib->art_later || !groups_ok ? 0 : (int64_t)sig;   /* (covers or groups still to make: not as it should be yet) */
         if (keep != meta_get64(db, "scan_sig")) {
             batch_write(&sc.b);
             if (sc.b.open) meta_set64(db, "scan_sig", keep);
@@ -5577,10 +5749,29 @@ int library_remove_found_cover(library_t *lib, int64_t album_id)
             }
             sqlite3_finalize(q);
         }
+        /* (on the screen's thread: not behind a helper that is measuring a
+         * song for the levelling, which is minutes, and which this thread's
+         * own timer would have to stop) */
+        g_rd_nowait = 1;
+        g_art_later = 0;
         int r = make_art(lib, others, album_id, dir, have ? first : NULL, a.key);
-        reader_close();                            /* (one album's: no helper left waiting; a scan under way starts its own again) */
+        int later = r < 0 && g_art_later;
+        g_rd_nowait = 0;
+        reader_close_nowait();                     /* (one album's: no helper left waiting; a scan under way starts its own again) */
         sqlite3_finalize(others);
         if (r >= 0) return set_cover_state(lib, album_id, r == 0 ? LIB_COVER_OWN : LIB_COVER_FOUND);
+        if (later) {
+            /* Its own couldn't be made just now, with little memory to
+             * spare: not "it has none" (marked so, no scan looked again).
+             * No cover for now, and the next scan makes it. */
+            art_del(lib, album_id);
+            sqlite3_stmt *s = prep(lib->db, "UPDATE albums SET art=0, art_sig=0 WHERE id=?");
+            if (!s) return -1;
+            sqlite3_bind_int64(s, 1, album_id);
+            int rc = sqlite3_step(s) == SQLITE_DONE ? 0 : -1;
+            sqlite3_finalize(s);
+            return rc;
+        }
         /* (its own is gone meanwhile: no cover, as below) */
     }
     if (library_found_cover_path(a.key, "none", path, sizeof path) == 0) {

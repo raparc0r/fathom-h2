@@ -561,8 +561,12 @@ static void test_logo(void)
     free(img);
     img = NULL;
 
-    /* a station's logo: the RGBA one above, whole inside each square (64x48:
-     * 136x102 and 34x25, white above and below), its clear corner white */
+    /* a station's logo: the RGBA one above, whole inside each square. 64x48,
+     * under the size that fills the large one: there it is as it is, sharp, in
+     * the middle (from 36 to 99 across, 44 to 91 down), white around it (its
+     * corners aren't of one colour: one is clear); in the small one 34x25,
+     * white above and below. (It was stretched to 136x102 for the large one,
+     * which was then never used: too small to show, the caller found.) */
     static uint16_t large[LIB_ART_LARGE * LIB_ART_LARGE], small[LIB_ART_SMALL * LIB_ART_SMALL];
     long n = 0;
     snprintf(path, sizeof path, "%s/logo-rgba.png", g_tmp);
@@ -572,10 +576,11 @@ static void test_logo(void)
     const uint16_t white = 0xFFFF, red = RGB565(200, 10, 20);
     CHECK(large[0] == white && large[10 * LIB_ART_LARGE + 60] == white);              /* above the picture */
     CHECK(large[(LIB_ART_LARGE - 5) * LIB_ART_LARGE + 60] == white);                 /* below it */
-    CHECK(large[20 * LIB_ART_LARGE + 5] == white);                                   /* its clear corner */
-    uint16_t mid = large[60 * LIB_ART_LARGE + 100];                                  /* red (dithered: within a step) */
+    CHECK(large[68 * LIB_ART_LARGE + 20] == white && large[68 * LIB_ART_LARGE + 110] == white);   /* beside it */
+    CHECK(large[43 * LIB_ART_LARGE + 90] == white && large[92 * LIB_ART_LARGE + 90] == white);     /* just above, just below */
+    uint16_t mid = large[68 * LIB_ART_LARGE + 90];                                   /* red (dithered: within a step) */
     CHECK(abs((mid >> 11) - (red >> 11)) <= 1 && abs(((mid >> 5) & 63) - ((red >> 5) & 63)) <= 1 && abs((mid & 31) - (red & 31)) <= 1);
-    CHECK(large[60 * LIB_ART_LARGE] != white && large[60 * LIB_ART_LARGE + LIB_ART_LARGE - 1] != white);   /* edge to edge across */
+    CHECK(large[68 * LIB_ART_LARGE + 99] != white && large[68 * LIB_ART_LARGE + 100] == white);   /* its last column, and past it */
     CHECK(small[0] == white && small[33 * LIB_ART_SMALL + 17] == white && small[17 * LIB_ART_SMALL + 20] != white);
     memset(small, 0, sizeof small);
     CHECK(enc && library_logo_decode(enc, (size_t)n, NULL, small, NULL) == 0 && small[0] == white);   /* the small one alone */

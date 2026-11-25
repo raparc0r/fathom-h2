@@ -72,6 +72,15 @@ static int exists(const char *path)
     return stat(path, &st) == 0;
 }
 
+/* A picture's file with both sizes in it. One with the list's alone is a
+ * small icon kept before those had Now Playing's too: still shown in the
+ * list, and fetched once more for the rest. */
+static int whole(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 && (size_t)st.st_size > SMALL_BYTES;
+}
+
 void ricon_site_id(const char *site_url, char id[13])
 {
     id[0] = '\0';
@@ -400,8 +409,9 @@ static int get_picture(const char *url, const char *path)
             if (bad || side < RICON_SMALL_MIN) {
                 r = 0;
             } else {
-                int both = side >= RICON_LARGE_MIN;  /* (a favicon blown up to Now Playing's size is a blur: the list only) */
-                r = put(path, small, SMALL_BYTES, large, both ? LARGE_BYTES : 0) == 0 ? 1 : -1;
+                /* (both sizes always: a favicon has Now Playing's too, sharp in the
+                 * square's middle: library_logo_decode. It had the list's alone.) */
+                r = put(path, small, SMALL_BYTES, large, LARGE_BYTES) == 0 ? 1 : -1;
             }
         }
     }
@@ -737,13 +747,13 @@ static void run_job(const job_t *j)
                 if (!was[0]) continue;
                 id_path(was, "565", path, sizeof path);
                 id_path(was, "none", none, sizeof none);
-                if (exists(path)) skip = 1;                       /* it has its picture */
+                if (whole(path)) skip = 1;                        /* it has its picture */
                 else if (!exists(none)) skip = !(pass == 1 && unreached_n(was, 0) > 0);
             }
             if (skip) continue;
             id_path(id, "565", path, sizeof path);
             id_path(id, "none", none, sizeof none);
-            if (exists(path) || exists(none) || unreached_n(id, 0) >= UNREACHED_MAX) continue;
+            if (whole(path) || exists(none) || unreached_n(id, 0) >= UNREACHED_MAX) continue;
             if (pass == 2 && dir_down) continue;
             int r = pass == 0 ? fetch_one(j->icon[i], id) : pass == 1 ? fetch_site(j->site[i], id)
                                                                       : fetch_stream(j->url[i], j->icon[i], id);

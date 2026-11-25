@@ -61,7 +61,8 @@ family = atkinson            ; a built-in family: atkinson | arkpixel | vt323
 file       = fonts/MyFont.ttf
 file_title = fonts/MyFont-Medium.ttf   ; optional, for titles and the header
 ; pixel sizes per role (optional; defaults 15, 20, 18, 22, 16):
-meta  = 15                   ; times, counts, the header's battery
+meta  = 15                   ; times, counts, the header's battery (with atkinson, a row's value and
+                             ; the artist after an album's name are drawn 1 px bigger than this)
 body  = 20                   ; list rows, and the artist on Now Playing
 sub   = 18                   ; the help Menu shows on a setting, and Find cover's artist
 title = 22                   ; the title on Now Playing (two lines)

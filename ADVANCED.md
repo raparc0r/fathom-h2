@@ -35,8 +35,10 @@ Updates over Wi-Fi never touch the bootloader. When a release's notes say it cha
 2. Hold **Vol+** while turning the H2 on, and choose **Bootloader → Install or update**.
 3. **Boot select → Linux** (or restart). You can delete `bootloader.erosq` afterwards.
 
-From Fathom 0.9.0 on, the bootloader also goes back to the previous version by itself if
-an update doesn't start twice in a row.
+From Fathom 0.9.0 on, if an update's new system (the kernel and its Wi-Fi modules) doesn't
+start twice in a row, the bootloader goes back to the one before by itself, and the H2
+says so. Fathom itself stays at the new version, and the next update brings a new system
+again.
 
 ## If an update doesn't start
 

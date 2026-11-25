@@ -123,15 +123,24 @@ int radio_load_list(const char *path, const char *example, radio_station_t *out,
 
 #define LIST_MAX 65536
 
-/* A file's text (NUL-terminated, a BOM dropped), or NULL. */
-static char *read_text(const char *path)
+/* A file's text (NUL-terminated, a BOM dropped), or NULL: there's none, or
+ * (*over set) it is longer than is held here. Such a list is shown as far as
+ * it's read and never written back: what was past the end would be lost. */
+static char *read_text(const char *path, int *over)
 {
+    if (over) *over = 0;
     FILE *f = path ? fopen(path, "rbe") : NULL;
     if (!f) return NULL;
     char *buf = malloc(LIST_MAX);
     size_t n = buf ? fread(buf, 1, LIST_MAX - 1, f) : 0;
+    int more = buf && n == LIST_MAX - 1 && fgetc(f) != EOF;
     fclose(f);
     if (!buf) return NULL;
+    if (more && over) {
+        *over = 1;
+        free(buf);
+        return NULL;
+    }
     buf[n] = '\0';
     if (n >= 3 && (unsigned char)buf[0] == 0xef && (unsigned char)buf[1] == 0xbb && (unsigned char)buf[2] == 0xbf)
         memmove(buf, buf + 3, n - 2);
@@ -160,12 +169,13 @@ static const char NEW_LIST[] =
 /* The list's text: the file, or until there's one, a new list with the example's stations. */
 static char *list_text(const char *path, const char *example)
 {
-    char *t = read_text(path);
-    if (t) return t;
+    int over;
+    char *t = read_text(path, &over);
+    if (t || over) return t;
     t = malloc(LIST_MAX);
     if (!t) return NULL;
     size_t n = (size_t)snprintf(t, LIST_MAX, "%s", NEW_LIST);
-    char *ex = read_text(example);
+    char *ex = read_text(example, NULL);
     for (const char *line = ex; line && *line;) {
         const char *end = strchr(line, '\n'), *stop = end ? end : line + strlen(line);
         radio_station_t st;
@@ -219,7 +229,15 @@ void radio_line(const radio_station_t *st, char *out, size_t cap)
     if (!*s) s = "Station";
     /* (the info before the icon: a build from before icons reads the info to
      * the line's end, and takes "radiofrance:7 | icon: ..." for station 7 still) */
-    int len = snprintf(out, cap, "%s = %s", s, st->url);
+    /* The address: up to anything that would end it when the line is read
+     * back (a space, or the '|' that starts the next part: with one let
+     * through, what follows would be read as the station's info, logo and
+     * site, whatever they were given as). */
+    char url[sizeof st->url];
+    size_t u = 0;
+    for (const char *c = st->url; *c && !isspace((unsigned char)*c) && *c != '|' && u + 1 < sizeof url; c++) url[u++] = *c;
+    url[u] = '\0';
+    int len = snprintf(out, cap, "%s = %s", s, url);
     if (st->info[0] && len >= 0 && (size_t)len < cap) len += snprintf(out + len, cap - (size_t)len, " | info: %s", st->info);
     if (radio_icon_ok(st->icon) && len >= 0 && (size_t)len < cap) len += snprintf(out + len, cap - (size_t)len, " | icon: %s", st->icon);
     if (radio_icon_ok(st->site) && len >= 0 && (size_t)len < cap) snprintf(out + len, cap - (size_t)len, " | site: %s", st->site);

@@ -53,6 +53,13 @@ struct engine {
     pending_t cmd_play;
     pending_t next[ENGINE_AHEAD];   /* lined up to follow, in order */
     int n_next;
+    /* The one to follow, opened ahead while the output plays out what the
+     * track that's on left queued (preopen): its decoder (NULL: it didn't
+     * open, or wasn't tried), for which file and how, and its format. */
+    decoder_t *pre;
+    char pre_path[1024];
+    unsigned pre_flags;
+    audio_format_t pre_fmt;
     int cmd_seek, quit;
     uint32_t seek_ms;
 
@@ -101,6 +108,7 @@ struct engine {
     /* internet streams */
     volatile int net_abort;    /* set (under mu) to make a stream's open or read give up */
     int connecting;            /* a stream is being opened, without mu */
+    int decoded;               /* something of the track that's on has been decoded (or it was jumped in, or carries on a CUE file) */
     int dec_net;               /* the current track is a stream */
     volatile uint32_t net_read_ms;  /* a stream read under way since (monotonic ms, 0 = none) */
     unsigned meta_seq, dec_meta;  /* ours (for eng_status_t), and the decoder's last seen */
@@ -342,6 +350,7 @@ static int start_track(engine_t *e, const pending_t *p, int gapless, decoder_t *
         e->error = 1;
         return -1;
     }
+    e->decoded = e->dec == d;                        /* (a CUE track carrying on: its file has played) */
     if (e->dec && e->dec != d) {                     /* (the same: a CUE track carrying on) */
         if (gapless) decoder_join(d, e->dec);       /* DSD: the filter carries on across the join */
         decoder_close(e->dec);
@@ -470,6 +479,7 @@ static int seek_unlocked(engine_t *e, uint64_t frame, uint32_t ms)
     pthread_mutex_lock(&e->mu);
     e->writing = 0;
     e->seeking = 0;
+    e->decoded = 1;                    /* (a jump to its very end isn't a file with nothing in it) */
     if (e->hold) pthread_cond_broadcast(&e->cv);
     return rc;
 }
@@ -483,6 +493,57 @@ static int seek_unlocked(engine_t *e, uint64_t frame, uint32_t ms)
  * command "starting" for the status and for a pause, now that cmd_play is
  * free for a newer one. The caller looks, on return, at whether it was
  * stopped (opening cleared) or replaced (cmd_play) meanwhile. */
+/* Called with mu held. What was opened ahead is let go (the queue changed,
+ * playback stopped): its file closed, and the next change of song opens
+ * its own as before. */
+static void pre_drop(engine_t *e)
+{
+    if (e->pre) decoder_close(e->pre);
+    e->pre = NULL;
+    e->pre_path[0] = '\0';
+}
+
+/* Two tracks of one file split by a CUE sheet ("file::2" after "file::1"):
+ * the decoder that's on carries on into the next (decoder_continue), and
+ * there's nothing to open ahead. */
+static int same_cue_file(const char *a, const char *b)
+{
+    const char *sa = strstr(a, "::"), *sb = strstr(b, "::");
+    return sa && sb && sa - a == sb - b && !strncmp(a, b, (size_t)(sa - a));
+}
+
+/* Called with mu held, which it lets go of while the file is opened: the
+ * track to follow, opened as soon as the one that's on has been decoded to
+ * its end. The output still has what's queued to play (a second, for a file
+ * on the H2's DAC) and this thread has nothing to feed it meanwhile, so the
+ * open costs nothing; it used to be left until the queue was down to what a
+ * join needs (a fifth of a second), and a file that took longer than that to
+ * open (a big picture to pass over, a card busy with something else) left a
+ * gap. Once per file: the result waits in e->pre for the change of song. */
+static void preopen(engine_t *e)
+{
+    const pending_t *p = &e->next[0];
+    unsigned flags = e->dop && e->gain == 1.0f ? DECODER_DOP : 0;
+    if (!strcmp(e->pre_path, p->path) && e->pre_flags == flags) return;   /* opened, or tried */
+    pre_drop(e);
+    if (decoder_is_stream(p->path) || same_cue_file(e->path, p->path)) return;
+    char path[sizeof e->pre_path];
+    snprintf(path, sizeof path, "%s", p->path);
+    snprintf(e->pre_path, sizeof e->pre_path, "%s", path);
+    e->pre_flags = flags;
+    audio_format_t f;
+    pthread_mutex_unlock(&e->mu);
+    decoder_t *d = decoder_open_flags(path, &f, flags);
+    pthread_mutex_lock(&e->mu);
+    /* (asked for again meanwhile, by another file's turn: this one isn't it) */
+    if (strcmp(e->pre_path, path) || e->pre_flags != flags || e->pre) {
+        if (d) decoder_close(d);
+        return;
+    }
+    e->pre = d;
+    if (d) e->pre_fmt = f;
+}
+
 static decoder_t *open_unlocked(engine_t *e, const pending_t *p, audio_format_t *f)
 {
     /* DoP only while nothing would change the samples (see start_track) */
@@ -510,6 +571,10 @@ static void *run(void *arg)
     audio_thread_priority(1);
     pthread_mutex_lock(&e->mu);
     while (!e->quit) {
+        /* what was opened ahead is for the track lined up next, while this one plays to its end */
+        if (e->pre_path[0] && (e->cmd_play.valid || e->state != ENG_PLAYING || !e->n_next ||
+                               strcmp(e->pre_path, e->next[0].path)))
+            pre_drop(e);
         if (e->cmd_play.valid) {
             pending_t p = e->cmd_play;
             e->cmd_play.valid = 0;
@@ -542,7 +607,7 @@ static void *run(void *arg)
                 e->connecting = 0;
                 if (e->cmd_play.valid || e->net_abort || e->quit) {   /* replaced or stopped meanwhile */
                     if (nd) decoder_close(nd);
-                    e->start_paused = 0;
+                    if (!e->cmd_play.valid) e->start_paused = 0;      /* (else it is the new command's) */
                     continue;
                 }
                 if (!nd) {
@@ -767,25 +832,51 @@ static void *run(void *arg)
         }
         if (n > 0) {
             e->pos_frames += (uint64_t)n;
+            e->decoded = 1;
             e->nap_since = 0;
             continue;
         }
-        /* The end of the track, with one to follow: not yet, while the
+        /* A file that opened and had nothing in it to play (a header and no
+         * more): a track that can't be played, as one that didn't open, once
+         * what's queued before it has played out. Taken as played to its end,
+         * with repeat one it was lined up and "played" some 300 times a
+         * second, for ever (and with one to follow, passed over unsaid). */
+        int empty = !e->decoded && !e->dec_net;
+        /* The end of the track, with one to follow: that one's file is
+         * opened now (preopen), and the change itself not yet, while the
          * output has more queued than it needs (the end comes round again:
          * commands are taken meanwhile, and the decoder says 0 again). */
-        if (e->n_next && !e->cmd_play.valid && queue_over(e) && nap(e)) continue;
+        if (e->n_next && !e->cmd_play.valid && !empty) {
+            preopen(e);
+            if (dec != e->dec || e->quit || e->cmd_play.valid || e->state != ENG_PLAYING) continue;   /* (changed while it opened) */
+        }
+        if (e->n_next && !e->cmd_play.valid && !empty && queue_over(e) && nap(e)) continue;
         e->nap_since = 0;
         /* end of track: gapless successor, or stop (a play asked for meanwhile comes first) */
         pending_t bad = {.valid = 0};
-        if (e->n_next && !e->cmd_play.valid) {
+        if (e->n_next && !e->cmd_play.valid && !empty) {
             pending_t p = e->next[0];
             audio_format_t cf;
             memmove(&e->next[0], &e->next[1], (size_t)--e->n_next * sizeof e->next[0]);
             /* the next CUE track of the same file: the decoder just carries on */
             if (decoder_continue(dec, p.path, &cf) == 0 && start_track(e, &p, 1, dec, &cf, 0) == 0) continue;
-            if (!decoder_is_stream(p.path) && start_track(e, &p, 1, NULL, NULL, 0) == 0) continue;
+            if (!decoder_is_stream(p.path)) {
+                /* the one opened ahead, if it is this file's and still fits (DoP or not) */
+                decoder_t *pd = NULL;
+                audio_format_t pf;
+                if (e->pre && !strcmp(e->pre_path, p.path) && e->pre_flags == (e->dop && e->gain == 1.0f ? DECODER_DOP : 0u)) {
+                    pd = e->pre;
+                    pf = e->pre_fmt;
+                    e->pre = NULL;
+                }
+                pre_drop(e);
+                if (start_track(e, &p, 1, pd, pd ? &pf : NULL, 0) == 0) continue;
+            }
             bad = p;                                 /* it can't be played: this one plays out first */
         }
+        /* (another asked for meanwhile, as when a station is left: that one
+         * now, at the top, not after what's queued has played out) */
+        if (e->cmd_play.valid) continue;
         e->writing = 1;
         e->draining = 1;
         pthread_mutex_unlock(&e->mu);
@@ -794,14 +885,26 @@ static void *run(void *arg)
         e->writing = 0;
         e->draining = 0;
         if (e->hold) pthread_cond_broadcast(&e->cv);
+        /* Paused while the last of it played out, on an output that drops its
+         * queue at a pause (ALSA can't pause a PCM that is draining, and
+         * out_alsa drops instead; Bluetooth ends its stream): not the end.
+         * The rest is played at the resume, from what was heard (the rewind
+         * engine_pause set), and the end comes round again. It ended there,
+         * paused: the last second of a queue's last song lost, and Play
+         * started the song over. */
+        if (dec == e->dec && !e->cmd_play.valid && e->state == ENG_PAUSED && e->rewind && !bad.valid && !empty) continue;
         if (dec == e->dec && !e->cmd_play.valid && e->state != ENG_STOPPED) {
             /* A next track queued while it drained: on to it (the end comes
              * round again). A track shorter than the output's buffer ends
              * before the player has queued its successor: on the H2's one
              * core this thread (real-time) gets there first, and it stopped. */
-            if (!bad.valid && e->n_next) continue;
+            if (!bad.valid && !empty && e->n_next) continue;
             if (bad.valid) {
                 track_failed(e, &bad);
+            } else if (empty) {
+                fprintf(stderr, "engine: nothing to play in %s\n", e->path);
+                e->n_next = 0;
+                failed(e, 0);
             } else {
                 e->state = ENG_STOPPED;
                 e->ended = 1;
@@ -855,6 +958,7 @@ void engine_free(engine_t *e)
     }
     pthread_join(e->thread, NULL);
     if (e->dec) decoder_close(e->dec);
+    if (e->pre) decoder_close(e->pre);
     if (e->out_open) e->out.close(e->out.ctx);
     eq_destroy(e->eq);
     crossfeed_free(e->xf);
@@ -917,7 +1021,10 @@ void engine_queue_ahead(engine_t *e, const engine_track_t *t, int n)
 void engine_pause(engine_t *e, int on)
 {
     pthread_mutex_lock(&e->mu);
-    int starting = e->cmd_play.valid || e->opening;   /* (asked for, or its file being opened) */
+    /* (asked for, its file being opened, or its stream being connected: the
+     * state is STOPPED all through a connection, and a pause then did
+     * nothing: an episode sounded once it had connected) */
+    int starting = e->cmd_play.valid || e->opening || e->connecting;
     if (on && starting) {
         e->start_paused = 1;            /* the track about to start starts paused */
     } else if (!on && starting) {

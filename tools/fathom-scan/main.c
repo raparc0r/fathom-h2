@@ -18,7 +18,8 @@
 static void progress(int done, int total, const char *path, void *ctx)
 {
     (void)ctx;
-    if (total > 0) fprintf(stderr, "\r%d/%d  %-60.60s", done, total, path);
+    if (path && (!strcmp(path, "looking") || !strcmp(path, "checking"))) fprintf(stderr, "\r%s %d  %-52s", path, done, "");
+    else if (total > 0) fprintf(stderr, "\r%d/%d  %-60.60s", done, total, path);
     else fprintf(stderr, "\r%d  %-60.60s", done, path);
 }
 

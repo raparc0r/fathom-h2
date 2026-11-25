@@ -84,9 +84,14 @@ int update_stage(const char *zip_path, const char *stage, update_progress_fn pro
                  const volatile int *abort);
 
 /* Install STAGE/sd onto the card (card: its top folder), as above; STAGE is
- * removed afterwards. UPDATE_OK or UPDATE_ERR_INSTALL (STAGE/INSTALLING then
- * stays: update_resume tries again). Restart afterwards for the new kernel. */
+ * removed afterwards. UPDATE_OK, or an error: with STAGE/INSTALLING there the
+ * install had begun (update_resume finishes it at the next start, and the
+ * stage must not be removed: update_install_begun); without it nothing has
+ * moved (UPDATE_ERR_SPACE: no room for the old kernel's copy, the stage still
+ * ready). Restart afterwards for the new kernel. */
 int update_install(const char *card, const char *stage);
+/* Whether an install of STAGE has begun and isn't finished. */
+int update_install_begun(const char *stage);
 /* At start: an install cut short? 1 and finished (restart now), 0 nothing
  * to do, -1 it failed again. A stage left from before (a download, or ready
  * and never installed) is removed. */

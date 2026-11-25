@@ -336,7 +336,7 @@ int main(void)
     /* one of each */
     int n = 0;
     st[n++] = station("jpeg", "https://img.example/logo.jpg");          /* a JPEG: both sizes */
-    st[n++] = station("small", "https://img.example/px16.png");         /* a favicon: the list's size only */
+    st[n++] = station("small", "https://img.example/px16.png");         /* a favicon: sharp in the middle of the large one */
     st[n++] = station("svg", "https://img.example/svg-logo.png");       /* SVG text under a .png name */
     st[n++] = station("huge", "https://img.example/huge.jpg");          /* over the cap (-2) */
     st[n++] = station("gone", "https://img.example/gone.png");          /* the server says no (-3) */
@@ -352,14 +352,14 @@ int main(void)
     ricon_sync(st, n, 1);
     settle();
     CHECK(pic(st[0].icon) == BOTH && !marked(st[0].icon));
-    CHECK(pic(st[1].icon) == SMALL && !marked(st[1].icon));
+    CHECK(pic(st[1].icon) == BOTH && !marked(st[1].icon));
     CHECK(pic(st[2].icon) == -1 && marked(st[2].icon));
     CHECK(pic(st[3].icon) == -1 && marked(st[3].icon));
     CHECK(pic(st[4].icon) == -1 && marked(st[4].icon));
     CHECK(pic(st[5].icon) == -1 && !marked(st[5].icon));                 /* nothing kept: tried again later */
     CHECK(pic(st[8].icon) == -1 && marked(st[8].icon));
     CHECK(pic(st[9].icon) == -1 && marked(st[9].icon));
-    CHECK(pic(st[10].icon) == SMALL && pic(st[11].icon) == BOTH);
+    CHECK(pic(st[10].icon) == BOTH && pic(st[11].icon) == BOTH);
     CHECK(pic(st[12].icon) == -1 && marked(st[12].icon));
     CHECK(ricon_seq() == seq + 4);                                       /* four pictures written */
     CHECK(asked_for(st[0].icon) == 1);                                   /* one fetch for the logo two stations share */
@@ -376,8 +376,11 @@ int main(void)
     CHECK(ricon_read(id, LIB_ART_SMALL, small) == 1 && !memcmp(small, want_s, sizeof small));
     CHECK(ricon_read(id, LIB_ART_LARGE, large) == 1 && !memcmp(large, want_l, sizeof large));
     ricon_id(st[1].icon, id2);
-    CHECK(ricon_read(id2, LIB_ART_SMALL, small) == 1 && ricon_read(id2, LIB_ART_LARGE, large) == 0);
+    CHECK(ricon_read(id2, LIB_ART_SMALL, small) == 1 && ricon_read(id2, LIB_ART_LARGE, large) == 1);
     CHECK((small[0] >> 11) >= 23 && (small[0] & 31) <= 5 && (small[SMALL / 2 - 1] >> 11) >= 23);   /* red, corner to corner */
+    /* Now Playing's: the favicon in the middle on its own corners' colour (all red here, so red throughout) */
+    CHECK((large[0] >> 11) >= 23 && (large[0] & 31) <= 5 && (large[68 * LIB_ART_LARGE + 68] >> 11) >= 23 &&
+          (large[LIB_ART_LARGE * LIB_ART_LARGE - 1] >> 11) >= 23);
     ricon_id(st[2].icon, id2);
     CHECK(ricon_read(id2, LIB_ART_SMALL, small) == 0 && ricon_read("", LIB_ART_SMALL, small) == 0 &&
           ricon_read(id, 50, small) == 0);
@@ -417,7 +420,7 @@ int main(void)
      * leftovers too; anything else in the folder is left alone */
     ricon_sync(st, n, 1);
     settle();
-    CHECK(pic(st[0].icon) == BOTH && pic(st[1].icon) == SMALL && marked(st[2].icon) && pic(st[n - 1].icon) == BOTH);
+    CHECK(pic(st[0].icon) == BOTH && pic(st[1].icon) == BOTH && marked(st[2].icon) && pic(st[n - 1].icon) == BOTH);
     snprintf(p, sizeof p, "%s/0123456789ab.565.tmp", dir);
     snprintf(q, sizeof q, "%s/notes.txt", dir);
     FILE *f = fopen(p, "wb");
@@ -428,7 +431,7 @@ int main(void)
     before = calls;
     ricon_sync(keep, 2, 0);
     settle();
-    CHECK(pic(st[1].icon) == SMALL && marked(st[2].icon));               /* still in the list */
+    CHECK(pic(st[1].icon) == BOTH && marked(st[2].icon));               /* still in the list */
     CHECK(pic(st[0].icon) == -1 && !marked(st[3].icon) && pic(st[n - 1].icon) == -1);
     CHECK(size_of(p) == -1 && size_of(q) == 1 && calls == before);
     CHECK(files_in(dir) == 3);
@@ -449,7 +452,7 @@ int main(void)
     ricon_sync(two, 2, 1);                                               /* (the one waiting replaced) */
     settle();
     slow_ms = 0;
-    CHECK(pic(st[0].icon) == BOTH && pic(st[10].icon) == SMALL && pic(st[1].icon) == -1 && calls == before + 2);
+    CHECK(pic(st[0].icon) == BOTH && pic(st[10].icon) == BOTH && pic(st[1].icon) == -1 && calls == before + 2);
 
     /* stopped mid-fetch: the run ends, nothing half-written; started again, it's fetched */
     slow_ms = 3000;
@@ -464,7 +467,23 @@ int main(void)
     CHECK(ricon_start(dir) == 0);
     ricon_sync(st, 2, 1);
     settle();
-    CHECK(pic(st[1].icon) == SMALL && !marked(st[1].icon));
+    CHECK(pic(st[1].icon) == BOTH && !marked(st[1].icon));
+    /* a small icon kept before those had Now Playing's size too (the list's
+     * alone in its file): still the list's picture, fetched once more for the
+     * rest, and not again after */
+    {
+        char sp[700], sid[13];
+        CHECK(ricon_path(st[1].icon, sp, sizeof sp) == 0 && truncate(sp, SMALL) == 0 && pic(st[1].icon) == SMALL);
+        ricon_station_id(&st[1], sid);
+        CHECK(sid[0] && ricon_read(sid, LIB_ART_SMALL, small) == 1);
+        before = calls;
+        ricon_sync(st, 2, 1);
+        settle();
+        CHECK(pic(st[1].icon) == BOTH && calls == before + 1);
+        ricon_sync(st, 2, 1);
+        settle();
+        CHECK(calls == before + 1);
+    }
     /* one whose server is never reached (it refuses every connection): asked
      * for twice since the player started, not at every opening of Radio */
     radio_station_t never = station("never", "https://unreachable.example/never.png");
@@ -506,11 +525,11 @@ int main(void)
     CHECK(spic(sdir, ss[1].site) == BOTH && asked_for("https://rel.example/a/b/icons/px96.png") == 1 &&
           asked_for("https://cdn.example/tiny-px16.png") == 0);
     CHECK(spic(sdir, ss[2].site) == BOTH && asked_for("https://long.example/t120.png") == 1);
-    CHECK(spic(sdir, ss[3].site) == SMALL && asked_for("https://ico.example/apple-touch-icon.png") == 1 &&
+    CHECK(spic(sdir, ss[3].site) == BOTH && asked_for("https://ico.example/apple-touch-icon.png") == 1 &&
           asked_for("https://ico.example/favicon.ico") == 1);
-    CHECK(spic(sdir, ss[4].site) == SMALL);
-    CHECK(spic(sdir, ss[5].site) == SMALL);
-    CHECK(spic(sdir, ss[6].site) == SMALL);                            /* 64 pixels: under the large size's need */
+    CHECK(spic(sdir, ss[4].site) == BOTH);
+    CHECK(spic(sdir, ss[5].site) == BOTH);
+    CHECK(spic(sdir, ss[6].site) == BOTH);                            /* 64 pixels: under the large size's need */
     CHECK(spic(sdir, ss[7].site) == -1 && smarked(sdir, ss[7].site));
     CHECK(spic(sdir, ss[8].site) == -1 && smarked(sdir, ss[8].site) && asked_for("https://bare.example/favicon.ico") == 1);
     CHECK(spic(sdir, ss[9].site) == -1 && !smarked(sdir, ss[9].site));
@@ -526,12 +545,20 @@ int main(void)
         /* (red 20, green 20, blue 250, as RGB565; the last bit of each is dithered) */
         #define BLUE(v) (((v) & 0x1f) >= 30 && ((v) >> 11) <= 3 && (((v) >> 5) & 0x3f) <= 6)
         CHECK(px[17 * LIB_ART_SMALL + 4] == 0xFFFF && BLUE(px[17 * LIB_ART_SMALL + 28]));
+        /* its large one: the icon as it is (48 pixels: once its size, from 44 to 91), in the
+         * middle; around it white, its corners not being of one colour */
+        static uint16_t lg[LIB_ART_LARGE * LIB_ART_LARGE];
+        CHECK(ricon_read(sid, LIB_ART_LARGE, lg) == 1);
+        CHECK(lg[0] == 0xFFFF && lg[68 * LIB_ART_LARGE + 5] == 0xFFFF && lg[68 * LIB_ART_LARGE + 130] == 0xFFFF);
+        CHECK(lg[68 * LIB_ART_LARGE + 46] == 0xFFFF && BLUE(lg[68 * LIB_ART_LARGE + 70]) && BLUE(lg[68 * LIB_ART_LARGE + 91]) &&
+              lg[68 * LIB_ART_LARGE + 92] == 0xFFFF && BLUE(lg[44 * LIB_ART_LARGE + 80]) && lg[43 * LIB_ART_LARGE + 80] == 0xFFFF);
         ricon_site_id(ss[5].site, sid);
         CHECK(ricon_read(sid, LIB_ART_SMALL, px) == 1 && px[17 * LIB_ART_SMALL + 4] == 0xFFFF && BLUE(px[17 * LIB_ART_SMALL + 28]));
         ricon_site_id(ss[3].site, sid);
         CHECK(ricon_read(sid, LIB_ART_SMALL, px) == 1 && BLUE(px[17 * LIB_ART_SMALL + 4]));
+        /* all of one colour: that colour to the square's edges */
+        CHECK(ricon_read(sid, LIB_ART_LARGE, lg) == 1 && BLUE(lg[0]) && BLUE(lg[68 * LIB_ART_LARGE + 68]));
         #undef BLUE
-        CHECK(ricon_read(sid, LIB_ART_LARGE, (uint16_t *)q) == 0);    /* (no large part to read) */
     }
     /* the picture a station shows: its own logo's, or its site's when that's the one there */
     char own[13], want[13];

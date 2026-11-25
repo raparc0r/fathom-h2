@@ -41,6 +41,8 @@ decoder_t *decoder_open_ex(const char *path, audio_format_t *fmt, const volatile
  * output that takes it to a DAC that knows it. Other files: as decoder_open. */
 #define DECODER_DOP 1u
 decoder_t *decoder_open_flags(const char *path, audio_format_t *fmt, unsigned flags);
+/* (tests: every decoder_open_flags takes this long first, as a file slow to open does; 0: none) */
+void decoder_test_open_delay(int ms);
 /* A mono file or stream is given as two equal channels (fmt.channels says 2).
  * Up to max_frames frames into out (max_frames * channels samples).
  * Returns frames decoded, 0 at end of stream, -1 on error. */
