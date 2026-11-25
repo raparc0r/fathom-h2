@@ -52,6 +52,7 @@ add_library(fathom_player STATIC
   app/library/tags.c
   app/library/cue.c
   app/library/library.c
+  app/library/reader.c
   app/library/artdec.c
   app/library/fatwalk.c
   app/library/playlist.c
@@ -243,6 +244,11 @@ add_executable(test_scan tests/test_scan.c)
 target_link_libraries(test_scan PRIVATE fathom_player pthread)
 target_compile_options(test_scan PRIVATE ${FATHOM_WARNINGS})
 add_test(NAME scan COMMAND test_scan)
+
+add_executable(test_reader tests/test_reader.c)
+target_link_libraries(test_reader PRIVATE fathom_player pthread)
+target_compile_options(test_reader PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME reader COMMAND test_reader WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_executable(test_tags tests/test_tags.c)
 target_link_libraries(test_tags PRIVATE fathom_player)
 target_compile_options(test_tags PRIVATE ${FATHOM_WARNINGS})

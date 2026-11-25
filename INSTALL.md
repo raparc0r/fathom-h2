@@ -79,6 +79,7 @@ You can delete `update.upt` from the card afterwards.
 - **If the installer won't run** or the H2 doesn't start: [ADVANCED.md](ADVANCED.md).
 - **If Fathom keeps starting again while it reads your library:** a file in the library
   is stopping the player. Fathom sets such a file aside by itself once it has stopped on
-  it twice, so a few minutes may get it through. If not, start with a few albums in
-  `Music` and add the rest in parts, and please report it with the logs
+  it twice, so a few minutes may get it through, and Settings → Library → Files not read
+  then says which files they were. If it doesn't get through, start with a few albums
+  in `Music` and add the rest in parts, and please report it with the logs
   ([ADVANCED.md](ADVANCED.md), "Logs").

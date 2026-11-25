@@ -31,6 +31,11 @@ mix, can need more memory to open than the H2 has. Fathom lists it all the same,
 "too long for the H2's memory" if it can't play it then; about two hours is where that
 starts. Cut into shorter files, it plays. Other formats have no such limit.
 
+A file Fathom can't read (a damaged one, or one it can't get past while it reads your
+library) is left out, and Fathom says so when it's done. Settings → Library → **Files not
+read** lists them, and **Play** on one says where it is on the card. A file left out is
+tried again when it changes, so replacing it with a good copy brings it in.
+
 You can also take the card out and put it back: Fathom stops, shows "No/bad card", and
 starts again with your new music when the card is back. Over Wi-Fi, the network drive
 (below) lets you copy music while the H2 plays.
@@ -98,8 +103,9 @@ Settings → Library → **Find missing covers** does it for every album without
 and keeps only sure matches (the same artist and title, from a year that fits). When it's
 done it says how many it found and how many it wasn't sure of; Find cover shows you those.
 Found covers are saved in the card's `fathom/covers/` folder, never beside your music.
-A cover of your own (a `cover.jpg` in the album's folder, or one in its files) comes first,
-unless it's wrong: on an album with a cover, **Menu → Find another cover** looks one up the
+A cover of your own (a `cover.jpg` in the album's folder, or one in its files) comes first
+(one inside a song is used up to 4 MB, and only the first in a file; an image in the
+folder has no such limit), unless it's wrong: on an album with a cover, **Menu → Find another cover** looks one up the
 same way, and the one you pick stays ahead of the album's own. **Menu → Remove cover**
 takes a found one away: back to the album's own cover if it had one; if it had none, Find
 missing covers then leaves that album alone. Your music files are never changed, so other

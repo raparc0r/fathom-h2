@@ -1,0 +1,32 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] id3v2: one picture, of a size that can be held
+
+Each APIC frame of an ID3v2 tag (in a WAV, an AIFF, an AAC stream...) was
+read whole and kept with the others for as long as the file was open:
+front, back and booklet pages of a few MB each add up to more than a small
+player has. Only the first picture is read now, and only up to 4 MB (as
+mov.c's FATHOM_COVER_MAX); the others are skipped, which read_apic() already
+does for a picture it can't use.
+
+Upstream-Status: Inappropriate [a small player's limits]
+
+--- a/libavformat/id3v2.c
++++ b/libavformat/id3v2.c
+@@ -607,7 +607,17 @@
+     int64_t end               = avio_tell(pb) + taglen;
+ 
+     if (taglen <= 4 || (!isv34 && taglen <= 6))
++        goto fail;
++
++    /* Fathom: one picture is all that is used, and never one over 4 MB
++     * (as mov.c's FATHOM_COVER_MAX): a second or a bigger one is passed
++     * over. Each used to be read whole and held with the others for as
++     * long as the file was open. */
++    if (taglen > 4 * 1024 * 1024 + 256)
+         goto fail;
++    for (const ID3v2ExtraMeta *e = extra_meta->head; e; e = e->next)
++        if (!strcmp(e->tag, "APIC"))
++            goto fail;
+ 
+     new_extra = av_mallocz(sizeof(*new_extra));
+     if (!new_extra)

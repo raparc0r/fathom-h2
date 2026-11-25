@@ -1,0 +1,58 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] oggdec: a header packet kept up to 256 KB, not whole
+
+An Ogg stream's comment header can carry a cover as text
+(METADATA_BLOCK_PICTURE, base64): megabytes in one packet. The demuxer
+gathered the whole packet in the stream's buffer, which doubles as it grows
+(the old and the new one held together for a moment), and the picture was
+then decoded into yet another buffer: about three times its size. An Opus
+file with a 4 MB cover couldn't be opened on a player with 10 MB to spare,
+for its tags or to play it.
+
+While a stream is still reading its headers, once OGG_HEADER_KEEP bytes of
+a packet are buffered, a page that is only the middle of that packet (every
+segment 255: it neither starts nor ends in the page) is dropped after its
+checksum is verified. The packet's last page is read as ever, so the packet
+ends where it should, cut short in the middle. The comment parser already
+stops at a comment longer than what is left ("truncated comment header"):
+the comments before the cut are read, the cut one is left out.
+
+Upstream-Status: Inappropriate [a small player's limits]
+
+--- a/libavformat/oggdec.c
++++ b/libavformat/oggdec.c
+@@ -295,6 +295,8 @@
+             return 1;
+     return 0;
+ }
++
++#define OGG_HEADER_KEEP (256 * 1024)   /* Fathom: see ogg_read_page() */
+ 
+ static int buf_realloc(struct ogg_stream *os, int size)
+ {
+@@ -427,6 +429,25 @@
+         return 0;
+     }
+ 
++    /* Fathom: a header packet is kept up to OGG_HEADER_KEEP and no more.
++     * A comment header can carry a cover as text, megabytes of it, and the
++     * whole packet was gathered in a buffer that doubled as it grew: more
++     * memory than a small player has, and the end of the file when there
++     * wasn't enough. Past that size, a page that is nothing but the middle
++     * of such a packet (it neither starts nor ends in it) is let go as if
++     * it had never been read. The packet's last page still comes, so it
++     * ends where it should, short: its comments up to the one cut are read
++     * as ever, and that one is left out as truncated. */
++    if (idx >= 0 && os->header && os->incomplete && (flags & OGG_FLAG_CONT) &&
++        nsegs > 0 && os->bufpos - os->pstart >= OGG_HEADER_KEEP) {
++        for (i = 0; i < nsegs && segments[i] == 255; i++)
++            ;
++        if (i == nsegs) {
++            *sid = -1;
++            return 0;
++        }
++    }
++
+     /* CRC is correct so we can be 99% sure there's an actual change here */
+     if (idx < 0) {
+         if (data_packets_seen(ogg))

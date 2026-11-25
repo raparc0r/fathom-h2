@@ -1225,6 +1225,169 @@ static void test_died_on(const char *dir)
     library_set_trying_dir(NULL);
 }
 
+/* ---- two files the player dies on, side by side ----
+ * The first, set aside, is written down before anything else is read (the
+ * player dying on the second would otherwise have it forgotten, and the two
+ * tried in turn for ever: a user's MP3 album, 0.17.0); and the second, in the
+ * folder of one already set aside, goes at its first death. */
+typedef struct { const char *db; const char *sql; int seen, calls; } at_start_t;
+
+static void at_start(int done, int total, const char *path, void *ctx)
+{
+    (void)total; (void)path;
+    at_start_t *a = ctx;
+    if (done == 1 && !a->calls++) a->seen = db_int(a->db, a->sql);   /* (before the first file is read) */
+}
+
+static void test_died_side_by_side(const char *dir)
+{
+    char music[300], db[300], art[300], notes[300], a[400], b[400], c[400], p[400];
+    snprintf(music, sizeof music, "%s/smusic", dir);
+    mkdir(music, 0755);
+    snprintf(db, sizeof db, "%s/side.db", dir);
+    snprintf(art, sizeof art, "%s/side-art", dir);
+    snprintf(notes, sizeof notes, "%s/side-notes", dir);
+    mkdir(notes, 0755);
+    make_album(music, "Bad Album", 4);
+    make_album(music, "Fine Album", 3);
+    snprintf(a, sizeof a, "%s/Bad Album/002.flac", music);
+    snprintf(b, sizeof b, "%s/Bad Album/005.flac", music);
+    snprintf(c, sizeof c, "%s/Fine Album/004.flac", music);
+    library_set_trying_dir(notes);
+    library_t *lib = library_open(db, art);
+    /* A, twice running: set aside, and in the library before the scan reads a file */
+    trying_write(notes, "tags", a);
+    trying_write(notes, "tags.1", a);
+    at_start_t st = {db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped' AND path LIKE '%Bad Album/002.flac'", 0, 0};
+    CHECK(lib && library_scan(lib, music, at_start, &st) == 6);
+    CHECK(st.calls == 1 && st.seen == 1);
+    /* B, new beside it, once: no second chance */
+    if (write_flac(b, "Bad 5", "Some Artist", "Bad Album", 5)) exit(1);
+    trying_write(notes, "tags", b);
+    CHECK(library_scan(lib, music, NULL, NULL) == 6);
+    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped'") == 2);
+    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%Bad Album/00_.flac'") == 3);
+    /* a new file in another folder, once: tried again as ever (and it reads) */
+    if (write_flac(c, "Fine 4", "Some Artist", "Fine Album", 4)) exit(1);
+    trying_write(notes, "tags", c);
+    CHECK(library_scan(lib, music, NULL, NULL) == 7);
+    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3") == 2);
+    /* one named by a note but in the library as it is (the player stopped on
+     * something else, after it): never set aside, here beside two that are */
+    snprintf(p, sizeof p, "%s/Bad Album/001.flac", music);
+    trying_write(notes, "tags", p);
+    snprintf(p, sizeof p, "%s/Fine Album/005.flac", music);
+    if (write_flac(p, "Fine 5", "Some Artist", "Fine Album", 5)) exit(1);
+    CHECK(library_scan(lib, music, NULL, NULL) == 8);
+    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3") == 2);
+    /* and both stay aside at later scans, unread, with nothing written */
+    CHECK(library_scan(lib, music, NULL, NULL) == 8 && library_scan_changes(lib) == 0);
+    /* a file that simply can't be read isn't one the player stopped on */
+    snprintf(p, sizeof p, "%s/Fine Album/junk.flac", music);
+    FILE *f = fopen(p, "wb");
+    if (f) { fputs("not a flac at all", f); fclose(f); }
+    CHECK(library_scan(lib, music, NULL, NULL) == 8);
+    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet IS NULL") == 1);
+    CHECK(library_unread_count(lib) == 3);
+    char got[400] = "";
+    CHECK(library_unread(lib, 0, got, sizeof got) == 0 && !strcmp(got, a));
+    CHECK(library_unread(lib, 1, got, sizeof got) == 0 && !strcmp(got, b));
+    CHECK(library_unread(lib, 2, got, sizeof got) == 0 && !strcmp(got, p));
+    CHECK(library_unread(lib, 3, got, sizeof got) != 0);
+    library_close(lib);
+    library_set_trying_dir(NULL);
+}
+
+/* ---- a file the H2 itself goes down on (a reset: the RAM's notes lost) ----
+ * A run leaves an empty mark on the card while it reads; one found at the
+ * next start makes that run note each item in it; and what such a run's mark
+ * names is tried once more, then set aside. */
+typedef struct { const char *mark; long size_at_25; int exists_at_25; } mark_look_t;
+
+static void mark_look(int done, int total, const char *path, void *ctx)
+{
+    (void)total; (void)path;
+    mark_look_t *m = ctx;
+    struct stat sb;
+    if (done != 26) return;                                      /* (25 files read) */
+    m->exists_at_25 = stat(m->mark, &sb) == 0;
+    m->size_at_25 = m->exists_at_25 ? (long)sb.st_size : -1;
+}
+
+static void test_reset_on(const char *dir)
+{
+    char music[300], db[300], art[300], keep[300], mark[400], once[400], bad[400];
+    snprintf(music, sizeof music, "%s/rmusic", dir);
+    mkdir(music, 0755);
+    snprintf(art, sizeof art, "%s/reset-art", dir);
+    snprintf(keep, sizeof keep, "%s/reset-keep", dir);
+    mkdir(keep, 0755);
+    snprintf(mark, sizeof mark, "%s/scan-reading-tags", keep);
+    snprintf(once, sizeof once, "%s/scan-reading-tags.1", keep);
+    make_album(music, "Reset", 30);
+    snprintf(bad, sizeof bad, "%s/Reset/007.flac", music);
+    library_set_trying_keep(keep);
+    /* an ordinary run: an empty mark while it reads, none after */
+    snprintf(db, sizeof db, "%s/reset1.db", dir);
+    library_t *lib = library_open(db, art);
+    mark_look_t m = {mark, -1, 0};
+    CHECK(lib && library_scan(lib, music, mark_look, &m) == 30);
+    CHECK(m.exists_at_25 && m.size_at_25 == 0);
+    CHECK(access(mark, F_OK) != 0);
+    /* a scan that reads nothing leaves no mark at all */
+    m = (mark_look_t){mark, -1, 0};
+    CHECK(library_scan(lib, music, mark_look, &m) == 30 && !m.exists_at_25);
+    library_close(lib);
+    /* a mark left by a run the H2 went down in: this run names each file in it */
+    snprintf(db, sizeof db, "%s/reset2.db", dir);
+    trying_write(keep, "nothing", "");                           /* (some other file there: no matter) */
+    FILE *f = fopen(mark, "wb");
+    if (f) fclose(f);
+    lib = library_open(db, art);
+    m = (mark_look_t){mark, -1, 0};
+    CHECK(lib && library_scan(lib, music, mark_look, &m) == 30);
+    CHECK(m.exists_at_25 && m.size_at_25 > 10);
+    CHECK(access(mark, F_OK) != 0 && access(once, F_OK) != 0);
+    library_close(lib);
+    /* such a run's mark names a file: once more (it reads: in), and the "once" goes with the run */
+    snprintf(db, sizeof db, "%s/reset3.db", dir);
+    f = fopen(mark, "wb");
+    if (f) { fwrite(bad, 1, strlen(bad) + 1, f); fclose(f); }
+    lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 30);
+    CHECK(access(mark, F_OK) != 0 && access(once, F_OK) != 0);
+    library_close(lib);
+    /* twice running: set aside */
+    snprintf(db, sizeof db, "%s/reset4.db", dir);
+    f = fopen(mark, "wb");
+    if (f) { fwrite(bad, 1, strlen(bad) + 1, f); fclose(f); }
+    f = fopen(once, "wb");
+    if (f) { fwrite(bad, 1, strlen(bad) + 1, f); fclose(f); }
+    lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 29);
+    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped' AND path LIKE '%Reset/007.flac'") == 1);
+    CHECK(access(mark, F_OK) != 0 && access(once, F_OK) != 0);
+    library_close(lib);
+    /* the player died (its note in RAM) with a careful run's mark on the card:
+     * the RAM's note is the one believed, and the run isn't careful */
+    char notes[300];
+    snprintf(notes, sizeof notes, "%s/reset-notes", dir);
+    mkdir(notes, 0755);
+    library_set_trying_dir(notes);
+    snprintf(db, sizeof db, "%s/reset5.db", dir);
+    trying_write(notes, "tags", bad);
+    f = fopen(mark, "wb");
+    if (f) { fputs("/somewhere/else.flac", f); fclose(f); }
+    lib = library_open(db, art);
+    m = (mark_look_t){mark, -1, 0};
+    CHECK(lib && library_scan(lib, music, mark_look, &m) == 30);
+    CHECK(m.exists_at_25 && m.size_at_25 == 0);
+    CHECK(access(mark, F_OK) != 0);
+    library_close(lib);
+    library_set_trying_dir(NULL);
+    library_set_trying_keep(NULL);
+}
+
 /* ---- after a stop that wasn't clean: the library checked; a damaged one's
  * play counts brought over to the one rebuilt ---- */
 static void test_check_and_import(const char *dir)
@@ -1316,6 +1479,8 @@ int main(void)
     test_groups_as_added(dir);
     test_known_files(dir);
     test_died_on(dir);
+    test_died_side_by_side(dir);
+    test_reset_on(dir);
     test_check_and_import(dir);
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     printf("scan: all good\n");

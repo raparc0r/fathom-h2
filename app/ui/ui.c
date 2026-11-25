@@ -147,7 +147,7 @@ typedef enum {
     ST_BT, ST_WIFI,
     ST_SHUF_BY, ST_SHUF_FRESH, ST_SHUF_INTERLUDES, ST_SHUF_WORKS, ST_SHUF_SPOKEN, ST_BALANCE, ST_VOL_LIMIT, ST_PURE, ST_TRANSPORT, ST_BATTERY, ST_LANGUAGE,
     ST_THEME, ST_ALBUM_ARTISTS, ST_POD_AUTO, ST_POD_KEEP, ST_POD_CLEAN, ST_POD_SPEED, ST_FIND_COVERS, ST_CROSSFEED, ST_WIDTH,
-    ST_HOME_SCREEN,
+    ST_HOME_SCREEN, ST_N_UNREAD,
 } setting_t;
 /* Quick settings (quick_rows(): Bluetooth's and Wi-Fi's rows where they are) */
 static const setting_t QUICK[] = {ST_BRIGHTNESS, ST_SHUFFLE, ST_REPEAT, ST_EQ, ST_WIDTH, ST_BT, ST_WIFI,
@@ -170,7 +170,8 @@ static const setting_t POWER_ROWS[] = {ST_BATTERY, ST_AUTO_OFF};
 static const setting_t POD_ROWS[] = {ST_POD_AUTO, ST_POD_KEEP, ST_POD_CLEAN, ST_POD_SPEED};
 static const int POD_KEEPS[] = {1, 2, 3, 5};
 static const int POD_CLEANS[] = {1, 3, 7, 30, 0};            /* days; 0 = never */
-static const setting_t LIBRARY_ROWS[] = {ST_RESCAN, ST_FIND_COVERS, ST_N_SONGS, ST_N_ALBUMS, ST_N_ARTISTS, ST_N_PLAYLISTS};
+/* (the last, Files not read, only while there are any: library_rows()) */
+static const setting_t LIBRARY_ROWS[] = {ST_RESCAN, ST_FIND_COVERS, ST_N_SONGS, ST_N_ALBUMS, ST_N_ARTISTS, ST_N_PLAYLISTS, ST_N_UNREAD};
 static const setting_t USB_ROWS[] = {ST_USB_COMPUTER, ST_USB_DRIVE, ST_USB_DAC};
 static const int AUTO_OFFS[] = {5, 15, 30, 0};               /* minutes; 0 = never */
 static const int SLEEPS[] = {0, 15, 30, 45, 60, 90, PLAYER_SLEEP_END_ALBUM};   /* minutes; 0 = off */
@@ -222,6 +223,7 @@ typedef enum {
     L_RDIR, L_RDIR_GENRES, L_RDIR_COUNTRIES, L_RDIR_RESULTS, L_RDIR_SEARCH, L_PODCASTS, L_POD_SHOW, L_POD_SEARCH, L_POD_CHAPTERS,
     L_UPDATE, L_BATTERY, L_BAT_SPAN, L_BAT_HISTORY, L_UNINSTALL, L_UPD_ASK, L_COVER_FIND,
     L_SMART_TRACKS,   /* a smart playlist's songs (parent: LIB_SMART_*) */
+    L_UNREAD,         /* Settings > Library > Files not read */
     L_PLACEHOLDER
 } list_kind_t;
 
@@ -280,6 +282,7 @@ static struct {
     lv_timer_t *marquee_timer;  /* starts scrolling long text after a pause */
     lv_obj_t *np_next, *np_out, *np_pause, *empty;
     int lib_counts[4];      /* songs, albums, artists, playlists (Library screen) */
+    int lib_unread;         /* music files the scans couldn't read (its last row, and that list) */
     uint32_t reset_armed;   /* About > Reset: first press time; a second within 3 s resets */
     uint32_t uni_armed;     /* About > Uninstall Fathom > Uninstall: the same */
     ui_uninstall_t uni;     /* its state, as the device last gave it */
@@ -897,7 +900,8 @@ static int list_count(const level_t *l)
     case L_PLAYBACK: return (int)(sizeof PLAYBACK_ROWS / sizeof PLAYBACK_ROWS[0]);
     case L_POWER: return (int)(sizeof POWER_ROWS / sizeof POWER_ROWS[0]);
     case L_POD_SETTINGS: return (int)(sizeof POD_ROWS / sizeof POD_ROWS[0]);
-    case L_LIBRARY: return (int)(sizeof LIBRARY_ROWS / sizeof LIBRARY_ROWS[0]);
+    case L_LIBRARY: return (int)(sizeof LIBRARY_ROWS / sizeof LIBRARY_ROWS[0]) - (S.lib_unread <= 0);
+    case L_UNREAD: return S.lib_unread > 0 ? S.lib_unread : 1;
     case L_SIGNAL: {
         int n = 0;
         char a[8], b[8];
@@ -1118,6 +1122,19 @@ static void lib_counts_load(void)
         S.lib_counts[i] = library_list(S.lib, v[i], 0, &tmp);
         library_list_free(&tmp);
     }
+    S.lib_unread = S.lib ? library_unread_count(S.lib) : 0;
+}
+
+/* Files not read: a file's name, the whole row for it (<Play> says where it is) */
+static void unread_row(int i, char *main, size_t mn)
+{
+    char path[1024];
+    if (!S.lib || S.lib_unread <= 0 || library_unread(S.lib, i, path, sizeof path)) {
+        snprintf(main, mn, "%s", tr("None"));
+        return;
+    }
+    const char *name = strrchr(path, '/');
+    snprintf(main, mn, "%s", name ? name + 1 : path);
 }
 
 static void push_ui(list_kind_t kind, const char *title, int64_t parent) { push_as(kind, title, parent, 1); }
@@ -1391,6 +1408,7 @@ static void setting_row(setting_t st, int editing, char *main, size_t mn, char *
     case ST_N_ALBUMS: snprintf(main, mn, "%s", tr("Albums")); snprintf(meta, tn, "%d", S.lib_counts[1]); break;
     case ST_N_ARTISTS: snprintf(main, mn, "%s", tr("Artists")); snprintf(meta, tn, "%d", S.lib_counts[2]); break;
     case ST_N_PLAYLISTS: snprintf(main, mn, "%s", tr("Playlists")); snprintf(meta, tn, "%d", S.lib_counts[3]); break;
+    case ST_N_UNREAD: snprintf(main, mn, "%s", tr("Files not read")); snprintf(meta, tn, "%d", S.lib_unread); break;
     case ST_TIMEOUT: {
         int t = screen_timeout();
         snprintf(main, mn, "%s", tr("Screen off after"));
@@ -2862,6 +2880,7 @@ static void list_item(const level_t *l, int i, char *main, size_t mn, char *meta
         setting_row(setting_at(l, i), S.editing && i == l->sel, main, mn, meta, tn);
         break;
     case L_SIGNAL: if (S.hooks.signal_path) S.hooks.signal_path(i, main, mn, meta, tn); break;
+    case L_UNREAD: unread_row(i, main, mn); break;
     case L_ABOUT:
         switch (about_row(i)) {
         case AB_RESET: snprintf(main, mn, "Reset all settings"); break;
@@ -3650,7 +3669,7 @@ static int row_opens(const level_t *l, int i)
     case L_QUICK: case L_DISPLAY: case L_SOUND: case L_PLAYBACK: case L_POWER: case L_LIBRARY: case L_USB: case L_POD_SETTINGS:
     case L_INTERFACE:
         switch (setting_at(l, i)) {
-        case ST_THEME: case ST_HOME_SCREEN: case ST_EQ: case ST_BT: case ST_WIFI: return 1;
+        case ST_THEME: case ST_HOME_SCREEN: case ST_EQ: case ST_BT: case ST_WIFI: case ST_N_UNREAD: return 1;
         case ST_BATTERY: return S.hooks.battery_report != NULL;
         case ST_OUTPUT: return S.hooks.signal_path != NULL;
         default: return 0;
@@ -5196,6 +5215,7 @@ static const char *setting_help(setting_t st)
     case ST_RESCAN: return "Read the music folder again, showing how far it has got. <Back> lets it carry on while you listen.";
     case ST_FIND_COVERS: return "Finds covers online for albums without one. Keeps only sure matches.";
     case ST_N_SONGS: case ST_N_ALBUMS: case ST_N_ARTISTS: case ST_N_PLAYLISTS: return "Library counts.";
+    case ST_N_UNREAD: return "Music files Fathom couldn't read: damaged, or ones that stopped it. They aren't in the library.";
     case ST_USB_COMPUTER: return "What to do when plugged into a computer.";
     case ST_USB_DRIVE: return "Use the H2 as a USB drive, to copy music.";
     default: return NULL;
@@ -7097,6 +7117,7 @@ static void setting_ok(setting_t st)
     }
     case ST_RESCAN: if (S.hooks.rescan) S.hooks.rescan(); ui_show_scan(); break;
     case ST_FIND_COVERS: covers_find_all(); break;
+    case ST_N_UNREAD: push_ui(L_UNREAD, "Files not read", 0); break;
     case ST_USB_DRIVE: if (S.hooks.usb_drive) S.hooks.usb_drive(); break;
     case ST_USB_COMPUTER: {      /* Ask, USB drive, USB DAC, Just charge */
         static const int order[] = {UI_USB_ASK, UI_USB_DRIVE, UI_USB_DAC, UI_USB_CHARGE};
@@ -7706,6 +7727,12 @@ static void open_selected(void)
             push_ui(L_BAT_HISTORY, "History", 0);
         }
         break;
+    case L_UNREAD: {                               /* where the file is, in full */
+        char path[1024];
+        if (S.lib && S.lib_unread > 0 && library_unread(S.lib, l->sel, path, sizeof path) == 0)
+            toast_show(!strncmp(path, "/mnt/sd/", 8) ? path + 8 : path, 6000, S.f->body);
+        break;
+    }
     case L_BAT_HISTORY:
         if (l->sel < S.bat.nspans) {
             char day[32];
@@ -8616,6 +8643,18 @@ void ui_show(const char *what)
         S.stack[S.depth - 1].sel = SET_LIBRARY;
         push_ui(L_LIBRARY, "Library", 0);
         S.stack[S.depth - 1].sel = 1;
+    } else if (!strcmp(what, "libunread") || !strcmp(what, "unread") || !strcmp(what, "unreadwhere")) {
+        /* Settings > Library on Files not read (its last row, there while there are any);
+         * the list it opens; Play on a file there (where it is) */
+        S.stack[0].sel = home_index(H_SETTINGS);
+        push_ui(L_SETTINGS, "Settings", 0);
+        S.stack[S.depth - 1].sel = SET_LIBRARY;
+        push_ui(L_LIBRARY, "Library", 0);
+        S.stack[S.depth - 1].sel = list_count(&S.stack[S.depth - 1]) - 1;
+        if (strcmp(what, "libunread") && S.lib_unread > 0) {
+            push_ui(L_UNREAD, "Files not read", 0);
+            if (!strcmp(what, "unreadwhere")) open_selected();
+        }
     } else if (!strcmp(what, "covermenu") || !strcmp(what, "coverfind") || !strcmp(what, "covermenuown")) {
         /* an album without a cover: Menu on it ("covermenu"), Find cover's first match ("coverfind");
          * one with its own: Menu on it ("covermenuown") */

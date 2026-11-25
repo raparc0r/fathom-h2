@@ -73,6 +73,7 @@
 #define USB_ONLINE HW_USB_ONLINE
 #include "input.h"
 #include "library/library.h"
+#include "library/reader.h"
 #include "library/tags.h"
 #include "net/update.h"
 #include "net/podsync.h"
@@ -2483,6 +2484,23 @@ static void scan_start(void)
     }
 }
 
+/* Music files the scans couldn't read (damaged ones, and those set aside
+ * because the player stopped while reading them: Settings > Library lists
+ * them): said when a scan ends with more of them than when it was last said,
+ * so once for each that turns up. */
+static void unread_tell(void)
+{
+    if (!g_lib) return;
+    int n = library_unread_count(g_lib), told = settings_get_int("library.unread_told", 0);
+    if (n == told) return;
+    settings_set_int("library.unread_told", n);
+    if (n < told) return;
+    char num[16], msg[200];
+    snprintf(num, sizeof num, "%d", n);
+    lang_fill(msg, sizeof msg, tr(n == 1 ? "%s file couldn't be read. See Settings > Library." : "%s files couldn't be read. See Settings > Library."), num, NULL);
+    ui_toast(msg, 7000);
+}
+
 /* Called often: picks up a finished scan. */
 static void scan_poll(lv_timer_t *t)
 {
@@ -2524,6 +2542,7 @@ static void scan_poll(lv_timer_t *t)
     } else if (g_scan_covers) ui_covers_changed();   /* (covers only: shown where they were missing) */
     else if (g_rescan_asked && g_scan_result >= 0) ui_toast("No changes found", 1500);
     else if (g_rescan_asked) ui_toast("Couldn't read the music folder", 2500);
+    if (g_scan_result >= 0) unread_tell();           /* (over "Library updated": the one to read) */
     g_rescan_asked = 0;
     g_scan_covers = 0;
     ui_show_scan();                                  /* (its screen goes) */
@@ -3206,6 +3225,14 @@ int main(int argc, char **argv)
 {
     const char *music = "/mnt/sd/Music", *data = "/mnt/sd/fathom", *assets = "/mnt/sd/fathom/assets";
     int force_scan = 0, theme = 0, theme_given = 0;
+    if (argc == 2 && !strcmp(argv[1], "--reader")) {
+        /* The player's helper for reading files (library/reader.h), started
+         * by the player itself: nothing of the player is set up here. The
+         * same limits as its own readers (below). */
+        tags_set_exact_mp3_length(0);
+        tags_set_max_picture(FATHOM_ART_MAX_FILE);
+        return library_reader_main();
+    }
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--music") && i + 1 < argc) music = argv[++i];
         else if (!strcmp(argv[i], "--data") && i + 1 < argc) data = argv[++i];
@@ -3304,6 +3331,8 @@ int main(int argc, char **argv)
     tags_set_exact_mp3_length(0);   /* SD card: don't read whole MP3s for their length */
     tags_set_max_picture(FATHOM_ART_MAX_FILE);   /* embedded covers held in RAM */
     library_set_trying_dir("/tmp");               /* (a file that kills the player: not read again for ever) */
+    library_set_trying_keep(data);                /* (and one that takes the H2 down with it: known after the restart) */
+    reader_set_helper("/proc/self/exe");          /* (and one that would: read by a helper, which goes in the player's place) */
     /* The last stop: clean if the player left its marker on the way out (below,
      * at the end of main); not, after a power cut, a forced power-off or a
      * crash. Then the library is checked once the player is up. */

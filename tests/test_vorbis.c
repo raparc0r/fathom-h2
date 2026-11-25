@@ -57,6 +57,68 @@ static char *picture(int type, const unsigned char *img, size_t n)
     return out;
 }
 
+/* An Opus file written by hand, pages and all (no checksums: the tag
+ * reader doesn't look at them): its two headers, the second with a title, a
+ * small picture of another kind, then the front cover `front`, which spans
+ * as many pages as it needs; and a page of sound. */
+static void opus_page(FILE *f, int flags, uint32_t seq, long long granule, const unsigned char *body, size_t n, int ends)
+{
+    unsigned char h[27] = "OggS";
+    size_t full = n / 255, nseg = full + (ends ? 1 : 0);
+    h[5] = (unsigned char)flags;
+    for (int i = 0; i < 8; i++) h[6 + i] = (unsigned char)((unsigned long long)granule >> (8 * i));
+    h[14] = 0x4f; h[15] = 0x50; h[16] = 0x55; h[17] = 0x53;      /* the stream's serial */
+    for (int i = 0; i < 4; i++) h[18 + i] = (unsigned char)(seq >> (8 * i));
+    h[26] = (unsigned char)nseg;
+    fwrite(h, 1, 27, f);
+    for (size_t i = 0; i < full; i++) fputc(255, f);
+    if (ends) fputc((int)(n % 255), f);
+    fwrite(body, 1, n, f);
+}
+
+static void opus_packet(FILE *f, uint32_t *seq, const unsigned char *p, size_t n, int first_flags)
+{
+    int flags = first_flags;
+    while (n >= 255 * 255) {                                     /* a page full of it, and more to come */
+        opus_page(f, flags, (*seq)++, -1, p, 255 * 255, 0);
+        p += 255 * 255;
+        n -= 255 * 255;
+        flags = 1;                                               /* continued */
+    }
+    opus_page(f, flags, (*seq)++, 0, p, n, 1);
+}
+
+static int make_opus(const char *path, const unsigned char *front, size_t front_n)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    uint32_t seq = 0;
+    static const unsigned char head[19] = "OpusHead\x01\x02\x38\x01\x80\xbb\0\0\0\0";
+    opus_packet(f, &seq, head, sizeof head, 2);
+    static const unsigned char other_img[] = "\xFF\xD8\xFF\xE0 an artist's photo";
+    char *other = picture(8, other_img, sizeof other_img), *cover = picture(3, front, front_n);
+    const char *c[] = {"TITLE=Opus Song", other, cover, "ALBUM=Opus Album"};
+    size_t n = 8 + 4 + 4 + 4;
+    for (int i = 0; i < 4; i++) n += 4 + strlen(c[i]);
+    unsigned char *t = malloc(n), *w = t;
+    memcpy(w, "OpusTags", 8); w += 8;
+    w[0] = 4; w[1] = w[2] = w[3] = 0; memcpy(w + 4, "test", 4); w += 8;
+    w[0] = 4; w[1] = w[2] = w[3] = 0; w += 4;
+    for (int i = 0; i < 4; i++) {
+        uint32_t l = (uint32_t)strlen(c[i]);
+        w[0] = (unsigned char)l; w[1] = (unsigned char)(l >> 8); w[2] = (unsigned char)(l >> 16); w[3] = (unsigned char)(l >> 24);
+        memcpy(w + 4, c[i], l);
+        w += 4 + l;
+    }
+    opus_packet(f, &seq, t, n, 0);
+    static const unsigned char sound[1] = {0xfc};
+    opus_page(f, 4, seq++, 960, sound, 1, 1);
+    free(t);
+    free(other);
+    free(cover);
+    return fclose(f);
+}
+
 static double tone(long i, int c) { return 0.5 * sin(2 * M_PI * (c ? 660.0 : 440.0) * (double)i / RATE); }
 
 /* A stereo file of FRAMES frames: a tone, tags, and two pictures (an "other"
@@ -176,6 +238,32 @@ int main(void)
     tags_set_max_picture(90000);                 /* too big: skipped */
     CHECK(tags_picture(path, &img, &n) == -1 && !img);
     tags_set_max_picture((size_t)-1);
+
+    /* An Opus file's cover, read the same way (FFmpeg's reader holds the
+     * whole comment header, and now keeps only its first 256 KB): the front
+     * cover whatever its size, 100 KB and 3 MB; and none over the limit */
+    {
+        char op[256];
+        snprintf(op, sizeof op, "%s/cover.opus", dir);
+        size_t big_n = 3000000;
+        unsigned char *big = malloc(big_n);
+        for (size_t i = 0; i < big_n; i++) big[i] = (unsigned char)(i * 13 + 7);
+        big[0] = 0xFF; big[1] = 0xD8;
+        CHECK(make_opus(op, front, 100000) == 0);
+        img = NULL;
+        CHECK(tags_picture(op, &img, &n) == 0 && n == 100000 && img && !memcmp(img, front, 100000));
+        free(img);
+        CHECK(make_opus(op, big, big_n) == 0);
+        img = NULL;
+        CHECK(tags_picture(op, &img, &n) == 0 && n == big_n && img && !memcmp(img, big, big_n));
+        free(img);
+        img = NULL;
+        tags_set_max_picture(1000000);
+        CHECK(tags_picture(op, &img, &n) == -1 && !img);
+        tags_set_max_picture((size_t)-1);
+        free(big);
+        unlink(op);
+    }
 
     /* decoding: every frame (gapless: exactly what was encoded), the tone */
     audio_format_t fmt;

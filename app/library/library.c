@@ -33,6 +33,7 @@
 #include "library/fatwalk.h"
 #include "library/keys.h"
 #include "library/playlist.h"
+#include "library/reader.h"
 #include "library/tags.h"
 
 #ifndef FATHOM_SQLITE_CACHE
@@ -596,79 +597,201 @@ void library_close(library_t *lib)
  * (the player is killed), did so again at every start: the scan picks up where
  * it left off, at the same file. Before reading one, its name is noted in a
  * file in RAM (library_set_trying_dir: /tmp on the H2); done, the note goes.
- * A note still there when the next scan starts means the player died on it
- * (and wasn't powered off: RAM would have lost it). Once could be chance (the
- * player killed for want of memory while reading a blameless file): it's
- * tried again. Twice running at the same one: that file is set aside as
- * unreadable (as one that can't be read is: tried again when it changes), that
- * album as having no cover, and the scan carries on. */
+ * A note still there when the next scan starts means the player died on it.
+ * Once could be chance (the player killed for want of memory while reading a
+ * blameless file): it's tried again. Twice running at the same one: that file
+ * is set aside as unreadable (as one that can't be read is: tried again when
+ * it changes), that album as having no cover, and the scan carries on.
+ *
+ * A file that stops the H2 itself (it hangs until the watchdog restarts it)
+ * takes the RAM with it. So a run also leaves a mark on the card
+ * (library_set_trying_keep: an empty file, written once, when the run reads
+ * its first item, and removed at its end). A mark found with no note in RAM
+ * means the H2 went down during the last run: this run is "careful", and
+ * writes each item's name into the mark before reading it (a write to the
+ * card per item: only ever after such a stop). A careful run's mark found at
+ * the next start names the item the H2 went down on: once, twice, as above. */
 static char g_trying_dir[256];
+static char g_keep_dir[256];
+
+#define RAM_PRE  "fathom-trying-"
+#define KEEP_PRE "scan-reading-"
+
+/* The runs that leave a mark on the card (each on a thread of its own) */
+static struct keep { const char *what; int careful, marked, fd; } g_keep[] = {
+    {"tags", 0, 0, -1}, {"cover", 0, 0, -1}, {"level", 0, 0, -1},
+};
 
 void library_set_trying_dir(const char *dir)
 {
     snprintf(g_trying_dir, sizeof g_trying_dir, "%s", dir ? dir : "");
 }
 
-static void trying_path(const char *what, char *out, size_t cap)
+void library_set_trying_keep(const char *dir)
 {
-    snprintf(out, cap, "%s/fathom-trying-%s", g_trying_dir, what);
+    snprintf(g_keep_dir, sizeof g_keep_dir, "%s", dir ? dir : "");
+    for (size_t i = 0; i < sizeof g_keep / sizeof g_keep[0]; i++) {
+        if (g_keep[i].fd >= 0) close(g_keep[i].fd);
+        g_keep[i].careful = g_keep[i].marked = 0;
+        g_keep[i].fd = -1;
+    }
 }
 
-static int trying_note_left(const char *what, char *out, size_t cap);
-
-/* What a run died on twice running (1, its text in out, and forgotten); a
- * first time is remembered (fathom-trying-WHAT.1) and 0 returned */
-int library_trying_left(const char *what, char *out, size_t cap)
+static struct keep *keep_slot(const char *what)
 {
-    char once[40], before[2048] = "";
-    snprintf(once, sizeof once, "%s.1", what);
-    if (!trying_note_left(what, out, cap)) return 0;
-    int again = trying_note_left(once, before, sizeof before) && !strcmp(before, out);
-    if (again) return 1;
-    int fd = -1;                                       /* the first time: noted, and tried again */
-    library_trying(once, &fd, out);
-    if (fd >= 0) close(fd);
-    fprintf(stderr, "library: the player stopped while on %.200s (%s): once more\n", out, what);
-    return 0;
+    if (!g_keep_dir[0]) return NULL;
+    for (size_t i = 0; i < sizeof g_keep / sizeof g_keep[0]; i++)
+        if (!strcmp(g_keep[i].what, what)) return &g_keep[i];
+    return NULL;
 }
 
-/* The note left by a run that died (and removes it): 1, its text in out */
-static int trying_note_left(const char *what, char *out, size_t cap)
+static void note_path(const char *dir, const char *pre, const char *what, const char *sfx, char *out, size_t cap)
 {
-    char p[320];
-    if (!g_trying_dir[0] || cap < 2) return 0;
-    trying_path(what, p, sizeof p);
+    snprintf(out, cap, "%s/%s%s%s", dir, pre, what, sfx);
+}
+
+/* A note's text (1; 0: no note, or an empty one) */
+static int note_read(const char *p, char *out, size_t cap)
+{
     int fd = open(p, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return 0;
     ssize_t n = read(fd, out, cap - 1);
     close(fd);
-    unlink(p);
     if (n <= 0) return 0;
     out[n] = '\0';                                    /* (the text ends at its own NUL, if earlier) */
     return out[0] != '\0';
 }
 
+static void dir_sync(const char *dir)
+{
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return;
+    fsync(fd);
+    close(fd);
+}
+
+/* (durable: on the card, to be there after a reset) */
+static void note_write(const char *dir, const char *p, const char *text, int durable)
+{
+    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    if (write(fd, text, strlen(text) + 1) < 0) { /* (no note: nothing set aside) */ }
+    if (durable) fsync(fd);
+    close(fd);
+    if (durable) dir_sync(dir);
+}
+
+/* A run stopped on `text`: 2 when the stop before it was on the same one
+ * (the note WHAT.1, forgotten now), else 1, and it's remembered */
+static int note_again(const char *dir, const char *pre, const char *what, const char *text, int durable)
+{
+    char p[400], before[2048] = "";
+    note_path(dir, pre, what, ".1", p, sizeof p);
+    if (note_read(p, before, sizeof before) && !strcmp(before, text)) {
+        unlink(p);
+        if (durable) dir_sync(dir);
+        return 2;
+    }
+    note_write(dir, p, text, durable);
+    return 1;
+}
+
+/* What the last run of `what` stopped on, its text in out: 0 nothing, 1 for
+ * the first time (to be tried once more), 2 twice running (to be set aside).
+ * Called once as each run starts: it also says whether this one is careful. */
+static int trying_left(const char *what, char *out, size_t cap)
+{
+    char p[400];
+    struct keep *k = keep_slot(what);
+    if (cap < 2) return 0;
+    if (k) k->careful = 0;
+    if (g_trying_dir[0]) {                            /* the player died (the H2 stayed up) */
+        note_path(g_trying_dir, RAM_PRE, what, "", p, sizeof p);
+        int got = note_read(p, out, cap);
+        unlink(p);
+        if (got) {
+            int r = note_again(g_trying_dir, RAM_PRE, what, out, 0);
+            if (r == 1) fprintf(stderr, "library: the player stopped while on %.200s (%s): once more\n", out, what);
+            return r;
+        }
+    }
+    if (!k) return 0;
+    note_path(g_keep_dir, KEEP_PRE, what, "", p, sizeof p);
+    if (access(p, F_OK) != 0) return 0;
+    k->careful = 1;                                   /* the H2 itself went down during the last run */
+    if (!note_read(p, out, cap)) {
+        fprintf(stderr, "library: the H2 stopped during the last run (%s): each item is noted on the card this time\n", what);
+        return 0;
+    }
+    int r = note_again(g_keep_dir, KEEP_PRE, what, out, 1);
+    if (r == 1) fprintf(stderr, "library: the H2 stopped while on %.200s (%s): once more\n", out, what);
+    return r;
+}
+
+/* What a run stopped on twice running (1, its text in out, and forgotten) */
+int library_trying_left(const char *what, char *out, size_t cap)
+{
+    return trying_left(what, out, cap) == 2;
+}
+
 /* A note kept open while a run of files is read: *fd -1 before the first */
 void library_trying(const char *what, int *fd, const char *text)
 {
-    if (!g_trying_dir[0]) return;
-    if (*fd < 0) {
-        char p[320];
-        trying_path(what, p, sizeof p);
-        *fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        if (*fd < 0) return;
+    if (g_trying_dir[0]) {
+        if (*fd < 0) {
+            char p[400];
+            note_path(g_trying_dir, RAM_PRE, what, "", p, sizeof p);
+            *fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        }
+        if (*fd >= 0 && pwrite(*fd, text, strlen(text) + 1, 0) < 0) { /* (no note: nothing set aside) */ }
     }
-    if (pwrite(*fd, text, strlen(text) + 1, 0) < 0) { /* (no note: nothing set aside) */ }
+    struct keep *k = keep_slot(what);
+    if (!k) return;
+    int made = 0;
+    if (!k->marked) {                                 /* the run's mark on the card, once */
+        char p[400];
+        note_path(g_keep_dir, KEEP_PRE, what, "", p, sizeof p);
+        k->marked = 1;                                /* (a card that can't be written: not tried per item) */
+        k->fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (k->fd < 0) return;
+        made = 1;
+        if (!k->careful) {
+            fsync(k->fd);
+            close(k->fd);
+            k->fd = -1;
+            dir_sync(g_keep_dir);
+            return;
+        }
+    }
+    if (k->careful && k->fd >= 0) {
+        if (pwrite(k->fd, text, strlen(text) + 1, 0) < 0) { /* (as above) */ }
+        fsync(k->fd);
+        if (made) dir_sync(g_keep_dir);
+    }
 }
 
 void library_trying_done(const char *what, int *fd)
 {
-    if (!g_trying_dir[0]) return;
-    char p[320];
-    if (*fd >= 0) close(*fd);
-    *fd = -1;
-    trying_path(what, p, sizeof p);
-    unlink(p);
+    char p[400];
+    if (g_trying_dir[0]) {
+        if (*fd >= 0) close(*fd);
+        *fd = -1;
+        note_path(g_trying_dir, RAM_PRE, what, "", p, sizeof p);
+        unlink(p);
+    }
+    struct keep *k = keep_slot(what);
+    if (!k) return;
+    if (k->fd >= 0) close(k->fd);
+    k->fd = -1;
+    int gone = 0;                                     /* (a run that read nothing left no mark: nothing written) */
+    note_path(g_keep_dir, KEEP_PRE, what, "", p, sizeof p);
+    gone |= unlink(p) == 0;
+    if (k->careful) {                                 /* (a careful run that ended: its "once" forgotten too) */
+        note_path(g_keep_dir, KEEP_PRE, what, ".1", p, sizeof p);
+        gone |= unlink(p) == 0;
+    }
+    if (gone) dir_sync(g_keep_dir);
+    k->marked = k->careful = 0;
 }
 
 /* ---------- scanning ---------- */
@@ -2682,6 +2805,168 @@ static unsigned char *art_from_track(const char *track, int *w, int *h)
     return img;
 }
 
+/* ---------- the scan's reads, done by the helper (reader.h) ----------
+ * A file's tags, the CUE sheet in them, and a cover decoded small from an
+ * image file or from a song's own picture: what a scan runs on files it has
+ * never seen. library_reader_do is the helper's side. */
+enum { RD_TAGS = 1, RD_SHEET, RD_ART_FILE, RD_ART_TRACK };
+
+int library_reader_do(int op, const char *path, unsigned char **out, size_t *len)
+{
+    switch (op) {
+    case RD_TAGS: {
+        tags_t *t = malloc(sizeof *t);
+        if (!t) return -1;
+        int r = tags_read(path, t);
+        *out = (unsigned char *)t;
+        *len = sizeof *t;
+        return r ? -1 : 0;
+    }
+    case RD_SHEET: {
+        char *text = NULL;
+        size_t n = 0;
+        if (tags_cuesheet(path, &text, &n)) return -1;
+        *out = (unsigned char *)text;
+        *len = n;
+        return 0;
+    }
+    case RD_ART_FILE:
+    case RD_ART_TRACK: {
+        int w = 0, h = 0;
+        unsigned char *img = op == RD_ART_FILE ? art_from_file(path, &w, &h) : art_from_track(path, &w, &h);
+        if (!img || w <= 0 || h <= 0) { free(img); return -1; }
+        size_t n = (size_t)w * (size_t)h * 3;
+        unsigned char *b = malloc(8 + n);          /* its width and height, then the pixels */
+        if (b) {
+            int32_t wh[2] = {w, h};
+            memcpy(b, wh, 8);
+            memcpy(b + 8, img, n);
+            *out = b;
+            *len = 8 + n;
+        }
+        free(img);
+        return b ? 0 : -1;
+    }
+    default: return -1;
+    }
+}
+
+int library_reader_main(void) { return reader_serve(library_reader_do); }
+
+/* What the helper may take for one file: the memory available now less a
+ * reserve for everything else (the player, the music it is playing), and at
+ * least RD_LEAST_KB. Under RD_FULL_KB it is "short": a file that fails then
+ * may only have wanted more than there was at that moment (a song playing,
+ * Wi-Fi and Bluetooth on), so nothing is concluded about it and a later scan
+ * reads it again. With RD_FULL_KB or more a failure is the file's own. 0
+ * where the system doesn't say what is available (not the H2): no limit. */
+#define RD_RESERVE_KB 2048
+#define RD_LEAST_KB   1024
+#define RD_FULL_KB    4096
+static long g_test_budget = -1;
+
+void library_test_reader_budget(long kb) { g_test_budget = kb; }
+
+static long rd_budget(int *is_short)
+{
+    long avail = 0;
+    if (g_test_budget >= 0) avail = g_test_budget + RD_RESERVE_KB;
+    else {
+        FILE *f = fopen("/proc/meminfo", "re");
+        char line[128];
+        while (f && fgets(line, sizeof line, f))
+            if (sscanf(line, "MemAvailable: %ld", &avail) == 1) break;
+        if (f) fclose(f);
+    }
+    *is_short = 0;
+    if (avail <= 0) return 0;
+    long b = avail - RD_RESERVE_KB;
+    *is_short = b < RD_FULL_KB;
+    return b < RD_LEAST_KB ? RD_LEAST_KB : b;
+}
+
+/* A file's tags: 0, -1 (not read: t emptied), or READER_DIED (the helper
+ * died on it twice running, or hung). *later (if given): it wasn't read, and
+ * the helper was short of memory for it (rd_budget): again at a later scan. */
+static int rd_tags(const char *path, tags_t *t, int *later)
+{
+    if (later) *later = 0;
+    if (reader_on()) {
+        int st, is_short;
+        unsigned char *b;
+        size_t n;
+        long budget = rd_budget(&is_short);
+        int r = reader_call(RD_TAGS, path, budget, &st, &b, &n);
+        if (r == 0) {
+            if (st == 0 && n == sizeof *t) memcpy(t, b, n);
+            else { memset(t, 0, sizeof *t); st = -1; }
+            free(b);
+            if (st && later) *later = is_short;
+            return st;
+        }
+        if (r == READER_DIED) {
+            memset(t, 0, sizeof *t);
+            if (later) *later = is_short;
+            return r;
+        }
+    }
+    return tags_read(path, t) ? -1 : 0;
+}
+
+/* The sheet in a file's tags (as tags_cuesheet) */
+static int rd_sheet(const char *path, char **text, size_t *len)
+{
+    if (reader_on()) {
+        int st, is_short;
+        unsigned char *b;
+        size_t n;
+        int r = reader_call(RD_SHEET, path, rd_budget(&is_short), &st, &b, &n);
+        if (r == READER_DIED) return -1;
+        if (r == 0) {
+            char *t = st == 0 && b ? realloc(b, n + 1) : NULL;
+            if (!t) { free(b); return -1; }
+            t[n] = '\0';
+            *text = t;
+            *len = n;
+            return 0;
+        }
+    }
+    return tags_cuesheet(path, text, len);
+}
+
+/* A cover decoded small (as art_from_file, art_from_track): NULL too when the
+ * helper died on it, and the album's cover is looked for elsewhere.
+ * g_art_later: one wasn't made while the helper was short of memory. */
+static _Thread_local int g_art_later;
+
+static unsigned char *rd_art(int op, const char *path, int *w, int *h)
+{
+    if (reader_on()) {
+        int st, is_short;
+        unsigned char *b;
+        size_t n;
+        int r = reader_call(op, path, rd_budget(&is_short), &st, &b, &n);
+        if (r == READER_DIED || (r == 0 && st)) g_art_later |= is_short;
+        if (r == READER_DIED) {
+            fprintf(stderr, "library: the reader stopped on %s: no cover from it\n", path);
+            return NULL;
+        }
+        if (r == 0) {
+            int32_t wh[2] = {0, 0};
+            if (st == 0 && n > 8) memcpy(wh, b, 8);
+            if (wh[0] > 0 && wh[1] > 0 && wh[0] <= 8192 && wh[1] <= 8192 && (size_t)wh[0] * (size_t)wh[1] * 3 == n - 8) {
+                *w = wh[0];
+                *h = wh[1];
+                memmove(b, b + 8, n - 8);
+                return b;
+            }
+            free(b);
+            return NULL;
+        }
+    }
+    return op == RD_ART_FILE ? art_from_file(path, w, h) : art_from_track(path, w, h);
+}
+
 /* "CD1", "Disc 2", "disk 01 - Bonus": one disc of an album, whose cover is
  * often in the folder above. */
 static int disc_folder(const char *dir)
@@ -2726,7 +3011,7 @@ static int make_art(library_t *lib, sqlite3_stmt *others, int64_t album_id, cons
     unsigned char *img = NULL;
     struct stat ost;
     if (key && library_found_cover_path(key, "over", over, sizeof over) == 0 && stat(over, &ost) == 0 &&
-        library_found_cover_path(key, "jpg", found, sizeof found) == 0 && (img = art_from_file(found, &w, &h)) != NULL)
+        library_found_cover_path(key, "jpg", found, sizeof found) == 0 && (img = rd_art(RD_ART_FILE, found, &w, &h)) != NULL)
         was_found = 2;
     int rank = img ? -1 : find_cover_file(dir, file, sizeof file);
     int prank = -1;
@@ -2734,20 +3019,20 @@ static int make_art(library_t *lib, sqlite3_stmt *others, int64_t album_id, cons
         prank = find_cover_file(up, pfile, sizeof pfile);
         if (prank > 4) prank = -1;                   /* (only one named like a cover up there) */
     }
-    if (rank >= 0 && rank <= 4) img = art_from_file(file, &w, &h);
-    if (!img && prank >= 0) img = art_from_file(pfile, &w, &h);
-    if (!img && first_track) img = art_from_track(first_track, &w, &h);
+    if (rank >= 0 && rank <= 4) img = rd_art(RD_ART_FILE, file, &w, &h);
+    if (!img && prank >= 0) img = rd_art(RD_ART_FILE, pfile, &w, &h);
+    if (!img && first_track) img = rd_art(RD_ART_TRACK, first_track, &w, &h);
     if (!img && others) {
         sqlite3_reset(others);
         sqlite3_bind_int64(others, 1, album_id);
         sqlite3_bind_text(others, 2, first_track ? first_track : "", -1, SQLITE_STATIC);
         while (!img && sqlite3_step(others) == SQLITE_ROW)
-            img = art_from_track((const char *)sqlite3_column_text(others, 0), &w, &h);
+            img = rd_art(RD_ART_TRACK, (const char *)sqlite3_column_text(others, 0), &w, &h);
         sqlite3_reset(others);
     }
     if (!img && key && library_found_cover_path(key, "jpg", found, sizeof found) == 0 &&
-        (img = art_from_file(found, &w, &h)) != NULL) was_found = 1;
-    if (!img && rank > 4) img = art_from_file(file, &w, &h);
+        (img = rd_art(RD_ART_FILE, found, &w, &h)) != NULL) was_found = 1;
+    if (!img && rank > 4) img = rd_art(RD_ART_FILE, file, &w, &h);
     if (!img) return -1;
     const int sizes[2] = {LIB_ART_LARGE, LIB_ART_SMALL};
     int ok = 0;
@@ -2875,7 +3160,12 @@ static void build_art(library_t *lib, const pathvec_t *iv, batch_t *b, lib_progr
                 char note[32];
                 snprintf(note, sizeof note, "%lld", (long long)id);
                 library_trying("cover", &trying, note);
+                g_art_later = 0;
                 r = id == poison ? -1 : make_art(lib, others, id, dir, page[k].first, page[k].key);
+                if (r < 0 && g_art_later) {         /* (not made with little memory to spare: looked for again next scan) */
+                    made++;
+                    continue;
+                }
                 if (art != 0) retried++;
                 if (r >= 0) found++;
                 else art_del(lib, id);              /* none (its cover gone, or an album's id used again): no thumbnails left */
@@ -2884,6 +3174,23 @@ static void build_art(library_t *lib, const pathvec_t *iv, batch_t *b, lib_progr
             }
             page[k].sig = sig;
             page[k].now = r == 0 ? LIB_COVER_OWN : r == 1 ? LIB_COVER_FOUND : r == 2 ? LIB_COVER_PICKED : LIB_COVER_NONE;
+            if (id == poison && r < 0) {
+                /* written now, not with its page: the player dying on the
+                 * next album's cover would have this one forgotten, and
+                 * the two of them tried in turn for ever (as the songs
+                 * were: scan_once) */
+                batch_write(b);
+                if (b->open) {
+                    sqlite3_reset(u);
+                    sqlite3_bind_int(u, 1, LIB_COVER_NONE);
+                    sqlite3_bind_int64(u, 2, sig);
+                    sqlite3_bind_int64(u, 3, id);
+                    sqlite3_step(u);
+                    sqlite3_reset(u);
+                    page[k].now = -1;
+                }
+                batch_end(b);
+            }
         }
         if (made) art_sync(lib);
         batch_write(b);
@@ -3417,7 +3724,7 @@ static int cue_unchanged(cue_stmts_t *c, pent_t *f, int kind, const char *sheet)
                sqlite3_column_int64(c->look, 1) == f->size && sqlite3_column_int(c->look, 2) == kind;
     if (same) {
         const char *was = (const char *)sqlite3_column_text(c->look, 3);
-        same = sheet ? was && !strcmp(was, sheet) : was == NULL;
+        same = kind == 3 ? 1 : sheet ? was && !strcmp(was, sheet) : was == NULL;   /* (kind 3: `sheet` is why) */
         if (kind == 3 && sqlite3_column_int(c->look, 4) < TAGS_READER) same = 0;   /* (a newer reader may manage) */
     }
     sqlite3_reset(c->look);
@@ -3433,16 +3740,20 @@ static int cue_unchanged(cue_stmts_t *c, pent_t *f, int kind, const char *sheet)
 /* A music file whose tags can't be read (a damaged or half-copied file):
  * noted, so it's not read again while it's the same, and the fast walk's
  * list still matches the library (that never matched again: one such file
- * meant the slow walk at every scan). */
-static void cue_unreadable(cue_stmts_t *c, pent_t *f)
+ * meant the slow walk at every scan). `why`: NULL, or UNREAD_STOPPED for one
+ * the player stopped on (kept in the row's `sheet`). */
+#define UNREAD_STOPPED "stopped"
+
+static void cue_unreadable(cue_stmts_t *c, pent_t *f, const char *why)
 {
-    fprintf(stderr, "library: can't read %s\n", f->p);
+    if (!why) fprintf(stderr, "library: can't read %s\n", f->p);
     sqlite3_reset(c->put_file);
     sqlite3_bind_text(c->put_file, 1, f->p, -1, SQLITE_STATIC);
     sqlite3_bind_int64(c->put_file, 2, f->mtime);
     sqlite3_bind_int64(c->put_file, 3, f->size);
     sqlite3_bind_int(c->put_file, 4, 3);
-    sqlite3_bind_null(c->put_file, 5);
+    if (why) sqlite3_bind_text(c->put_file, 5, why, -1, SQLITE_STATIC);
+    else sqlite3_bind_null(c->put_file, 5);
     sqlite3_bind_int(c->put_file, 6, TAGS_READER);
     sqlite3_step(c->put_file);
     sqlite3_reset(c->put_file);
@@ -3534,7 +3845,7 @@ static int cue_embedded(cue_stmts_t *c, pent_t *f, const tags_t *t, cue_sheet_t 
 {
     char *text;
     size_t len;
-    if (!sheet_buf(sheet) || tags_cuesheet(f->p, &text, &len)) return -1;
+    if (!sheet_buf(sheet) || rd_sheet(f->p, &text, &len)) return -1;
     int r = cue_parse(text, len, *sheet);
     free(text);
     if (r < 2) return -1;
@@ -3550,7 +3861,7 @@ static int cue_external(cue_stmts_t *c, pathvec_t *pv, int i, const pent_t *e, c
     for (int fi = 0; fi < s->nfiles; fi++) {
         tags_t t;
         if (cue_file_tracks(s, fi) >= 2 && cue_resolve(pv, e->p, s->files[fi], s->nfiles == 1) == i)
-            return tags_read(pv->v[i].p, &t) ? -1 : cue_write(c, &pv->v[i], s, fi, &t, 1, e->p);
+            return rd_tags(pv->v[i].p, &t, NULL) ? -1 : cue_write(c, &pv->v[i], s, fi, &t, 1, e->p);
     }
     return -1;
 }
@@ -3795,6 +4106,22 @@ static void scan_dirty(scan_t *sc, int level)
     if (level > sc->marked) sc->marked = level;
 }
 
+/* A file the player stopped on is already set aside in `path`'s folder: 1 */
+static int stopped_beside(sqlite3 *db, const char *path)
+{
+    const char *sl = strrchr(path, '/');
+    if (!sl) return 0;
+    size_t n = (size_t)(sl - path) + 1;
+    sqlite3_stmt *q = prep(db, "SELECT path FROM cues WHERE kind=3 AND sheet='" UNREAD_STOPPED "'");
+    int r = 0;
+    while (q && !r && sqlite3_step(q) == SQLITE_ROW) {
+        const char *p = (const char *)sqlite3_column_text(q, 0);
+        r = p && !strncmp(p, path, n) && !strchr(p + n, '/');
+    }
+    sqlite3_finalize(q);
+    return r;
+}
+
 static void scan_flush(scan_t *sc, pathvec_t *pv)
 {
     if (!sc->npend) return;
@@ -3809,7 +4136,7 @@ static void scan_flush(scan_t *sc, pathvec_t *pv)
         pend_t *e = &sc->pend[k];
         pent_t *f = &pv->v[e->i];
         if (e->kind == PEND_BAD) {
-            cue_unreadable(&sc->cs, f);
+            cue_unreadable(&sc->cs, f, f->skip ? UNREAD_STOPPED : NULL);
         } else if (e->kind == PEND_LATER) {
             sqlite3_reset(sc->later);
             sqlite3_bind_int64(sc->later, 1, e->id);
@@ -3963,6 +4290,7 @@ int library_scan(library_t *lib, const char *root, lib_progress_cb cb, void *ctx
      * way out, library_open does it at the next start.) */
     if (lib->bulk && !lib->cancel) bulk_end(lib);
     lib->defer_art = 0;
+    reader_close();                                /* (the helper's memory back until the next scan) */
     return n;
 }
 
@@ -4088,12 +4416,30 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
 
     int changed = 0;   /* tracks added, changed or gone */
     int extra = 0;     /* unchanged tracks that got a tag read later (a composer) */
-    {   /* the file the player died reading, last time: not read again */
+    {   /* The file the player died reading, last time: not read again. It's
+         * written down now, in a batch of its own: left to go with the next
+         * songs', it was lost when the player died on the very next file (the
+         * rest of an album made the same way), which was then the one set
+         * aside, and forgotten in its turn: two such files side by side, and
+         * the scan never got past them. And after one in a folder, the others
+         * there get no second chance: an album of twelve is twelve starts,
+         * not twenty-four. */
         char died[2048];
-        int j = library_trying_left("tags", died, sizeof died) ? pv_find(&pv, died) : -1;
-        if (j >= 0) {
+        int times = trying_left("tags", died, sizeof died);
+        int j = ok && times ? pv_find(&pv, died) : -1;
+        if (j >= 0) {                              /* (in the library as it is: it was read, and something else stopped the player) */
+            sqlite3_bind_text(look, 1, died, -1, SQLITE_STATIC);
+            if (sqlite3_step(look) == SQLITE_ROW && sqlite3_column_int64(look, 1) == pv.v[j].mtime &&
+                sqlite3_column_int64(look, 2) == pv.v[j].size) j = -1;
+            sqlite3_reset(look);
+        }
+        if (j >= 0 && times == 1 && stopped_beside(db, died)) times = 2;
+        if (j >= 0 && times == 2) {
             pv.v[j].skip = 1;
             fprintf(stderr, "library: the player stopped while reading %s: set aside as unreadable\n", died);
+            batch_write(&sc.b);
+            cue_unreadable(&sc.cs, &pv.v[j], UNREAD_STOPPED);
+            batch_end(&sc.b);
         }
     }
     int trying = -1;
@@ -4133,7 +4479,7 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
             e->id = id;
             tt = now_s();
             library_trying("tags", &trying, path);
-            int got = !f->skip && tags_read(path, &e->t) == 0;
+            int got = !f->skip && rd_tags(path, &e->t, NULL) == 0;
             t_tags += now_s() - tt;
             if (!got) memset(&e->t, 0, sizeof e->t);
             if (got && e->t.has_cuesheet) {
@@ -4165,10 +4511,17 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
         pend_t *e = scan_queue(&sc, &pv, i, PEND_NEW);
         tt = now_s();
         library_trying("tags", &trying, path);
-        int unread = f->skip || tags_read(path, &e->t);
+        int later = 0;
+        int rr = f->skip ? -1 : rd_tags(path, &e->t, &later);
+        if (rr == READER_DIED && !later) {         /* (the helper, not the player: the scan carries on) */
+            f->skip = 1;
+            fprintf(stderr, "library: the reader stopped on %s: set aside as unreadable\n", path);
+        }
+        if (rr && later) fprintf(stderr, "library: %s not read with little memory to spare: again at the next scan\n", path);
+        int unread = rr != 0;
         t_tags += now_s() - tt;
         if (unread) {
-            if (f->skip || readable(path)) { e->kind = PEND_BAD; continue; }
+            if (!later && (f->skip || readable(path))) { e->kind = PEND_BAD; continue; }
             sc.npend--;                        /* can't be read now (EIO, no memory): next time */
             if (fast && !row && access(path, F_OK) != 0 && errno == ENOENT) {
                 lib->fw_bad = 1;               /* (never there: the FAT reading's mistake) */
@@ -4805,6 +5158,27 @@ void library_artist_counts(library_t *lib, int64_t artist_id, int *nalbums, int 
 
 int library_scan_changes(const library_t *lib) { return lib->scan_changes; }
 
+/* The music files a scan couldn't read: damaged ones, and those set aside
+ * because the player stopped while reading them */
+int library_unread_count(library_t *lib)
+{
+    return lib ? (int)get_int_col(lib, "SELECT COUNT(*) FROM cues WHERE kind=3", 0) : 0;
+}
+
+int library_unread(library_t *lib, int i, char *path, size_t cap)
+{
+    sqlite3_stmt *q = lib && i >= 0 ? prep(lib->db, "SELECT path FROM cues WHERE kind=3 ORDER BY path LIMIT 1 OFFSET ?") : NULL;
+    int r = -1;
+    if (!q) return -1;
+    sqlite3_bind_int(q, 1, i);
+    if (sqlite3_step(q) == SQLITE_ROW && sqlite3_column_text(q, 0)) {
+        snprintf(path, cap, "%s", (const char *)sqlite3_column_text(q, 0));
+        r = 0;
+    }
+    sqlite3_finalize(q);
+    return r;
+}
+
 int library_scan_quick(const library_t *lib) { return lib ? lib->quick : 0; }
 int library_scan_held(const library_t *lib) { return lib ? lib->scan_held : 0; }
 
@@ -5204,6 +5578,7 @@ int library_remove_found_cover(library_t *lib, int64_t album_id)
             sqlite3_finalize(q);
         }
         int r = make_art(lib, others, album_id, dir, have ? first : NULL, a.key);
+        reader_close();                            /* (one album's: no helper left waiting; a scan under way starts its own again) */
         sqlite3_finalize(others);
         if (r >= 0) return set_cover_state(lib, album_id, r == 0 ? LIB_COVER_OWN : LIB_COVER_FOUND);
         /* (its own is gone meanwhile: no cover, as below) */

@@ -62,6 +62,7 @@ struct decoder {
     AVFormatContext *fc;
     AVCodecContext *cc;
     AVPacket *pkt;
+    int pkt_held;            /* pkt already holds the next packet to decode (ff_drop_pictures) */
     AVFrame *frm;
     int stream, ff_eof;
     int64_t ff_target;   /* after a seek: the first frame to hand out, or -1 */
@@ -319,6 +320,33 @@ static int hls_io_open(AVFormatContext *s, AVIOContext **pb, const char *url, in
 
 /* hls: the URL is an HLS media playlist, for FFmpeg's hls demuxer. -2 for
  * a stream in Vorbis, which FFmpeg reads but (on the H2) can't decode. */
+/* A file's pictures (its cover, sometimes several) aren't the decoder's to
+ * hold. FFmpeg keeps each for as long as the file is open, and queues a copy
+ * of it to hand out before the first sound: a cover of 4 MB in each song of
+ * an album was 4 MB less while one played and 8 while the next was opened
+ * beside it, on an H2 with 9 to spare (the player killed at the first change
+ * of song, 2026-11-24). They're let go as soon as the file is open: the
+ * streams' own, then the queued copies, by reading up to the first packet of
+ * sound, which waits in d->pkt (pkt_held) for ff_fill. */
+static void ff_drop_pictures(decoder_t *d)
+{
+    int any = 0;
+    for (unsigned i = 0; i < d->fc->nb_streams; i++) {
+        AVStream *s = d->fc->streams[i];
+        if ((int)i == d->stream) continue;
+        s->discard = AVDISCARD_ALL;                  /* (and none queued again after a seek) */
+        if (s->disposition & AV_DISPOSITION_ATTACHED_PIC) {
+            av_packet_unref(&s->attached_pic);
+            any = 1;
+        }
+    }
+    for (int n = 0; any && n < 64; n++) {
+        if (av_read_frame(d->fc, d->pkt) < 0) return;    /* (no sound at all: ff_fill finds the end) */
+        if (d->pkt->stream_index == d->stream) { d->pkt_held = 1; return; }
+        av_packet_unref(d->pkt);
+    }
+}
+
 static int open_ff(decoder_t *d, const char *path, int hls)
 {
     ff_quiet();
@@ -380,6 +408,7 @@ static int open_ff(decoder_t *d, const char *path, int hls)
     d->pkt = av_packet_alloc();
     d->frm = av_frame_alloc();
     if (!d->pkt || !d->frm) return -1;
+    if (!d->net) ff_drop_pictures(d);
 
     int ch = d->cc->ch_layout.nb_channels;
     if (ch < 1 || ch > 2 || d->cc->sample_rate <= 0) return -1;   /* stereo DAC; no downmixing */
@@ -488,7 +517,9 @@ static long ff_fill(decoder_t *d)
         if (r == AVERROR_EOF) return 0;
         if (r != AVERROR(EAGAIN)) return -1;
         if (d->ff_eof) return 0;
-        if (av_read_frame(d->fc, d->pkt) < 0) {
+        if (d->pkt_held) {
+            d->pkt_held = 0;                          /* (read when the file was opened) */
+        } else if (av_read_frame(d->fc, d->pkt) < 0) {
             d->ff_eof = 1;
             avcodec_send_packet(d->cc, NULL);                   /* drain the decoder */
             continue;
@@ -523,6 +554,10 @@ static int seek_ff(decoder_t *d, uint64_t frame)
 {
     AVStream *st = d->fc->streams[d->stream];
     int64_t ts = av_rescale_q((int64_t)frame, (AVRational){1, (int)d->fmt.rate}, st->time_base);
+    if (d->pkt_held) {
+        av_packet_unref(d->pkt);
+        d->pkt_held = 0;
+    }
     if (av_seek_frame(d->fc, d->stream, ts, AVSEEK_FLAG_BACKWARD) < 0) return -1;
     avcodec_flush_buffers(d->cc);
     d->ff_eof = 0;

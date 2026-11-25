@@ -65,6 +65,7 @@ add_executable(fathom-player
   ${ROOT}/app/library/tags.c
   ${ROOT}/app/library/cue.c
   ${ROOT}/app/library/library.c
+  ${ROOT}/app/library/reader.c
   ${ROOT}/app/library/artdec.c
   ${ROOT}/app/library/fatwalk.c
   ${ROOT}/app/library/playlist.c
@@ -200,6 +201,7 @@ add_executable(fathom-scan
   ${ROOT}/app/library/tags.c
   ${ROOT}/app/library/cue.c
   ${ROOT}/app/library/library.c
+  ${ROOT}/app/library/reader.c
   ${ROOT}/app/core/fsafe.c
   ${ROOT}/app/library/artdec.c
   ${ROOT}/app/library/fatwalk.c
@@ -240,6 +242,27 @@ target_compile_options(fathom-rg-bench PRIVATE -Wall -Wextra -Wno-unused-paramet
 target_compile_definitions(fathom-rg-bench PRIVATE FATHOM_HAVE_FFMPEG FATHOM_HAVE_VORBIS FATHOM_VORBIS_TREMOR)
 target_link_options(fathom-rg-bench PRIVATE -static)
 target_link_libraries(fathom-rg-bench PRIVATE ${DEPS_STATIC_LDFLAGS} pthread m)
+
+# A file or a stream opened and decoded as the player does, without a sound
+# (tools/decode-check). Not installed; copied by hand.
+add_executable(fathom-decode-check
+  ${ROOT}/tools/decode-check/main.c
+  ${ROOT}/app/net/dnscache.c
+  ${ROOT}/app/library/cue.c
+  ${ROOT}/app/audio/decoder.c
+  ${ROOT}/app/audio/dsd.c
+  ${ROOT}/app/audio/vorbis.c
+  ${ROOT}/app/audio/streamlist.c
+  ${ROOT}/app/audio/ff_util.c
+  ${ROOT}/app/net/http.c
+  ${ROOT}/app/core/fsafe.c
+  ${ROOT}/app/net/json.c)
+target_include_directories(fathom-decode-check PRIVATE ${ROOT}/app ${DEPS_STATIC_INCLUDE_DIRS})
+target_compile_options(fathom-decode-check PRIVATE -Wall -Wextra -Wno-unused-parameter)
+target_compile_definitions(fathom-decode-check PRIVATE FATHOM_HAVE_FFMPEG FATHOM_HAVE_VORBIS FATHOM_VORBIS_TREMOR)
+# (the player's name lookups: IPv4 where either family would do, as on a network without IPv6)
+target_link_options(fathom-decode-check PRIVATE -static -Wl,--wrap=getaddrinfo -Wl,--wrap=freeaddrinfo)
+target_link_libraries(fathom-decode-check PRIVATE ${DEPS_STATIC_LDFLAGS} pthread m)
 
 # Request timing (tools/httptime): a URL fetched a few times through the
 # player's HTTP client, each a new connection. Not installed; copied by hand.

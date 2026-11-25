@@ -72,6 +72,145 @@ static void write_mp3(const char *path, int version, int flags, const buf_t *ext
 
 static void v1_field(unsigned char *at, const char *s, size_t n) { memcpy(at, s, strlen(s) < n ? strlen(s) : n); }
 
+/* A tag with a picture of `pic` bytes (pic[i] = i * 7 + 3) between a title
+ * and an album, written straight to the file: megabytes of it. `ext`: with
+ * an extended header (v2.3, v2.4). `before`: bytes of some other big frame
+ * ahead of the picture (GEOB, GEO). */
+static void write_big_mp3(const char *path, int version, int ext, size_t pic, size_t before)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); exit(1); }
+    buf_t a = {.n = 0}, z = {.n = 0}, ph = {.n = 0}, bh = {.n = 0}, x = {.n = 0};
+    text(&a, version, version == 2 ? "TT2" : "TIT2", "Big Tag Song");
+    text(&z, version, version == 2 ? "TAL" : "TALB", "Big Tag Album");
+    text(&z, version, version == 2 ? "TP1" : "TPE1", "Big Tag Artist");
+    /* the picture frame's header and the start of its body */
+    unsigned char lead[32];
+    size_t ln = 0;
+    lead[ln++] = 0;                                              /* Latin-1 */
+    if (version == 2) { memcpy(lead + ln, "JPG", 3); ln += 3; }
+    else { memcpy(lead + ln, "image/jpeg", 11); ln += 11; }
+    lead[ln++] = 3;                                              /* front cover */
+    lead[ln++] = 0;                                              /* no description */
+    uint32_t psz = (uint32_t)(ln + pic), bsz = (uint32_t)before;
+    if (version == 2) { put(&ph, "PIC", 3); put_be(&ph, psz, 3); put(&bh, "GEO", 3); put_be(&bh, bsz, 3); }
+    else {
+        put(&ph, "APIC", 4);
+        if (version == 4) put_syncsafe(&ph, psz); else put_be(&ph, psz, 4);
+        put_be(&ph, 0, 2);
+        put(&bh, "GEOB", 4);
+        if (version == 4) put_syncsafe(&bh, bsz); else put_be(&bh, bsz, 4);
+        put_be(&bh, 0, 2);
+    }
+    if (ext) {
+        if (version == 3) { put_be(&x, 6, 4); put_be(&x, 0, 2); put_be(&x, 0, 4); }
+        else { put_syncsafe(&x, 6); x.b[x.n++] = 1; x.b[x.n++] = 0; }
+    }
+    size_t total = x.n + a.n + (before ? bh.n + before : 0) + ph.n + psz + z.n + 64;
+    buf_t h = {.n = 0};
+    put(&h, "ID3", 3);
+    h.b[h.n++] = (unsigned char)version;
+    h.b[h.n++] = 0;
+    h.b[h.n++] = ext ? 0x40 : 0;
+    put_syncsafe(&h, (uint32_t)total);
+    fwrite(h.b, 1, h.n, f);
+    fwrite(x.b, 1, x.n, f);
+    fwrite(a.b, 1, a.n, f);
+    if (before) {
+        fwrite(bh.b, 1, bh.n, f);
+        for (size_t i = 0; i < before; i++) fputc('g', f);
+    }
+    fwrite(ph.b, 1, ph.n, f);
+    fwrite(lead, 1, ln, f);
+    for (size_t i = 0; i < pic; i++) fputc((int)((i * 7 + 3) & 0xff), f);
+    fwrite(z.b, 1, z.n, f);
+    static const unsigned char pad[64];
+    fwrite(pad, 1, sizeof pad, f);
+    static unsigned char mp3[417] = {0xFF, 0xFB, 0x90, 0x00};
+    for (int i = 0; i < 40; i++) fwrite(mp3, 1, sizeof mp3, f);
+    fclose(f);
+}
+
+/* A FLAC with no audio: STREAMINFO, then a comment block of a title, a
+ * comment of `big` bytes (a rip's log, lyrics, a cover as text), a sheet if
+ * given, and an album after them. */
+static void put_le32(FILE *f, uint32_t v) { for (int i = 0; i < 4; i++) fputc((int)((v >> (8 * i)) & 0xff), f); }
+static void put_entry(FILE *f, const char *e) { put_le32(f, (uint32_t)strlen(e)); fwrite(e, 1, strlen(e), f); }
+
+static void write_big_flac(const char *path, size_t big, const char *sheet)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); exit(1); }
+    unsigned char si[34] = {0};
+    si[0] = 0x10; si[2] = 0x10;                                  /* block sizes 4096 */
+    si[10] = 0x0A; si[11] = 0xC4; si[12] = 0x42; si[13] = 0xF0;  /* 44.1 kHz, stereo, 16-bit */
+    si[15] = 0x02; si[16] = 0xB1; si[17] = 0x10;                 /* 176400 samples: 4 s */
+    fwrite("fLaC", 1, 4, f);
+    fputc(0x00, f); fputc(0, f); fputc(0, f); fputc(34, f);
+    fwrite(si, 1, 34, f);
+    const char *vendor = "test", *title = "TITLE=Big Comment Song", *album = "ALBUM=Big Comment Album";
+    char sh[600] = "";
+    if (sheet) snprintf(sh, sizeof sh, "CUESHEET=%s", sheet);
+    uint32_t n = 3 + (sheet != NULL);
+    uint32_t len = 4 + (uint32_t)strlen(vendor) + 4 + 4 + (uint32_t)strlen(title) + 4 + 4 + (uint32_t)big +
+                   (sheet ? 4 + (uint32_t)strlen(sh) : 0) + 4 + (uint32_t)strlen(album);
+    fputc(0x84, f); fputc((int)(len >> 16), f); fputc((int)((len >> 8) & 0xff), f); fputc((int)(len & 0xff), f);   /* the last block */
+    put_entry(f, vendor);
+    put_le32(f, n);
+    put_entry(f, title);
+    put_le32(f, 4 + (uint32_t)big);
+    fwrite("LOG=", 1, 4, f);
+    for (size_t i = 0; i < big; i++) fputc('x', f);
+    if (sheet) put_entry(f, sh);
+    put_entry(f, album);
+    fclose(f);
+}
+
+/* `mp3` (a file that starts with an ID3 tag) as the ID3 chunk of a WAV or an
+ * AIFF, after a little sound; `tag` 0: the same file without that chunk */
+static void wrap_id3(const char *mp3, const char *out, int aiff, int tag)
+{
+    FILE *in = fopen(mp3, "rb"), *f = fopen(out, "wb");
+    if (!in || !f) { perror(out); exit(1); }
+    fseek(in, 0, SEEK_END);
+    long n = ftell(in);
+    rewind(in);
+    unsigned char *b = malloc((size_t)n);
+    if (!b || fread(b, 1, (size_t)n, in) != (size_t)n) exit(1);
+    fclose(in);
+    unsigned char sound[1001] = {0};                             /* (an odd size: padded) */
+    uint32_t total = 4 + 8 + sizeof sound + 1 + (tag ? 8 + (uint32_t)n + ((uint32_t)n & 1) : 0);
+    if (aiff) {
+        fwrite("FORM", 1, 4, f);
+        for (int i = 3; i >= 0; i--) fputc((int)((total >> (8 * i)) & 0xff), f);
+        fwrite("AIFFSSND", 1, 8, f);
+        for (int i = 3; i >= 0; i--) fputc((int)((sizeof sound >> (8 * i)) & 0xff), f);
+    } else {
+        fwrite("RIFF", 1, 4, f);
+        put_le32(f, total);
+        fwrite("WAVEdata", 1, 8, f);
+        put_le32(f, sizeof sound);
+    }
+    fwrite(sound, 1, sizeof sound, f);
+    fputc(0, f);
+    if (tag) {
+        fwrite(aiff ? "ID3 " : "id3 ", 1, 4, f);
+        if (aiff) for (int i = 3; i >= 0; i--) fputc((int)(((uint32_t)n >> (8 * i)) & 0xff), f);
+        else put_le32(f, (uint32_t)n);
+        fwrite(b, 1, (size_t)n, f);
+        if (n & 1) fputc(0, f);
+    }
+    free(b);
+    fclose(f);
+}
+
+static int pic_right(const unsigned char *d, size_t n, size_t want)
+{
+    if (!d || n != want) return 0;
+    for (size_t i = 0; i < n; i += 4099) if (d[i] != (unsigned char)((i * 7 + 3) & 0xff)) return 0;
+    return d[n - 1] == (unsigned char)(((n - 1) * 7 + 3) & 0xff);
+}
+
 int main(void)
 {
     char dir[200], path[300];
@@ -180,6 +319,97 @@ int main(void)
     CHECK(tags_read(path, &t) == 0);
     CHECK_STR(t.title, "Bare Name");
     CHECK(!t.artist[0] && !t.genre[0]);
+
+    /* A tag too big to hold whole (a cover of megabytes in each song: read
+     * whole, twice over, it took the H2's memory and the player with it):
+     * the texts on both sides of the picture, and the picture itself from
+     * the file, in each version; with an extended header; with another big
+     * frame ahead of it */
+    {
+        static const struct { int version, ext; size_t pic, before; } big[] = {
+            {3, 0, 3000000, 0}, {4, 0, 3000000, 0}, {2, 0, 3000000, 0},
+            {3, 1, 2500000, 0}, {4, 1, 2500000, 0}, {3, 0, 1500000, 2000000}, {4, 0, 12000000, 0},
+        };
+        /* (on the H2, the limit its player sets: a picture of 12 MB held
+         * whole is more than the H2 has, for this test as for the player) */
+        size_t most = getenv("FATHOM_TEST_ON_H2") ? (size_t)4 * 1024 * 1024 : (size_t)-1;
+        tags_set_max_picture(most);
+        for (size_t i = 0; i < sizeof big / sizeof big[0]; i++) {
+            snprintf(path, sizeof path, "%s/big%d.mp3", dir, (int)i);
+            write_big_mp3(path, big[i].version, big[i].ext, big[i].pic, big[i].before);
+            CHECK(tags_read(path, &t) == 0);
+            CHECK_STR(t.title, "Big Tag Song");
+            CHECK_STR(t.album, "Big Tag Album");
+            CHECK_STR(t.artist, "Big Tag Artist");
+            CHECK(t.has_picture == 1 && t.sample_rate == 44100);
+            unsigned char *bd = NULL;
+            size_t bn = 0;
+            if (big[i].pic <= most) CHECK(tags_picture(path, &bd, &bn) == 0 && pic_right(bd, bn, big[i].pic));
+            else CHECK(tags_picture(path, &bd, &bn) != 0 && bd == NULL);
+            free(bd);
+            /* a picture over the limit set (4 MB on the H2) is left unread */
+            tags_set_max_picture(1024 * 1024);
+            bd = NULL;
+            CHECK(tags_picture(path, &bd, &bn) != 0 && bd == NULL);
+            tags_set_max_picture(most);
+            unlink(path);
+        }
+        /* a small picture in a big tag (behind a big frame of something else) is found as ever */
+        snprintf(path, sizeof path, "%s/bigsmall.mp3", dir);
+        write_big_mp3(path, 3, 0, 30000, 2000000);
+        unsigned char *bd = NULL;
+        size_t bn = 0;
+        CHECK(tags_read(path, &t) == 0 && t.has_picture == 1);
+        CHECK_STR(t.album, "Big Tag Album");
+        CHECK(tags_picture(path, &bd, &bn) == 0 && pic_right(bd, bn, 30000));
+        free(bd);
+        unlink(path);
+        /* a WAV's and an AIFF's cover, from the ID3 chunk they keep it in
+         * (read from the file, as an MP3's: not through FFmpeg, twice over) */
+        {
+            char src[300], out[300];
+            snprintf(src, sizeof src, "%s/forwav.mp3", dir);
+            write_big_mp3(src, 3, 0, 3000001, 0);
+            for (int aiff = 0; aiff < 2; aiff++) {
+                snprintf(out, sizeof out, "%s/cover.%s", dir, aiff ? "aiff" : "wav");
+                wrap_id3(src, out, aiff, 1);
+                bd = NULL;
+                CHECK(tags_picture(out, &bd, &bn) == 0 && pic_right(bd, bn, 3000001));
+                free(bd);
+                wrap_id3(src, out, aiff, 0);
+                bd = NULL;
+                CHECK(tags_picture(out, &bd, &bn) != 0 && bd == NULL);
+                unlink(out);
+            }
+            unlink(src);
+        }
+        /* a FLAC whose comment block is megabytes (read whole before): the
+         * tags on both sides of the big comment, and a sheet among them */
+        snprintf(path, sizeof path, "%s/bigvc.flac", dir);
+        write_big_flac(path, 12000000, NULL);
+        CHECK(tags_read(path, &t) == 0 && t.sample_rate == 44100 && t.bits == 16 && t.duration_ms == 4000);
+        CHECK_STR(t.title, "Big Comment Song");
+        CHECK_STR(t.album, "Big Comment Album");
+        unlink(path);
+        snprintf(path, sizeof path, "%s/bigvcsheet.flac", dir);
+        write_big_flac(path, 3000000, "FILE \"x.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n");
+        char *sheet = NULL;
+        size_t sn = 0;
+        CHECK(tags_read(path, &t) == 0 && t.has_cuesheet == 1);
+        CHECK_STR(t.album, "Big Comment Album");
+        CHECK(tags_cuesheet(path, &sheet, &sn) == 0 && sheet && sn > 20 && !strncmp(sheet, "FILE \"x.flac\"", 13));
+        free(sheet);
+        unlink(path);
+        /* and a tag just under the size held whole reads as before */
+        snprintf(path, sizeof path, "%s/whole.mp3", dir);
+        write_big_mp3(path, 3, 0, 900000, 0);
+        bd = NULL;
+        CHECK(tags_read(path, &t) == 0 && t.has_picture == 1);
+        CHECK_STR(t.title, "Big Tag Song");
+        CHECK(tags_picture(path, &bd, &bn) == 0 && pic_right(bd, bn, 900000));
+        free(bd);
+        unlink(path);
+    }
 
     const char *names[] = {"v22", "v23ext", "v24ext", "v1only", "both", "Bare Name"};
     for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {

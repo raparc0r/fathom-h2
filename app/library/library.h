@@ -103,13 +103,30 @@ void library_scan_defer_art(library_t *lib, int on);
  * cover is made, and sets aside the one a note was left for. For work of the
  * player's own (levelling): library_trying(what, &fd, text) before each item
  * (fd -1 at first), library_trying_done after the run, and at the next run
- * library_trying_left(what, ...) gives the item it died on (1, and forgets it). */
+ * library_trying_left(what, ...) gives the item it died on (1, and forgets it).
+ * library_set_trying_keep names a folder on the card as well: a run ("tags",
+ * "cover", "level") leaves a mark there while it lasts, so one the H2 itself
+ * went down in (a reset: the RAM's notes lost) is known at the next start, and
+ * that run notes each item on the card before reading it. */
 void library_set_trying_dir(const char *dir);
+void library_set_trying_keep(const char *dir);
 void library_trying(const char *what, int *fd, const char *text);
 void library_trying_done(const char *what, int *fd);
 int  library_trying_left(const char *what, char *out, size_t cap);
+/* The helper that reads files for a scan (library/reader.h: set with
+ * reader_set_helper): its program's whole job when started with --reader, and
+ * the one request it serves (for a helper that wraps it: a test's). */
+int library_reader_main(void);
+int library_reader_do(int op, const char *path, unsigned char **out, size_t *len);
+/* (tests: the memory the helper is given for a file, in kB; -1: what the system has) */
+void library_test_reader_budget(long kb);
 /* Tracks the last scan added, changed or dropped (0: the library is as it was). */
 int library_scan_changes(const library_t *lib);
+/* The music files the scans couldn't read (damaged ones, and those set aside
+ * because the player stopped while reading them): how many, and the i-th's
+ * path, in order (0; -1: no such one). */
+int library_unread_count(library_t *lib);
+int library_unread(library_t *lib, int i, char *path, size_t cap);
 /* How the last scan listed the music folder: 1 the quick FAT listing, 0 the
  * slow walk through the kernel. */
 int library_scan_quick(const library_t *lib);

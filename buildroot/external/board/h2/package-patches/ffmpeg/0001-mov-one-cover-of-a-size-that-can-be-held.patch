@@ -1,0 +1,78 @@
+From: Fathom <fathom@localhost>
+Subject: [PATCH] mov: one cover, of a size that can be held; the rest passed over
+
+Every `covr` picture of an M4A was read whole and kept as a stream for as
+long as the file was open: a cover of 12 MB, or three of 4 MB, on a player
+with about 10 MB to spare. One there was no memory for made
+mov_read_covr() fail, and with it the whole header: the file couldn't be
+opened at all, for its tags or to play it. (av_get_packet() can also come
+back short when memory runs out part of the way: a piece of a picture, kept.)
+
+Now only the first cover is read, and only if it is no bigger than
+FATHOM_COVER_MAX (4 MB: the most the player's own cover reader takes). Any
+other is skipped where it is in the file, as is one that can't be allocated
+or comes back short. The file opens either way.
+
+Upstream-Status: Inappropriate [a small player's limits]
+
+--- a/libavformat/mov.c
++++ b/libavformat/mov.c
+@@ -184,12 +184,15 @@
+     return p - dst;
+ }
+ 
++#define FATHOM_COVER_MAX (4 * 1024 * 1024)
++
+ static int mov_read_covr(MOVContext *c, AVIOContext *pb, int type, int len)
+ {
+     AVStream *st;
+     MOVStreamContext *sc;
+     enum AVCodecID id;
+     int ret;
++    int64_t covr_pos;
+ 
+     switch (type) {
+     case 0xd:  id = AV_CODEC_ID_MJPEG; break;
+@@ -200,6 +203,22 @@
+         avio_skip(pb, len);
+         return 0;
+     }
++
++    /* Fathom: one cover is all that is used, and never one over
++     * FATHOM_COVER_MAX. A second or a bigger one is passed over where it
++     * is in the file, and so is one there is no memory for: each used to
++     * be read whole and held for as long as the file was open, and one
++     * that couldn't be was the end of the whole file. */
++    if (len > FATHOM_COVER_MAX) {
++        avio_skip(pb, len);
++        return 0;
++    }
++    for (unsigned i = 0; i < c->fc->nb_streams; i++)
++        if (c->fc->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC) {
++            avio_skip(pb, len);
++            return 0;
++        }
++    covr_pos = avio_tell(pb);
+ 
+     sc = av_mallocz(sizeof(*sc));
+     if (!sc)
+@@ -207,10 +226,19 @@
+     ret = ff_add_attached_pic(c->fc, NULL, pb, NULL, len);
+     if (ret < 0) {
+         av_free(sc);
++        if (ret == AVERROR(ENOMEM) && avio_seek(pb, covr_pos + len, SEEK_SET) >= 0)
++            return 0;
+         return ret;
+     }
+     st = c->fc->streams[c->fc->nb_streams - 1];
+     st->priv_data = sc;
++    if (st->attached_pic.size < len) {
++        /* (read short: memory ran out part of the way. Not a picture.) */
++        st->priv_data = NULL;
++        av_free(sc);
++        ff_remove_stream(c->fc, st);
++        return avio_seek(pb, covr_pos + len, SEEK_SET) >= 0 ? 0 : AVERROR(ENOMEM);
++    }
+ 
+     if (st->attached_pic.size >= 8 && id != AV_CODEC_ID_BMP) {
+         if (AV_RB64(st->attached_pic.data) == 0x89504e470d0a1a0a) {

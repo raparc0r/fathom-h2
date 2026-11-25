@@ -636,7 +636,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                                           "uninstallnone", "uninstallpending", "homeupdate", "askupdate", "askignore", "askinstall", "askinstallwn", "eqedit", "eqband",
                                           "themesnew", "themeedit", "themecolours", "themecolour", "themesave",
                                           "podcasts", "podshow", "podsearch", "podnp", "podchapters", "podmenu", "podsettings",
-                                          "settings", "wifi", "libsettings", "libhelp", "xfhelp", "whatsnew", "whatsnewend", "aboutwn", "covermenu", "covermenuown", "coverfind",
+                                          "settings", "wifi", "libsettings", "libhelp", "libunread", "unread", "unreadwhere", "xfhelp", "whatsnew", "whatsnewend", "aboutwn", "covermenu", "covermenuown", "coverfind",
                                           "albummenu", "artistmenu", "aartistmenu", "homemove",
                                           "smartlists", "smartopen", "smartmenu",
                                           "cv-tracks", "cv-artist", "cv-artistsongs", "cv-playlist", "cv-queue",
@@ -870,7 +870,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
             } else {
                 ui_show(screens[s]);
             }
-            int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp") ||
+            int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast") || !strcmp(screens[s], "unreadwhere") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp") ||
                          !strncmp(screens[s], "whatsnew", 8) || !strncmp(screens[s], "welcome", 7) || !strcmp(screens[s], "abouthelp") ||
                          !strcmp(screens[s], "clockset") || !strncmp(screens[s], "rescan", 6) ||
                          (g_sim_upd.state >= UI_UPD_DOWNLOADING && g_sim_upd.state <= UI_UPD_RESTARTING) ||
@@ -903,7 +903,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
             }
             if (!strncmp(screens[s], "whatsnew", 8) || !strcmp(screens[s], "aboutwn") || !strcmp(screens[s], "askinstallwn"))
                 ui_set_whats_new("", "", 0);
-            if (!strcmp(screens[s], "toast") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp") || !strcmp(screens[s], "abouthelp") ||
+            if (!strcmp(screens[s], "toast") || !strcmp(screens[s], "unreadwhere") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp") || !strcmp(screens[s], "abouthelp") ||
                 !strcmp(screens[s], "clockset"))   /* (gone before the next screens) */
                 for (uint32_t c = 0; c < lv_obj_get_child_count(lv_layer_top()); c++)
                     lv_obj_add_flag(lv_obj_get_child(lv_layer_top(), (int32_t)c), LV_OBJ_FLAG_HIDDEN);
