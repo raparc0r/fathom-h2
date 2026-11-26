@@ -8,6 +8,12 @@ stays where it is: Fathom only reads it.
 player → Version shows **V1.9 to V2.3** on these. Older H2s (V1.1 to V1.8) aren't
 supported yet, and the installer refuses them.
 
+**Surfans F20:** it's the same player inside, and one owner has reported that Fathom runs
+well on theirs. We haven't tried it ourselves. Only the newest F20 matches the supported
+H2: the one whose stock firmware shows **V3.4**. Older F20s (V2.2 to V3.3) are like the
+older H2s and aren't supported. Uninstall Fathom has only been tried with HiFi Walker's
+update file.
+
 **You need:**
 
 - a microSD card formatted **FAT32** (exFAT won't work: see below);
