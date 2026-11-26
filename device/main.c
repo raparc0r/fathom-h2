@@ -2945,6 +2945,15 @@ static void battery_log_poll(void)
  * quarters of a second, then goes on to the next whole second each time, so
  * the 10 s and 30 s polls keep their periods and those under a second come
  * once a second. */
+/* (timed for the cover flow's measurements, ui_timing: what on this thread makes a frame late) */
+static long timed_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)(ts.tv_sec * 1000000L + ts.tv_nsec / 1000);
+}
+#define TIMED(what, call) do { long t0_ = ui_timing() ? timed_us() : 0; call; if (t0_) ui_took(what, timed_us() - t0_); } while (0)
+
 static void polls(lv_timer_t *t)
 {
     (void)t;
@@ -2968,13 +2977,10 @@ static void polls(lv_timer_t *t)
     }
     if (k % 40 == 0) auto_update_poll();   /* 10 s */
     if (k % 4 == 0) {          /* 1 s */
-        every_second(NULL);
-        now_publish(NULL);
-        charge_poll(NULL);
-        rg_poll(NULL);
+        TIMED("the second's checks", every_second(NULL); now_publish(NULL); charge_poll(NULL); rg_poll(NULL));
     }
-    if (k % 40 == 0) { poll_battery(NULL); battery_log_poll(); }   /* 10 s */
-    if (k % 40 == 20) queue_timer(NULL);   /* 10 s */
+    if (k % 40 == 0) { TIMED("the battery's reading and log", poll_battery(NULL); battery_log_poll()); }   /* 10 s */
+    if (k % 40 == 20) TIMED("saving the queue's place", queue_timer(NULL));   /* 10 s */
     if (k % 120 == 0) idle_timer(NULL);    /* 30 s */
     /* a USB DAC or Bluetooth headphones just came or went: the usual pace for what follows (the EQ for it) */
     if (usb != g_usb_card || bt != (g_bt_routed[0] != '\0')) fast_hold();

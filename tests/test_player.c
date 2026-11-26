@@ -415,6 +415,7 @@ static void counts(const char *db, int64_t id, int *plays, int *skips)
     sqlite3 *raw = NULL;
     sqlite3_stmt *q = NULL;
     *plays = *skips = -1;
+    library_plays_wait();                             /* (the player's plays are written by the library's own thread) */
     if (sqlite3_open_v2(db, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK &&
         sqlite3_prepare_v2(raw, "SELECT play_count, skip_count FROM tracks WHERE id=?", -1, &q, NULL) == SQLITE_OK) {
         sqlite3_bind_int64(q, 1, id);
@@ -750,6 +751,72 @@ static void warm_counted(const char *file, long bytes)
     snprintf(g_warm_path, sizeof g_warm_path, "%s", file);
 }
 
+/* A play given to the library for later (the player does, at a song's end,
+ * on the UI's thread): the caller isn't kept, not even while another
+ * connection holds the database for writing (a scan: the player's own
+ * connection waited up to ten seconds there, the screen still); the play is
+ * in once that connection lets go; and closing the library writes what waits. */
+static void test_plays_later(const char *dir)
+{
+    char music[300], path[400], db[300], art[300];
+    snprintf(music, sizeof music, "%s/later", dir);
+    snprintf(db, sizeof db, "%s/later.db", dir);
+    snprintf(art, sizeof art, "%s/later-art", dir);
+    mkdir(music, 0755);
+    for (int i = 0; i < 2; i++) {
+        snprintf(path, sizeof path, "%s/%02d.flac", music, i + 1);
+        CHECK(write_flac_rate(path, i + 1, 44100) == 0);
+    }
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 2);
+    lib_list_t tr;
+    CHECK(library_list(lib, LIB_SONGS, 0, &tr) == 2);
+    int64_t now = (int64_t)time(NULL);
+    /* given, and in a moment later */
+    library_played_later(lib, tr.ids[0], 0, now);
+    library_played_later(lib, tr.ids[0], 1, now);
+    CHECK(counted(db, tr.ids[0], 1, 1));
+    lib_track_t lt;
+    CHECK(library_track(lib, tr.ids[0], &lt) == 0);                  /* (and the caller's own connection reads it) */
+    /* another connection writing: the caller goes on at once, the play waits its turn */
+    sqlite3 *other = NULL;
+    CHECK(sqlite3_open(db, &other) == SQLITE_OK && sqlite3_exec(other, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK);
+    struct timeval a, b;
+    gettimeofday(&a, NULL);
+    library_played_later(lib, tr.ids[1], 0, now);
+    gettimeofday(&b, NULL);
+    long took_ms = (long)((b.tv_sec - a.tv_sec) * 1000 + (b.tv_usec - a.tv_usec) / 1000);
+    CHECK(took_ms < 100);
+    if (took_ms >= 100) fprintf(stderr, "a play given for later kept its caller %ld ms\n", took_ms);
+    usleep(300 * 1000);
+    {   /* (not in yet: read beside, without waiting for it) */
+        sqlite3_stmt *q = NULL;
+        int n = -1;
+        if (sqlite3_prepare_v2(other, "SELECT play_count FROM tracks WHERE id=?", -1, &q, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(q, 1, tr.ids[1]);
+            if (sqlite3_step(q) == SQLITE_ROW) n = sqlite3_column_int(q, 0);
+        }
+        sqlite3_finalize(q);
+        CHECK(n == 0);
+    }
+    CHECK(sqlite3_exec(other, "COMMIT", NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(other);
+    CHECK(counted(db, tr.ids[1], 1, 0));
+    /* closed with one still to write: written first */
+    library_played_later(lib, tr.ids[1], 0, now);
+    library_list_free(&tr);
+    library_close(lib);
+    sqlite3 *raw = NULL;
+    sqlite3_stmt *q = NULL;
+    int n = -1;
+    if (sqlite3_open_v2(db, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK &&
+        sqlite3_prepare_v2(raw, "SELECT SUM(play_count) FROM tracks", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW)
+        n = sqlite3_column_int(q, 0);
+    sqlite3_finalize(q);
+    sqlite3_close(raw);
+    CHECK(n == 3);
+}
+
 static void test_warm_next(const char *dir)
 {
     char music[300], path[400], db[300], art[300];
@@ -1080,6 +1147,7 @@ int main(void)
     test_save_starting(dir);
     test_keys_while_starting(dir);
     test_empty_repeat(dir);
+    test_plays_later(dir);
     test_warm_next(dir);
     char db[300], art[300], queue[300];
     snprintf(db, sizeof db, "%s/lib.db", dir);

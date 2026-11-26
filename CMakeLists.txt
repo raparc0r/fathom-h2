@@ -29,7 +29,8 @@ add_library(fathom_core STATIC
   app/core/tz.c
   app/library/keys.c
   app/shuffle/shuffle.c
-  app/ui/theme.c)
+  app/ui/theme.c
+  app/ui/coverflow.c)
 target_include_directories(fathom_core PUBLIC app)
 target_compile_options(fathom_core PRIVATE ${FATHOM_WARNINGS})
 target_link_libraries(fathom_core PUBLIC m)
@@ -205,6 +206,11 @@ add_executable(test_theme tests/test_theme.c)
 target_link_libraries(test_theme PRIVATE fathom_core)
 target_compile_options(test_theme PRIVATE ${FATHOM_WARNINGS})
 add_test(NAME theme COMMAND test_theme WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_coverflow tests/test_coverflow.c)
+target_link_libraries(test_coverflow PRIVATE fathom_core)
+target_compile_options(test_coverflow PRIVATE ${FATHOM_WARNINGS})
+add_test(NAME coverflow COMMAND test_coverflow)
 
 add_executable(test_eq tests/test_eq.c)
 target_link_libraries(test_eq PRIVATE fathom_player)

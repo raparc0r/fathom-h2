@@ -102,6 +102,7 @@ add_executable(fathom-player
   ${ROOT}/app/player/radio.c
   ${ROOT}/app/player/rfmeta.c
   ${ROOT}/app/ui/theme.c
+  ${ROOT}/app/ui/coverflow.c
   ${ROOT}/app/ui/fonts.c
   ${ROOT}/app/ui/assets.c
   ${ROOT}/app/ui/ui.c)

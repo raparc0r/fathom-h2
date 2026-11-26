@@ -623,6 +623,7 @@ static int write_bmp(const char *path, const lv_draw_buf_t *buf)
     return 0;
 }
 
+
 static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts)
 {
     lv_display_t *d = lv_display_create(UI_W, UI_H);
@@ -925,6 +926,42 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                 for (uint32_t c = 0; c < lv_obj_get_child_count(lv_layer_top()); c++)
                     lv_obj_add_flag(lv_obj_get_child(lv_layer_top(), (int32_t)c), LV_OBJ_FLAG_HIDDEN);
             printf("%s\n", path);
+        }
+        /* Albums as cover flow (Settings > Interface > Cover flow): at rest some
+         * way into Albums, at the list's start, and half way from one album to
+         * the next ("flow", "flowstart", "flowslide") */
+        for (int m = 0; m < 6; m++) {
+            /* ("flowartist", "flowartistalbums": set to Inside artists, an artist's albums are a cover flow and Albums a list) */
+            static const char *const NAME[] = {"flow", "flowstart", "flowslide", "flowfast", "flowartist", "flowartistalbums"};
+            if (g_sim_scanning) { g_sim_scanning = 0; ui_show_scan(); }   /* (the last screen's put away) */
+            settings_set_int("display.album_flow", m >= 4 ? 2 : 1);
+            ui_show(m == 4 ? "artist" : "albums");
+            for (int k = 0; m == 3 && k < 12; k++) {       /* quick turns: a letter at a time, once it is quick */
+                struct timespec gap = {0, 20 * 1000 * 1000L};
+                ui_key(UI_KEY_DOWN);
+                nanosleep(&gap, NULL);
+                lv_timer_handler();
+            }
+            for (int k = 0; (m == 0 || m == 2) && k < 9; k++) {   /* (a turn at a time: quick ones leap) */
+                struct timespec gap = {0, 100 * 1000 * 1000L};
+                ui_key(UI_KEY_DOWN);
+                nanosleep(&gap, NULL);
+                lv_timer_handler();
+            }
+            for (int k = 0; k < 40; k++) {                 /* (its covers come a few a tick) */
+                struct timespec ts = {0, (m == 2 && k >= 30 ? 9 : 4) * 1000 * 1000L};
+                if (m == 2 && k == 30) ui_key(UI_KEY_DOWN);   /* the slide begins: caught about 90 ms in */
+                nanosleep(&ts, NULL);
+                lv_tick_inc((uint32_t)(ts.tv_nsec / 1000000));
+                lv_timer_handler();
+            }
+            lv_obj_update_layout(lv_screen_active());
+            lv_draw_buf_t *img = lv_snapshot_take(lv_screen_active(), LV_COLOR_FORMAT_RGB888);
+            char path[1024];
+            snprintf(path, sizeof path, "%s/%s-%s.bmp", dir, slug[t], NAME[m]);
+            if (img) { write_bmp(path, img); lv_draw_buf_destroy(img); printf("%s\n", path); }
+            settings_set_int("display.album_flow", 0);
+            ui_show("home");
         }
     }
     /* contributed themes (build/sim-data/themes): the home screen, to check fonts and colours */

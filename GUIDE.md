@@ -83,7 +83,12 @@ Settings → USB connection → On a computer chooses what happens when you plug
 ## Covers, artists and themes
 
 Settings → Interface holds the look: the theme, the Home screen's items, album covers in
-the lists, artist names in Albums, and the language. **Home screen items** lists everything
+the lists, how albums are browsed, artist names in Albums, and the language. **Cover flow**
+shows lists of albums by their covers: **Everywhere** (Albums, an artist's, a genre's, a
+year's) or only **Inside artists** (an artist's albums, with Albums itself staying a
+list). The wheel goes from one album to the
+next and a quick turn from one letter to the next (the alphabet runs along the bottom,
+the album's letter lit); Play opens the album and Menu is its menu, as in the list. **Home screen items** lists everything
 Home can show: Play shows or hides an item, and Menu → Move, then the wheel, puts it
 somewhere else (Settings always stays). Your own themes go in the card's `fathom/themes/` folder
 ([THEMES.md](THEMES.md) explains every option); restart the H2 to see a new one.

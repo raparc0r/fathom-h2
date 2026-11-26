@@ -339,6 +339,12 @@ int64_t library_top_track(library_t *lib);
 int64_t library_track_from(library_t *lib, int64_t id);
 /* Playback history for freshness and "most played". */
 void library_played(library_t *lib, int64_t track_id, int skipped_early, int64_t now);
+/* The same, written by a thread of the library's own through its own
+ * connection to the file: the caller (the UI's thread, at a song's end) goes
+ * on at once, and reads the play once it is in. library_plays_wait: until
+ * every play given so far is written (library_close does it for its file). */
+void library_played_later(library_t *lib, int64_t track_id, int skipped_early, int64_t now);
+void library_plays_wait(void);
 
 /* Your own playlists: M3U8 files in a folder of their own (fathom/playlists on
  * the card, never the music folder), scanned with the music and editable on the

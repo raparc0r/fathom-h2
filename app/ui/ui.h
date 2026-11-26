@@ -53,6 +53,7 @@ struct ui_fonts {
 /* Defaults of settings read in more than one place (settings.ini keeps
  * only what was changed: someone who never changed one gets a new default) */
 #define UI_COVERS_DEFAULT          1   /* display.covers: 1 Albums, 2 Songs, 3 both */
+#define UI_ALBUM_FLOW_DEFAULT      0   /* display.album_flow: albums as a cover flow (1 every list of them, 2 an artist's only) */
 #define UI_DIM_DEFAULT             1   /* display.dim: dimmed 5 s before the screen goes off */
 #define UI_ON_CHARGING_DEFAULT     0   /* display.on_charging: the screen stays on while plugged in */
 #define UI_TRANSPORT_DEFAULT       0   /* sound.transport: the USB DAC's transport mode */
@@ -264,6 +265,11 @@ void ui_init(lv_obj_t *screen, const theme_t *themes, int n_themes,
              const ui_fonts_t *fonts, int n_fonts, library_t *lib, player_t *player);
 void ui_key(ui_key_t k);
 int ui_tick(void);              /* ~10x per second: follows the player; 0 when it needn't until a key */
+/* Measuring (a cover flow's slides timed to the log: `touch /tmp/fathom-flow`
+ * before one is opened): 1 while it is on, and then what the platform did on
+ * the UI's thread and how long it took, for a late frame to name. */
+int ui_timing(void);
+void ui_took(const char *what, long us);
 void ui_tick_1s(void);
 /* What's new in this version: the release notes' summary, one point per line
  * (fathom/assets/whatsnew.txt). Shown at once if `show` (the first start of a

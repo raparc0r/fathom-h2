@@ -3,6 +3,8 @@
 #include "player.h"
 #include "core/fsafe.h"
 #include "core/lat.h"
+
+#include <pthread.h>
 #include "library/cue.h"
 
 #include <fcntl.h>
@@ -319,17 +321,42 @@ static const char *track_file(const char *path, char *buf, size_t cap)
     return cue_part_parse(path, buf, cap, &cs, &ce) > 0 ? buf : path;
 }
 
+#ifdef POSIX_FADV_WILLNEED
+typedef struct { char file[sizeof ((lib_track_t *)0)->path]; long bytes; } warm_t;
+
+static void *warm_thread(void *arg)
+{
+    warm_t *w = arg;
+    uint32_t t0 = lat_ms();
+    int fd = open(w->file, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        posix_fadvise(fd, 0, (off_t)w->bytes, POSIX_FADV_WILLNEED);
+        close(fd);
+    }
+    LAT("player: next file asked for ahead, %ld KB in %u ms: %s", w->bytes / 1024, lat_ms() - t0, w->file);
+    free(w);
+    return NULL;
+}
+#endif
+
 static void warm_file(const char *file, long bytes)
 {
     if (file[0] != '/' || strstr(file, "://")) return;   /* (a file on the card: nothing is fetched for this) */
     if (warm_hook) warm_hook(file, bytes);
 #ifdef POSIX_FADV_WILLNEED
-    uint32_t t0 = lat_ms();
-    int fd = open(file, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
-    posix_fadvise(fd, 0, (off_t)bytes, POSIX_FADV_WILLNEED);
-    close(fd);
-    LAT("player: next file asked for ahead, %ld KB in %u ms: %s", bytes / 1024, lat_ms() - t0, file);
+    /* On a thread of its own: finding the file in its folder and asking for
+     * it took 5 to 125 ms on the H2, on the UI's thread, at a song's start
+     * and again near its end (2026-11-25). Nothing waits for it. */
+    warm_t *w = malloc(sizeof *w);
+    if (!w) return;
+    snprintf(w->file, sizeof w->file, "%s", file);
+    w->bytes = bytes;
+    pthread_t th;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&th, &at, warm_thread, w)) free(w);
+    pthread_attr_destroy(&at);
 #endif
 }
 
@@ -663,7 +690,8 @@ static played_t record_take(player_t *p, int skipped_by_user)
 
 static void record_put(player_t *p, const played_t *r)
 {
-    if (r->valid) library_played(p->lib, r->id, r->early, now_s());
+    /* (written by the library's own thread: on this one, the UI's, it held the screen at every song's end) */
+    if (r->valid) library_played_later(p->lib, r->id, r->early, now_s());
 }
 
 static void record(player_t *p, int skipped_by_user)
@@ -1506,13 +1534,18 @@ static void follow(player_t *p, const eng_status_t *st)
     if (j >= 0) {
         /* it moved on by itself (gapless) through what we lined up: maybe
          * several tracks, if they were short */
+        uint32_t t0 = lat_ms(), t1 = t0, t2 = t0;
         for (int i = 0; i <= j; i++) {
             finished(p);
+            t1 = lat_ms();
             set_pos(p, p->ahead[i].pos);
             library_track(p->lib, id_at(p, p->pos), &p->cur);
+            t2 = lat_ms();
         }
         p->seq++;
         queue_next(p);
+        LAT("player: a track's end taken up in %u ms: its play recorded %u, the next looked up %u, what follows lined up %u",
+            lat_ms() - t0, t1 - t0, t2 - t1, lat_ms() - t2);
     } else if (ours && st->track_id == p->cur.id) {
         /* the track we started ourselves */
     } else if (st->track_id >= 0 && st->track_id != p->cur.id) {

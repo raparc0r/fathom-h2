@@ -13,6 +13,7 @@
  * Now Playing from the player.
  */
 #include "ui/ui.h"
+#include "ui/coverflow.h"
 #include "core/lang.h"
 #include "core/settings.h"
 #include "core/datetime.h"
@@ -35,6 +36,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <unistd.h>
 
 #define HEADER_H   28
 #define ROW_PITCH  42
@@ -146,7 +148,7 @@ enum { SET_SOUND, SET_PLAYBACK, SET_INTERFACE, SET_WIFI, SET_BLUETOOTH, SET_PODC
 /* Rows of the quick settings panel and of Settings > Display. */
 typedef enum {
     ST_BRIGHTNESS, ST_SHUFFLE, ST_REPEAT, ST_SLEEP, ST_STOP_AFTER, ST_TIMEOUT,
-    ST_DIM, ST_ON_CHARGING, ST_COVERS, ST_OUTPUT, ST_EQ, ST_LEVELLING, ST_DAC_FILTER, ST_PAUSE_UNPLUG, ST_AUTO_OFF,
+    ST_DIM, ST_ON_CHARGING, ST_COVERS, ST_ALBUM_FLOW, ST_OUTPUT, ST_EQ, ST_LEVELLING, ST_DAC_FILTER, ST_PAUSE_UNPLUG, ST_AUTO_OFF,
     ST_RESCAN, ST_USB_DRIVE, ST_USB_COMPUTER, ST_USB_DAC, ST_N_SONGS, ST_N_ALBUMS, ST_N_ARTISTS, ST_N_PLAYLISTS,
     ST_BT, ST_WIFI,
     ST_SHUF_BY, ST_SHUF_FRESH, ST_SHUF_INTERLUDES, ST_SHUF_WORKS, ST_SHUF_SPOKEN, ST_BALANCE, ST_VOL_LIMIT, ST_PURE, ST_TRANSPORT, ST_BATTERY, ST_LANGUAGE,
@@ -180,7 +182,7 @@ static const setting_t USB_ROWS[] = {ST_USB_COMPUTER, ST_USB_DRIVE, ST_USB_DAC};
 static const int AUTO_OFFS[] = {5, 15, 30, 0};               /* minutes; 0 = never */
 static const int SLEEPS[] = {0, 15, 30, 45, 60, 90, PLAYER_SLEEP_END_ALBUM};   /* minutes; 0 = off */
 static const setting_t DISPLAY_ROWS[] = {ST_BRIGHTNESS, ST_TIMEOUT, ST_DIM, ST_ON_CHARGING};
-static const setting_t INTERFACE_ROWS[] = {ST_THEME, ST_HOME_SCREEN, ST_COVERS, ST_ALBUM_ARTISTS, ST_LANGUAGE};
+static const setting_t INTERFACE_ROWS[] = {ST_THEME, ST_HOME_SCREEN, ST_COVERS, ST_ALBUM_FLOW, ST_ALBUM_ARTISTS, ST_LANGUAGE};
 static const int TIMEOUTS[] = {15, 30, 60, 120, 300, 0};   /* seconds; 0 = never */
 
 /* The theme editor: its colours, as it names them, and its rows */
@@ -372,6 +374,21 @@ static struct {
         rdir_query_t q;
     } wifi_then;
     lv_obj_t *np_radio, *np_radio_px;   /* the radio's sign where a cover would be */
+    /* Albums as cover flow (Settings > Interface > Cover flow): a panel over the
+     * rows of a list of albums. The picture (ui/coverflow.c) and what is under it. */
+    lv_obj_t *flow, *flow_img, *flow_title, *flow_by, *flow_track, *flow_thumb;
+    lv_obj_t *flow_az[27];              /* "#", A to Z along the foot: where in the alphabet (a list by name) */
+    lv_obj_t *flow_az_pill;             /* round themes: a small pill behind the letter that's on */
+    int flow_az_every;                  /* 1: every letter drawn; 2: every other (a wide font), and the one that's on */
+    int flow_az_on;                     /* the letter lit (0 "#", 1..26; -1: none) */
+    lv_image_dsc_t flow_dsc;
+    int flow_shift;                     /* the slide under way (FLOW_STEPs: 0 at rest) */
+    int flow_sel;                       /* the album the picture is of, of flow_ids (-1: none yet) */
+    const int64_t *flow_ids;            /* ...the list it belongs to, as last drawn */
+    unsigned flow_gen;                  /* ...and the library then */
+    int flow_theme;                     /* ...and the theme */
+    int64_t flow_named;                 /* the album the two lines under it name */
+    lv_timer_t *flow_more;              /* covers still to read: the picture is drawn again */
     lv_obj_t *np, *np_shadow, *np_art, *np_title, *np_artist, *np_album, *np_chip,
              *np_track, *np_fill, *np_seg[SEGMENTS], *np_t0, *np_t1, *np_img, *h_mode;
     /* header indicators: each slot shows the theme's icon or the built-in symbol */
@@ -1256,6 +1273,13 @@ static void setting_row(setting_t st, int editing, char *main, size_t mn, char *
         static const char *const W[] = {"Off", "Albums", "Songs", "Albums, songs"};
         snprintf(main, mn, "%s", tr("Covers in lists"));
         snprintf(meta, tn, "%s", tr(W[settings_get_int("display.covers", UI_COVERS_DEFAULT) & 3]));
+        break;
+    }
+    case ST_ALBUM_FLOW: {
+        static const char *const W[] = {"Off", "Everywhere", "Inside artists"};
+        int v = settings_get_int("display.album_flow", UI_ALBUM_FLOW_DEFAULT);
+        snprintf(main, mn, "%s", tr("Cover flow"));
+        snprintf(meta, tn, "%s", tr(W[v >= 0 && v <= 2 ? v : 0]));
         break;
     }
     case ST_OUTPUT:
@@ -3125,6 +3149,45 @@ static void apply_theme(void)
     for (int i = 0; i < SEGMENTS; i++) show(S.np_seg[i], t->progress_segments);
     style_label(S.np_t0, S.f->meta, t->text_muted);
     style_label(S.np_t1, S.f->meta, t->text_muted);
+
+    /* Albums as cover flow */
+    fill(S.flow, t->bg);
+    style_label(S.flow_title, S.f->body, t->text);
+    style_label(S.flow_by, VALUE_FONT, t->text_muted);
+    {
+        /* Under the covers: the album's name, who it is by, and the letters
+         * (or the line for where in the list). Three lines of a tall font
+         * (Pixel Pastel's) are more than the room there is: the first goes up
+         * a little, the last may lose the foot of its line (capitals have
+         * none), and the lines close up by the rest. */
+        int lb = lv_font_get_line_height(S.f->body), lv = lv_font_get_line_height(VALUE_FONT), lm = lv_font_get_line_height(S.f->meta);
+        int room = UI_H - HEADER_H - (FLOW_H - 2), over = lb + 1 + lv + lm > room ? lb + 1 + lv + lm - room : 0;
+        int up = over > 3 ? 3 : over, spill = over - up > 3 ? 3 : over - up, close = (over - up - spill + 1) / 2;
+        int ty = FLOW_H - 2 - up, by = ty + lb + 1 - close, ay = by + lv - close;
+        lv_obj_set_y(S.flow_title, ty);
+        lv_obj_set_y(S.flow_by, by);
+        /* every letter where they fit side by side; every other one in a wide font */
+        lv_point_t all;
+        lv_text_get_size(&all, "#ABCDEFGHIJKLMNOPQRSTUVWXYZ", S.f->meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        S.flow_az_every = all.x + 27 > UI_W - 16 ? 2 : 1;
+        for (int i = 0; i < 27; i++) {
+            style_label(S.flow_az[i], S.f->meta, t->text_muted);
+            lv_obj_set_pos(S.flow_az[i], 8 + i * (UI_W - 16) / 27 - 6, ay);
+        }
+        S.flow_az_on = -1;
+        /* The letter that's on, in a round theme: in a pill of the selection's
+         * colours (the signal's colour alone, on a letter 15 pixels tall,
+         * was hard to pick out: the owner, on the H2). A pixel theme's
+         * letters are big and bright enough lit. */
+        fill(S.flow_az_pill, t->select_bg);
+        lv_obj_set_size(S.flow_az_pill, (UI_W - 16) / 27 + 4, lm - 1);    /* (no wider: the letters at each side stay whole) */
+        lv_obj_set_y(S.flow_az_pill, ay);
+        lv_obj_set_style_radius(S.flow_az_pill, (lm - 1) / 2, 0);
+    }
+    fill(S.flow_track, t->surface);
+    fill(S.flow_thumb, t->signal);
+    lv_obj_set_style_radius(S.flow_track, t->corner == THEME_CORNER_ROUND ? 2 : 0, 0);
+    lv_obj_set_style_radius(S.flow_thumb, t->corner == THEME_CORNER_ROUND ? 2 : 0, 0);
 
     /* Find cover */
     fill(S.cf, t->bg);
@@ -5206,6 +5269,7 @@ static const char *setting_help(setting_t st)
     case ST_THEME: return "Pick how Fathom looks. More themes can go in fathom/themes.";
     case ST_HOME_SCREEN: return "Show, hide and move the items on the Home screen.";
     case ST_COVERS: return "Show album covers in lists of albums and of songs.";
+    case ST_ALBUM_FLOW: return "Browse albums by their covers: in every list of albums, or only inside an artist.";
     case ST_ALBUM_ARTISTS: return "Display artist name when browsing albums.";
     case ST_BRIGHTNESS: return "How bright the screen is. Press <Play>, then turn the wheel.";
     case ST_TIMEOUT: return "How long the screen stays on. Saves battery.";
@@ -5499,9 +5563,356 @@ static void say_failed(void)
     ui_toast(msg, 3000);
 }
 
+/* ---------- albums as cover flow ----------
+ * Settings > Interface > Cover flow. A list of albums (Albums, an
+ * artist's, a genre's, a year's...) shown by its covers: the selected one in
+ * the middle, three at each side turned towards it, its name and artist
+ * under it, and a line at the foot for where in the list it is. Everything
+ * else is the list's: the wheel moves the selection, Play opens the album,
+ * Menu is its menu, Back goes back. Only what is drawn differs (render_flow
+ * in place of render_list), so the list's keys and levels know nothing of it.
+ *
+ * The covers are the library's large ones (136 pixels, 37 KB each, read from
+ * the card's art cache as they come into view), ten held at most, with each
+ * one's narrow copy for when it is turned: 0.6 MB with the picture, taken when
+ * a cover flow is drawn and given back when it goes or the screen turns off. */
+_Static_assert(FLOW_COVER == LIB_ART_LARGE && FLOW_W == UI_W, "the cover flow's sizes are the library's and the screen's");
+#define FLOW_HELD 10
+#define DUR_FLOW 220            /* ms: from one album to the next */
+static struct flow_mem {
+    uint16_t px[FLOW_W * FLOW_H];
+    struct flow_ent {
+        int64_t id;
+        uint32_t used;          /* 0: free */
+        int has;                /* its cover read; 0: the album has none */
+        uint16_t full[FLOW_COVER * FLOW_COVER], narrow[FLOW_NARROW * FLOW_COVER];
+    } e[FLOW_HELD];
+    uint32_t tick;
+    /* an album with no cover: a record drawn on a tile, in the theme's colours */
+    uint16_t none_full[FLOW_COVER * FLOW_COVER], none_narrow[FLOW_NARROW * FLOW_COVER];
+    int none_theme;
+    /* `touch /tmp/fathom-flow` before a cover flow is opened: each slide's
+     * frames and what drawing them took go to the log (measured on the H2) */
+    int timed, frames, reads;
+    long paint_us, paint_max, read_us, began_ms;
+    long frame_at;              /* the last frame of the slide under way (0: its first is to come) */
+    const char *took_what;      /* the longest thing the UI's thread did since that frame (ui_took) */
+    long took_us;
+} *g_flow;
+
+static long flow_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)(ts.tv_sec * 1000000L + ts.tv_nsec / 1000);
+}
+
+/* Settings > Interface > Cover flow (display.album_flow): 1 every list of
+ * albums; 2 only an artist's (an album artist's, an artist's by their credits,
+ * a composer's), Albums and the rest staying lists. */
+static long g_render_head_us;      /* (timed: what a render does before the screen's own part) */
+
+/* While slides are timed: something on the UI's thread took this long (the
+ * platform says its own: the queue's place saved, its polls). A slide's frame
+ * that comes late names the longest since the frame before. */
+int ui_timing(void) { return g_flow && g_flow->timed; }
+
+void ui_took(const char *what, long us)
+{
+    if (!g_flow || !g_flow->timed || us <= g_flow->took_us) return;
+    g_flow->took_what = what;
+    g_flow->took_us = us;
+}
+
+static int flow_on(const level_t *l)
+{
+    if (!S.lib || !is_album_list(l->kind) || l->items.n <= 0 || S.moving) return 0;
+    int v = settings_get_int("display.album_flow", UI_ALBUM_FLOW_DEFAULT);
+    if (v == 2) return l->kind == L_ARTIST_ALBUMS || l->kind == L_CREDIT_ALBUMS || l->kind == L_COMPOSER_ALBUMS;
+    return v == 1;
+}
+
+static int row_initial(const level_t *l, int i);
+
+/* A cover flow of albums in the order of their names: the letters show along
+ * its foot (a list no longer than what shows at once has no use for them) */
+static int flow_lettered(const level_t *l)
+{
+    return (l->kind == L_ALBUMS || l->kind == L_GENRE_ALBUMS || l->kind == L_YEAR_ALBUMS) && l->items.n > FLOW_N;
+}
+
+static void flow_anim_cb(void *var, int32_t v);
+
+static void flow_free(void)
+{
+    if (S.flow) {
+        lv_anim_delete(S.flow_img, flow_anim_cb);
+        show(S.flow, 0);
+    }
+    if (S.flow_more) { lv_timer_delete(S.flow_more); S.flow_more = NULL; }
+    S.flow_shift = 0;
+    S.flow_sel = -1;
+    S.flow_ids = NULL;
+    S.flow_named = -1;
+    if (!g_flow) return;
+    lv_image_cache_drop(&S.flow_dsc);
+    S.flow_dsc.data = NULL;
+    free(g_flow);
+    g_flow = NULL;
+}
+
+static uint16_t rgb565_of(uint32_t rgb)
+{
+    return (uint16_t)(((rgb >> 19) & 31) << 11 | ((rgb >> 10) & 63) << 5 | ((rgb >> 3) & 31));
+}
+
+/* An album's cover from those held; read from the card if it isn't and *budget
+ * allows (NULL then: its place shows a plain tile until it is) */
+static struct flow_ent *flow_cover(int64_t id, int *budget)
+{
+    struct flow_ent *old = &g_flow->e[0];
+    for (int k = 0; k < FLOW_HELD; k++) {
+        struct flow_ent *e = &g_flow->e[k];
+        if (e->used && e->id == id) { e->used = ++g_flow->tick; return e; }
+        if (e->used < old->used) old = e;
+    }
+    if (*budget <= 0) return NULL;
+    (*budget)--;
+    long t0 = g_flow->timed ? flow_us() : 0;
+    old->id = id;
+    old->used = ++g_flow->tick;
+    old->has = library_art(S.lib, id, LIB_ART_LARGE, old->full) == 0;
+    if (old->has) flow_narrow(old->full, old->narrow);
+    if (g_flow->timed) {
+        g_flow->reads++;
+        g_flow->read_us += flow_us() - t0;
+        ui_took("a cover read", flow_us() - t0);
+    }
+    return old;
+}
+
+/* The tile for an album with no cover: a record (its rim, its label's ring,
+ * its hole) on the theme's surface colour. Drawn again when the theme changes. */
+static void flow_none(void)
+{
+    const theme_t *t = T();
+    uint16_t ground = rgb565_of(t->surface), line = rgb565_of(theme_fit(t->text_muted, t->surface, 2.0));
+    const int c = FLOW_COVER / 2;
+    for (int y = 0; y < FLOW_COVER; y++)
+        for (int x = 0; x < FLOW_COVER; x++) {
+            int d2 = (2 * x + 1 - 2 * c) * (2 * x + 1 - 2 * c) + (2 * y + 1 - 2 * c) * (2 * y + 1 - 2 * c);   /* (twice the distance, squared) */
+            int on = (d2 >= 4 * 40 * 40 && d2 <= 4 * 43 * 43) || (d2 >= 4 * 14 * 14 && d2 <= 4 * 16 * 16) || d2 <= 4 * 4 * 4;
+            g_flow->none_full[y * FLOW_COVER + x] = on ? line : ground;
+        }
+    flow_narrow(g_flow->none_full, g_flow->none_narrow);
+    g_flow->none_theme = S.theme_gen;
+}
+
+static void flow_more_cb(lv_timer_t *t);
+
+/* The picture, for the list's selection and the slide as it is now. A cover
+ * not held yet is read here, `budget` of them at most (37 KB from the card
+ * each, 2 to 16 ms on the H2): one for a key's own picture and for a frame of
+ * a slide (a turn of the wheel, or a frame, mustn't wait for seven); three a
+ * time once the wheel is still (flow_more_cb), until all are there. */
+static void flow_paint(const level_t *l, int budget)
+{
+    if (!g_flow) return;
+    flow_cover_t cov[FLOW_N];
+    int missing = 0;
+    long t0 = g_flow->timed ? flow_us() : 0;
+    if (g_flow->none_theme != S.theme_gen) flow_none();
+    /* (the middle one first, then outwards: what is read first is what shows most) */
+    static const int ORDER[FLOW_N] = {4, 3, 5, 2, 6, 1, 7, 0, 8};
+    for (int o = 0; o < FLOW_N; o++) {
+        int k = ORDER[o], i = l->sel + k - FLOW_REACH;
+        cov[k] = (flow_cover_t){0, NULL, NULL};
+        if (i < 0 || i >= l->items.n) continue;
+        cov[k].there = 1;
+        struct flow_ent *e = flow_cover(l->items.ids[i], &budget);
+        if (!e) { missing++; continue; }
+        if (e->has) { cov[k].full = e->full; cov[k].narrow = e->narrow; }
+        else { cov[k].full = g_flow->none_full; cov[k].narrow = g_flow->none_narrow; }
+    }
+    const theme_t *t = T();
+    int shift = S.flow_shift;
+    if (t->motion_stepped) shift = shift / 64 * 64;         /* (a pixel theme's moves are steps) */
+    flow_draw(g_flow->px, cov, shift, rgb565_of(t->bg), rgb565_of(t->surface), t->corner == THEME_CORNER_ROUND);
+    lv_image_cache_drop(&S.flow_dsc);
+    lv_obj_invalidate(S.flow_img);
+    if (g_flow->timed) {
+        long us = flow_us() - t0;
+        g_flow->frames++;
+        g_flow->paint_us += us;
+        if (us > g_flow->paint_max) g_flow->paint_max = us;
+    }
+    if (missing && !S.flow_shift && !S.flow_more) {
+        S.flow_more = lv_timer_create(flow_more_cb, 30, NULL);
+        lv_timer_set_repeat_count(S.flow_more, 1);
+    }
+}
+
+static void flow_more_cb(lv_timer_t *t)
+{
+    (void)t;
+    S.flow_more = NULL;                         /* (a timer that has run its count deletes itself) */
+    level_t *l = &S.stack[S.depth - 1];
+    if (g_flow && !S.asleep && !S.now_playing_view && flow_on(l) && l->items.ids == S.flow_ids) flow_paint(l, 3);
+}
+
+static void flow_anim_cb(void *var, int32_t v)
+{
+    (void)var;
+    level_t *l = &S.stack[S.depth - 1];
+    S.flow_shift = (int)v;
+    if (g_flow && g_flow->timed) {
+        long now = flow_us();
+        if (g_flow->frame_at && now - g_flow->frame_at > 80000)
+            fprintf(stderr, "flow: %ld ms between two frames; the longest thing meanwhile: %s, %ld ms\n",
+                    (now - g_flow->frame_at) / 1000, g_flow->took_what ? g_flow->took_what : "nothing timed", g_flow->took_us / 1000);
+        g_flow->frame_at = now;
+        g_flow->took_what = NULL;
+        g_flow->took_us = 0;
+    }
+    if (g_flow && flow_on(l) && l->items.ids == S.flow_ids) flow_paint(l, 1);
+    if (g_flow && g_flow->timed && v == 0 && g_flow->frames) {       /* the slide's end */
+        long ms = flow_us() / 1000 - g_flow->began_ms;
+        fprintf(stderr, "flow: a slide of %ld ms in %d frames; drawing %ld us a frame, %ld at most; %d covers read, %ld us each\n",
+                ms, g_flow->frames, g_flow->paint_us / g_flow->frames, g_flow->paint_max, g_flow->reads,
+                g_flow->reads ? g_flow->read_us / g_flow->reads : 0);
+    }
+}
+
+/* The top level as a cover flow: 1 if it is one (and drawn), 0 for the list. */
+static int render_flow(render_mode_t mode)
+{
+    level_t *l = &S.stack[S.depth - 1];
+    if (!flow_on(l)) { flow_free(); return 0; }
+    if (!g_flow) {
+        if (!(g_flow = calloc(1, sizeof *g_flow))) return 0;      /* (no memory for it: the list) */
+        S.flow_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+        S.flow_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+        S.flow_dsc.header.w = FLOW_W;
+        S.flow_dsc.header.h = FLOW_H;
+        S.flow_dsc.header.stride = FLOW_W * 2;
+        S.flow_dsc.data = (const uint8_t *)g_flow->px;
+        S.flow_dsc.data_size = sizeof g_flow->px;
+        lv_image_set_src(S.flow_img, &S.flow_dsc);
+        S.flow_sel = -1;
+        g_flow->none_theme = -1;
+        g_flow->timed = access("/tmp/fathom-flow", F_OK) == 0;
+        if (g_flow->timed) fprintf(stderr, "flow: %zu bytes held while it shows\n", sizeof *g_flow);
+    }
+    int n = l->items.n;
+    if (l->sel < 0) l->sel = 0;
+    if (l->sel >= n) l->sel = n - 1;
+    char head[136];
+    const char *title = l->title_ui ? tr(l->title) : l->title;
+    if (S.depth > 1) snprintf(head, sizeof head, "\xe2\x80\xb9 %s", title);
+    else snprintf(head, sizeof head, "%s", title);
+    set_text(S.h_left, head);
+    S.last_depth = S.depth;
+    S.last_kind = l->kind;
+    S.last_parent = l->parent;
+    S.last_top = l->top;
+
+    /* the same list as last drawn, one album on: the row slides there. Anything
+     * else (another list, a jump, the library or the theme changed): at rest. */
+    int same = S.flow_ids == l->items.ids && S.flow_gen == S.lib_gen && S.flow_sel >= 0;
+    if (S.flow_gen != S.lib_gen || S.flow_theme != S.theme_gen)
+        for (int k = 0; k < FLOW_HELD; k++) g_flow->e[k].used = 0;          /* (covers may have changed: read again) */
+    int by = same ? l->sel - S.flow_sel : 0;
+    int changed = !same || by || S.flow_theme != S.theme_gen || !lv_obj_is_visible(S.flow);
+    if (same && (by == 1 || by == -1) && mode == R_ANIMATE) {
+        if (g_flow->timed) {
+            g_flow->frames = g_flow->reads = 0;
+            g_flow->paint_us = g_flow->paint_max = g_flow->read_us = 0;
+            g_flow->began_ms = flow_us() / 1000;
+            if (!lv_anim_get(S.flow_img, flow_anim_cb)) g_flow->frame_at = 0;   /* (a new slide: no frame before its first) */
+        }
+        /* (a slide under way: on from where it is, up to a place and a half
+         * away. Held to one place, a turn made before the last slide was
+         * over threw the rest of it away: the row jumped.) */
+        int from = S.flow_shift + by * FLOW_STEP;
+        if (from > FLOW_SHIFT_MAX) from = FLOW_SHIFT_MAX;
+        if (from < -FLOW_SHIFT_MAX) from = -FLOW_SHIFT_MAX;
+        S.flow_shift = from;
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, S.flow_img);
+        lv_anim_set_exec_cb(&a, flow_anim_cb);
+        lv_anim_set_values(&a, from, 0);
+        lv_anim_set_duration(&a, DUR_FLOW);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_start(&a);                              /* (takes the place of one already running on it) */
+        changed = 2;                                    /* (its first frame is drawn as it starts: not again below) */
+    } else if (changed) {
+        lv_anim_delete(S.flow_img, flow_anim_cb);
+        S.flow_shift = 0;
+    }
+    S.flow_ids = l->items.ids;
+    S.flow_sel = l->sel;
+    S.flow_gen = S.lib_gen;
+    S.flow_theme = S.theme_gen;
+    show(S.flow, 1);
+    lv_obj_move_foreground(S.flow);
+    long tp0 = g_flow->timed ? flow_us() : 0;
+    if (changed == 1) flow_paint(l, 1);
+    long tp1 = g_flow->timed ? flow_us() : 0, ti1 = tp1, tl0 = tp1;
+
+    /* its name, and who it is by; the one that's playing in the signal's colour */
+    int64_t id = l->items.ids[l->sel];
+    if (changed || id != S.flow_named) {
+        lib_album_t al;
+        memset(&al, 0, sizeof al);
+        library_album_info(S.lib, id, &al);
+        char line[300];
+        if (al.artist[0] && al.year) snprintf(line, sizeof line, "%s \xC2\xB7 %d", al.artist, al.year);
+        else if (al.year) snprintf(line, sizeof line, "%d", al.year);
+        else snprintf(line, sizeof line, "%s", al.artist);
+        set_text(S.flow_title, al.title[0] ? al.title : tr("Unknown album"));
+        set_text(S.flow_by, line);
+        S.flow_named = id;
+        if (g_flow->timed) ti1 = flow_us();
+    }
+    set_text_color(S.flow_title, C(S.now.active && S.now.track.album_id == id && !S.now.radio ? T()->signal : T()->text));
+    /* where in the list: the letters, the album's lit (a list by name), or a line */
+    if (g_flow->timed) tl0 = flow_us();
+    int az = flow_lettered(l), pill = az && T()->corner == THEME_CORNER_ROUND;
+    show(S.flow_track, !az);
+    show(S.flow_az_pill, pill);
+    if (az) {
+        int on = row_initial(l, l->sel), every = S.flow_az_every;
+        uint32_t lit = pill ? T()->select_fg : T()->signal;
+        for (int i = 0; i < 27; i++) {
+            /* (every other one: the one that's on always, its neighbours making room for it) */
+            int there = every == 1 || i == on || (i % 2 == 0 && abs(i - on) != 1);
+            show(S.flow_az[i], there);
+            if (i == on || i == S.flow_az_on) set_text_color(S.flow_az[i], C(i == on ? lit : T()->text_muted));
+        }
+        S.flow_az_on = on;
+        /* (its letter's place is 11 wide in a label of 23: the pill, 15, about its middle) */
+        int px = 8 + on * (UI_W - 16) / 27 - 6 + ((UI_W - 16) / 27 + 12) / 2 - ((UI_W - 16) / 27 + 4) / 2;
+        if (pill && lv_obj_get_style_x(S.flow_az_pill, 0) != px) lv_obj_set_x(S.flow_az_pill, px);
+    } else {
+        for (int i = 0; i < 27; i++) show(S.flow_az[i], 0);
+        int tw = UI_W - 24, w = n > 1 ? tw / n : tw;
+        if (w < 16) w = 16;
+        int x = n > 1 ? (int)((long)(tw - w) * l->sel / (n - 1)) : 0;
+        if (lv_obj_get_style_width(S.flow_thumb, 0) != w) lv_obj_set_width(S.flow_thumb, w);
+        if (lv_obj_get_style_x(S.flow_thumb, 0) != x) lv_obj_set_x(S.flow_thumb, x);
+    }
+    if (g_flow->timed && changed)
+        fprintf(stderr, "flow: drawn for a key: the player and the header %ld us, the picture %ld us, the album's name %ld us, its letter %ld us\n",
+                g_render_head_us, tp1 - tp0, ti1 - tp1, flow_us() - tl0);
+    return 1;
+}
+
+
 static void render(render_mode_t mode)
 {
     int np_changed = S.now_playing_view != S.last_np;
+    long th0 = ui_timing() ? flow_us() : 0;
     if (S.player) player_now(S.player, &S.now);
     if (S.player) say_failed();
     if (S.asleep) {                 /* drawn when the screen comes on (no animations meanwhile) */
@@ -5514,16 +5925,17 @@ static void render(render_mode_t mode)
     show(S.np, S.now_playing_view);
     show(S.cf, cfv);
     render_header_status();
+    if (th0) g_render_head_us = flow_us() - th0;
     if (cfv) {
         render_cf();
     } else if (S.now_playing_view) {
         render_np();
         if (np_changed && mode == R_ANIMATE) start_transition(TR_NP_IN);
     } else if (np_changed && mode == R_ANIMATE) {
-        render_list(R_SNAP);
+        if (!render_flow(R_SNAP)) render_list(R_SNAP);
         start_transition(TR_NP_OUT);
     } else {
-        render_list(mode);
+        if (!render_flow(mode)) render_list(mode);
     }
     S.last_np = S.now_playing_view;
     pending_free();   /* the key did not change screens: drop the unused snapshot */
@@ -7108,6 +7520,11 @@ static void setting_ok(setting_t st)
     case ST_DIM: settings_set_int("display.dim", !settings_get_int("display.dim", UI_DIM_DEFAULT)); break;
     case ST_ON_CHARGING: settings_set_int("display.on_charging", !settings_get_int("display.on_charging", UI_ON_CHARGING_DEFAULT)); break;
     case ST_COVERS: settings_set_int("display.covers", (settings_get_int("display.covers", UI_COVERS_DEFAULT) + 1) & 3); break;
+    case ST_ALBUM_FLOW: {
+        int v = settings_get_int("display.album_flow", UI_ALBUM_FLOW_DEFAULT);
+        settings_set_int("display.album_flow", v >= 0 && v < 2 ? v + 1 : 0);
+        break;
+    }
     case ST_THEME: push_ui(L_THEMES, "Theme", 0); break;
     case ST_HOME_SCREEN:
         push_ui(L_HOME_EDIT, "Home screen items", 0);
@@ -7981,21 +8398,56 @@ static void initial_hide(lv_timer_t *t)
     S.letter_timer = NULL;
 }
 
-/* The letter the selected row sorts under ("The Beatles" under B, digits under #). */
-static void show_initial(const level_t *l)
+/* The letter row i sorts under ("The Beatles" under B, digits under #): 1 to
+ * 26 for A to Z, 0 for "#". */
+static int row_initial(const level_t *l, int i)
 {
-    if (!alphabetical(l->kind) || l->sel >= list_count(l)) return;
     char main[256], meta[32];
     int playing;
-    list_item(l, l->sel, main, sizeof main, meta, sizeof meta, &playing);
+    list_item(l, i, main, sizeof main, meta, sizeof meta, &playing);
     const char *p = main;     /* as the library sorts: leading punctuation, then "the ", skipped */
     while (*p && (unsigned char)*p < 0x80 && !isalnum((unsigned char)*p)) p++;
     if (!*p) p = main;
     if (l->kind != L_SONGS && l->kind != L_FAVOURITES && !strncasecmp(p, "the ", 4)) p += 4;
     char fold[8];
     path_loose_key(p, 1 << 30, fold, sizeof fold);     /* first letter, accents folded */
+    return fold[0] >= 'a' && fold[0] <= 'z' ? fold[0] - 'a' + 1 : 0;
+}
+
+/* The first row of the letter row i is under, and the first of the next
+ * letter (the last row, if there is none): the rows under a letter are
+ * together, so a few rows are looked at, not all of them. */
+static int letter_first(const level_t *l, int i)
+{
+    int a = row_initial(l, i), lo = i, hi, step = 1;
+    while ((hi = lo - step) >= 0 && row_initial(l, hi) == a) { lo = hi; step *= 2; }
+    if (hi < -1) hi = -1;
+    while (lo - hi > 1) {
+        int mid = (lo + hi) / 2;
+        if (row_initial(l, mid) == a) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+
+static int letter_next(const level_t *l, int i)
+{
+    int n = list_count(l), a = row_initial(l, i), lo = i, hi, step = 1;
+    while ((hi = lo + step) < n && row_initial(l, hi) == a) { lo = hi; step *= 2; }
+    if (hi > n) hi = n;
+    while (hi - lo > 1) {
+        int mid = (lo + hi) / 2;
+        if (row_initial(l, mid) == a) lo = mid; else hi = mid;
+    }
+    return hi < n ? hi : n - 1;
+}
+
+/* The letter the selected row sorts under, shown for a moment over the list. */
+static void show_initial(const level_t *l)
+{
+    if (!alphabetical(l->kind) || l->sel >= list_count(l)) return;
+    int a = row_initial(l, l->sel);
     char letter[4] = "#";
-    if (fold[0] >= 'a' && fold[0] <= 'z') { letter[0] = (char)(fold[0] - 32); letter[1] = 0; }
+    if (a) { letter[0] = (char)('A' + a - 1); letter[1] = 0; }
 
     const theme_t *t = T();
     if (!S.letter) {
@@ -8179,11 +8631,19 @@ void ui_set_awake(int on)
     S.asleep = !on;
     if (!S.h_right) return;
     if (!on) {
+        /* Nothing more is drawn from here: what the panel holds is the screen
+         * as it was. (The covers given back first, their pictures hidden, were
+         * drawn so once more: a cover flow's panel gone, the rows under it,
+         * which are another list's, were what the panel held, and what showed
+         * for a moment when the screen came back on. Seen in a screenshot of
+         * the owner's H2, its screen off in Albums: Home's rows under
+         * "Albums", 2026-11-25.) */
+        lv_display_enable_invalidation(NULL, false);
         covers_free();                        /* (read again when the screen's back) */
+        flow_free();
         render_header_status();               /* (the charging pulse stops) */
         marquee_set(0);
         if (S.marquee_timer) lv_timer_pause(S.marquee_timer);
-        lv_display_enable_invalidation(NULL, false);
         return;
     }
     lv_display_enable_invalidation(NULL, true);
@@ -8209,7 +8669,20 @@ void ui_set_output(const char *name)
     if (S.now_playing_view) render(R_CONTENT);
 }
 
+static void key_do(ui_key_t k);
+
 void ui_key(ui_key_t k)
+{
+    long t0 = ui_timing() ? flow_us() : 0;
+    key_do(k);
+    if (t0) {
+        long us = flow_us() - t0;
+        ui_took("a key", us);
+        if (us > 15000) fprintf(stderr, "flow: a key took %ld ms\n", us / 1000);
+    }
+}
+
+static void key_do(ui_key_t k)
 {
     int had_help = S.help_shown;
     help_hide();
@@ -8510,9 +8983,25 @@ void ui_key(ui_key_t k)
     case UI_KEY_UP:
     case UI_KEY_DOWN: {
         int step = wheel_step(n);
+        if (flow_on(l)) {
+            /* A cover flow: a quick turn goes a letter at a time (the next
+             * one's first album; back, this letter's first, then the one
+             * before's), where the list's leaps of 8 and 20 albums passed
+             * whole letters by; the letters are along the foot, so none is
+             * shown over the covers. Not by name: three albums at most. */
+            if (step > 1 && flow_lettered(l) && n > 0) {
+                if (k == UI_KEY_DOWN) l->sel = letter_next(l, l->sel);
+                else {
+                    int first = letter_first(l, l->sel);
+                    l->sel = first < l->sel || first == 0 ? first : letter_first(l, first - 1);
+                }
+                break;
+            }
+            if (step > 3) step = 3;
+        }
         int sel = l->sel + (k == UI_KEY_DOWN ? step : -step);
         l->sel = sel < 0 ? 0 : sel > n - 1 ? (n ? n - 1 : 0) : sel;
-        if (step > 1) show_initial(l);
+        if (step > 1 && !flow_on(l)) show_initial(l);
         break;
     }
     case UI_KEY_OK: open_selected(); break;
@@ -8525,7 +9014,17 @@ void ui_key(ui_key_t k)
 
 #define SCRUB_IDLE_MS 3000
 
+static int tick_do(void);
+
 int ui_tick(void)
+{
+    long t0 = ui_timing() ? flow_us() : 0;
+    int r = tick_do();
+    if (t0) ui_took("following the player", flow_us() - t0);
+    return r;
+}
+
+static int tick_do(void)
 {
     int asking = rd_poll();      /* the station directory's answer */
     asking |= pod_poll();        /* ...and the podcast directory's */
@@ -9156,6 +9655,36 @@ void ui_init(lv_obj_t *screen, const theme_t *themes, int n_themes,
     show(S.ghost, 0);
 
     /* Find cover: a match's picture, as Now Playing's, and what it is */
+    /* Albums as cover flow: over the list's rows, in the list's own box (it
+     * slides with it when a level opens or closes) */
+    S.flow = box(S.list, 0, 0, UI_W, UI_H - HEADER_H);
+    S.flow_img = lv_image_create(S.flow);
+    lv_obj_set_pos(S.flow_img, 0, 0);
+    S.flow_title = label(S.flow);
+    lv_obj_set_pos(S.flow_title, 12, FLOW_H - 2);
+    lv_obj_set_width(S.flow_title, UI_W - 24);
+    lv_obj_set_style_text_align(S.flow_title, LV_TEXT_ALIGN_CENTER, 0);
+    S.flow_by = label(S.flow);
+    lv_obj_set_pos(S.flow_by, 12, FLOW_H + 24);
+    lv_obj_set_width(S.flow_by, UI_W - 24);
+    lv_obj_set_style_text_align(S.flow_by, LV_TEXT_ALIGN_CENTER, 0);
+    S.flow_az_pill = box(S.flow, 0, 0, 19, 18);     /* (made first: behind the letters) */
+    show(S.flow_az_pill, 0);
+    for (int i = 0; i < 27; i++) {
+        char one[2] = {i ? (char)('A' + i - 1) : '#', 0};
+        S.flow_az[i] = label(S.flow);
+        lv_obj_set_width(S.flow_az[i], (UI_W - 16) / 27 + 12);     /* (its place and 6 px each side: a W is wider than a place) */
+        lv_obj_set_style_text_align(S.flow_az[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(S.flow_az[i], LV_LABEL_LONG_CLIP);
+        lv_label_set_text(S.flow_az[i], one);
+        show(S.flow_az[i], 0);
+    }
+    S.flow_az_on = -1;
+    S.flow_track = box(S.flow, 12, UI_H - HEADER_H - 8, UI_W - 24, 3);
+    S.flow_thumb = box(S.flow_track, 0, 0, 16, 3);
+    S.flow_sel = -1;
+    show(S.flow, 0);
+
     S.cf = box(screen, 0, HEADER_H, UI_W, UI_H - HEADER_H);
     S.cf_art = box(S.cf, 12, 6, LIB_ART_LARGE, LIB_ART_LARGE);
     lv_obj_set_style_clip_corner(S.cf_art, true, 0);
