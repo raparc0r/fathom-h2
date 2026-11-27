@@ -70,6 +70,28 @@ A song counts as played once it has played past its first 30 seconds. Only lists
 songs in them show. Menu on one plays it, shuffles it, or adds it to one of your own
 playlists as it is now.
 
+## Lyrics
+
+**Menu → Lyrics** on a song, or on Now Playing, shows the song's lyrics. Fathom looks
+for them in this order: a file beside the song with the same name and `.lrc`, the lyrics
+in the song's own tags, and lyrics it found online before.
+
+Lyrics with times (an `.lrc` file's `[01:23.45]`) follow the song that's playing: the
+line being sung is in the middle, in the theme's colour, with the lines before it above
+and the ones to come below. Turn the wheel to read ahead or back; a few seconds after you
+stop, it follows the song again. **Menu** switches between following the song and moving
+only with the wheel (the line being sung stays marked), and says which. Lyrics without
+times, and those of a song that isn't the one playing, are a page the wheel moves through.
+**Play** still plays and pauses, and **Back** puts the lyrics away. The album's cover fills the screen behind the
+words, out of focus and shaded so they stay easy to read.
+
+When a song has none, **Play** on that screen looks them up on
+[LRCLIB](https://lrclib.net), a free collection of lyrics that needs no account. This
+needs Wi-Fi, and sends the song's artist, title, album and length. What it finds is saved
+in the card's `fathom/lyrics/` folder, never beside your music, so it's there the next
+time without Wi-Fi. A track of an album ripped as one file with a CUE sheet only has
+lyrics found this way: the file's tags and its `.lrc` are the whole album's.
+
 ## The H2 as your computer's sound card
 
 Plug it in and choose **Use as a USB DAC** (or Settings → USB connection → USB DAC mode). The
@@ -388,7 +410,7 @@ Update** as in [INSTALL.md](INSTALL.md). Your settings and library are where you
 Fathom keeps its settings, library and cover cache in the card's `fathom` folder, and
 that's where you add things of your own: `radio.txt`, `eq/`, `themes/`, `lang/` and
 `packs/` (all above). `podcasts/` holds your shows, their episodes' downloads and where you left each;
-`radio-icons/` your stations' logos and what the station directory said about them, fetched and asked again if you delete them. Wi-Fi passwords and the network drive's password are kept there too, so anyone
+`lyrics/` the lyrics found online; `radio-icons/` your stations' logos and what the station directory said about them, fetched and asked again if you delete them. Wi-Fi passwords and the network drive's password are kept there too, so anyone
 holding the card can read them.
 
 More for the technically minded (SSH, logs, recovery): [ADVANCED.md](ADVANCED.md).

@@ -2,7 +2,7 @@
 
 # Fathom
 
-Latest version: [0.22.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.22.0) released November 27th 2026
+Latest version: [0.23.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.23.0) released November 27th 2026
 
 [Features](#features) · [Compatibility](#compatibility) · [Installing](#installing) · [Navigation](#navigation) · [Licence](#licence) · [How it was made](#how-it-was-made)
 
@@ -38,6 +38,7 @@ I recommend you check it out: [rockbox.org](https://www.rockbox.org).
   with their logos.
 - **Podcasts.** Find shows on the H2, or import them from another app, each with its
   picture; new episodes download while it charges.
+- **Lyrics**, from your files or found online, following the song as it plays.
 - **Smart playlists.** Never played, On repeat, Not heard in a while, Forgotten favourites,
   Often skipped.
 - **A network drive**, so you can copy music to the H2 over Wi-Fi while it plays.

@@ -19,7 +19,7 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SOURCES = ['app/ui/ui_internal.h', 'app/ui/ui.c', 'app/ui/ui_graphs.c', 'app/ui/sound_text.h', 'app/net/radiodir.c',
+SOURCES = ['app/ui/ui_internal.h', 'app/ui/ui.c', 'app/ui/ui_graphs.c', 'app/ui/ui_lyrics.c', 'app/ui/sound_text.h', 'app/net/radiodir.c',
            # (fathom-player's own pieces: main.c and the files cut out of it)
            'device/main.c', 'device/early.c', 'device/output.c', 'device/usbmode.c', 'device/clockset.c',
            'device/updates.c', 'device/radiohooks.c', 'device/power.c', 'device/bgscan.c', 'device/packs.c',

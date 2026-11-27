@@ -73,6 +73,7 @@
 #include "library/scripts.h"
 #include "net/podsync.h"
 #include "net/coverfind.h"
+#include "net/lyricfind.h"
 #include "net/radioicon.h"
 #include "audio/crossfeed.h"
 #include "audio/width.h"

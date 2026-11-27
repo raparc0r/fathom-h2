@@ -423,6 +423,15 @@ int ui_test_ctx_row(const char *label);
 int ui_test_row(const char *text);
 /* The message over the screen now (a toast, a setting's help); NULL: none (tests). */
 const char *ui_test_toast(void);
+/* The Lyrics screen (tests): -2 it isn't up; else how its song's lyrics stand
+ * (net/lyricfind.h's LF_*), and with lyrics shown, the line in the middle
+ * (timed ones) or the page's words. */
+int ui_test_lyrics(char *now, size_t cap);
+/* ...and for timed lyrics, the tallest stretch of the screen with no line in
+ * it as drawn this instant, in px (-1: no timed lyrics shown). */
+int ui_test_lyrics_gap(void);
+/* ...and its heading's height in px (-1: the screen isn't up). */
+int ui_test_lyrics_heading(void);
 /* The cover flow's cache: 1 if it holds this album's cover, 0 if it holds the
  * album as having none, -1 if it doesn't hold it (or there is no cache) (tests). */
 int ui_test_flow_cover(int64_t album);

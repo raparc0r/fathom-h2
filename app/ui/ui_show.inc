@@ -431,5 +431,32 @@ static void show_named(const char *what)
     } else if (!strcmp(what, "themes")) {
         push_ui(L_SETTINGS, "Settings", 0);
         push_ui(L_THEMES, "Theme", 0);
+    } else if (!strncmp(what, "lyrics", 6)) {
+        /* Lyrics: the song cued, from Now Playing (timed ones: "lyrics", and
+         * read ahead with the wheel: "lyricsahead"); its album's second song,
+         * from the list (a page: "lyricsplain", and turned on: "lyricsmore");
+         * the next album's first, which has none ("lyricsnone") */
+        int k = !strcmp(what, "lyricsplain") || !strcmp(what, "lyricsmore") ? 1 : !strcmp(what, "lyricsnone") ? 2 : 0;
+        if (S.player) player_now(S.player, &S.now);        /* (the song playing: as drawn, here not yet) */
+        if (k == 0 && S.now.active && !S.now.radio && !S.now.podcast && S.now.track.id) {
+            S.now_playing_view = 1;
+        } else {
+            /* (the pictures' later themes: a podcast is "playing" by then, and
+             * the cued song's lyrics are opened from its album, not followed) */
+            push_ui(L_ALBUMS, "Albums", 0);
+            level_t *l = &S.stack[S.depth - 1];
+            int al = k == 2 ? 2 : 1;
+            l->sel = l->items.n > al ? al : 0;
+            char name[128];
+            if (!l->items.n || !S.lib || library_album_name(S.lib, l->items.ids[l->sel], name, sizeof name)) return;
+            if (!push(L_TRACKS, name, l->items.ids[l->sel])) return;
+            l = &S.stack[S.depth - 1];
+            if (k == 1 && l->items.n > 1) l->sel = 1;
+        }
+        if (open_context() == 0) run_context(CTX_LYRICS);
+        lyrics_settle();
+        if (!strcmp(what, "lyricsahead")) for (int i = 0; i < 3; i++) lyrics_key(UI_KEY_DOWN);
+        if (!strcmp(what, "lyricsmore")) for (int i = 0; i < 4; i++) lyrics_key(UI_KEY_DOWN);
+        lyrics_still();
     }
 }

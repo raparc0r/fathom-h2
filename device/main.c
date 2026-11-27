@@ -967,6 +967,9 @@ int main(int argc, char **argv)
         char covers[600];                /* covers found online (Find cover): on the card, never beside the music */
         snprintf(covers, sizeof covers, "%s/covers", data);
         cf_start(covers);
+        char lyr[600];                   /* lyrics found online (a song's menu > Lyrics): there too */
+        snprintf(lyr, sizeof lyr, "%s/lyrics", data);
+        lf_start(lyr);
         char icons[600];                 /* your radio stations' logos, kept small (fetched when Home > Radio reads the list) */
         snprintf(icons, sizeof icons, "%s/radio-icons", data);
         ricon_start(icons);
@@ -1161,6 +1164,7 @@ int main(int argc, char **argv)
     packs_stop_ask();      /* (a pack being fetched: dropped; what it left is cleared by the next fetch) */
     cf_stop_ask();
     ricon_stop_ask();      /* (an icon being fetched: dropped) */
+    lf_stop_ask();         /* (lyrics being looked up: dropped) */
     queue_save();
     if (player) player_free(player);
     if (eng) engine_free(eng);
@@ -1168,7 +1172,7 @@ int main(int argc, char **argv)
     library_close(lib);
     LAT("main: library closed");
     mark_clean_stop();                  /* (it checks the library otherwise) */
-    {   /* The network workers, 2 s between the three: they use nothing closed
+    {   /* The network workers, 2 s between them all: they use nothing closed
          * above (files on the card and memory of their own: no library, no
          * player, no UI). One not back by then is left and ends with the
          * player; what it was writing (a .part, a .tmp) is removed when its
@@ -1181,7 +1185,9 @@ int main(int argc, char **argv)
         back += ricon_stop_wait(ms > 0 ? ms : 0);
         ms = 2000 - (int)(clock_ms32() - t0);
         back += packs_stop_wait(ms > 0 ? ms : 0);
-        if (back < 4) fprintf(stderr, "fathom-player: %d of the network's workers not back in 2 s: left\n", 4 - back);
+        ms = 2000 - (int)(clock_ms32() - t0);
+        back += lf_stop_wait(ms > 0 ? ms : 0);
+        if (back < 5) fprintf(stderr, "fathom-player: %d of the network's workers not back in 2 s: left\n", 5 - back);
         LAT("main: network workers stopped");
     }
     return g_usb_drive ? USB_DRIVE_EXIT : 0;

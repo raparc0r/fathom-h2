@@ -410,7 +410,7 @@ static int id3_load(FILE *f, id3_t *id)
 /* v2.2's three-letter frames by their v2.3 names (iTunes wrote v2.2 for years) */
 static const char *const ID3_V22[][2] = {
     {"TT2", "TIT2"}, {"TP1", "TPE1"}, {"TP2", "TPE2"}, {"TAL", "TALB"}, {"TCO", "TCON"}, {"TCM", "TCOM"},
-    {"TRK", "TRCK"}, {"TPA", "TPOS"}, {"TYE", "TYER"}, {"TXX", "TXXX"},
+    {"TRK", "TRCK"}, {"TPA", "TPOS"}, {"TYE", "TYER"}, {"TXX", "TXXX"}, {"ULT", "USLT"},
 };
 
 /* Iterate frames: returns pointer to next frame body, fills id/size. A v2.2
@@ -458,13 +458,12 @@ static size_t latin1_put(const unsigned char *b, size_t n, int latin1, char *out
     return w;
 }
 
-/* Decode an ID3 text frame body into UTF-8. */
-static void id3_text(const unsigned char *b, size_t n, char *out, size_t cap)
+/* ID3 text in encoding enc (a frame's first byte) into UTF-8, up to its end
+ * or its first NUL. */
+static void id3_text_enc(int enc, const unsigned char *b, size_t n, char *out, size_t cap)
 {
     size_t w = 0;
-    if (n == 0 || cap == 0) { if (cap) out[0] = '\0'; return; }
-    int enc = b[0];
-    b++; n--;
+    if (cap == 0) return;
     if (enc == 0 || enc == 3) {  /* Latin-1 or UTF-8 */
         w = latin1_put(b, n, enc == 0, out, cap);
     } else {  /* UTF-16 with BOM (1) or big-endian (2) */
@@ -487,6 +486,13 @@ static void id3_text(const unsigned char *b, size_t n, char *out, size_t cap)
     }
     out[w] = '\0';
     while (w > 0 && out[w - 1] == ' ') out[--w] = '\0';
+}
+
+/* Decode an ID3 text frame body into UTF-8. */
+static void id3_text(const unsigned char *b, size_t n, char *out, size_t cap)
+{
+    if (n == 0 || cap == 0) { if (cap) out[0] = '\0'; return; }
+    id3_text_enc(b[0], b + 1, n - 1, out, cap);
 }
 
 /* ID3v1's genres by number (with Winamp's additions), which v2.2 and v2.3
@@ -1156,6 +1162,148 @@ int tags_cuesheet(const char *path, char **text, size_t *len)
         if (n && n < CUE_MAX_BYTES && (*text = malloc(n + 1))) {
             memcpy(*text, v, n + 1);
             *len = n;
+        }
+        avformat_close_input(&fc);
+    }
+#endif
+    return *text ? 0 : -1;
+}
+
+/* ---------- lyrics ----------
+ * Read when a song's lyrics are asked for, never by a scan: a FLAC's LYRICS,
+ * UNSYNCEDLYRICS or SYNCEDLYRICS comment, an MP3's USLT frame (v2.2's ULT),
+ * what FFmpeg calls "lyrics" in the others (an M4A's, an APE tag's, an ID3
+ * chunk's "lyrics-eng"). Of several, one with times comes first. */
+#define TAG_LYRICS_MAX (128 * 1024)
+
+static int lyrics_timed(const char *s)      /* "[01:23" at the start of a line: an LRC's text */
+{
+    for (const char *p = s; p; p = strchr(p, '\n')) {
+        while (*p == '\n' || *p == '\r' || *p == ' ') p++;
+        if (p[0] == '[' && isdigit((unsigned char)p[1]) && (p[2] == ':' || (isdigit((unsigned char)p[2]) && p[3] == ':'))) return 1;
+    }
+    return 0;
+}
+
+/* text (malloc'd, NUL-ended, n bytes) offered as the song's lyrics: kept if
+ * there are none yet, or it has times and what's kept hasn't; else freed. */
+static void lyrics_offer(char **have, size_t *have_len, char *text, size_t n)
+{
+    while (n && (text[n - 1] == '\n' || text[n - 1] == '\r' || text[n - 1] == ' ' || text[n - 1] == '\0')) n--;
+    text[n] = '\0';
+    if (!n || (*have && !(lyrics_timed(text) && !lyrics_timed(*have)))) { free(text); return; }
+    free(*have);
+    *have = text;
+    *have_len = n;
+}
+
+static int lyrics_key(const char *k, size_t n)
+{
+    return (n == 6 && !strncasecmp(k, "LYRICS", 6)) || (n == 14 && !strncasecmp(k, "UNSYNCEDLYRICS", 14)) ||
+           (n == 12 && !strncasecmp(k, "SYNCEDLYRICS", 12)) || (n > 7 && !strncasecmp(k, "LYRICS-", 7));
+}
+
+static void flac_lyrics(const char *path, char **text, size_t *len)
+{
+    FILE *f = fopen(path, "rbe");
+    if (!f) return;
+    if (flac_start(f)) goto out;
+    for (int last = 0, blocks = 0; !last && blocks < FLAC_MAX_BLOCKS; blocks++) {
+        int type;
+        uint32_t blen;
+        if (flac_block(f, &last, &type, &blen)) break;
+        if (type == 127) break;
+        if (type != 4) {
+            if (fseek(f, (long)blen, SEEK_CUR)) break;
+            continue;
+        }
+        /* the comments, one at a time, as read_flac_cue walks them */
+        unsigned char q[4];
+        if (blen < 8 || fread(q, 1, 4, f) != 4 || le32(q) > blen - 8 || fseek(f, (long)le32(q), SEEK_CUR) || fread(q, 1, 4, f) != 4) break;
+        uint32_t n = le32(q);                      /* (a count or a length that isn't so: the reads below end at the file's end) */
+        for (uint32_t i = 0; i < n; i++) {
+            if (fread(q, 1, 4, f) != 4) break;
+            uint32_t el = le32(q);
+            unsigned char head[16];
+            uint32_t hn = el < sizeof head ? el : (uint32_t)sizeof head;
+            if (fread(head, 1, hn, f) != hn) break;
+            const unsigned char *eq = memchr(head, '=', hn);
+            size_t kl = eq ? (size_t)(eq - head) : 0;
+            if (!eq || !lyrics_key((const char *)head, kl) || el - kl - 1 > TAG_LYRICS_MAX) {
+                if (fseek(f, (long)(el - hn), SEEK_CUR)) break;
+                continue;
+            }
+            size_t vl = el - kl - 1, got = hn - kl - 1;
+            char *v = malloc(vl + 1);
+            if (!v) break;
+            memcpy(v, eq + 1, got);
+            if (fread(v + got, 1, vl - got, f) != vl - got) { free(v); break; }
+            lyrics_offer(text, len, v, vl);
+        }
+        break;                                     /* (one block of comments) */
+    }
+out:
+    fclose(f);
+}
+
+static void id3_lyrics(const char *path, char **text, size_t *len)
+{
+    FILE *f = fopen(path, "rbe");
+    if (!f) return;
+    id3_t id;
+    if (id3_load(f, &id) == 0) {
+        size_t pos = 0, sz;
+        char fid[5];
+        const unsigned char *b;
+        while ((b = id3_next(&id, &pos, fid, &sz))) {
+            /* its encoding, a language's three letters, a description ended
+             * with a NUL (two in UTF-16), then the words */
+            if (strcmp(fid, "USLT") || sz < 5 || sz > TAG_LYRICS_MAX) continue;
+            int enc = b[0];
+            size_t at = 4;
+            if (enc == 1 || enc == 2) {
+                while (at + 1 < sz && (b[at] || b[at + 1])) at += 2;
+                at += 2;
+            } else {
+                while (at < sz && b[at]) at++;
+                at++;
+            }
+            if (at >= sz) continue;
+            size_t cap = (sz - at) * 2 + 8;         /* (Latin-1 at its longest as UTF-8; UTF-16 never longer than 3 for 2) */
+            char *v = malloc(cap);
+            if (!v) break;
+            id3_text_enc(enc, b + at, sz - at, v, cap);
+            lyrics_offer(text, len, v, strlen(v));
+        }
+        free(id.buf);
+    }
+    fclose(f);
+}
+
+int tags_lyrics(const char *path, char **text, size_t *len)
+{
+    *text = NULL;
+    *len = 0;
+    if (cue_part_suffix(path)) return -1;          /* (a track of an album in one file: the tags are the album's) */
+    const char *e = path_ext(path);
+    if (!strcasecmp(e, "flac")) flac_lyrics(path, text, len);
+    else if (!strcasecmp(e, "mp3")) id3_lyrics(path, text, len);
+#ifdef FATHOM_HAVE_FFMPEG
+    else if (ff_ext(e)) {
+        AVFormatContext *fc;
+        int s = ff_open(path, &fc);
+        if (s < 0) return -1;
+        AVDictionary *both[2] = {fc->metadata, fc->streams[s]->metadata};
+        for (int d = 0; d < 2; d++) {
+            const AVDictionaryEntry *t = NULL;
+            while ((t = av_dict_get(both[d], "", t, AV_DICT_IGNORE_SUFFIX))) {
+                size_t n = strlen(t->value);
+                if (!lyrics_key(t->key, strlen(t->key)) || !n || n > TAG_LYRICS_MAX) continue;
+                char *v = malloc(n + 1);
+                if (!v) break;
+                memcpy(v, t->value, n + 1);
+                lyrics_offer(text, len, v, n);
+            }
         }
         avformat_close_input(&fc);
     }

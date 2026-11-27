@@ -28,7 +28,7 @@ set(FATHOM_SRC_LIBRARY
   ${_r}/library/library_pixels.c ${_r}/library/library_playlists.c ${_r}/library/library_plays.c
   ${_r}/library/library_search.c ${_r}/library/library_trying.c ${_r}/library/library_upkeep.c
   ${_r}/library/reader.c ${_r}/library/artdec.c ${_r}/library/fatwalk.c ${_r}/library/playlist.c
-  ${_r}/library/stb_impl.c)
+  ${_r}/library/stb_impl.c ${_r}/library/lyrics.c)
 
 set(FATHOM_SRC_SHUFFLE
   ${_r}/shuffle/shuffle.c)
@@ -43,7 +43,7 @@ set(FATHOM_SRC_FFMPEG
 set(FATHOM_SRC_NET
   ${_r}/net/http.c ${_r}/net/json.c ${_r}/net/radiodir.c ${_r}/net/radioicon.c ${_r}/net/podcast.c
   ${_r}/net/podsync.c ${_r}/net/coverfind.c ${_r}/net/netclock.c ${_r}/net/sha256.c ${_r}/net/unzip.c
-  ${_r}/net/update.c ${_r}/net/packfetch.c)
+  ${_r}/net/update.c ${_r}/net/packfetch.c ${_r}/net/lyricfind.c)
 
 set(FATHOM_SRC_ENGINE
   ${_r}/audio/engine.c ${_r}/audio/loudness.c ${_r}/audio/btconv.c ${_r}/audio/eq.c ${_r}/audio/tempo.c
@@ -56,7 +56,7 @@ set(FATHOM_SRC_PLAYER
 set(FATHOM_SRC_UI_BASE
   ${_r}/ui/theme.c ${_r}/ui/coverflow.c ${_r}/ui/glyphpack.c)
 set(FATHOM_SRC_UI
-  ${_r}/ui/fonts.c ${_r}/ui/assets.c ${_r}/ui/ui.c ${_r}/ui/ui_graphs.c)
+  ${_r}/ui/fonts.c ${_r}/ui/assets.c ${_r}/ui/ui.c ${_r}/ui/ui_graphs.c ${_r}/ui/ui_lyrics.c)
 
 # What a tool that only plays or measures a file needs beside the decoders
 set(FATHOM_SRC_DECODE_TOOL

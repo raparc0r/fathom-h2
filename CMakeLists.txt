@@ -170,6 +170,8 @@ fathom_test(reader LIBS fathom_player pthread CWD)
 fathom_test(tags LIBS fathom_player)
 fathom_test(sort LIBS fathom_player)
 fathom_test(cue LIBS fathom_player)
+# Lyrics: an LRC's lines and times, the tags' lyrics, where they're kept, the lookup online
+fathom_test(lyrics LIBS fathom_player pthread INCLUDES tests)
 # The FAT32 reader of the quick check (app/library/fatwalk.c) on card images made by the test
 fathom_test(fatwalk LIBS fathom_player INCLUDES tests)
 fathom_test(works LIBS fathom_player)

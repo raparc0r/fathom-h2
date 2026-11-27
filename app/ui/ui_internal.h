@@ -26,6 +26,7 @@
 #include "net/podsync.h"
 #include "net/coverfind.h"
 #include "net/netclock.h"
+#include "net/lyricfind.h"
 #include "core/clock.h"
 #include "core/utf8.h"
 
@@ -134,11 +135,12 @@ typedef enum {
     CTX_RADIO_PLAY, CTX_RADIO_ADD, CTX_RADIO_REMOVE,
     CTX_POD_REFRESH, CTX_POD_UNSUB, CTX_POD_DOWNLOAD, CTX_POD_CANCEL, CTX_POD_DELETE, CTX_POD_PLAYED, CTX_POD_UNPLAYED,
     CTX_POD_CHAPTERS, CTX_POD_SPEED, CTX_FIND_COVER, CTX_REMOVE_COVER, CTX_FIND_ANOTHER,
-    CTX_SHUFFLE,
+    CTX_SHUFFLE, CTX_LYRICS,
 } ctx_action_t;
 
 /* Rows of the track info screen. */
 enum { INFO_TITLE, INFO_ARTIST, INFO_ALBUM, INFO_TRACK, INFO_FORMAT, INFO_LENGTH, INFO_FILE, INFO_N };
+#define LYR_SLOTS 28    /* the Lyrics screen: lines drawn at once, a screen's worth above and below what shows included */
 
 /* ---------- state ---------- */
 
@@ -449,6 +451,34 @@ struct ui_state {
              *thp_sel_m, *thp_dot, *thp_eq[3], *thp_row_t, *thp_row_m, *thp_track, *thp_fill, *thp_seg[10],
              *thp_warn;                       /* its preview over the list (the_place) */
     int list_y0;
+    /* Lyrics (ui_lyrics.c): the screen, whose song, how its lookup stands */
+    lv_obj_t *lyr_ov, *lyr_title, *lyr_artist, *lyr_body, *lyr_page, *lyr_msg, *lyr_hint;
+    /* behind the words: the album's cover over the whole screen, blurred and shaded with the theme's background */
+    lv_obj_t *lyr_bg;
+    uint16_t *lyr_bg_px;                      /* UI_W x UI_H, held while the screen is up */
+    lv_image_dsc_t lyr_bg_dsc;
+    int64_t lyr_bg_album;                     /* whose cover it is */
+    int lyr_bg_on;                            /* there is one (the album has a cover) */
+    uint32_t lyr_bg_ink;                      /* its colour at its nearest to the words': they are kept clear of it */
+    /* timed lyrics: a strip of lines, one label each, that slides when the line being sung changes */
+    lv_obj_t *lyr_win, *lyr_roll, *lyr_slot[LYR_SLOTS];   /* (the window the strip shows through) */
+    int lyr_slot_line[LYR_SLOTS];             /* the line each shows (-1: none) */
+    int16_t lyr_slot_y[LYR_SLOTS], lyr_slot_h[LYR_SLOTS];
+    int lyr_shift;                            /* px the strip is from its place, while it slides */
+    lv_timer_t *lyr_timer;
+    lyrics_t lyr;                 /* the lyrics shown */
+    lf_song_t lyr_song;
+    int64_t lyr_track;
+    int lyr_state;                /* LF_* */
+    int lyr_online, lyr_tried;    /* it is, or was, looked up online; it was before, and not found */
+    int lyr_follow;               /* the song playing: its place and its changes are followed */
+    int lyr_auto;                 /* timed lyrics move with the song (Menu: or only with the wheel) */
+    int lyr_from_np, lyr_depth;
+    int lyr_line;                 /* timed, read with the wheel: the line in the middle; a page: its first line */
+    int lyr_last;                 /* a page: its last line */
+    int lyr_manual;               /* the wheel moved it, at lyr_manual_at: not following the song until it rests */
+    uint32_t lyr_manual_at;
+    int lyr_drawn, lyr_drawn_sung;   /* as drawn: the line in the middle, the line being sung */
 };
 /* The one there is (ui.c). The interface's files have always called it S: the
  * name the linker sees is longer, so that it can meet no other. */
@@ -597,6 +627,18 @@ static inline int quantize(int v, int target)
 #define BAT_GRAPH_H 90          /* the graph above the rows (three fit below it) */
 int ui_zone(void);                       /* the time zone times are shown in (clock.tz) */
 const char *ui_month(int mon);           /* a month's short name (1-12), translated */
+/* ui_lyrics.c: the Lyrics screen */
+void lyrics_open(int64_t track, int from_np);
+void lyrics_close(void);
+int  lyrics_key(ui_key_t k);       /* a key while it shows: 1 if it was its */
+void lyrics_awake(int on);         /* the screen on or off */
+#ifdef FATHOM_UI_SHOW
+void lyrics_settle(void);
+void lyrics_still(void);
+#endif
+/* ui.c, for it: the network usable (1), else Wi-Fi asked for or why not said (0) */
+int  ui_net_or_ask(const char *need);
+
 void bat_day(char *b, size_t n, int64_t t);
 void battery_row(list_kind_t k, int i, char *main, size_t mn, char *meta, size_t tn);
 void battery_labels(void);

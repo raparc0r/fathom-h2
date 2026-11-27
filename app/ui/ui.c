@@ -102,7 +102,7 @@ static const char *const CTX_LABEL[] = {
     "Play", "Add to your stations", "Remove from your stations",
     "Check for new episodes", "Unsubscribe", "Download", "Cancel download", "Delete download", "Mark as played",
     "Mark as not played", "Chapters", "Speed", "Find cover", "Remove cover", "Find another cover",
-    "Shuffle",
+    "Shuffle", "Lyrics",
 };
 
 struct ui_state g_ui;   /* (S: ui_internal.h) */
@@ -5570,6 +5570,15 @@ static int net_or_ask(int then, const char *need)
     return 0;
 }
 
+/* The same for the Lyrics screen (ui_lyrics.c), which has just put itself
+ * away: the question, if one is asked, is drawn where it was opened from. */
+int ui_net_or_ask(const char *need)
+{
+    int r = net_or_ask(WT_NONE, need);
+    render(R_SNAP);
+    return r;
+}
+
 /* The directory can be asked now (Wi-Fi is connected); else why not. */
 static int rd_ready(char *why, size_t cap)
 {
@@ -6588,6 +6597,7 @@ static int open_context(void)
             CTX_ADD(CTX_Q_PLAY); CTX_ADD(CTX_Q_MOVE); CTX_ADD(CTX_Q_REMOVE); CTX_ADD(CTX_Q_CLEAR);
         } else if (on_np) {
             CTX_ADD(CTX_SHOW_QUEUE);
+            CTX_ADD(CTX_LYRICS);                    /* (near the top here: the song is playing) */
         } else {
             CTX_ADD(CTX_PLAY_NEXT); CTX_ADD(CTX_ADD_QUEUE);
         }
@@ -6598,6 +6608,7 @@ static int open_context(void)
         if (S.ctx_artist) CTX_ADD(CTX_GO_ARTIST);
         CTX_ADD(library_favourite(S.lib, S.ctx_track) ? CTX_FAV_REMOVE : CTX_FAV_ADD);
         CTX_ADD(CTX_INFO);
+        if (!on_np) CTX_ADD(CTX_LYRICS);
         if (S.ctx_album) ctx_add_cover(S.ctx_album);
     } else if (!S.ctx_album) {                      /* an artist: their songs */
         if (library_artist_name(S.lib, S.ctx_artist, title, sizeof title)) return -1;
@@ -6847,6 +6858,11 @@ static void run_context(ctx_action_t a)
     case CTX_INFO:
         pop_level(1);
         if (push_ui(L_INFO, "Info", track)) S.stack[S.depth - 1].back_to_np = from_np;
+        break;
+    case CTX_LYRICS:
+        pop_level(1);
+        if (from_np) S.now_playing_view = 1;        /* (under the lyrics, and there when they're put away) */
+        lyrics_open(track, from_np);
         break;
     case CTX_FIND_COVER:
     case CTX_FIND_ANOTHER:
@@ -8208,12 +8224,14 @@ void ui_set_awake(int on)
         render_header_status();               /* (the charging pulse stops) */
         marquee_set(0);
         if (S.marquee_timer) lv_timer_pause(S.marquee_timer);
+        lyrics_awake(0);
         return;
     }
     lv_display_enable_invalidation(NULL, true);
     render_mode_t m = S.wake_mode;
     S.wake_mode = R_CONTENT;
     render(m);
+    lyrics_awake(1);
     lv_obj_invalidate(lv_screen_active());
     lv_obj_invalidate(lv_layer_top());
     marquee_arm();
@@ -8278,6 +8296,7 @@ static void key_do(ui_key_t k)
     if (S.upd_ov && update_overlay_key(k)) return;
     if (S.scan_ov && scan_overlay_key(k)) return;
     if (S.wn_ov && whats_new_key(k)) return;
+    if (S.lyr_ov && lyrics_key(k)) return;
     if (S.uni_ov && uninstall_overlay_key(k)) return;
     if (S.clk_ov && clock_key(k)) return;
     /* Typing: <Prev> and <Next> move the cursor through what's typed (not the
@@ -8723,6 +8742,7 @@ int ui_list_state(int *sel, int *n, int *home_edit)
 void ui_show(const char *what)
 {
     clock_close();
+    lyrics_close();
     S.scrubbing = 0;
     finish_transition();
     pending_free();

@@ -43,6 +43,8 @@
 #include "library/tags.h"
 #include "library/scripts.h"
 #include "net/coverfind.h"
+#include "library/lyrics.h"
+#include "net/lyricfind.h"
 #include "net/json.h"
 #include "net/netclock.h"
 #include "net/podcast.h"
@@ -214,6 +216,42 @@ static void t_cover(const char *s, size_t n)
     cf_norm(s, 0, norm, sizeof norm);
 }
 
+/* Lyrics: a text's lines and times (an .lrc, a tag's, LRCLIB's), and LRCLIB's answer */
+static void t_lyrics(const uint8_t *d, size_t n)
+{
+    lyrics_t l;
+    lyrics_looks_synced((const char *)d, n);
+    if (lyrics_parse((const char *)d, n, &l)) return;
+    for (int i = 0; i < l.n; i++) {
+        if (strlen(lyrics_line(&l, i)) > 2 * n) abort();          /* (Latin-1 read as UTF-8: twice at most) */
+        if (l.synced && i && l.line[i].ms < l.line[i - 1].ms) abort();
+        if (l.synced && l.line[i].ms < 0) abort();
+    }
+    static const int32_t at[] = {-5, 0, 1, 999, 60000, 3600000, INT32_MAX};
+    for (size_t k = 0; k < sizeof at / sizeof at[0]; k++) {
+        int i = lyrics_at(&l, at[k]);
+        if (i < -1 || i >= l.n) abort();
+    }
+    lyrics_free(&l);
+}
+
+static void t_lyricfind(const char *s, size_t n)
+{
+    static const int dur[] = {0, 1, 180, 100000};
+    for (size_t k = 0; k < sizeof dur / sizeof dur[0]; k++) {
+        char *text = NULL;
+        size_t tl = 0;
+        int r = lf_parse(s, n, dur[k], &text, &tl);
+        if ((r == 1) != (text != NULL)) abort();
+        if (text) {
+            lyrics_t l;
+            if (strlen(text) != tl) abort();
+            if (lyrics_parse(text, tl, &l) == 0) lyrics_free(&l);
+            free(text);
+        }
+    }
+}
+
 static void t_tags(const uint8_t *d, size_t n, const char *ext)
 {
     tags_t t;
@@ -226,6 +264,13 @@ static void t_tags(const uint8_t *d, size_t n, const char *ext)
     if (tags_picture(g_tmp, &pic, &pl) == 0) free(pic);
     long off, len;
     tags_picture_at(g_tmp, &off, &len);
+    char *ly = NULL;
+    size_t ll;
+    if (tags_lyrics(g_tmp, &ly, &ll) == 0) {
+        lyrics_t l;
+        if (lyrics_parse(ly, ll, &l) == 0) lyrics_free(&l);
+        free(ly);
+    }
     pod_chapter_t ch[32];
     pod_file_chapters(g_tmp, ch, 32);
 }
@@ -437,6 +482,8 @@ static void run_one(const uint8_t *d, size_t n)
     else if (!strcmp(t, "upt")) t_upt(d, n);
     else if (!strcmp(t, "glyphpack")) t_glyphpack(d, n);
     else if (!strcmp(t, "scripts")) t_scripts(s, n);
+    else if (!strcmp(t, "lyrics")) t_lyrics(d, n);
+    else if (!strcmp(t, "lyricfind")) t_lyricfind(s, n);
     else { fprintf(stderr, "unknown target %s\n", t); exit(2); }
     free(s);
 }

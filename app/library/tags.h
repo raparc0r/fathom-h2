@@ -36,6 +36,11 @@ int tags_read(const char *path, tags_t *t);
 /* The CUE sheet in the file's tags, malloc'd and NUL-terminated (its length
  * in *len), or -1. */
 int tags_cuesheet(const char *path, char **text, size_t *len);
+/* The lyrics in the file's tags (FLAC's LYRICS and UNSYNCEDLYRICS, an MP3's
+ * USLT, an M4A's...), malloc'd and NUL-terminated, as tagged: plain text, or
+ * an LRC's with its times (library/lyrics.h reads either). Of several, one
+ * with times. -1: none (or a CUE track's path: the tags are its album's). */
+int tags_lyrics(const char *path, char **text, size_t *len);
 /* A FLAC through libFLAC, as tags_read() did before its own one-pass reader:
  * to check that reader against (tools/tags-compare). */
 int tags_read_flac_reference(const char *path, tags_t *t);

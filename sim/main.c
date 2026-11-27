@@ -51,6 +51,7 @@
 #include "net/podcast.h"
 #include "net/podsync.h"
 #include "net/coverfind.h"
+#include "net/lyricfind.h"
 #include "net/radioicon.h"
 #include "audio/crossfeed.h"
 #include "audio/width.h"
@@ -177,6 +178,53 @@ static void sim_unquote(const char *url, const char *field, char *out, size_t ca
     }
     out[k] = '\0';
 }
+/* Lyrics, made up (the simulator asks nobody): what LRCLIB would answer for
+ * any song, and the three songs the pictures show: the one cued has timed
+ * ones kept, its album's second a page of plain ones, the next album's first
+ * none. */
+#define SIM_LYRICS_TIMED \
+    "[ar:Nobody]\n[00:00.00]A drop falls into still water\n[00:00.00]and the rings go out\n[00:00.00]as far as the shore\n" \
+    "[00:12.00]Count the fathoms down\n[00:17.00]to where the light gets thin\n[00:22.00]\n" \
+    "[00:26.00]Somewhere a wheel is turning, slowly, in the dark\n[00:31.00]one song at a time\n[00:36.00]and the night is long enough\n" \
+    "[00:41.00]for every one of them\n"
+#define SIM_LYRICS_PLAIN \
+    "A drop falls into still water\nand the rings go out\nas far as the shore\n\n" \
+    "Count the fathoms down\nto where the light gets thin\n\n" \
+    "Somewhere a wheel is turning\none song at a time\nand the night is long enough\nfor every one of them\n\n" \
+    "A drop falls into still water\nand the rings come back again\n"
+static long sim_lf_fetch(const char *url, char *buf, size_t cap, const volatile int *abort)
+{
+    (void)abort;
+    const char *d = strstr(url, "&duration=");
+    return snprintf(buf, cap, "{\"trackName\":\"x\",\"duration\":%d,\"instrumental\":false,\"plainLyrics\":\"Made-up words\","
+                              "\"syncedLyrics\":\"[00:01.00]Made-up words, timed\\n[00:06.00]for a song the simulator plays\\n"
+                              "[00:11.00]one line every five seconds\\n[00:16.00]until the song is over\"}", d ? atoi(d + 10) : 0);
+}
+static void sim_lyrics_seed(const char *dir)
+{
+    lib_list_t albums, tracks;
+    if (!g_lib || library_list(g_lib, LIB_ALBUMS, 0, &albums) < 2) return;
+    for (int k = 0; k < 3; k++) {
+        lib_track_t t;
+        char path[1100];
+        int n = library_list(g_lib, LIB_ALBUM_TRACKS, albums.ids[k < 2 ? 1 : albums.n > 2 ? 2 : 0], &tracks);
+        int at = k == 1 ? 1 : 0;
+        if (n > at && library_track(g_lib, tracks.ids[at], &t) == 0) {
+            lyrics_song_t s = {t.path, t.artist, t.title, t.album};
+            const char *text = k == 0 ? SIM_LYRICS_TIMED : SIM_LYRICS_PLAIN;
+            if (k < 2) lyrics_store_save(dir, &s, text, strlen(text));
+            else {
+                lyrics_store_path(dir, &s, "lrc", path, sizeof path);
+                remove(path);
+                lyrics_store_path(dir, &s, "none", path, sizeof path);
+                remove(path);
+            }
+        }
+        if (n > 0) library_list_free(&tracks);
+    }
+    library_list_free(&albums);
+}
+
 static long sim_cf_fetch(const char *url, char *buf, size_t cap, const volatile int *abort)
 {
     (void)abort;
@@ -729,7 +777,9 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
     }
 
     static const char *const screens[] = {"home", "albums", "tracks", "playlists", "playlist", "nowplaying", "themes",
-                                          "quick", "context", "info", "queue", "glyphs", "search",
+                                          "quick", "context", "info", "queue",
+                                          "lyrics", "lyricsahead", "lyricsplain", "lyricsmore", "lyricsnone",   /* (while the song cued is the one playing) */
+                                          "glyphs", "search",
                                           "artists", "artist", "artistsongs", "albumartists", "homeedit",
                                           "usbask", "wifiask", "interface", "packs", "packsgetting", "packsthere", "packsfailed", "packshelp", "packsshared", "homepacks", "packsneeded", "usbdrive", "scrub", "sound", "radio", "radionp", "share", "ssh", "toast", "abouthelp", "genres", "folders", "folder", "years", "homeend", "homeall", "signal", "purenp",
                                           "rdir", "rdirgenres", "rdirresults", "rdirbusy", "rdircountries", "rdirsearch",
@@ -746,7 +796,12 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                                           "cv-tracks", "cv-artist", "cv-artistsongs", "cv-playlist", "cv-queue",
                                           "welcome", "welcomeend", "abouttips", "rescanlooking", "rescanchecking", "rescan", "rescanalbums", "rescanworking", "rescancovers"};
     static const char *const slug[] = {"studio-mint", "studio-ember", "studio-pastel", "pixel-pastel"};
+    /* FATHOM_SIM_ONLY_THEME: the pictures of one theme alone (0-3): its first
+     * ones are then taken with the song cued, as only the first theme's are
+     * otherwise (the podcasts' pictures leave an episode "playing") */
+    const char *only_theme = getenv("FATHOM_SIM_ONLY_THEME");
     for (int t = 0; t < 4 && t < g_n_themes; t++) {   /* the built-in themes */
+        if (only_theme && atoi(only_theme) != t) continue;
         ui_set_theme(t);
         for (size_t s = 0; s < sizeof screens / sizeof screens[0]; s++) {
             if (s > 0 && !strcmp(screens[s - 1], "wifi")) {   /* (its made-up networks: for that screen only) */
@@ -1009,6 +1064,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
             }
             int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast") || !strcmp(screens[s], "unreadwhere") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "packshelp") || !strcmp(screens[s], "xfhelp") ||
                          !strncmp(screens[s], "whatsnew", 8) || !strncmp(screens[s], "welcome", 7) || !strcmp(screens[s], "abouthelp") ||
+                         !strncmp(screens[s], "lyrics", 6) ||
                          !strcmp(screens[s], "clockset") || !strncmp(screens[s], "rescan", 6) ||
                          (g_sim_upd.state >= UI_UPD_DOWNLOADING && g_sim_upd.state <= UI_UPD_RESTARTING) ||
                          !strcmp(screens[s], "uninstallpending") || !strcmp(screens[s], "uninstallnone");   /* (the update's progress screen) */
@@ -3166,6 +3222,172 @@ static void uc_packs_before_init(const ui_fonts_t *ff)
     advance(100);
 }
 
+/* The Lyrics screen's state once its lookup has answered (a worker's: real time) */
+static int uc_lyrics_wait(char *now, size_t cap)
+{
+    for (int i = 0; i < 400 && ui_test_lyrics(now, cap) == LF_LOOKING; i++) { usleep(5000); advance(50); }
+    advance(250);
+    return ui_test_lyrics(now, cap);
+}
+
+/* Lyrics: opened from Now Playing's menu, they follow the song (its place,
+ * and the song itself when it changes); the wheel reads ahead and it follows
+ * again once the wheel rests; Play is the music's; a song with none says so,
+ * and Play there looks online; Back puts the screen away, onto Now Playing. */
+static void uc_lyrics(void)
+{
+    char now[256];
+    player_now_t n;
+    ui_hooks_t hooks = g_hooks;
+    hooks.wifi_state = ww_state;
+    hooks.wifi_networks = uc_networks;
+    hooks.wifi_do = ww_do;
+    hooks.radio_ready = ww_ready;
+    ui_set_hooks(&hooks);
+    ww_set(1, UI_WIFI_CONNECTED, "");
+    lf_set_fetch(sim_lf_fetch);                   /* (the made-up answer: nobody is asked) */
+    lf_start("uc-lyrics");
+    FILE *f = fopen("uc-music/Amber.lrc", "w");
+    if (f) { fputs("[00:01.00]First line\n[00:10.00]Second line\n[00:20.00]Third line\n", f); fclose(f); }
+    uc_cue(0);                                    /* Amber, paused at its start */
+    ui_show("nowplaying");
+    advance(400);
+    UC(ui_test_lyrics(now, sizeof now) == -2);
+    UC(uc_menu("Lyrics") == 0);
+    UC(uc_lyrics_wait(now, sizeof now) == LF_FOUND);
+    player_now(g_player, &n);                     /* (paused a few seconds in: the checks before played it) */
+    UC(!strcmp(now, n.pos_ms < 1000 ? "" : n.pos_ms < 10000 ? "First line" : "Second line"));
+    player_seek_by(g_player, 14000 - (int)n.pos_ms);   /* to 0:14, in its second line */
+    player_tick(g_player);
+    advance(400);
+    player_now(g_player, &n);
+    UC(n.pos_ms >= 10000 && n.pos_ms < 20000);
+    UC(ui_test_lyrics(now, sizeof now) == LF_FOUND && !strcmp(now, "Second line"));
+    ui_key(UI_KEY_DOWN);                          /* read ahead... */
+    advance(100);
+    UC(ui_test_lyrics(now, sizeof now) == LF_FOUND && !strcmp(now, "Third line"));
+    ui_key(UI_KEY_DOWN);                          /* (no further than the last line) */
+    advance(100);
+    UC(ui_test_lyrics(now, sizeof now) == LF_FOUND && !strcmp(now, "Third line"));
+    advance(4500);                                /* ...and back with the song once the wheel rests */
+    UC(ui_test_lyrics(now, sizeof now) == LF_FOUND && !strcmp(now, "Second line"));
+    ui_key(UI_KEY_MENU);                          /* Menu: with the wheel alone, said; the screen stays */
+    advance(200);
+    UC(ui_test_toast() && strstr(ui_test_toast(), "wheel"));
+    UC(ui_test_lyrics(now, sizeof now) == LF_FOUND && !strcmp(now, "Second line"));
+    ui_key(UI_KEY_DOWN);
+    advance(4500);                                /* (it stays where it was read to) */
+    UC(ui_test_lyrics(now, sizeof now) == LF_FOUND && !strcmp(now, "Third line"));
+    ui_key(UI_KEY_MENU);                          /* Menu again: with the song, said, and back at its line */
+    advance(200);
+    UC(ui_test_toast() && strstr(ui_test_toast(), "follow the song"));
+    advance(600);
+    UC(ui_test_lyrics(now, sizeof now) == LF_FOUND && !strcmp(now, "Second line"));
+    player_now(g_player, &n);
+    int playing = n.playing;
+    ui_key(UI_KEY_OK);                            /* Play is the music's, the screen stays */
+    advance(200);
+    player_now(g_player, &n);
+    UC(n.playing != playing && ui_test_lyrics(now, sizeof now) == LF_FOUND);
+    ui_key(UI_KEY_OK);
+    advance(200);
+    ui_key(UI_KEY_MENU_LONG);                     /* (quick settings don't open under it) */
+    advance(200);
+    UC(ui_test_lyrics(now, sizeof now) == LF_FOUND && ui_list_state(NULL, NULL, NULL) == 0);
+    ui_key(UI_KEY_NEXT);                          /* the next song (Aster: no lyrics): the screen is that song's */
+    advance(400);
+    UC(uc_lyrics_wait(now, sizeof now) == LF_NONE);
+    ui_key(UI_KEY_UP);                            /* (nothing to turn through) */
+    advance(100);
+    UC(ui_test_lyrics(now, sizeof now) == LF_NONE);
+    ui_key(UI_KEY_OK);                            /* Play: looked up online (the simulator's made-up answer), kept, shown */
+    UC(uc_lyrics_wait(now, sizeof now) == LF_FOUND);
+    ui_key(UI_KEY_BACK);                          /* put away: Now Playing, as it was opened from */
+    advance(300);
+    UC(ui_test_lyrics(now, sizeof now) == -2 && ui_list_state(NULL, NULL, NULL) == 0);
+    UC(uc_menu("Lyrics") == 0);                   /* again: from the card this time */
+    UC(uc_lyrics_wait(now, sizeof now) == LF_FOUND);
+    ui_key(UI_KEY_BACK_LONG);                     /* a long Back puts it away too */
+    advance(300);
+    UC(ui_test_lyrics(now, sizeof now) == -2 && ui_list_state(NULL, NULL, NULL) == 0);
+    /* a song with none, and no Wi-Fi: Play puts the screen away and asks for Wi-Fi */
+    UC(uc_menu("Lyrics") == 0);
+    UC(uc_lyrics_wait(now, sizeof now) == LF_FOUND);
+    ui_key(UI_KEY_NEXT);                          /* (Briar) */
+    advance(400);
+    UC(uc_lyrics_wait(now, sizeof now) == LF_NONE);
+    ww_set(0, UI_WIFI_OFF, "");
+    ui_key(UI_KEY_OK);
+    advance(400);
+    UC(ui_test_lyrics(now, sizeof now) == -2 && ui_list_state(NULL, NULL, NULL) >= 1);   /* (the question) */
+    ui_key(UI_KEY_BACK);
+    advance(400);
+    ww_set(1, UI_WIFI_CONNECTED, "");
+    /* from a list, a song that isn't the one playing: read with the wheel, from its first line */
+    ui_show("home");
+    advance(300);
+    uc_open("Songs");
+    uc_row(0);                                    /* Amber (Aster is "playing") */
+    UC(uc_menu("Lyrics") == 0);
+    UC(uc_lyrics_wait(now, sizeof now) == LF_FOUND && !strcmp(now, "First line"));
+    ui_key(UI_KEY_DOWN);
+    advance(100);
+    UC(ui_test_lyrics(now, sizeof now) == LF_FOUND && !strcmp(now, "Second line"));
+    advance(4500);                                /* (it stays where it was read to) */
+    UC(ui_test_lyrics(now, sizeof now) == LF_FOUND && !strcmp(now, "Second line"));
+    ui_key(UI_KEY_MENU);                          /* (Menu: nothing to follow, and it says so; the screen stays) */
+    advance(200);
+    UC(ui_test_toast() && strstr(ui_test_toast(), "while it plays") && ui_test_lyrics(now, sizeof now) == LF_FOUND);
+    UC(ui_test_lyrics_heading() > 0 && ui_test_lyrics_heading() <= 30);   /* (one line) */
+    ui_key(UI_KEY_BACK);
+    advance(300);
+    /* the heading is one line, however long the title and the artist (cut with
+     * dots: a long one went on to a second row, over the words): Birch, whose
+     * artist's name is too long for a row */
+    uc_row(3);
+    UC(uc_menu("Lyrics") == 0);
+    uc_lyrics_wait(now, sizeof now);
+    UC(ui_test_lyrics_heading() > 0 && ui_test_lyrics_heading() <= 30);
+    if (ui_test_lyrics_heading() > 30) printf("lyrics: the heading is %d px high\n", ui_test_lyrics_heading());
+    ui_key(UI_KEY_BACK);
+    advance(300);
+    uc_row(0);                                    /* (Amber again) */
+    int depth = ui_list_state(NULL, NULL, NULL);
+    UC(ui_test_lyrics(now, sizeof now) == -2 && depth == 2);   /* (Songs, as it was opened from) */
+    /* the wheel turned faster than the lines slide, in long lyrics: no part of
+     * the screen is left without lines while they catch up. (They fell
+     * further behind than the lines laid out reached: an empty band where
+     * they came from, on the H2; 100 px and more here.) */
+    f = fopen("uc-music/Amber.lrc", "w");
+    if (f) {
+        for (int i = 0; i < 60; i++) fprintf(f, "[00:%02d.%02d]Line %d of the song\n", i / 4, i % 4 * 25, i);
+        fclose(f);
+    }
+    UC(uc_menu("Lyrics") == 0);
+    UC(uc_lyrics_wait(now, sizeof now) == LF_FOUND);
+    int gap = 0;
+    for (int i = 0; i < 30; i++) {
+        ui_key(UI_KEY_DOWN);
+        advance(10);
+        if (i >= 12 && ui_test_lyrics_gap() > gap) gap = ui_test_lyrics_gap();   /* (well into the lyrics: lines on every side) */
+    }
+    for (int i = 0; i < 12; i++) {
+        ui_key(UI_KEY_UP);
+        advance(10);
+        if (ui_test_lyrics_gap() > gap) gap = ui_test_lyrics_gap();
+    }
+    UC(gap >= 0 && gap <= 40);
+    if (gap > 40) printf("lyrics, the wheel fast: %d px of the screen without a line\n", gap);
+    advance(600);
+    UC(ui_test_lyrics_gap() <= 40);
+    ui_key(UI_KEY_BACK);
+    advance(300);
+    remove("uc-music/Amber.lrc");
+    ui_set_hooks(&g_hooks);
+    ui_show("home");
+    advance(400);
+}
+
 static int ui_check(theme_t *themes, const ui_fonts_t *fonts)
 {
     lv_tick_set_cb(fake_tick);
@@ -3210,6 +3432,7 @@ static int ui_check(theme_t *themes, const ui_fonts_t *fonts)
     uc_packs_shared();
     uc_packs_order();
     uc_packs_offer();
+    uc_lyrics();
     uc_plain_square();
     player_pause(g_player, 1);
     printf("ui-checks: %s\n", g_uc_bad ? "FAILED" : "ok");
@@ -3285,6 +3508,29 @@ static int motion(const char *dir, theme_t *themes, const ui_fonts_t *fonts, int
     advance(200);
     snprintf(n, sizeof n, "m%d-h0", theme);
     frame(dir, n);
+    /* 8. Lyrics: the lines slide up one (the wheel here; the song does the
+     * same): the screen at rest, then every 40 ms through the slide and past it */
+    lf_stop_ask();
+    lf_stop_wait(2000);
+    lf_start("build/sim-data/lyrics-shots");
+    sim_lyrics_seed("build/sim-data/lyrics-shots");
+    cue_sample();
+    ui_show("lyrics");
+    advance(300);
+    for (int i = 0; i < 9; i++) {
+        snprintf(n, sizeof n, "m%d-i%d", theme, i);
+        lv_obj_update_layout(lv_layer_top());
+        lv_draw_buf_t *img = lv_snapshot_take(lv_layer_top(), LV_COLOR_FORMAT_RGB888);
+        if (img) {
+            char path[1024];
+            snprintf(path, sizeof path, "%s/%s.bmp", dir, n);
+            write_bmp(path, img);
+            lv_draw_buf_destroy(img);
+            printf("%s\n", path);
+        }
+        if (i == 0) ui_key(UI_KEY_DOWN);
+        advance(40);
+    }
     return 0;
 }
 
@@ -3380,6 +3626,63 @@ static void bench_scroll(const char *name, int seconds, int max_wait)
            100.0 * c / seconds, steps);
 }
 
+static void bench_pump(uint32_t ms)
+{
+    uint32_t t0 = clock_ms32();
+    while (clock_ms32() - t0 < ms) { lv_timer_handler(); usleep(2000); }
+}
+
+/* Lyrics, the wheel turned fast, looked at while the lines slide: every part
+ * of the panel is what the screen is (the strip of lines moves as one object,
+ * three times the height that shows). Needs the simulator's library: run from
+ * the repository's folder. */
+static int bench_lyrics(void)
+{
+    if (!g_lib || !g_player) return 0;
+    lf_stop_ask();
+    lf_stop_wait(2000);
+    lf_set_fetch(sim_lf_fetch);
+    lf_start("build/sim-data/lyrics-shots");
+    sim_lyrics_seed("build/sim-data/lyrics-shots");
+    cue_sample();
+    player_pause(g_player, 1);                    /* (the lines move with the wheel alone) */
+    ui_show("nowplaying");
+    bench_pump(300);
+    ui_key(UI_KEY_MENU);                          /* its menu > Lyrics, as a person opens it */
+    bench_pump(400);
+    int row = ui_test_ctx_row("Lyrics");
+    for (int i = 0; i < row; i++) { ui_key(UI_KEY_DOWN); bench_pump(150); }
+    ui_key(UI_KEY_OK);
+    char now[64];
+    for (int i = 0; i < 100 && ui_test_lyrics(now, sizeof now) == LF_LOOKING; i++) bench_pump(20);
+    bench_pump(300);
+    if (row < 0 || ui_test_lyrics(now, sizeof now) != LF_FOUND) {
+        /* (run where there is no library, as ctest runs it: nothing to look at) */
+        printf("%-28s not shown (its row %d, its state %d): not looked at\n", "lyrics, the wheel fast", row, ui_test_lyrics(now, sizeof now));
+        ui_show("home");
+        return 0;
+    }
+    long bad = 0, looks = 0;
+    for (int round = 0; round < 14; round++) {
+        for (int k = 0; k < 3; k++) { ui_key(round < 7 ? UI_KEY_DOWN : UI_KEY_UP); bench_pump(12); }
+        bench_pump(30);                            /* (part of the way) */
+        lv_refr_now(NULL);
+        lv_draw_buf_t *img = lv_snapshot_take(lv_layer_top(), LV_COLOR_FORMAT_RGB565);
+        if (!img) return 1;
+        long rows = 0;
+        for (int y = 0; y < UI_H; y++)
+            if (memcmp(img->data + (size_t)y * img->header.stride, g_bench_fb + (size_t)y * UI_W, UI_W * 2)) rows++;
+        lv_draw_buf_destroy(img);
+        if (rows) bad++;
+        looks++;
+    }
+    bench_pump(500);
+    printf("%-28s %ld of %ld looks while the lines slid: the panel was not the screen\n", "lyrics, the wheel fast", bad, looks);
+    ui_show("home");
+    bench_pump(300);
+    return bad ? 1 : 0;
+}
+
 static int bench(theme_t *themes, const ui_fonts_t *fonts, int seconds)
 {
     uint16_t *fb = g_bench_fb;
@@ -3425,6 +3728,7 @@ static int bench(theme_t *themes, const ui_fonts_t *fonts, int seconds)
     ui_show("songs");                              /* the wheel turned, a step every 60 ms */
     bench_scroll("songs, scrolling", seconds, max_wait);
     bad += bench_fb_check("songs, scrolling");
+    bad += bench_lyrics();
     return bad ? 1 : 0;
 }
 
@@ -3569,6 +3873,10 @@ int main(int argc, char **argv)
     cf_set_download(sim_cf_download);
     if (shots || lang_file) cf_set_mb_gap_ms(0);
     cf_start(covers);
+    const char *lyr = shots || lang_file ? "build/sim-data/lyrics-shots" : "build/sim-data/lyrics";
+    lf_set_fetch(sim_lf_fetch);
+    lf_start(lyr);
+    if (shots || lang_file) sim_lyrics_seed(lyr);
     ricon_set_fetch(sim_icon_fetch);
     ricon_start(shots || lang_file ? "build/sim-data/radio-icons-shots" : "build/sim-data/radio-icons");
     if (shots || lang_file) sim_icon_seed("build/sim-data/radio-icons-shots");

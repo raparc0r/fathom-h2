@@ -102,10 +102,11 @@ set_property(SOURCE main.c early.c output.c usbmode.c clockset.c updates.c radio
   ${ROOT}/app/shuffle/shuffle.c
   ${ROOT}/app/net/http.c ${ROOT}/app/net/json.c ${ROOT}/app/net/radiodir.c ${ROOT}/app/net/radioicon.c
   ${ROOT}/app/net/podcast.c ${ROOT}/app/net/podsync.c ${ROOT}/app/net/coverfind.c ${ROOT}/app/net/netclock.c
-  ${ROOT}/app/net/unzip.c ${ROOT}/app/net/update.c ${ROOT}/app/net/packfetch.c
+  ${ROOT}/app/net/unzip.c ${ROOT}/app/net/update.c ${ROOT}/app/net/packfetch.c ${ROOT}/app/net/lyricfind.c
+  ${ROOT}/app/library/lyrics.c
   ${ROOT}/app/player/player.c ${ROOT}/app/player/radio.c ${ROOT}/app/player/rfmeta.c
   ${ROOT}/app/ui/theme.c ${ROOT}/app/ui/fonts.c ${ROOT}/app/ui/assets.c ${ROOT}/app/ui/ui.c
-  ${ROOT}/app/ui/ui_graphs.c
+  ${ROOT}/app/ui/ui_graphs.c ${ROOT}/app/ui/ui_lyrics.c
   APPEND PROPERTY COMPILE_OPTIONS -Os)
 # Link-time optimisation of the player's own code (the libraries are plain
 # objects): calls across its files inlined or dropped, 22 KB less. Each file
