@@ -9,7 +9,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+/* The file is a few KB. One far over that is not ours as we wrote it (a size
+ * damaged on the card: hundreds of MB, and no line break in them, were read
+ * into memory at every start): not read, and never saved over. */
+#define SETTINGS_MAX (256 * 1024)
 
 /* As many entries, keys and values as long, as the file has: a fixed table
  * once dropped what didn't fit, and the next save erased it from the file. */
@@ -18,6 +24,7 @@ static entry_t *g_e;
 static int g_n, g_cap, g_dirty;
 static int g_short;          /* an entry couldn't be held (out of memory): never save over the file */
 static unsigned g_changed_ms;
+static unsigned g_retry_ms;  /* after an autosave that failed: no other try sooner than this (0: none failed) */
 static char g_path[512];
 
 static char *trim(char *s)
@@ -65,6 +72,7 @@ int settings_load(const char *path)
     snprintf(g_path, sizeof g_path, "%s", path);
     clear();
     g_dirty = g_short = 0;
+    g_retry_ms = 0;
     FILE *f = fopen(path, "re");
     if (!f) {
         /* None yet (a first start): the defaults. There but unreadable (the
@@ -74,10 +82,19 @@ int settings_load(const char *path)
         if (errno != ENOENT) g_short = 1;
         return 0;
     }
+    struct stat st;
+    if (fstat(fileno(f), &st) || st.st_size > SETTINGS_MAX) {
+        fclose(f);
+        g_short = 1;
+        return 0;
+    }
     char *line = NULL;
     size_t cap = 0;
+    int first = 1;
     while (getline(&line, &cap, f) >= 0) {
-        char *s = trim(line);
+        /* (a byte-order mark, as Notepad's "UTF-8" saves one: not part of the first key) */
+        char *s = trim(first && !strncmp(line, "\xEF\xBB\xBF", 3) ? line + 3 : line);
+        first = 0;
         if (!*s || *s == ';' || *s == '#' || *s == '[') continue;
         char *eq = strchr(s, '=');
         if (!eq) continue;
@@ -86,6 +103,9 @@ int settings_load(const char *path)
         if (!*k) continue;
         if (put(k, v)) g_short = 1;
     }
+    /* Ended by a read that failed (the card, no memory for a line), not by
+     * the file's end: what was read is not all of it, so it is not saved over. */
+    if (ferror(f) || !feof(f)) g_short = 1;
     free(line);
     fclose(f);
     return 0;
@@ -132,10 +152,9 @@ int settings_save(void)
     if (!f) return -1;
     fprintf(f, "; Fathom settings. Edit with the player off; unknown keys are kept.\n");
     for (int i = 0; i < g_n; i++) fprintf(f, "%s = %s\n", g_e[i].key, g_e[i].value);
-    int ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
-    ok = fclose(f) == 0 && ok;
-    if (!ok || file_replace(tmp, g_path)) { unlink(tmp); return -1; }
+    if (file_commit(f, 1, tmp, g_path)) return -1;
     g_dirty = 0;
+    g_retry_ms = 0;
     return 0;
 }
 
@@ -147,9 +166,18 @@ int settings_reset(void)
     return settings_save();
 }
 
+/* A save that fails (a full card, one gone read-only) is not tried again at
+ * every tick: a file made and removed on the UI thread each second, for good.
+ * The quiet period starts again, and is this long at least. */
+#define SAVE_RETRY_MS 30000u
+
 void settings_autosave(unsigned now_ms, unsigned quiet_ms)
 {
     if (!g_dirty) return;
     if (!g_changed_ms) { g_changed_ms = now_ms ? now_ms : 1; return; }
-    if (now_ms - g_changed_ms >= quiet_ms) settings_save();
+    if (now_ms - g_changed_ms < (quiet_ms > g_retry_ms ? quiet_ms : g_retry_ms)) return;
+    if (settings_save()) {
+        g_changed_ms = now_ms ? now_ms : 1;
+        g_retry_ms = SAVE_RETRY_MS;
+    }
 }

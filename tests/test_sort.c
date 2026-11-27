@@ -2,8 +2,6 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 /* How albums and songs sort (app/library/library.c): leading punctuation
  * skipped, "the " too for albums, and an older library re-sorted on opening. */
-#include <FLAC/metadata.h>
-#include <FLAC/stream_encoder.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,10 +11,8 @@
 #include <sqlite3.h>
 
 #include "library/library.h"
-#include "tmpdir.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_flac.h"
+#include "test_util.h"
 
 static const char *const ALBUMS[][2] = {   /* album, its one song */
     {"Zebra", "Alpha"}, {"(What's the Story) Morning Glory", "(Intro)"}, {"Apple", "Beta"}, {"The Wall", "\"Quoted\""},
@@ -25,26 +21,7 @@ static const char *const ALBUMS[][2] = {   /* album, its one song */
 
 static int write_flac(const char *path, const char *album, const char *title)
 {
-    FLAC__StreamEncoder *e = FLAC__stream_encoder_new();
-    FLAC__stream_encoder_set_channels(e, 2);
-    FLAC__stream_encoder_set_bits_per_sample(e, 16);
-    FLAC__stream_encoder_set_sample_rate(e, 44100);
-    FLAC__StreamMetadata *vc = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
-    FLAC__StreamMetadata_VorbisComment_Entry en;
-    FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, "ALBUM", album);
-    FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-    FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, "TITLE", title);
-    FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-    FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, "ARTIST", "Someone");
-    FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-    FLAC__stream_encoder_set_metadata(e, &vc, 1);
-    if (FLAC__stream_encoder_init_file(e, path, NULL, NULL) != FLAC__STREAM_ENCODER_INIT_STATUS_OK) return -1;
-    static FLAC__int32 pcm[2 * 4410];
-    FLAC__stream_encoder_process_interleaved(e, pcm, 4410);
-    FLAC__stream_encoder_finish(e);
-    FLAC__stream_encoder_delete(e);
-    FLAC__metadata_object_delete(vc);
-    return 0;
+    return t_write_flac(path, &(t_flac_t){.frames = 4410, .tags = {{"ALBUM", album}, {"TITLE", title}, {"ARTIST", "Someone"}}});
 }
 
 static void names(library_t *lib, lib_view_t v, char out[N][64])
@@ -70,8 +47,7 @@ static void check_order(library_t *lib)
 int main(void)
 {
     char dir[200];
-    test_tmp(dir, sizeof dir, "fathom-test-sort");
-    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    t_mkdtemp(dir, sizeof dir, "fathom-test-sort");
     char music[300], path[400], db[300], art[300];
     snprintf(music, sizeof music, "%s/music", dir);
     mkdir(music, 0755);
@@ -98,7 +74,5 @@ int main(void)
     check_order(lib);
     library_close(lib);
 
-    if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
-    printf("sort: all good\n");
-    return 0;
+    return t_result();
 }

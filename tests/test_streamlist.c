@@ -5,9 +5,7 @@
 #include <string.h>
 
 #include "audio/streamlist.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_util.h"
 
 static int first(const char *text, const char *base, char *out)
 {
@@ -109,7 +107,5 @@ int main(void)
     char small[16];
     CHECK(streamlist_first("http://a.example/a-long-path\n", 28, NULL, small, sizeof small) == STREAMLIST_NONE);
 
-    if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
-    printf("streamlist: all good\n");
-    return 0;
+    return t_result();
 }

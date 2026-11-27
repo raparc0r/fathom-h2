@@ -9,9 +9,7 @@
 #include "audio/loudness.h"
 #include "loudness_ref.h"
 #include "loudness_v1.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_util.h"
 
 /* A sine of `hz` at `dbfs` peak in both channels (or only the left), `secs` long. */
 static double measure(unsigned rate, double hz, double dbfs, double secs, int both, double *peak)
@@ -153,7 +151,5 @@ int main(void)
     printf("gated: %.2f LUFS\n", g);
     CHECK(fabs(g + 23.0) < 0.2);
     loudness_free(l);
-    if (failures) { fprintf(stderr, "loudness: %d failures\n", failures); return 1; }
-    printf("loudness: all checks passed\n");
-    return 0;
+    return t_result();
 }

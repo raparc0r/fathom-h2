@@ -107,9 +107,3 @@ int out_sdl_create(audio_output_t *out)
     return 0;
 }
 
-void out_sdl_destroy(audio_output_t *out)
-{
-    s_close(out->ctx);
-    free(out->ctx);
-    out->ctx = NULL;
-}

@@ -25,8 +25,18 @@ enum { DT_YEAR, DT_MONTH, DT_DAY, DT_HOUR, DT_MIN, DT_FIELDS };
 #define DT_START 1767225600LL
 
 int dt_days_in_month(int year, int mon);
-/* Days from 1970-01-01 to year-mon-day (proleptic Gregorian) */
-int64_t dt_days_from_civil(int64_t year, int mon, int day);
+/* Days from 1970-01-01 to year-mon-day (proleptic Gregorian; Howard
+ * Hinnant's). Here in the header: files built without datetime.c use it too
+ * (the feeds' dates, the uninstaller's), where each had its own copy. */
+static inline int64_t dt_days_from_civil(int64_t y, int m, int d)
+{
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
 /* t (seconds since 1970, UTC) as a date and time, its seconds dropped; a time
  * outside DT_YEAR_MIN-DT_YEAR_MAX (a clock that isn't set) gives DT_START's */
 void dt_from_time(int64_t t, dt_t *d);

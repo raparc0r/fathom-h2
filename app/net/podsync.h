@@ -2,7 +2,10 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 /*
  * Podcasts over the network (net/podcast.h for the files): one worker thread
- * does one job at a time, in the order asked:
+ * does one job at a time, in the order asked (subscribing, unsubscribing and
+ * an import before anything else waiting; podsync_stop does those the worker
+ * hadn't reached, on the card only; what the user asks for during an
+ * automatic round of the feeds goes between its shows):
  *
  *   - reading a show's feed (or every show's), keeping its newest episodes
  *     and its picture, small (ID/cover.565, ID/thumb.565);
@@ -27,21 +30,31 @@
 
 /* Fetching and downloading: http_get and http_download unless replaced (the
  * simulator and the tests read saved files). Same contracts as those. */
-typedef long (*podsync_fetch_fn)(const char *url, char *buf, size_t cap, const volatile int *abort);
-typedef int64_t (*podsync_download_fn)(const char *url, const char *path, http_progress_fn progress, void *ctx,
-                                       const volatile int *abort);
-void podsync_set_fetch(podsync_fetch_fn fn);
-void podsync_set_download(podsync_download_fn fn);
+void podsync_set_fetch(http_get_fn fn);
+void podsync_set_download(http_download_fn fn);
 /* The waits before a second and a third try (2 s and 5 s; the tests': 0). */
 void podsync_set_retry_waits(int first_ms, int second_ms);
 
 /* Start the worker for the podcasts in dir (fathom/podcasts). 0, -1. */
 int  podsync_start(const char *dir);
-void podsync_stop(void);                      /* (stops a download, waits for the worker) */
+void podsync_stop(void);                      /* (stops a download, waits for the worker, does shows.txt's work still waiting) */
+/* The same in two steps, for the player's stop, which asks every network
+ * worker first and waits for them together: _ask only tells the worker (the
+ * job under way gives up; nothing is waited for), _wait waits for it, ms at
+ * most (under 0: as long as it takes), and does shows.txt's work still
+ * waiting. 1: the worker is back; 0: it isn't (inside a name lookup, which
+ * can't be interrupted) and is left: it ends with the player. */
+void podsync_stop_ask(void);
+int  podsync_stop_wait(int ms);
 const char *podsync_dir(void);
 
 /* Jobs, queued (0) or not (-1: the queue is full, or not started). */
 int podsync_refresh(const char *url);         /* "" or NULL: every show */
+/* Every show, when nobody asked (podsync_auto's rounds): a search, a download
+ * asked for by hand and shows.txt's work asked for meanwhile go between its
+ * shows, and it carries on after them. A round asked for (podsync_refresh)
+ * is read through first, as ever. */
+int podsync_refresh_auto(void);
 int podsync_subscribe(const pod_show_t *s);   /* then its feed is read */
 int podsync_unsubscribe(const char *url);     /* its downloads go too */
 int podsync_import_opml(const char *path);    /* every show in it (those not there yet) */

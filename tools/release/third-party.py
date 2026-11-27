@@ -120,6 +120,12 @@ def main():
     w.append('Fonts (sd/fathom/assets/fonts/): Atkinson Hyperlegible Next, Noto Sans,')
     w.append('VT323, Ark Pixel (SIL Open Font License 1.1) and Tabler Icons (MIT), their')
     w.append('licences next to them.')
+    w.append('')
+    w.append('Language packs (not in this zip: the player downloads them from')
+    w.append('%s/releases/tag/packs-1): the characters are drawn from' % REPO)
+    w.append('Noto Sans JP, KR, SC and TC, Regular and Medium (SIL Open Font License 1.1;')
+    w.append('https://github.com/notofonts/noto-cjk). Each pack\'s zip carries its font\'s')
+    w.append('copyright line and the licence.')
     open(os.path.join(about, 'THIRD-PARTY.txt'), 'w').write('\n'.join(w) + '\n')
 
     s = []

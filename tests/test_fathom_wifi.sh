@@ -3,8 +3,7 @@
 # stand-in wpa_cli and udhcpc.
 #   sh tests/test_fathom_wifi.sh       (in the build container too: docker/run.sh sh tests/test_fathom_wifi.sh)
 set -u
-here=$(cd "$(dirname "$0")/.." && pwd)
-T=$(mktemp -d); SRC=${SRC:-$here/buildroot/external/board/h2/rootfs-overlay}
+. "$(dirname "$0")/lib.sh"
 mkdir -p $T/wifi/usr/sbin $T/run $T/ctrl $T/st $T/fw
 # (nothing of the machine it runs on is touched: its modules, its MMC hosts, its /var/run and resolv.conf)
 sed -e "s#^W=.*#W=$T/wifi#" -e "s#^RUN=.*#RUN=$T/run#" -e "s#^CTRL=.*#CTRL=$T/ctrl#" \
@@ -40,7 +39,7 @@ status)
         refuse:*) echo SCANNING > \$S/state; set_col \$id 3 t; rm \$S/sel ;;
         esac
     fi
-    echo "bssid=00:11:22:33:44:55"; echo "wpa_state=\$(cat \$S/state)"
+    echo "bssid=\$(cat \$S/bssid 2>/dev/null || echo 00:11:22:33:44:55)"; echo "wpa_state=\$(cat \$S/state)"
     [ "\$(cat \$S/state)" = COMPLETED ] && { awk -F'\t' -v c=\$(cat \$S/cur) '\$1==c{print "ssid="\$2; print "id="\$1}' \$S/nets; echo "ip_address=\$(cat \$S/ip)"; }
     ;;
 list_networks) echo "network id / ssid / bssid / flags"
@@ -76,8 +75,6 @@ nets() { printf "$@" | tr '|' '\t' > $T/st/nets; }   # (| for a tab)
 sleep 300 & echo $! > $T/run/wpa.pid
 ( trap 'echo USR2 >> $T/st/sig' USR2; trap 'echo USR1 >> $T/st/sig' USR1; while :; do sleep 0.1; done ) & U=$!; echo $U > $T/run/udhcpc.pid
 sleep 0.3
-ok=0; bad=0
-check() { if eval "$2"; then echo "ok   $1"; ok=$((ok+1)); else echo "FAIL $1"; bad=$((bad+1)); fi; }
 
 # 1. At home (0), joined; the hook records the network the address is from
 nets '0|Home|e|WPA-PSK\n1|Phone|e|WPA-PSK\n'; echo 0 > $T/st/cur; echo COMPLETED > $T/st/state; echo 192.168.1.5 > $T/st/ip
@@ -212,6 +209,47 @@ echo refuse > $T/st/join; : > $T/st/sig; rm -f $T/run/asked
 $T/fathom-wifi connect Phone 2>/dev/null >/dev/null; sleep 0.3
 check "connect: not joined: udhcpc not touched" '[ ! -s $T/st/sig ]'
 
+# 7c. Two networks with one name (another place's, with addresses of its own): the lease
+# remembers its access point too, and a join at another one has udhcpc renew (USR1), once:
+# kept on the same network (moving between its access points drops nothing), refused or
+# unanswered on another, where udhcpc then asks afresh by itself
+nets '0|Home|e|WPA-PSK\n1|Phone|e|WPA-PSK\n'; echo 0 > $T/st/cur; echo COMPLETED > $T/st/state; echo 192.168.1.5 > $T/st/ip
+echo aa:aa:aa:00:00:01 > $T/st/bssid; interface=wlan0 $T/hook bound; : > $T/st/sig; echo "2200.00 900.00" > $T/uptime
+check "hook: the lease's access point recorded, beside its network" '[ "$(cat $T/run/lease-bssid)" = aa:aa:aa:00:00:01 ] && [ "$(cat $T/run/lease-ssid)" = Home ]'
+check "bssid (for the hook): the access point joined" '[ "$($T/fathom-wifi bssid)" = aa:aa:aa:00:00:01 ]'
+out=$($T/fathom-wifi status); sleep 0.3
+check "status: the access point the address is from: nothing sent" '[ "$out" = "connected|Home|192.168.1.5|-50" ] && [ ! -s $T/st/sig ]'
+echo aa:aa:aa:00:00:02 > $T/st/bssid
+out=$($T/fathom-wifi status); sleep 0.3
+check "status: the same name at another access point: udhcpc renews, the address shown meanwhile" '[ "$out" = "connected|Home|192.168.1.5|-50" ] && [ "$(tr "\n" " " < $T/st/sig)" = "USR1 " ]'
+check "...no release, the lease's network still noted" '[ "$(cat $T/run/lease-ssid)" = Home ]'
+$T/fathom-wifi status >/dev/null; echo "2215.00 900.00" > $T/uptime; $T/fathom-wifi status >/dev/null; sleep 0.3
+check "...once: not again at the looks that follow" '[ "$(tr "\n" " " < $T/st/sig)" = "USR1 " ]'
+interface=wlan0 $T/hook renew; : > $T/st/sig
+$T/fathom-wifi status >/dev/null; sleep 0.3
+check "hook: the renewed lease is this access point's; nothing more sent" '[ "$(cat $T/run/lease-bssid)" = aa:aa:aa:00:00:02 ] && [ ! -s $T/st/sig ]'
+echo aa:aa:aa:00:00:03 > $T/st/bssid; echo ok > $T/st/join
+$T/fathom-wifi connect Home >/dev/null; sleep 0.3
+check "connect: joined at another access point: the same renew, at the join" '[ "$(tr "\n" " " < $T/st/sig)" = "USR1 " ]'
+$T/fathom-wifi status >/dev/null; sleep 0.3
+check "...and not again by the status that follows" '[ "$(tr "\n" " " < $T/st/sig)" = "USR1 " ]'
+# another name at another access point: released and asked afresh as before, nothing added
+: > $T/st/sig; echo aa:aa:aa:00:00:09 > $T/st/bssid; echo 1 > $T/st/cur
+out=$($T/fathom-wifi status); sleep 0.5
+check "status: another name and access point: released, asked afresh, as before" '[ "$out" = "connecting|Phone||-50" ] && [ "$(tr "\n" " " < $T/st/sig)" = "USR2 USR1 " ] && [ ! -f $T/run/lease-bssid ]'
+echo 172.20.10.3 > $T/st/ip; interface=wlan0 $T/hook bound
+check "hook: the new lease's access point" '[ "$(cat $T/run/lease-bssid)" = aa:aa:aa:00:00:09 ]'
+interface=wlan0 $T/hook nak
+check "hook: a refused renew drops both records" '[ ! -f $T/run/lease-ssid ] && [ ! -f $T/run/lease-bssid ]'
+interface=wlan0 $T/hook bound; interface=wlan0 $T/hook deconfig
+check "hook: deconfig too" '[ ! -f $T/run/lease-ssid ] && [ ! -f $T/run/lease-bssid ]'
+interface=wlan0 $T/hook bound; echo 1 > $T/carrier; interface=wlan0 $T/hook leasefail
+check "hook: and a failed try" '[ ! -f $T/run/lease-ssid ] && [ ! -f $T/run/lease-bssid ]'
+: > $T/st/sig; echo aa:aa:aa:00:00:0a > $T/st/bssid
+out=$($T/fathom-wifi status); sleep 0.3
+check "status: no record of the lease's access point: nothing sent" '[ "$out" = "connected|Phone|172.20.10.3|-50" ] && [ ! -s $T/st/sig ]'
+rm -f $T/st/bssid $T/carrier; echo "2100.00 900.00" > $T/uptime
+
 # 8. The chip's settings for this board: the stock ones and Bluetooth coexistence
 NV=$T/fw/brcmfmac43430-sdio.txt; NVB=$T/fw/brcmfmac43430-sdio.hifiwalker,h2.txt
 printf 'boardflags=0x00404201\nmuxenab=0x10\n' > $NV; touch -t 201901020000 $NV
@@ -325,7 +363,15 @@ X
 # (its control socket made too, where there's a python3 to make one: else "on" waits its 4 s for it)
 cat > $T/wifi/usr/sbin/wpa_supplicant <<X
 #!/bin/sh
-while [ \$# -gt 0 ]; do [ "\$1" = -P ] && P="\$2"; shift; done
+while [ \$# -gt 0 ]; do [ "\$1" = -P ] && P="\$2"; [ "\$1" = -c ] && C="\$2"; shift; done
+# (st/wpa: never: it doesn't start; once: not the first time; file: not on a file with a
+# network cut short; st/wpa-n counts its starts)
+n=\$(cat $T/st/wpa-n 2>/dev/null || echo 0); echo \$((n + 1)) > $T/st/wpa-n
+case "\$(cat $T/st/wpa 2>/dev/null)" in
+never) exit 1 ;;
+once) [ \$n = 0 ] && exit 1 ;;
+file) [ "\$(grep -c '^network={' "\$C")" = "\$(grep -c '^}' "\$C")" ] || exit 1 ;;
+esac
 ( while :; do sleep 0.1; done ) > /dev/null 2>&1 &
 echo \$! > "\$P"
 python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM).bind(sys.argv[1])' $T/ctrl/wlan0 2>/dev/null
@@ -378,5 +424,49 @@ check "on: the chip never starts: exit 1, said as the player expects it, not unp
 check "...and no lock left" '[ ! -e $L ]'
 $T/fathom-wifi off >/dev/null 2>&1
 
+# 13. on: a wpa_supplicant that doesn't start isn't yet a damaged networks.conf (no memory
+# at that moment, the program not read from the card yet, wlan0 not ready): tried once more
+# on the file as it is; only then is the file set aside for its copy or a fresh one; and
+# when that doesn't start either, the file goes back exactly as it was. A networks.conf.bad
+# with more networks than the file set aside is kept (that one goes to networks.conf.bad2).
+echo "$ROOMY" > $T/buddyinfo
+two() { printf 'ctrl_interface=x\nupdate_config=1\n\nnetwork={\n\tssid="Home"\n\tpsk="x"\n}\n\nnetwork={\n\tssid="Cafe"\n\tpsk="y"\n}\n'; }
+one() { printf 'ctrl_interface=x\nupdate_config=1\n\nnetwork={\n\tssid="Home"\n\tpsk="x"\n}\n'; }
+cut() { printf 'ctrl_interface=x\nupdate_config=1\n\nnetwork={\n\tssid="Ho'; }       # (a write cut short)
+none() { printf 'ctrl_interface=%s\nupdate_config=1\n' $T/ctrl; }
+wpa() { echo $1 > $T/st/wpa; echo 0 > $T/st/wpa-n; }
+up_now() { kill -0 "$(cat $T/run/wpa.pid 2>/dev/null)" 2>/dev/null; }
+# it never starts: nothing is lost
+fresh 0.2; two > $CONF; cp $CONF $CONF.bak; rm -f $CONF.bad $CONF.bad2; two > $T/st/was; wpa never
+out=$($T/fathom-wifi on 2>$T/st/err); rc=$?
+check "on: wpa_supplicant never starts: exit 1, said as before" '[ $rc = 1 ] && grep -q "wpa_supplicant didn.t start" $T/st/err && ! up_now'
+check "...networks.conf as it was, byte for byte, and its copy" 'cmp -s $CONF $T/st/was && cmp -s $CONF.bak $T/st/was'
+check "...after three tries: two on the file as it was, one on a fresh one" '[ "$(cat $T/st/wpa-n)" = 3 ] && cmp -s $CONF.bad $T/st/was'
+check "...and no lock left" '[ ! -e $L ]'
+# the same with an older networks.conf.bad that holds more: that one kept too
+fresh 0.2; one > $CONF; cp $CONF $CONF.bak; two > $CONF.bad; one > $T/st/was; wpa never
+out=$($T/fathom-wifi on 2>$T/st/err); rc=$?
+check "on: never starts, a fuller .bad there: the file as it was, the fuller .bad kept" '[ $rc = 1 ] && cmp -s $CONF $T/st/was && [ "$(cat $CONF.bad)" = "$(two)" ]'
+# it fails once, then starts: the file was never the matter
+fresh 0.2; two > $CONF; cp $CONF $CONF.bak; rm -f $CONF.bad $CONF.bad2; wpa once
+out=$($T/fathom-wifi on 2>$T/st/err); rc=$?; sleep 0.3
+check "on: wpa_supplicant fails once, then starts: Wi-Fi on" '[ "$out" = on ] && [ $rc = 0 ] && up_now && [ "$(cat $T/st/wpa-n)" = 2 ]'
+check "...networks.conf untouched, nothing set aside" '[ "$(cat $CONF)" = "$(two)" ] && [ ! -e $CONF.bad ] && [ ! -e $CONF.bad2 ]'
+# the file really is damaged past its first lines (and so is its copy): set aside, a fresh one
+fresh 0.2; cut > $CONF; cp $CONF $CONF.bak; rm -f $CONF.bad $CONF.bad2; wpa file
+out=$($T/fathom-wifi on 2>$T/st/err); rc=$?; sleep 0.3
+check "on: a file it won't read, no better copy: set aside as .bad, a fresh one, Wi-Fi on" '[ "$out" = on ] && up_now && [ "$(cat $CONF)" = "$(none)" ] && [ "$(cat $CONF.bad)" = "$(cut)" ]'
+# ...with a sound copy: the copy; and a fuller .bad from before isn't replaced by the damaged file
+fresh 0.2; cut > $CONF; one > $CONF.bak; two > $CONF.bad; rm -f $CONF.bad2; wpa file
+out=$($T/fathom-wifi on 2>$T/st/err); rc=$?; sleep 0.3
+check "on: a file it won't read, a sound copy: the copy, Wi-Fi on" '[ "$out" = on ] && up_now && [ "$(cat $CONF)" = "$(one)" ]'
+check "...a .bad with more networks kept, the damaged file beside it as .bad2" '[ "$(cat $CONF.bad)" = "$(two)" ] && [ "$(cat $CONF.bad2)" = "$(cut)" ]'
+# no copy of the file can be made (here: a folder where .bad would go): the file isn't touched
+fresh 0.2; cut > $CONF; cp $CONF $CONF.bak; rm -f $CONF.bad $CONF.bad2; mkdir $CONF.bad; wpa file
+out=$($T/fathom-wifi on 2>$T/st/err); rc=$?
+check "on: a file it won't read that can't be set aside: left as it is, exit 1" '[ $rc = 1 ] && [ "$(cat $CONF)" = "$(cut)" ] && [ "$(cat $T/st/wpa-n)" = 2 ] && [ ! -e $L ]'
+rm -rf $CONF.bad
+$T/fathom-wifi off >/dev/null 2>&1; : > $T/st/wpa
+
 kill $U $(cat $T/run/wpa.pid 2>/dev/null) $(cat $T/run/udhcpc.pid 2>/dev/null) 2>/dev/null
-echo "$ok passed, $bad failed"; [ $bad = 0 ]
+finish

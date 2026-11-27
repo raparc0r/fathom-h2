@@ -32,11 +32,18 @@ static void dec(const unsigned char *p, batrec_t *r)
 /* A record, not a header written again or anything else: 0.9.0 and before
  * wrote the header at every flush on the H2 (in append mode, musl's ftell()
  * before the first write says 0), and each read back as a sample dated 2014.
- * Such files are read as if they had none, and trimmed without them. */
+ * Such files are read as if they had none, and trimmed without them. Nor a
+ * damaged one: a charge is 100 at most (more drew off the graph, or read as
+ * "off"), a start and a clock carry no charge or state, the last byte is 0. */
 static int ours(const unsigned char *p)
 {
-    return memcmp(p, MAGIC, 8) && p[6] <= BL_CLOCK;
+    if (!memcmp(p, MAGIC, 8) || p[6] > BL_CLOCK || p[4] > 100 || p[7]) return 0;
+    return (p[6] != BL_BOOT && p[6] != BL_CLOCK) || (!p[4] && !p[5]);
 }
+
+/* No start lasts this long: a record further than this from its start's clock
+ * is damaged */
+#define START_MAX_S (5u * 366 * 86400)
 
 /* The file's records into *out (malloc'd): the count, 0 for none, -1 not ours */
 static int read_file(const char *path, batrec_t **out)
@@ -51,8 +58,27 @@ static int read_file(const char *path, batrec_t **out)
     batrec_t *r = n > 0 ? malloc((size_t)n * sizeof *r) : NULL;
     long k = 0;
     unsigned char b[8];
-    while (r && k < n && fread(b, 1, 8, f) == 8)
-        if (ours(b)) dec(b, &r[k++]);
+    /* A sample's time is its start's clock (the start's record, or a clock
+     * set since) plus the seconds the H2 had been on: never before that
+     * clock, never behind the sample before it, never years on. One that is
+     * (a damaged record) isn't taken: far ahead, it moved every later start
+     * after it and the graph showed nothing. (32 bits, as in the file.) */
+    int have_base = 0;
+    uint32_t base = 0, up_last = 0;
+    while (r && k < n && fread(b, 1, 8, f) == 8) {
+        if (!ours(b)) continue;
+        batrec_t x;
+        dec(b, &x);
+        if (x.kind == BL_BOOT || x.kind == BL_CLOCK) {
+            if (x.kind == BL_BOOT) up_last = 0;
+            base = (uint32_t)x.t, have_base = 1;
+        } else if (have_base) {
+            uint32_t up = (uint32_t)x.t - base;
+            if (up < up_last || up > START_MAX_S) continue;
+            up_last = up;
+        }
+        r[k++] = x;
+    }
     fclose(f);
     *out = r;
     return (int)k;
@@ -72,7 +98,11 @@ static void trim(const char *path, int64_t now)
     FILE *f = fopen(path, "rbe");
     if (!f) return;
     unsigned char h[8], b[8];
-    if (fread(h, 1, 8, f) != 8 || memcmp(h, MAGIC, 8)) { fclose(f); remove(path); return; }   /* (not ours: started again) */
+    /* (its start couldn't be read: left as it is. The file is past the limit,
+     * so a read that comes up short has failed, and it was taken for "not
+     * ours": the whole history removed for one bad read) */
+    if (fread(h, 1, 8, f) != 8) { fclose(f); return; }
+    if (memcmp(h, MAGIC, 8)) { fclose(f); remove(path); return; }   /* (not ours: started again) */
     long n = (long)(st.st_size - 8) / 8;
     long keep = BATLOG_TRIM_BYTES * 3 / 4 / 8;
     long lo = n - keep > n / 4 ? n - keep : n / 4;         /* (a quarter at least goes) */
@@ -111,9 +141,7 @@ static void trim(const char *path, int64_t now)
     }
     ok = !ferror(f) && ok;
     fclose(f);
-    int flushed = fflush(o) == 0 && fsync(fileno(o)) == 0;
-    if (fclose(o) == 0 && flushed && ok) file_replace(tmp, path);
-    else remove(tmp);
+    file_commit(o, ok, tmp, path);
 }
 
 /* ---------- the log ---------- */
@@ -142,7 +170,7 @@ void batlog_open(batlog_t *b, const char *path, int64_t wall_now, int64_t mono_n
 
 void batlog_note(batlog_t *b, int64_t mono_now, int pct, int flags)
 {
-    if (pct < 0 || pct > 100) return;
+    if (b->off || pct < 0 || pct > 100) return;
     b->mono = mono_now;
     int was = b->flags;
     if (pct != b->pct || flags != b->flags) {
@@ -156,32 +184,53 @@ void batlog_note(batlog_t *b, int64_t mono_now, int pct, int flags)
 void batlog_clock_set(batlog_t *b, int64_t wall_now, int64_t mono_now)
 {
     int64_t base = wall_now - mono_now;
-    if (base - b->base < 3 && b->base - base < 3) return;   /* (as it was) */
+    if (b->off || (base - b->base < 3 && b->base - base < 3)) return;   /* (as it was) */
     b->base = base;
     b->mono = mono_now;
     put(b, base, 0, 0, BL_CLOCK);
 }
 
+/* The off record is the start's last: the H2 takes a few seconds to go down,
+ * with the screen on for its message and the music stopping, and a sample of
+ * that after it read as the H2 being on again, for as long as it was off. */
 void batlog_off(batlog_t *b, int64_t mono_now)
 {
-    b->mono = mono_now;
-    if (b->pct >= 0) put(b, b->base + mono_now, b->pct, b->flags, BL_OFF);
+    if (!b->off) {
+        b->mono = mono_now;
+        if (b->pct >= 0) put(b, b->base + mono_now, b->pct, b->flags, BL_OFF);
+        b->off = 1;
+    }
     batlog_flush(b);
 }
 
 int batlog_flush(batlog_t *b)
 {
     if (!b->n) return 0;
-    FILE *f = fopen(b->path, "abe");
+    FILE *f = fopen(b->path, "a+be");
     if (!f) return -1;
     /* (the file's size, not ftell(): in append mode that's 0 before the
      * first write on musl, and a header went in at every flush) */
     struct stat st;
     int ok = fstat(fileno(f), &st) == 0;
     long size = ok ? (long)st.st_size : 0;
+    /* A file that doesn't begin with the header (cut short as it was first
+     * written, or damaged since) can't be read back, and was added to all
+     * the same: nothing to show, for good. It starts again. (One that can't
+     * be read just now is left as it is.) */
+    if (ok && size > 0) {
+        unsigned char h[8];
+        ok = fseek(f, 0, SEEK_SET) == 0;
+        size_t got = ok ? fread(h, 1, 8, f) : 0;
+        if (ok && ferror(f)) ok = 0;
+        if (ok && (got != 8 || memcmp(h, MAGIC, 8))) ok = ftruncate(fileno(f), 0) == 0, size = 0;
+        if (ok) ok = fseek(f, 0, SEEK_END) == 0;      /* (a seek between reading and writing) */
+    }
     if (ok && size == 0) ok = fwrite(MAGIC, 1, 8, f) == 8, size = 8;
     unsigned char e[8];
     for (int i = 0; ok && i < b->n; i++) { enc(&b->buf[i], e); ok = fwrite(e, 1, 8, f) == 8; size += 8; }
+    /* On the card now, not when the kernel gets to it: the H2 may lose its
+     * power right after (the off record at an empty battery, above all) */
+    if (ok && fflush(f) == 0) fsync(fileno(f));
     if (fclose(f) || !ok) return -1;
     b->n = 0;
     b->flushed = b->mono;
@@ -432,4 +481,16 @@ void batlog_report(const batrec_t *r, int n, int days, batrep_t *rep)
     }
     rep->avg_full_h10 = cnt ? (sum + cnt / 2) / cnt : 0;
     free(all);
+}
+
+/* ---------- an empty battery, before the player is up ---------- */
+
+int batlog_low_step(int *run, const char *status, const char *volt, long low_uv)
+{
+    long uv = volt ? atol(volt) : 0;
+    if (!status || !strncmp(status, "Charging", 8) || uv <= 0 || uv >= low_uv) {
+        *run = 0;
+        return 0;
+    }
+    return ++*run == 3;
 }

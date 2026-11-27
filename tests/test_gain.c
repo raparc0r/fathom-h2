@@ -7,8 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-static int fails;
-#define CHECK(c, ...) do { if (!(c)) { printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); fails++; } } while (0)
+#include "test_util.h"
 
 int main(void)
 {
@@ -26,7 +25,7 @@ int main(void)
             double want = o[i] * gains[g];
             if (want >= 2147483647.0 || want <= -2147483648.0) {
                 clipped++;
-                CHECK(s[i] == (want > 0 ? INT32_MAX : INT32_MIN), "gain %.3f: %d clipped to %d", gains[g], o[i], s[i]);
+                CHECKF(s[i] == (want > 0 ? INT32_MAX : INT32_MIN), "gain %.3f: %d clipped to %d", gains[g], o[i], s[i]);
                 continue;
             }
             /* the product's rounding (half a step), plus the gain's own: Q28 holds it to
@@ -34,7 +33,7 @@ int main(void)
              * at most 0.0000005 dB at -30 dB) */
             double err = fabs(s[i] - want), allow = 0.5 + fabs((double)o[i]) * ldexp(1.0, -29) + 1e-6;
             if (err > worst) worst = err;
-            CHECK(err <= allow, "gain %.6f: %d -> %d, want %.1f", gains[g], o[i], s[i], want);
+            CHECKF(err <= allow, "gain %.6f: %d -> %d, want %.1f", gains[g], o[i], s[i], want);
         }
         printf("gain %8.5f: worst error %.2f of a 32-bit step, %ld clipped\n", gains[g], worst, clipped);
     }
@@ -42,7 +41,7 @@ int main(void)
     gain_run(s, N, gain_q28(1.0));
     int same = 1;
     for (int i = 0; i < N; i++) same &= s[i] == o[i];
-    CHECK(same, "unity isn't bit for bit");
+    CHECKF(same, "unity isn't bit for bit");
 
     /* the balance: each channel its own gain, the left untouched */
     for (int i = 0; i < N; i++) s[i] = o[i];
@@ -52,7 +51,6 @@ int main(void)
         left &= s[i] == o[i];
         right &= fabs(s[i + 1] - o[i + 1] * 0.5) <= 0.5 + 1e-6;
     }
-    CHECK(left && right, "balance: left %d, right %d", left, right);
-    printf(fails ? "%d failures\n" : "gain ok\n", fails);
-    return fails != 0;
+    CHECKF(left && right, "balance: left %d, right %d", left, right);
+    return t_result();
 }

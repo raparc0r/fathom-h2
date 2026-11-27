@@ -4,17 +4,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "library/playlist.h"
-#include "tmpdir.h"
-
-static int failures;
-
-#define CHECK_STR(got, want) do { \
-    if (strcmp((got), (want))) { fprintf(stderr, "%s:%d: got \"%s\", want \"%s\"\n", __FILE__, __LINE__, (got), (want)); failures++; } \
-} while (0)
-#define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #cond); failures++; } } while (0)
+#include "test_util.h"
 
 static void norm(const char *in, const char *want)
 {
@@ -95,8 +89,7 @@ int main(void)
      * taken as Windows-1252 ("Café", "Don’t"); UTF-8 lines in it stay as
      * they are; an .m3u8 is UTF-8 whatever it holds */
     char dir[200], path[300];
-    test_tmp(dir, sizeof dir, "fathom-test-playlist");
-    if (mkdtemp(dir)) {
+    if (t_mkdtemp(dir, sizeof dir, "fathom-test-playlist")) {
         const char latin[] = "#EXTINF:200,Caf\xE9 Tacvba - Don\x92t Go\r\n"
                              "Caf\xE9 Tacvba\\Album\\01.flac\r\n"
                              "Bj\xC3\xB6rk/Post/02.flac\n"
@@ -120,10 +113,43 @@ int main(void)
             m3u_free(&m);
             unlink(path);
         }
+        /* A playlist is 20,000 entries at most, and 1 MB: more is refused, not
+         * cut short (half a million two-byte lines took 30 MB in a scan; a file
+         * over 1 MB was read as its first 1 MB) */
+        static char many[20001 * 2 + 1];
+        for (int i = 0; i < 20001; i++) memcpy(many + 2 * i, "a\n", 2);
+        CHECK(m3u_parse(many, 20000 * 2, "/d", "Most", &m) == 0 && m.n == 20000);
+        m3u_free(&m);
+        CHECK(m3u_parse(many, 20001 * 2, "/d", "More", &m) == -1 && m.n == 0);
+        snprintf(path, sizeof path, "%s/big.m3u8", dir);
+        for (int over = 0; over < 2; over++) {
+            FILE *pf = fopen(path, "wb");
+            long lines = 0;
+            if (pf) {
+                for (long at = 0; at < 1 << 20; at += 128, lines++) fprintf(pf, "%0127ld\n", at);   /* (128 bytes a line) */
+                if (over) fputc('\n', pf);
+                fclose(pf);
+            }
+            int r = m3u_read(path, &m);
+            if (over) CHECK(r == -1);                               /* 1 MB and a byte */
+            else CHECK(r == 0 && m.n == (int)lines && lines == 8192);   /* 1 MB exactly */
+            if (r == 0) m3u_free(&m);
+        }
+        unlink(path);
+        /* A file that can't be read to its end is not a playlist of what was
+         * read. (A folder stands in: it opens, has a size, and reading fails.) */
+        snprintf(path, sizeof path, "%s/unread.m3u8", dir);
+        CHECK(mkdir(path, 0755) == 0);
+        CHECK(m3u_read(path, &m) == -1 && m.n == 0);
+        rmdir(path);
+        /* (an empty file is an empty playlist) */
+        FILE *ef = fopen(path, "wb");
+        if (ef) fclose(ef);
+        CHECK(m3u_read(path, &m) == 0 && m.n == 0);
+        m3u_free(&m);
+        unlink(path);
         rmdir(dir);
     }
 
-    if (failures) fprintf(stderr, "%d failure(s)\n", failures);
-    else printf("playlist: all checks passed\n");
-    return failures != 0;
+    return t_result();
 }

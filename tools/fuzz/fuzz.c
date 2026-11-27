@@ -10,7 +10,8 @@
  *   fuzz TARGET -run FILE...    -> run inputs once (to reproduce)
  *
  * TARGET: json feed opml search chapters dates cue m3u theme stream rfmeta rdir
- * cover mp3 flac ogg opus dsf dff art zip settings lang. Seeds: the files in
+ * cover mp3 flac ogg opus dsf dff art zip settings lang wifitxt batlog radio
+ * release clock keys upt. Seeds: the files in
  * tests/data and tests/fixtures, and a few music files' first 64-400 KB.
  * FUZZ_TMP: where the file targets write their input (default /tmp);
  * FUZZ_CORPUS: a folder each new input is kept in, to seed the next run.
@@ -30,18 +31,28 @@
 #include "audio/decoder.h"
 #include "audio/dsd.h"
 #include "audio/streamlist.h"
+#include "core/batlog.h"
 #include "core/lang.h"
 #include "core/settings.h"
+#include "core/tz.h"
+#include "core/wifitxt.h"
+#include "library/keys.h"
 #include "library/artdec.h"
 #include "library/cue.h"
 #include "library/playlist.h"
 #include "library/tags.h"
+#include "library/scripts.h"
 #include "net/coverfind.h"
 #include "net/json.h"
+#include "net/netclock.h"
 #include "net/podcast.h"
 #include "net/radiodir.h"
 #include "net/unzip.h"
+#include "net/update.h"
+#include "player/radio.h"
 #include "player/rfmeta.h"
+#include "sys/hibyupt.h"
+#include "ui/glyphpack.h"
 #include "ui/theme.h"
 
 /* ---------- coverage ---------- */
@@ -266,6 +277,126 @@ static void t_lang(const uint8_t *d, size_t n)
     tr_fill(out, sizeof out, "%s tracks", "12", NULL);
 }
 
+static void t_wifitxt(const char *s, size_t n)
+{
+    wifitxt_net_t nets[WIFITXT_MAX];
+    int bad = 0;
+    int k = wifitxt_parse(s, n, nets, WIFITXT_MAX, &bad);
+    for (int i = 0; i < k; i++)                  /* (each a string that ends inside its array) */
+        if (strlen(nets[i].ssid) > 32 || strlen(nets[i].pass) > 63) abort();
+}
+
+static void t_batlog(const uint8_t *d, size_t n)
+{
+    /* the file as a cut or a bad card left it, read back and reported both ways */
+    batrec_t *r = NULL;
+    int k = batlog_load(as_file(d, n, "bat"), NULL, 1000, &r);
+    if (k > 0) {
+        static batrep_t rep;
+        batlog_report(r, k, 1, &rep);
+        batlog_report(r, k, 7, &rep);
+    }
+    free(r);
+    /* ...and taken on by a start: trimmed, noted, written */
+    static batlog_t b;
+    batlog_open(&b, g_tmp, 1795000000, 5);
+    batlog_note(&b, 20, 80, 0);
+    batlog_clock_set(&b, 1795003600, 30);
+    batlog_off(&b, 40);
+}
+
+static void t_radio(const char *s, size_t n)
+{
+    (void)n;
+    static radio_station_t st[64];
+    int k = radio_parse(s, st, 64);
+    char line[1024], a[128], t[128];
+    for (int i = 0; i < k; i++) radio_line(&st[i], line, sizeof line);
+    radio_split_meta(s, a, sizeof a, t, sizeof t);
+    radio_icon_ok(s);
+}
+
+static void t_release(const char *s, size_t n)
+{
+    update_release_t r;
+    update_parse_release(s, n, &r);
+    int v[3];
+    update_parse_version(s, v);
+    update_is_newer(s, "0.21.0");
+    update_is_newer("v0.21.0", s);
+}
+
+static void t_clock(const char *s, size_t n)
+{
+    netclock_parse_date(s, n);
+    tz_find(s);          /* (not tz_rule_offset: only the built-in rules reach it; a ten-digit hour overflows its int) */
+}
+
+static void t_keys(const char *s, size_t n)
+{
+    char out[256], names[KEY_CREDIT_MAX][KEY_CREDIT_LEN];
+    key_artist(s, "", out, sizeof out);
+    key_artist("", s, out, sizeof out);
+    key_artist(s, s, out, 8);
+    key_credits(s, s + n / 2, names);
+    key_is_various(s);
+}
+
+/* A character pack from outside (a download, a copy from a computer): opened,
+ * and every character it says it has looked up and its cells read end to end
+ * (a number or a place the checks let through would be read off the mapping) */
+static void t_glyphpack(const uint8_t *d, size_t n)
+{
+    glyphpack_t *p = glyphpack_open(as_file(d, n, "bin"));
+    if (!p) return;
+    int px[GLYPHPACK_MAX_SIZES], ns = glyphpack_sizes(p, px), count = glyphpack_count(p);
+    volatile unsigned sink = 0;
+    for (uint32_t cp = 0; cp < 0x10400; cp++) {
+        int half = 0, num = glyphpack_find(p, cp, &half);
+        if (num < 0) continue;
+        if (num >= count) abort();
+        for (int s = 0; s < ns; s++) {
+            int row = 0;
+            const uint8_t *c = glyphpack_cell(p, s, num, &row);
+            if (!c || row != (px[s] + 1) / 2) abort();
+            sink += c[0] + c[(size_t)row * (size_t)px[s] - 1];
+            if (glyphpack_foot(p, s) > 0) abort();
+        }
+    }
+    for (int want = 0; want < 80; want++) {
+        int s = glyphpack_size_for(p, want);
+        if (s < 0 || s >= ns) abort();
+    }
+    glyphpack_close(p);
+    (void)sink;
+}
+
+/* A name from a tag, any bytes: which writing it is in, alone and into a library's count */
+static void t_scripts(const char *s, size_t n)
+{
+    lib_scripts_t c;
+    int w[WANT_N];
+    memset(&c, 0, sizeof c);
+    unsigned has = script_of(s);
+    if (has & ~(unsigned)(SCRIPT_KANA | SCRIPT_HANGUL | SCRIPT_HAN | SCRIPT_SIMPLIFIED | SCRIPT_TRADITIONAL)) abort();
+    scripts_add(&c, s, s + n / 2, s + n / 3);
+    scripts_add(&c, s + n / 4, NULL, s);
+    scripts_want(&c, w);
+    for (int i = 0; i < WANT_N; i++)
+        if (w[i] < 0 || w[i] > 2) abort();
+    if (c.simplified_chars > 1060 || c.traditional_chars > 1389) abort();
+}
+
+static void t_upt(const uint8_t *d, size_t n)
+{
+    static upt_t u;
+    if (upt_open(&u, as_file(d, n, "upt"), 0) == 0) {
+        upt_file(&u, "update.txt");
+        upt_check(&u, NULL, NULL);
+    }
+    upt_close(&u);
+}
+
 static const char *g_target;
 
 static void run_one(const uint8_t *d, size_t n)
@@ -297,6 +428,15 @@ static void run_one(const uint8_t *d, size_t n)
     else if (!strcmp(t, "zip")) t_zip(d, n);
     else if (!strcmp(t, "settings")) t_settings(d, n);
     else if (!strcmp(t, "lang")) t_lang(d, n);
+    else if (!strcmp(t, "wifitxt")) t_wifitxt(s, n);
+    else if (!strcmp(t, "batlog")) t_batlog(d, n);
+    else if (!strcmp(t, "radio")) t_radio(s, n);
+    else if (!strcmp(t, "release")) t_release(s, n);
+    else if (!strcmp(t, "clock")) t_clock(s, n);
+    else if (!strcmp(t, "keys")) t_keys(s, n);
+    else if (!strcmp(t, "upt")) t_upt(d, n);
+    else if (!strcmp(t, "glyphpack")) t_glyphpack(d, n);
+    else if (!strcmp(t, "scripts")) t_scripts(s, n);
     else { fprintf(stderr, "unknown target %s\n", t); exit(2); }
     free(s);
 }

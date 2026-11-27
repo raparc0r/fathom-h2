@@ -12,9 +12,7 @@
 #include <unistd.h>
 
 #include "net/netclock.h"
-
-static int fails;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
+#include "test_util.h"
 
 static int64_t date_of(const char *head) { return netclock_parse_date(head, strlen(head)); }
 
@@ -111,8 +109,6 @@ static void year_tests(void)
 #include <psa/crypto.h>
 #endif
 
-#include "tmpdir.h"
-
 /* ---- certificates, made here (no keys kept anywhere) ---- */
 static mbedtls_entropy_context g_ent;
 static mbedtls_ctr_drbg_context g_drbg;
@@ -165,7 +161,7 @@ static void make_certs(void)
     make_key(&g_leaf_key);
     char ca[PEM_MAX], dir[PATH_MAX + 32];
     make_cert(ca, "CN=Clock CA", &g_ca_key, "CN=Clock CA", &g_ca_key, 1, "20000101000000", "21200101000000");
-    need(mkdtemp(test_tmp(dir, sizeof dir, "netclock")) != NULL, "a folder");
+    t_mkdtemp(dir, sizeof dir, "netclock");
     snprintf(g_ca_file, sizeof g_ca_file, "%s/ca.pem", dir);
     FILE *f = fopen(g_ca_file, "w");
     need(f && fputs(ca, f) >= 0 && !fclose(f), "the bundle");
@@ -409,10 +405,5 @@ int main(void)
 #else
     printf("(no mbedTLS here: the HTTPS request not tried)\n");
 #endif
-    if (fails) {
-        fprintf(stderr, "%d failed\n", fails);
-        return 1;
-    }
-    printf("netclock: all passed\n");
-    return 0;
+    return t_result();
 }

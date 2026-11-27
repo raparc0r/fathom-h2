@@ -3,6 +3,7 @@
 /* Covers found online: MusicBrainz and the Cover Art Archive, then Apple (coverfind.h). */
 #include "net/coverfind.h"
 #include "core/fsafe.h"
+#include "core/clock.h"
 
 #include <ctype.h>
 #include <pthread.h>
@@ -302,6 +303,9 @@ static struct {
     pthread_cond_t cv;
     pthread_t th;
     int started, stop;
+    pthread_cond_t done_cv;
+    int done;                  /* the worker has ended (under mu; done_cv tells) */
+    int left;                  /* a stop gave up waiting for it (cf_stop_wait) */
     char dir[512];
     /* the find */
     unsigned gen;              /* the find asked last */
@@ -321,27 +325,26 @@ static struct {
     int n_user_kept;
     cf_batch_t bst;
     volatile int batch_abort;
+    /* a picture's download under way: it goes by dl_stop, set with the flag
+     * it was started under (dl_for: find_abort or batch_abort; NULL: none
+     * under way), and by the download itself once it's too big */
+    const volatile int *dl_for;
+    volatile int dl_stop;
     struct { int64_t id; uint16_t *large, *small; } kept[4];
     int n_kept;
     int64_t last_mb_ms;
-} C = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .find_state = -1, .load_req = -1};
+} C = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .done_cv = PTHREAD_COND_INITIALIZER,
+     .find_state = -1, .load_req = -1};
 
-static cf_fetch_fn g_fetch_once = http_get;
-static cf_download_fn g_download_once = http_download;
+static http_get_fn g_fetch_once = http_get;
+static http_download_fn g_download_once = http_download;
 static int g_mb_gap_ms = 1100;
 static int g_retry_ms[3] = {2000, 3000, 5000};   /* between tries (a picture's: the first two) */
 
-void cf_set_fetch(cf_fetch_fn fn) { g_fetch_once = fn ? fn : http_get; }
-void cf_set_download(cf_download_fn fn) { g_download_once = fn ? fn : http_download; }
+void cf_set_fetch(http_get_fn fn) { g_fetch_once = fn ? fn : http_get; }
+void cf_set_download(http_download_fn fn) { g_download_once = fn ? fn : http_download; }
 void cf_set_mb_gap_ms(int ms) { g_mb_gap_ms = ms; }
 void cf_set_retry_ms(int ms) { g_retry_ms[0] = g_retry_ms[1] = g_retry_ms[2] = ms; }
-
-static int64_t now_ms(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
-}
 
 static int wait_ms(int ms, const volatile int *abort)
 {
@@ -360,24 +363,49 @@ static long fetch(const char *url, char *buf, size_t cap, const volatile int *ab
     int tries = mb ? 4 : 3;                      /* (MusicBrainz says it's busy more often: 503) */
     for (int i = 0; i < tries; i++) {
         if (mb && g_mb_gap_ms > 0) {             /* once a second at most, as MusicBrainz asks */
-            int64_t since = now_ms() - C.last_mb_ms;
+            int64_t since = clock_ms() - C.last_mb_ms;
             if (since < g_mb_gap_ms && wait_ms((int)(g_mb_gap_ms - since), abort)) return -1;
         }
         n = g_fetch_once(url, buf, cap, abort);
-        if (mb) C.last_mb_ms = now_ms();
+        if (mb) C.last_mb_ms = clock_ms();
         if (n >= 0 || n == -2 || n == -3 || i == tries - 1 || wait_ms(g_retry_ms[i], abort)) break;   /* (-3: not there) */
     }
     return n;
 }
 
+/* (with C.mu held) flag was just set: a picture's download started under it gives up */
+static void dl_aborted(const volatile int *flag)
+{
+    if (C.dl_for == flag) C.dl_stop = 1;
+}
+
+/* A picture's download gives up once it's past PICTURE_MAX (a search can
+ * name anything as a cover: one of 50 MB was written to the card whole, one
+ * with no end down to the card's floor, and only then found too big) */
+static void dl_progress(uint64_t done, uint64_t total, void *ctx)
+{
+    int *over = ctx;
+    if (done > (uint64_t)PICTURE_MAX || total > (uint64_t)PICTURE_MAX) *over = C.dl_stop = 1;
+}
+
 /* A picture, tried up to 3 times as an answer is: its size, -3 if the server
- * says it isn't there (the Cover Art Archive has none for that album), or -1.
+ * says it isn't there (the Cover Art Archive has none for that album) or it's
+ * too big to be a cover, or -1.
  * Not again when it was the card that stopped it (HTTP_ERR_FULL, _WRITE). */
 static int64_t download(const char *url, const char *path, const volatile int *abort)
 {
     int64_t n = -1;
+    int over = 0;
     for (int i = 0; i < 3; i++) {
-        n = g_download_once(url, path, NULL, NULL, abort);
+        pthread_mutex_lock(&C.mu);
+        C.dl_for = abort;
+        C.dl_stop = *abort || C.stop;
+        pthread_mutex_unlock(&C.mu);
+        n = g_download_once(url, path, dl_progress, &over, &C.dl_stop);
+        pthread_mutex_lock(&C.mu);
+        C.dl_for = NULL;
+        pthread_mutex_unlock(&C.mu);
+        if (over) { remove(path); return -3; }     /* (whatever of it was kept; not tried again) */
         if (n > 0 || n == -3 || n == HTTP_ERR_FULL || n == HTTP_ERR_WRITE || i == 2 || wait_ms(g_retry_ms[i], abort)) break;
     }
     return n;
@@ -644,13 +672,37 @@ static void *worker(void *arg)
         }
         pthread_mutex_lock(&C.mu);
     }
+    C.done = 1;
+    pthread_cond_broadcast(&C.done_cv);
     pthread_mutex_unlock(&C.mu);
     return NULL;
+}
+
+/* The worker has ended: it's joined, and what it held is given back */
+static void ended(void)
+{
+    pthread_join(C.th, NULL);
+    drop_pics();
+    for (int i = 0; i < C.n_kept; i++) { free(C.kept[i].large); free(C.kept[i].small); }
+    C.n_kept = 0;
+    free(C.list);
+    C.list = NULL;
+    C.list_n = C.next = 0;
+    C.bst.running = 0;
+    C.find_state = -1;
 }
 
 int cf_start(const char *dir)
 {
     if (C.started) return 0;
+    if (C.left) {                                /* a worker the last stop left at its fetch */
+        pthread_mutex_lock(&C.mu);
+        int done = C.done;
+        pthread_mutex_unlock(&C.mu);
+        if (!done) return -1;                    /* (still there: not a second one beside it) */
+        ended();
+        C.left = 0;
+    }
     snprintf(C.dir, sizeof C.dir, "%s", dir);
     mkdir(C.dir, 0755);
     char p[600];
@@ -666,29 +718,56 @@ int cf_start(const char *dir)
     snprintf(part, sizeof part, "%s.part", p);
     remove(part);
     C.stop = 0;
+    C.done = 0;
     if (pthread_create(&C.th, NULL, worker, NULL)) return -1;
     C.started = 1;
     return 0;
 }
 
-void cf_stop(void)
+void cf_stop_ask(void)
 {
     if (!C.started) return;
     pthread_mutex_lock(&C.mu);
     C.stop = 1;
     C.find_abort = C.batch_abort = 1;
+    C.dl_stop = 1;
     pthread_cond_broadcast(&C.cv);
     pthread_mutex_unlock(&C.mu);
-    pthread_join(C.th, NULL);
+}
+
+int cf_stop_wait(int ms)
+{
+    if (!C.started) return 1;
+    /* In steps of 100 ms counted on the clock that only goes forward: a
+     * condition's wait goes by the wall clock, which is set days ahead (or
+     * back) when the network first gives the time. */
+    int64_t until = clock_ms() + ms;
+    pthread_mutex_lock(&C.mu);
+    while (!C.done) {
+        if (ms < 0) { pthread_cond_wait(&C.done_cv, &C.mu); continue; }
+        int64_t rest = until - clock_ms();
+        if (rest <= 0) break;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += (rest < 100 ? (long)rest : 100) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&C.done_cv, &C.mu, &ts);
+    }
+    int back = C.done;
     C.started = 0;
-    drop_pics();
-    for (int i = 0; i < C.n_kept; i++) { free(C.kept[i].large); free(C.kept[i].small); }
-    C.n_kept = 0;
-    free(C.list);
-    C.list = NULL;
-    C.list_n = C.next = 0;
-    C.bst.running = 0;
-    C.find_state = -1;
+    C.left = !back;
+    pthread_mutex_unlock(&C.mu);
+    /* Not back: it's inside a name lookup, which nothing interrupts, and is
+     * left there with what it holds (the player is stopping: it ends with
+     * it; a picture's .part it was at is removed by the next cf_start). */
+    if (back) ended();
+    return back;
+}
+
+void cf_stop(void)
+{
+    cf_stop_ask();
+    cf_stop_wait(-1);
 }
 
 int cf_find(const cf_album_t *a)
@@ -697,6 +776,7 @@ int cf_find(const cf_album_t *a)
     pthread_mutex_lock(&C.mu);
     C.gen++;
     C.find_abort = 1;                                 /* (the last one, if it's still going) */
+    dl_aborted(&C.find_abort);
     drop_pics();
     C.album = *a;
     C.n = 0;
@@ -792,6 +872,7 @@ void cf_find_close(void)
     pthread_mutex_lock(&C.mu);
     C.gen++;
     C.find_abort = 1;
+    dl_aborted(&C.find_abort);
     C.find_req = 0;
     C.load_req = -1;
     C.find_state = -1;
@@ -837,6 +918,7 @@ void cf_batch_stop(void)
     pthread_mutex_lock(&C.mu);
     if (C.bst.running) {
         C.batch_abort = 1;
+        dl_aborted(&C.batch_abort);
         C.list_n = C.next;                            /* (none after the one under way) */
         if (!C.in_flight) batch_end();                /* (none under way: done now) */
         pthread_cond_broadcast(&C.cv);

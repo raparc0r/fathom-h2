@@ -15,8 +15,15 @@
 
 #include "core/batlog.h"
 
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: CHECK(%s)\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+/* batlog.c itself, not the library's copy of it, so that a read can be made
+ * to fail here (g_read_fails): its fread is the one below */
+static size_t test_fread(void *p, size_t size, size_t n, FILE *f);
+#define fread test_fread
+#include "../app/core/batlog.c"
+#include "test_util.h"
+#undef fread
+static int g_read_fails;
+static size_t test_fread(void *p, size_t size, size_t n, FILE *f) { return g_read_fails ? 0 : fread(p, size, n, f); }
 
 static char g_path[600];
 
@@ -387,6 +394,200 @@ static void test_stray_headers(void)
     free(r);
 }
 
+/* Switching off closes the log: in the seconds the H2 takes to go down the
+ * screen comes on for "Powering off" and the music stops, and neither is
+ * noted after the off record (the history then read as on again, for as long
+ * as the H2 was off). The next start opens it again. */
+static void test_closed_by_off(void)
+{
+    unlink(g_path);
+    h2_t h = {.wall_true = 1795000000, .level = 80};
+    start(&h, h.wall_true);
+    run(&h, 1800, BL_ACT_PLAYING, 0);
+    batlog_off(&h.log, h.mono);
+    batlog_note(&h.log, h.mono + 1, pct_of(h.level), flags_of(BL_ACT_SCREEN, 0));
+    batlog_note(&h.log, h.mono + 3, pct_of(h.level) - 1, flags_of(BL_ACT_PAUSED, 0));
+    batlog_off(&h.log, h.mono + 4);                   /* (asked twice: said once) */
+    batlog_flush(&h.log);
+    batrec_t *r;
+    int n = batlog_load(g_path, NULL, 0, &r), offs = 0;
+    for (int i = 0; i < n; i++) offs += r[i].kind == BL_OFF;
+    CHECK(n > 2 && r[n - 1].kind == BL_OFF && offs == 1);
+    free(r);
+    h.wall_true += 3600;
+    start(&h, h.wall_true);
+    run(&h, 1800, BL_ACT_PLAYING, 0);
+    batlog_flush(&h.log);
+    int m = batlog_load(g_path, NULL, 0, &r);
+    CHECK(m > n + 1 && r[n].kind == BL_BOOT && r[m - 1].kind == BL_SAMPLE);
+    free(r);
+}
+
+static void raw(unsigned char *o, int64_t t, int pct, int flags, int kind, int last)
+{
+    uint32_t u = (uint32_t)t;
+    o[0] = (unsigned char)u, o[1] = (unsigned char)(u >> 8), o[2] = (unsigned char)(u >> 16), o[3] = (unsigned char)(u >> 24);
+    o[4] = (unsigned char)pct, o[5] = (unsigned char)flags, o[6] = (unsigned char)kind, o[7] = (unsigned char)last;
+}
+
+/* Damaged records in the middle of a start (a card's bad block, a file put
+ * back by a repair tool): a charge over 100, a time before its start or years
+ * after it or behind the record before it, a start with a charge, a last byte
+ * that isn't 0. None is taken: the history reads as it did without them.
+ * (Taken, one far ahead moved every later start after it, and the graph
+ * showed nothing.) */
+static void test_damaged_records(void)
+{
+    unlink(g_path);
+    h2_t h = {.wall_true = 1795000000, .level = 100};
+    start(&h, h.wall_true);
+    int64_t base = h.log.base;
+    run(&h, 6 * 3600, BL_ACT_PLAYING, 0);
+    batlog_off(&h.log, h.mono);
+    h.wall_true += 2 * 3600;
+    start(&h, h.wall_true);
+    run(&h, 3600, BL_ACT_PLAYING, 0);
+    batlog_off(&h.log, h.mono);
+    batrec_t *r;
+    int n = batlog_load(g_path, NULL, 0, &r);
+    batrep_t a, b;
+    batlog_report(r, n, 1, &a);
+    free(r);
+
+    FILE *f = fopen(g_path, "rb");
+    struct stat st;
+    if (!f || fstat(fileno(f), &st)) { CHECK(0); if (f) fclose(f); return; }
+    unsigned char *d = malloc((size_t)st.st_size), bad[8 * 8];
+    size_t got = fread(d, 1, (size_t)st.st_size, f), at = 8 + 8 * 10;   /* (after the first start's tenth record: 1 h in) */
+    fclose(f);
+    int f0 = flags_of(BL_ACT_PLAYING, 0);
+    raw(bad + 0, base + 3700, 200, f0, BL_SAMPLE, 0);                /* 200 % */
+    raw(bad + 8, base + 3700, 101, f0, BL_OFF, 0);
+    raw(bad + 16, base + 20LL * 366 * 86400, 50, f0, BL_SAMPLE, 0);  /* twenty years on */
+    raw(bad + 24, base - 100000, 50, f0, BL_SAMPLE, 0);              /* before its start */
+    raw(bad + 32, base + 60, 50, f0, BL_OFF, 0);                     /* behind the record before it */
+    raw(bad + 40, base + 3700, 50, f0, BL_BOOT, 0);                  /* a start has no charge */
+    raw(bad + 48, base + 3700, 0, f0, BL_CLOCK, 0);                  /* nor a clock a state */
+    raw(bad + 56, base + 3700, 50, f0, BL_SAMPLE, 7);                /* the last byte is always 0 */
+    f = fopen(g_path, "wb");
+    CHECK(got > at && f && fwrite(d, 1, at, f) == at && fwrite(bad, 1, sizeof bad, f) == sizeof bad &&
+          fwrite(d + at, 1, got - at, f) == got - at);
+    if (f) fclose(f);
+    free(d);
+
+    int m = batlog_load(g_path, NULL, 0, &r);
+    batlog_report(r, m, 1, &b);
+    int over = 0, ordered = 1;
+    for (int i = 0; i < m; i++) over += r[i].pct > 100;
+    for (int i = 1; i < m; i++) ordered &= r[i].t >= r[i - 1].t;
+    free(r);
+    printf("damaged records: %d read of %d good and 8 bad\n", m, n);
+    CHECK(m == n && !over && ordered);
+    CHECK(b.t1 == a.t1 && b.nspans == a.nspans && b.span[0].used == a.span[0].used && b.span[0].on_s == a.span[0].on_s);
+    CHECK(!memcmp(a.pct, b.pct, sizeof a.pct));
+}
+
+/* A file that doesn't begin with the header (cut short as it was first
+ * written, or damaged since) can't be read back, and was added to all the
+ * same: nothing to show, for good. It starts again at the next write. */
+static void test_bad_header(void)
+{
+    static const char *const heads[] = {"FBATL", "not a battery log at all, and longer than a header", "FBATLOG2........"};
+    for (int k = 0; k < 3; k++) {
+        FILE *f = fopen(g_path, "wb");
+        CHECK(f && fputs(heads[k], f) >= 0);
+        if (f) fclose(f);
+        h2_t h = {.wall_true = 1795000000, .level = 70};
+        start(&h, h.wall_true);
+        run(&h, 1800, BL_ACT_PLAYING, 0);
+        CHECK(batlog_flush(&h.log) == 0);
+        batrec_t *r;
+        int n = batlog_load(g_path, NULL, 0, &r);
+        CHECK(headers() == 1 && n > 2 && r[0].kind == BL_BOOT);
+        free(r);
+        /* and a good one is added to, not started again */
+        run(&h, 1800, BL_ACT_PLAYING, 0);
+        batlog_off(&h.log, h.mono);
+        int m = batlog_load(g_path, NULL, 0, &r);
+        CHECK(headers() == 1 && m > n && r[0].kind == BL_BOOT && r[m - 1].kind == BL_OFF);
+        free(r);
+    }
+}
+
+/* A file past the trim size whose first bytes can't be read just now (the
+ * card's read failed) is left alone: it was taken for "not ours" and
+ * removed, the whole history with it. One that was read and isn't ours
+ * still goes. */
+static void test_trim_read_fails(void)
+{
+    unlink(g_path);
+    h2_t h = {.wall_true = 1790000000, .level = 100};
+    start(&h, h.wall_true);
+    run(&h, 600, BL_ACT_PLAYING, 0);
+    batlog_flush(&h.log);
+    FILE *f = fopen(g_path, "ab");                      /* (grown past the limit with no trim on the way) */
+    unsigned char rec[8];
+    for (int k = 0; f && k < BATLOG_TRIM_BYTES / 8; k++) {
+        raw(rec, h.log.base + h.mono + k, 50, flags_of(BL_ACT_PLAYING, 0), BL_SAMPLE, 0);
+        fwrite(rec, 1, 8, f);
+    }
+    if (f) fclose(f);
+    struct stat before, after;
+    CHECK(stat(g_path, &before) == 0 && before.st_size > BATLOG_TRIM_BYTES);
+    g_read_fails = 1;
+    start(&h, h.wall_true);
+    g_read_fails = 0;
+    CHECK(stat(g_path, &after) == 0 && after.st_size == before.st_size);
+    start(&h, h.wall_true);                             /* read this time: trimmed, as ever */
+    CHECK(stat(g_path, &after) == 0 && after.st_size < before.st_size && after.st_size > 8 && headers() == 1);
+    /* not ours at all, and that big: removed at the start */
+    f = fopen(g_path, "wb");
+    for (int k = 0; f && k < BATLOG_TRIM_BYTES / 8 + 100; k++) fwrite("NOTOURS!", 1, 8, f);
+    if (f) fclose(f);
+    start(&h, h.wall_true);
+    CHECK(stat(g_path, &after) != 0);
+}
+
+/* The screens before the player (the first scan): off at the third low
+ * reading in a row, not charging; a reading that couldn't be made, or that
+ * says nothing, is not a low one and starts the count again. */
+static void test_low_step(void)
+{
+    const long low = 3450000;
+    int run = 0;
+    CHECK(batlog_low_step(&run, "Discharging\n", "3440000\n", low) == 0 && run == 1);
+    CHECK(batlog_low_step(&run, "Discharging\n", "3430000\n", low) == 0 && run == 2);
+    CHECK(batlog_low_step(&run, "Discharging\n", "3420000\n", low) == 1);
+    CHECK(batlog_low_step(&run, "Discharging\n", "3410000\n", low) == 0);   /* (said once) */
+    /* a good reading between two low ones: from nothing again */
+    run = 0;
+    CHECK(batlog_low_step(&run, "Discharging\n", "3440000\n", low) == 0);
+    CHECK(batlog_low_step(&run, "Discharging\n", "3440000\n", low) == 0);
+    CHECK(batlog_low_step(&run, "Discharging\n", "3450000\n", low) == 0 && run == 0);   /* (at the mark: not under it) */
+    CHECK(batlog_low_step(&run, "Discharging\n", "3440000\n", low) == 0 && run == 1);
+    /* charging: never, however low */
+    run = 2;
+    CHECK(batlog_low_step(&run, "Charging\n", "3300000\n", low) == 0 && run == 0);
+    /* plugged in and not charging (full, or held): the voltage decides, as in the player */
+    run = 2;
+    CHECK(batlog_low_step(&run, "Not charging\n", "3300000\n", low) == 1);
+    run = 2;
+    CHECK(batlog_low_step(&run, "Full\n", "4150000\n", low) == 0 && run == 0);
+    /* a reading that couldn't be made, or isn't a voltage */
+    run = 2;
+    CHECK(batlog_low_step(&run, NULL, "3300000\n", low) == 0 && run == 0);
+    run = 2;
+    CHECK(batlog_low_step(&run, "Discharging\n", NULL, low) == 0 && run == 0);
+    run = 2;
+    CHECK(batlog_low_step(&run, "Discharging\n", "\n", low) == 0 && run == 0);
+    run = 2;
+    CHECK(batlog_low_step(&run, "Discharging\n", "0\n", low) == 0 && run == 0);
+    run = 2;
+    CHECK(batlog_low_step(&run, "Discharging\n", "-5\n", low) == 0 && run == 0);
+    run = 2;
+    CHECK(batlog_low_step(&run, "Discharging\n", "what\n", low) == 0 && run == 0);
+}
+
 int main(void)
 {
     snprintf(g_path, sizeof g_path, "%s/fathom-batlog-%d.log", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid());
@@ -398,8 +599,11 @@ int main(void)
     test_trim_heavy();
     test_trim_one_start();
     test_stray_headers();
+    test_closed_by_off();
+    test_damaged_records();
+    test_bad_header();
+    test_trim_read_fails();
+    test_low_step();
     unlink(g_path);
-    if (failures) { fprintf(stderr, "%d failures\n", failures); return 1; }
-    printf("batlog: ok\n");
-    return 0;
+    return t_result();
 }

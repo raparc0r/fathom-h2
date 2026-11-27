@@ -23,10 +23,7 @@
 #include "sys/hibyupt.h"
 #include "sys/md5.h"
 #include "sys/uninstall.h"
-#include "tmpdir.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_util.h"
 
 #define S 2048u
 
@@ -59,12 +56,6 @@ static void md5_file(const char *path, char hex[33])
     }
     md5_final(&m, d);
     md5_hex(d, hex);
-}
-
-static int exists(const char *path)
-{
-    struct stat st;
-    return !stat(path, &st);
 }
 
 /* ---------- making images ---------- */
@@ -294,7 +285,7 @@ static void test_hiby(int joliet)
 
     CHECK(upt_patch(&u, undo) == UPT_OK);
     CHECK(u.kind == UPT_HIBY_PATCHED);
-    CHECK(exists(undo));
+    CHECK(t_exists(undo));
     upt_close(&u);
 
     make_manifest(1, 0);                                  /* what mkstockuboot makes */
@@ -318,7 +309,7 @@ static void test_hiby(int joliet)
     CHECK(upt_undo(path, undo) == UPT_OK);
     md5_file(path, after);
     CHECK(!strcmp(before, after));
-    CHECK(!exists(undo));
+    CHECK(!t_exists(undo));
     CHECK(upt_undo(path, undo) == UPT_ERR_UNDO);          /* nothing left to undo */
     unlink(path);
 }
@@ -425,7 +416,7 @@ static void test_refusals(void)
     upt_close(&u);
     md5_file(path, after);
     CHECK(!strcmp(before, after));
-    CHECK(!exists(undo));
+    CHECK(!t_exists(undo));
     /* one byte less fits exactly */
     make_manifest(0, (int)S - 118 - base);
     make_hiby(path, 0, 1);
@@ -443,7 +434,7 @@ static void test_refusals(void)
     CHECK(upt_check(&u, NULL, NULL) == UPT_OK);
     CHECK(upt_patch(&u, undo) == UPT_ERR_WRITE);
     upt_close(&u);
-    CHECK(!exists(undo));
+    CHECK(!t_exists(undo));
 
     /* an undo file for another file */
     char other[600];
@@ -454,7 +445,7 @@ static void test_refusals(void)
     tfile_t lone[] = {{"README.TXT;1", "readme.txt", (const uint8_t *)"hello\n", 6}};
     make_iso(other, lone, 1, 0);
     CHECK(upt_undo(other, undo) == UPT_ERR_UNDO);
-    CHECK(exists(undo));
+    CHECK(t_exists(undo));
     CHECK(upt_undo(path, undo) == UPT_OK);
     unlink(other);
 
@@ -497,7 +488,7 @@ static void test_fathom(void)
     CHECK(!strcmp(u.uboot_md5, m));
     CHECK(upt_patch(&u, undo) == UPT_ERR_NOT_UPDATE);
     upt_close(&u);
-    CHECK(!exists(undo));
+    CHECK(!t_exists(undo));
     unlink(path);
 }
 
@@ -602,7 +593,7 @@ static void test_card(void)
     upt_kind_t kind = UPT_HIBY;
     CHECK(kind_of(card, "update.upt", &kind) == UPT_OK && kind == UPT_HIBY_PATCHED);
     CHECK(kind_of(card, "fathom-install.upt", &kind) == UPT_OK && kind == UPT_FATHOM);
-    CHECK(!exists(p));
+    CHECK(!t_exists(p));
     /* found again while pending: update.upt, HiBy's */
     CHECK(uninstall_find(card, name, sizeof name, &why) == UNI_OK && !strcmp(name, "update.upt"));
 
@@ -613,9 +604,9 @@ static void test_card(void)
     CHECK(!strcmp(before, after));
     CHECK(kind_of(card, "update.upt", &kind) == UPT_OK && kind == UPT_FATHOM);
     card_file(p, sizeof p, card, "fathom-install.upt");
-    CHECK(!exists(p));
+    CHECK(!t_exists(p));
     card_file(p, sizeof p, card, "fathom/uninstall");
-    CHECK(!exists(p));
+    CHECK(!t_exists(p));
 
     /* made ready, then HiBy's recovery installed it and Fathom's installer went
      * back to update.upt by hand: the record is forgotten at start, the files
@@ -656,6 +647,82 @@ static void test_card(void)
     unlink(p);
     CHECK(uninstall_forget_stale(card) == 1 && !uninstall_pending(card));
 
+    /* An Apply cut short (the player stopped in the second it takes): at the next
+     * start the file is put back from the undo, not the undo forgotten. First
+     * HiBy's file already named update.upt, its new text written and its length
+     * not yet: it doesn't open, and it was taken for "no longer the file made
+     * ready". */
+    clear_card(card);
+    hiby_at(card, "update.upt", "erosq_2024");
+    card_file(p, sizeof p, card, "update.upt");
+    md5_file(p, before);
+    CHECK(upt_open(&u, p, 1) == UPT_OK && upt_check(&u, NULL, NULL) == UPT_OK);
+    {
+        const upt_file_t *uf = upt_file(&u, "update.txt");
+        uint64_t rec = uf->rec[0], rec2 = uf->nrec > 1 ? uf->rec[1] : 0;
+        uint32_t old = uf->size;
+        CHECK(uninstall_apply(card, "update.upt", &u, &why) == UNI_OK);
+        upt_close(&u);
+        int fd = open(p, O_RDWR);
+        uint8_t v[8];
+        both32(v, old);
+        CHECK(fd >= 0 && pwrite(fd, v, 8, (off_t)rec + 10) == 8);
+        if (rec2) CHECK(pwrite(fd, v, 8, (off_t)rec2 + 10) == 8);
+        close(fd);
+        CHECK(upt_open(&u, p, 0) != UPT_OK);
+        upt_close(&u);
+        CHECK(uninstall_forget_stale(card) == 1 && !uninstall_pending(card));
+        md5_file(p, after);
+        CHECK(!strcmp(before, after));                       /* as HiBy made it */
+    }
+    /* ...and HiBy's file under its own name, Fathom's installer already set
+     * aside, cut before the last rename: the bytes back, and Fathom's
+     * installer update.upt again */
+    clear_card(card);
+    fathom_at(card, "update.upt");
+    hiby_at(card, "H2-Firmware-V2.3.upt", "erosq_2024");
+    card_file(p, sizeof p, card, "H2-Firmware-V2.3.upt");
+    md5_file(p, before);
+    CHECK(upt_open(&u, p, 1) == UPT_OK && upt_check(&u, NULL, NULL) == UPT_OK);
+    {
+        const upt_file_t *uf = upt_file(&u, "update.txt");
+        uint64_t rec = uf->rec[0], rec2 = uf->nrec > 1 ? uf->rec[1] : 0;
+        uint32_t old = uf->size;
+        CHECK(uninstall_apply(card, "H2-Firmware-V2.3.upt", &u, &why) == UNI_OK);
+        upt_close(&u);
+        char upd[700], ren[700], line[300] = "";
+        card_file(upd, sizeof upd, card, "update.upt");
+        CHECK(!rename(upd, p));                              /* (the last rename not made) */
+        card_file(ren, sizeof ren, card, "fathom/uninstall/renames");
+        FILE *rf = fopen(ren, "r");                          /* (...nor noted: the first line only) */
+        CHECK(rf && fgets(line, sizeof line, rf));
+        if (rf) fclose(rf);
+        rf = fopen(ren, "w");
+        if (rf) { fputs(line, rf); fclose(rf); }
+        int fd = open(p, O_RDWR);                            /* (and the file half changed) */
+        uint8_t v[8];
+        both32(v, old);
+        CHECK(fd >= 0 && pwrite(fd, v, 8, (off_t)rec + 10) == 8);
+        if (rec2) CHECK(pwrite(fd, v, 8, (off_t)rec2 + 10) == 8);
+        close(fd);
+        CHECK(uninstall_forget_stale(card) == 1 && !uninstall_pending(card));
+        md5_file(p, after);
+        CHECK(!strcmp(before, after));
+        CHECK(kind_of(card, "update.upt", &kind) == UPT_OK && kind == UPT_FATHOM);
+        card_file(upd, sizeof upd, card, "fathom-install.upt");
+        CHECK(!t_exists(upd));
+        /* the same cut with the file whole (all written, the rename not made): back too */
+        CHECK(upt_open(&u, p, 1) == UPT_OK && upt_check(&u, NULL, NULL) == UPT_OK);
+        CHECK(uninstall_apply(card, "H2-Firmware-V2.3.upt", &u, &why) == UNI_OK);
+        upt_close(&u);
+        card_file(upd, sizeof upd, card, "update.upt");
+        CHECK(!rename(upd, p));
+        CHECK(uninstall_forget_stale(card) == 1 && !uninstall_pending(card));
+        md5_file(p, after);
+        CHECK(!strcmp(before, after));
+        CHECK(kind_of(card, "update.upt", &kind) == UPT_OK && kind == UPT_FATHOM);
+    }
+
     /* put in the Music folder through the network drive: found there, moved to the
      * card's top as update.upt, and back into Music on cancel */
     clear_card(card);
@@ -671,13 +738,13 @@ static void test_card(void)
         CHECK(upt_open(&u, p, 1) == UPT_OK && upt_check(&u, NULL, NULL) == UPT_OK);
         CHECK(uninstall_apply(card, name, &u, &why) == UNI_OK);
         upt_close(&u);
-        CHECK(!exists(p));
+        CHECK(!t_exists(p));
         CHECK(kind_of(card, "update.upt", &kind) == UPT_OK && kind == UPT_HIBY_PATCHED);
         CHECK(uninstall_cancel(card) == 0);
         md5_file(p, before);
         CHECK(!strcmp(m1, before));
         card_file(p, sizeof p, card, "update.upt");
-        CHECK(!exists(p));
+        CHECK(!t_exists(p));
         /* one at the top and one in Music: which? */
         hiby_at(card, "H2-Firmware-V2.2.upt", "erosq_2024");
         CHECK(uninstall_find(card, name, sizeof name, &why) == UNI_SEVERAL);
@@ -761,23 +828,12 @@ static void test_card(void)
 
 /* ---------- a real one ---------- */
 
-static void copy(const char *from, const char *to)
-{
-    static uint8_t buf[1 << 16];
-    FILE *a = fopen(from, "rb"), *b = fopen(to, "wb");
-    size_t n;
-    if (!a || !b) { perror(from); exit(1); }
-    while ((n = fread(buf, 1, sizeof buf, a)) > 0) fwrite(buf, 1, n, b);
-    fclose(a);
-    fclose(b);
-}
-
 static void test_real(const char *real, const char *patched)
 {
     char path[600], undo[600], before[33], after[33], text[S + 1];
     path_of(path, sizeof path, "real.upt");
     path_of(undo, sizeof undo, "undo");
-    copy(real, path);
+    if (t_copy(real, path)) { perror(real); exit(1); }
     md5_file(path, before);
     upt_t u;
     CHECK(upt_open(&u, path, 1) == UPT_OK);
@@ -804,8 +860,7 @@ static void test_real(const char *real, const char *patched)
 int main(void)
 {
     char tmpl[512];
-    test_tmp(tmpl, sizeof tmpl, "hibyupt");
-    if (!mkdtemp(tmpl)) { perror(tmpl); return 1; }
+    t_mkdtemp(tmpl, sizeof tmpl, "hibyupt");
     snprintf(g_dir, sizeof g_dir, "%s", tmpl);
     make_images();
 
@@ -821,10 +876,5 @@ int main(void)
     if (real && *real) test_real(real, getenv("FATHOM_TEST_UPT_PATCHED"));
 
     rmdir(g_dir);
-    if (failures) {
-        fprintf(stderr, "%d check(s) failed\n", failures);
-        return 1;
-    }
-    printf("hibyupt: all passed\n");
-    return 0;
+    return t_result();
 }

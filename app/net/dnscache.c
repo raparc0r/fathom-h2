@@ -21,6 +21,8 @@
  * A result handed out is a copy in one block of ours, recorded until it's
  * freed (freeaddrinfo() tells ours from musl's by that record). */
 #include "net/dnscache.h"
+#include "core/clock.h"
+#include "core/thread.h"
 
 #include <ctype.h>
 #include <pthread.h>
@@ -79,11 +81,7 @@ static const struct addrinfo *hints_for(const struct addrinfo *h, struct addrinf
 
 static uint32_t now_ms(void)
 {
-    if (clock_fn) return clock_fn();
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint32_t t = (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000);
-    return t ? t : 1;     /* (0 marks an empty entry) */
+    return clock_fn ? clock_fn() : clock_ms32_set();      /* (0 marks an empty entry) */
 }
 
 void dnscache_test_clock(uint32_t (*now)(void)) { clock_fn = now; }
@@ -318,13 +316,7 @@ static int ask_behind(const char *host, int port, const struct addrinfo *h)
     if (q_n == PREFETCH_Q || !g_resolve) return 0;
     queue[q_n++] = w;
     if (!q_running) {
-        pthread_attr_t a;
-        pthread_t t;
-        pthread_attr_init(&a);
-        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-        pthread_attr_setstacksize(&a, 64 * 1024);
-        q_running = pthread_create(&t, &a, prefetch_run, NULL) == 0;
-        pthread_attr_destroy(&a);
+        q_running = thread_detached(prefetch_run, NULL, 64 * 1024) == 0;
         if (!q_running) { q_n = 0; return 0; }
     }
     return 1;

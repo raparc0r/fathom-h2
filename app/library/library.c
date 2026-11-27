@@ -4,19 +4,21 @@
 #define _DARWIN_C_SOURCE
 #define _GNU_SOURCE   /* strcasestr (glibc, musl) */
 #include "library.h"
+#include "library/library_int.h"
 #include "core/fsafe.h"
+#include "core/clock.h"
+#include "core/hash.h"
+#include "core/path.h"
 
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <math.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -25,7 +27,6 @@
 #include <sys/syscall.h>
 #endif
 
-#include <pthread.h>
 #include <sqlite3.h>
 
 #include "core/lang.h"
@@ -33,6 +34,7 @@
 #include "library/cue.h"
 #include "library/fatwalk.h"
 #include "library/keys.h"
+#include "library/scripts.h"
 #include "library/playlist.h"
 #include "library/reader.h"
 #include "library/tags.h"
@@ -40,45 +42,6 @@
 #ifndef FATHOM_SQLITE_CACHE
 #define FATHOM_SQLITE_CACHE "-2000"   /* KiB; the H2 build uses less */
 #endif
-
-#ifndef FATHOM_JPEG_MAX_MEMORY
-#define FATHOM_JPEG_MAX_MEMORY (64L * 1024 * 1024)   /* desktop; the H2 build uses 4 MB */
-#endif
-
-#ifndef FATHOM_ART_MAX_FILE
-#define FATHOM_ART_MAX_FILE (64L * 1024 * 1024)   /* encoded bytes held in RAM; the H2 uses 4 MB */
-#endif
-
-#ifndef FATHOM_ART_MAX_PIXELS
-#define FATHOM_ART_MAX_PIXELS (16LL * 1024 * 1024)   /* desktop; the H2 build sets ~2.4 MP */
-#endif
-
-struct library {
-    sqlite3 *db;
-    void *search_run;       /* the search under way (search_keep) */
-    int no_album_artists;   /* album rows show the year, not the artist (library_set_album_artists) */
-    char art_dir[1024];
-    sqlite3_stmt *row_album, *row_artist, *row_credited, *row_track, *track_full, *album_name, *artist_name;
-    sqlite3_stmt *row_playlist, *row_pl_track, *row_plays, *track_album, *playlist_name;
-    sqlite3_stmt *row_genre, *row_composer, *row_year, *row_folder, *genre_name, *composer_name, *folder_name;
-    char pl_dir[1024];      /* your own playlists ("" = none) */
-    int scan_changes;       /* tracks the last scan added, changed or dropped */
-    volatile int cancel;    /* library_scan_cancel(): stop the scan in progress */
-    char fw_dev[64], fw_mount[256];   /* library_set_fast_walk(): the music folder's FAT partition */
-    int art_fd[2];          /* the covers' store: large.pack, small.pack (-1: not open) */
-    int art_legacy;         /* a cover file per album and size (before the store) may still be in art_dir */
-    int quick;              /* the last scan's listing was the fast walk's */
-    int scan_held;          /* files whose names the last scan held in memory (library_scan_held) */
-    int plays_trimmed;      /* the play log's year-old entries removed since it was opened (library_played) */
-    int fw_bad;             /* ...and named a new file that isn't there: the scan stops, and walks the folder instead */
-    int bulk;               /* a first scan in progress with the tracks' indexes set aside (bulk_begin) */
-    int defer_art;          /* library_scan_defer_art: the next scan leaves the covers to the one after */
-    int art_later;          /* this scan left a cover unmade for want of memory: the next looks again */
-    int retry_unread;       /* library_scan_retry_unread: the next scan reads again the files none could read */
-    int groups_how;         /* library_scan_groups() */
-    char db_path[1024];     /* the database's file, as opened (library_played_later opens it again) */
-    int plays_conn;         /* this connection is the plays' own (PW.conn) */
-};
 
 /* Every connection's own settings. */
 static const char *PRAGMAS =
@@ -118,14 +81,13 @@ static const char *SCHEMA =
 
     "CREATE INDEX IF NOT EXISTS albums_artist ON albums(artist_id, year);";
 
-static void rebuild_groups(library_t *lib);
+static int rebuild_groups(library_t *lib);
+static void meta_set(sqlite3 *db, const char *key, int v);
 static int bulk_end(library_t *lib);
 static void art_del(library_t *lib, int64_t album_id);
 static void art_open(library_t *lib);
-static int64_t get_int_col(library_t *lib, const char *sql, int64_t id);
-static double now_s(void);
 
-static sqlite3_stmt *prep(sqlite3 *db, const char *sql)
+sqlite3_stmt *prep(sqlite3 *db, const char *sql)
 {
     sqlite3_stmt *s = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &s, NULL) != SQLITE_OK) {
@@ -135,192 +97,76 @@ static sqlite3_stmt *prep(sqlite3 *db, const char *sql)
     return s;
 }
 
-static void copy_col(sqlite3_stmt *s, int col, char *out, size_t cap)
+/* A query's one number (its first row's first column), ?1 bound to `bind` if
+ * it has one: `otherwise` when it gives no row or can't be run (said by prep). */
+int64_t db_int(sqlite3 *db, const char *sql, int64_t bind, int64_t otherwise)
+{
+    sqlite3_stmt *s = prep(db, sql);
+    if (!s) return otherwise;
+    sqlite3_bind_int64(s, 1, bind);
+    int64_t v = sqlite3_step(s) == SQLITE_ROW ? sqlite3_column_int64(s, 0) : otherwise;
+    sqlite3_finalize(s);
+    return v;
+}
+
+int64_t get_int_col(library_t *lib, const char *sql, int64_t id) { return db_int(lib->db, sql, id, 0); }
+
+/* A statement run once with ?1 = v and ?2 = id (0, or -1: it couldn't be run or didn't end well) */
+int set_int_col(library_t *lib, const char *sql, int64_t id, int64_t v)
+{
+    sqlite3_stmt *s = prep(lib->db, sql);
+    if (!s) return -1;
+    sqlite3_bind_int64(s, 1, v);
+    sqlite3_bind_int64(s, 2, id);
+    int rc = sqlite3_step(s) == SQLITE_DONE ? 0 : -1;
+    sqlite3_finalize(s);
+    return rc;
+}
+
+/* ...and one with ?1 = id alone */
+int db_run_id(sqlite3 *db, const char *sql, int64_t id)
+{
+    sqlite3_stmt *s = prep(db, sql);
+    if (!s) return -1;
+    sqlite3_bind_int64(s, 1, id);
+    int rc = sqlite3_step(s) == SQLITE_DONE ? 0 : -1;
+    sqlite3_finalize(s);
+    return rc;
+}
+
+void copy_col(sqlite3_stmt *s, int col, char *out, size_t cap)
 {
     const unsigned char *t = sqlite3_column_text(s, col);
     snprintf(out, cap, "%s", t ? (const char *)t : "");
 }
 
-/* SQL fold(text): words for search (text_search_fold). */
+/* Room for one more item in an array of n (room for *cap, each `size` bytes;
+ * doubled when full, `first` to begin with). The array, which may have moved:
+ * NULL when there is no memory for it, and it is then as it was. */
+void *vec_room(void *v, int n, int *cap, int first, size_t size)
+{
+    if (n < *cap) return v;
+    int nc = *cap ? *cap * 2 : first;
+    void *nv = realloc(v, (size_t)nc * size);
+    if (nv) *cap = nc;
+    return nv;
+}
+
+/* The folder a file is in, from its path (NULL: ""), into dir: 1, or 0 for a
+ * path with no '/' in it (dir is then the path). */
+int dir_of(const char *path, char *dir, size_t cap)
+{
+    snprintf(dir, cap, "%s", path ? path : "");
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = '\0';
+    return slash != NULL;
+}
+
 static void sql_sortkey(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 
-static void sql_fold(sqlite3_context *ctx, int argc, sqlite3_value **argv)
-{
-    (void)argc;
-    const unsigned char *in = sqlite3_value_text(argv[0]);
-    char out[1024];
-    text_search_fold(in ? (const char *)in : "", out, sizeof out);
-    sqlite3_result_text(ctx, out, -1, SQLITE_TRANSIENT);
-}
-
-/* ---- Search keys, and how close a name is to what was typed ----
- * Each artist, album and song has a key in its `search` column: its name, its
- * artist's and its album's, each folded (text_search_fold: lower case, no
- * accents, words a space apart), with '|' between them (no fold has one):
- *     exodus|bob marley the wailers|exodus
- * A search reads only these (the songs' from an index of their own,
- * tracks_search: 4 MB for 50,000 songs, where the table's rows are 30 MB and
- * reading them from the card took a second by itself), and what's typed is
- * matched against them as they are: nothing folded or copied per row. */
-#define SKEY_SEP '|'
-
-/* SQL skey(name, artist, album): the key. */
-static void sql_skey(sqlite3_context *ctx, int argc, sqlite3_value **argv)
-{
-    char out[1600];
-    size_t w = 0;
-    for (int i = 0; i < 3; i++) {
-        const unsigned char *in = i < argc ? sqlite3_value_text(argv[i]) : NULL;
-        if (i) out[w++] = SKEY_SEP;
-        text_search_fold(in ? (const char *)in : "", out + w, 500);
-        w += strlen(out + w);
-    }
-    sqlite3_result_text(ctx, out, (int)w, SQLITE_TRANSIENT);
-}
-
-static void sql_search_keep(sqlite3_context *ctx, int argc, sqlite3_value **argv);
-
-typedef struct { const char *p; int n; } tok_t;
-
-/* [s, e) cut into its words (at most max: a longer name's last ones aren't
- * looked at). */
-static int toks_of(const char *s, const char *e, tok_t *t, int max)
-{
-    int n = 0;
-    while (s < e && n < max) {
-        const char *sp = memchr(s, ' ', (size_t)(e - s));
-        if (!sp) sp = e;
-        if (sp > s) t[n++] = (tok_t){s, (int)(sp - s)};
-        s = sp + 1;
-    }
-    return n;
-}
-
-static int tok_is(tok_t t, const char *w, int wl, int whole)
-{
-    return (whole ? t.n == wl : t.n >= wl) && !memcmp(t.p, w, (size_t)wl);
-}
-
-/* The words typed, in order, are the tokens from `at` on (the last one whole
- * only if asked). */
-static int phrase_at(const tok_t *t, int nt, int at, const char *const *w, const int *wl, int n, int last_whole)
-{
-    if (at + n > nt) return 0;
-    for (int k = 0; k < n; k++)
-        if (!tok_is(t[at + k], w[k], wl[k], k < n - 1 || last_whole)) return 0;
-    return 1;
-}
-
-/* A word of [s, e) starts with w. */
-static int span_has(const char *s, const char *e, const char *w, int wl)
-{
-    while (s < e) {
-        if (e - s >= wl && !memcmp(s, w, (size_t)wl)) return 1;
-        const char *sp = memchr(s, ' ', (size_t)(e - s));
-        if (!sp) break;
-        s = sp + 1;
-    }
-    return 0;
-}
-
-/* library_search_tier, of a key. */
-static int tier_of_key(const char *key, const char *const *words, int n, int last_whole)
-{
-    if (n <= 0 || n > 8 || !key) return 0;
-    const char *own_e = strchr(key, SKEY_SEP);
-    if (!own_e) own_e = key + strlen(key);
-    const char *art = *own_e ? own_e + 1 : own_e, *art_e = strchr(art, SKEY_SEP);
-    if (!art_e) art_e = art + strlen(art);
-    const char *alb = *art_e ? art_e + 1 : art_e, *alb_e = alb + strlen(alb);
-    int wl[8], in_own[8], begin = 1, any_own = 0;
-    for (int k = 0; k < n; k++) {
-        wl[k] = (int)strlen(words[k]);
-        in_own[k] = span_has(key, own_e, words[k], wl[k]);
-        /* (most rows end here: a word that's nowhere in them) */
-        if (!in_own[k]) {
-            begin = 0;
-            if (!span_has(art, art_e, words[k], wl[k]) && !span_has(alb, alb_e, words[k], wl[k])) return 0;
-        } else {
-            any_own = 1;
-        }
-    }
-    if (!any_own) return 0;                                  /* an artist's or an album's name alone */
-    if (begin) {                                             /* every word begins a word of the name */
-        tok_t own[48];
-        int no = toks_of(key, own_e, own, 48);
-        int the = no > 1 && own[0].n == 3 && !memcmp(own[0].p, "the", 3);   /* (a leading The passed over, as in the lists) */
-        if (no - the == n && phrase_at(own, no, the, words, wl, n, 1)) return 1;
-        if (no == n && phrase_at(own, no, 0, words, wl, n, 1)) return 1;
-        if (phrase_at(own, no, the, words, wl, n, last_whole) || phrase_at(own, no, 0, words, wl, n, last_whole)) return 2;
-        for (int at = 1; at + n <= no; at++)
-            if (phrase_at(own, no, at, words, wl, n, last_whole)) return 3;
-        int all = 1;
-        for (int k = 0; k < n && all; k++) {
-            int whole = k < n - 1 || last_whole, hit = 0;
-            for (int i = 0; i < no && !hit; i++) hit = tok_is(own[i], words[k], wl[k], whole);
-            all = hit;
-        }
-        return all ? 4 : 5;
-    }
-    /* split between the name and its artist's or album's: one of the words
-     * at least in the name and not in the artist's */
-    for (int k = 0; k < n; k++)
-        if (in_own[k] && !span_has(art, art_e, words[k], wl[k])) return 6;
-    return 0;
-}
-
-int library_search_tier(const char *name, const char *artist, const char *album, const char *const *words, int n,
-                        int last_whole)
-{
-    char key[1600];
-    size_t w = 0;
-    const char *part[3] = {name, artist, album};
-    for (int i = 0; i < 3; i++) {
-        if (i) key[w++] = SKEY_SEP;
-        text_search_fold(part[i] ? part[i] : "", key + w, 500);
-        w += strlen(key + w);
-    }
-    return tier_of_key(key, words, n, last_whole);
-}
-
-/* A song's key and an artist's, as SQL (an album's: index_search). A song's
- * artist: its own and its album's, if that's another. */
-#define SKEY_TRACK(title, artist, album_artist, album) \
-    "skey(" title ", coalesce(" artist ",'')||CASE WHEN " album_artist " IS " artist " THEN '' ELSE ' '||coalesce(" \
-    album_artist ",'') END, " album ")"
-#define SKEY_ARTIST "skey(name, NULL, NULL)"
-
-/* Fill the search columns (only the empty ones, or all after a scan; 2: the
- * empty ones of the songs a scan wrote, temp.g_c, and of albums and artists:
- * not a read of every song for a few new ones, the write lock held). */
-static void index_search(library_t *lib, int only_missing)
-{
-    const char *w = only_missing == 2 ? " WHERE search IS NULL AND id IN (SELECT id FROM temp.g_c)"
-                  : only_missing ? " WHERE search IS NULL" : "";
-    char sql[600];
-    snprintf(sql, sizeof sql, "UPDATE tracks SET search=" SKEY_TRACK("title", "artist", "album_artist", "album") "%s;", w);
-    sqlite3_exec(lib->db, sql, NULL, NULL, NULL);
-    if (only_missing) w = " WHERE search IS NULL";
-    snprintf(sql, sizeof sql,
-             "UPDATE albums SET search=skey(title, (SELECT name FROM artists a WHERE a.id=albums.artist_id), NULL)%s;", w);
-    sqlite3_exec(lib->db, sql, NULL, NULL, NULL);
-    snprintf(sql, sizeof sql, "UPDATE artists SET search=" SKEY_ARTIST "%s;", w);
-    sqlite3_exec(lib->db, sql, NULL, NULL, NULL);
-}
-
-/* user_version: what the database has been brought up to. 5: every column,
- * table and index below is there and the one-off upgrades are done, so
- * later opens (a background scan's, levelling's: each a connection of its
- * own) skip them; they read the tracks table three times over and took the
- * write lock, waiting behind a scan's. 6: the play log (plays). 7: an index for
- * each query a person waits on (the lists, smart playlists, Shuffle all), so
- * none reads the whole tracks table: about 2 s for 50,000 songs on the H2.
- * 8: an artist's songs found from an index (the groups rebuilt only where
- * songs changed). 9: the search keys (name|artist|album, where it was all
- * their words in a row) and the index a search reads the songs' from. */
-#define LIB_SCHEMA_V 9
-#define LIB_STR_(x) #x
-#define LIB_STR(x) LIB_STR_(x)
+/* An album as covers are looked for: library_album_info, library_albums_without_cover */
+#define ALBUM_INFO_SQL "SELECT al.id, al.key, al.title, al.year, ar.name FROM albums al" \
+                       " LEFT JOIN artists ar ON ar.id=al.artist_id"
 
 /* Bring a database from `version` up to LIB_SCHEMA_V. */
 /* How far an upgrade has got (library_set_upgrade_progress) */
@@ -440,10 +286,11 @@ static void migrate(library_t *lib, int version)
      * album keys took the album artist's key (user_version 2: "X feat. Y" and
      * "The X" no longer split an album), or before names followed their tags'
      * spelling (4) */
+    int regroup = 0;                             /* (1: it stopped part way: none of it kept, the next scan's to do) */
     if (!had_composer || !had_credits || version < 4) {   /* (4: names spelled as tagged now) */
         sqlite3_exec(lib->db, "BEGIN", NULL, NULL, NULL);
-        rebuild_groups(lib);
-        sqlite3_exec(lib->db, "PRAGMA user_version=4; COMMIT", NULL, NULL, NULL);
+        regroup = rebuild_groups(lib) != 0;
+        sqlite3_exec(lib->db, regroup ? "ROLLBACK" : "PRAGMA user_version=4; COMMIT", NULL, NULL, NULL);
     }
     /* 3: covers' signatures cover found covers too, and images' dates: noted
      * afresh at the next scan (a found cover kept as it is) */
@@ -458,6 +305,7 @@ static void migrate(library_t *lib, int version)
         "CREATE INDEX IF NOT EXISTS tracks_rg_todo ON tracks(id) WHERE rg_state=0;"
         "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER);",
         NULL, NULL, NULL);
+    if (regroup) meta_set(lib->db, "scan_pending", 2);
     /* the play log: when each song was played (On repeat), a year of it */
     sqlite3_exec(lib->db,
         "CREATE TABLE IF NOT EXISTS plays(track_id INTEGER NOT NULL, at INTEGER NOT NULL);"
@@ -511,17 +359,12 @@ library_t *library_open(const char *db_path, const char *art_dir)
         library_close(lib);
         return NULL;
     }
-    sqlite3_create_function(lib->db, "fold", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_fold, NULL, NULL);
-    sqlite3_create_function(lib->db, "skey", 3, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_skey, NULL, NULL);
-    sqlite3_create_function(lib->db, "search_keep", 2, SQLITE_UTF8, &lib->search_run, sql_search_keep, NULL, NULL);
+    search_register(lib);
     /* how names sort: albums (without "the"), and songs (as titled) */
     static int strip_the = 1;
     sqlite3_create_function(lib->db, "sortkey", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, &strip_the, sql_sortkey, NULL, NULL);
     sqlite3_create_function(lib->db, "songkey", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_sortkey, NULL, NULL);
-    int version = 0;
-    sqlite3_stmt *v = prep(lib->db, "PRAGMA user_version");
-    if (v && sqlite3_step(v) == SQLITE_ROW) version = sqlite3_column_int(v, 0);
-    sqlite3_finalize(v);
+    int version = (int)db_int(lib->db, "PRAGMA user_version", 0, 0);
     if (version < LIB_SCHEMA_V) {
         if (sqlite3_exec(lib->db, SCHEMA, NULL, NULL, &err) != SQLITE_OK) {
             fprintf(stderr, "library: cannot open %s: %s\n", db_path, err ? err : sqlite3_errmsg(lib->db));
@@ -555,7 +398,10 @@ library_t *library_open(const char *db_path, const char *art_dir)
     lib->genre_name = prep(lib->db, "SELECT name FROM genres WHERE id=?");
     lib->composer_name = prep(lib->db, "SELECT name FROM composers WHERE id=?");
     lib->folder_name = prep(lib->db, "SELECT name FROM folders WHERE id=?");
-    if (!lib->row_playlist || !lib->row_pl_track || !lib->row_plays || !lib->track_album || !lib->playlist_name ||
+    lib->artist_counts = prep(lib->db, "SELECT nalbums, ncredit_albums FROM artists WHERE id=?");
+    lib->album_info = prep(lib->db, ALBUM_INFO_SQL " WHERE al.id=?");
+    lib->unread_at = prep(lib->db, "SELECT path FROM cues WHERE kind=3 ORDER BY path LIMIT 1 OFFSET ?");
+    if (!lib->artist_counts || !lib->album_info || !lib->unread_at || !lib->row_playlist || !lib->row_pl_track || !lib->row_plays || !lib->track_album || !lib->playlist_name ||
         !lib->row_album || !lib->row_artist || !lib->row_credited || !lib->row_track || !lib->track_full ||
         !lib->album_name || !lib->artist_name || !lib->row_genre || !lib->row_composer || !lib->row_year ||
         !lib->row_folder || !lib->genre_name || !lib->composer_name || !lib->folder_name) {
@@ -569,8 +415,6 @@ void library_release_memory(library_t *lib)
 {
     if (lib) sqlite3_db_release_memory(lib->db);
 }
-
-static void plays_release(const library_t *lib);
 
 void library_close(library_t *lib)
 {
@@ -597,210 +441,11 @@ void library_close(library_t *lib)
     sqlite3_finalize(lib->row_plays);
     sqlite3_finalize(lib->track_album);
     sqlite3_finalize(lib->playlist_name);
+    sqlite3_finalize(lib->artist_counts);
+    sqlite3_finalize(lib->album_info);
+    sqlite3_finalize(lib->unread_at);
     sqlite3_close(lib->db);
     free(lib);
-}
-
-/* ---------- what the player died on ----------
- * A file whose tags or cover crash the reader, or take all the memory there is
- * (the player is killed), did so again at every start: the scan picks up where
- * it left off, at the same file. Before reading one, its name is noted in a
- * file in RAM (library_set_trying_dir: /tmp on the H2); done, the note goes.
- * A note still there when the next scan starts means the player died on it.
- * Once could be chance (the player killed for want of memory while reading a
- * blameless file): it's tried again. Twice running at the same one: that file
- * is set aside as unreadable (as one that can't be read is: tried again when
- * it changes), that album as having no cover, and the scan carries on.
- *
- * A file that stops the H2 itself (it hangs until the watchdog restarts it)
- * takes the RAM with it. So a run also leaves a mark on the card
- * (library_set_trying_keep: an empty file, written once, when the run reads
- * its first item, and removed at its end). A mark found with no note in RAM
- * means the H2 went down during the last run: this run is "careful", and
- * writes each item's name into the mark before reading it (a write to the
- * card per item: only ever after such a stop). A careful run's mark found at
- * the next start names the item the H2 went down on: once, twice, as above. */
-static char g_trying_dir[256];
-static char g_keep_dir[256];
-
-#define RAM_PRE  "fathom-trying-"
-#define KEEP_PRE "scan-reading-"
-
-/* The runs that leave a mark on the card (each on a thread of its own) */
-static struct keep { const char *what; int careful, marked, fd; } g_keep[] = {
-    {"tags", 0, 0, -1}, {"cover", 0, 0, -1}, {"level", 0, 0, -1},
-};
-
-void library_set_trying_dir(const char *dir)
-{
-    snprintf(g_trying_dir, sizeof g_trying_dir, "%s", dir ? dir : "");
-}
-
-void library_set_trying_keep(const char *dir)
-{
-    snprintf(g_keep_dir, sizeof g_keep_dir, "%s", dir ? dir : "");
-    for (size_t i = 0; i < sizeof g_keep / sizeof g_keep[0]; i++) {
-        if (g_keep[i].fd >= 0) close(g_keep[i].fd);
-        g_keep[i].careful = g_keep[i].marked = 0;
-        g_keep[i].fd = -1;
-    }
-}
-
-static struct keep *keep_slot(const char *what)
-{
-    if (!g_keep_dir[0]) return NULL;
-    for (size_t i = 0; i < sizeof g_keep / sizeof g_keep[0]; i++)
-        if (!strcmp(g_keep[i].what, what)) return &g_keep[i];
-    return NULL;
-}
-
-static void note_path(const char *dir, const char *pre, const char *what, const char *sfx, char *out, size_t cap)
-{
-    snprintf(out, cap, "%s/%s%s%s", dir, pre, what, sfx);
-}
-
-/* A note's text (1; 0: no note, or an empty one) */
-static int note_read(const char *p, char *out, size_t cap)
-{
-    int fd = open(p, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return 0;
-    ssize_t n = read(fd, out, cap - 1);
-    close(fd);
-    if (n <= 0) return 0;
-    out[n] = '\0';                                    /* (the text ends at its own NUL, if earlier) */
-    return out[0] != '\0';
-}
-
-static void dir_sync(const char *dir)
-{
-    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd < 0) return;
-    fsync(fd);
-    close(fd);
-}
-
-/* (durable: on the card, to be there after a reset) */
-static void note_write(const char *dir, const char *p, const char *text, int durable)
-{
-    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0) return;
-    if (write(fd, text, strlen(text) + 1) < 0) { /* (no note: nothing set aside) */ }
-    if (durable) fsync(fd);
-    close(fd);
-    if (durable) dir_sync(dir);
-}
-
-/* A run stopped on `text`: 2 when the stop before it was on the same one
- * (the note WHAT.1, forgotten now), else 1, and it's remembered */
-static int note_again(const char *dir, const char *pre, const char *what, const char *text, int durable)
-{
-    char p[400], before[2048] = "";
-    note_path(dir, pre, what, ".1", p, sizeof p);
-    if (note_read(p, before, sizeof before) && !strcmp(before, text)) {
-        unlink(p);
-        if (durable) dir_sync(dir);
-        return 2;
-    }
-    note_write(dir, p, text, durable);
-    return 1;
-}
-
-/* What the last run of `what` stopped on, its text in out: 0 nothing, 1 for
- * the first time (to be tried once more), 2 twice running (to be set aside).
- * Called once as each run starts: it also says whether this one is careful. */
-static int trying_left(const char *what, char *out, size_t cap)
-{
-    char p[400];
-    struct keep *k = keep_slot(what);
-    if (cap < 2) return 0;
-    if (k) k->careful = 0;
-    if (g_trying_dir[0]) {                            /* the player died (the H2 stayed up) */
-        note_path(g_trying_dir, RAM_PRE, what, "", p, sizeof p);
-        int got = note_read(p, out, cap);
-        unlink(p);
-        if (got) {
-            int r = note_again(g_trying_dir, RAM_PRE, what, out, 0);
-            if (r == 1) fprintf(stderr, "library: the player stopped while on %.200s (%s): once more\n", out, what);
-            return r;
-        }
-    }
-    if (!k) return 0;
-    note_path(g_keep_dir, KEEP_PRE, what, "", p, sizeof p);
-    if (access(p, F_OK) != 0) return 0;
-    k->careful = 1;                                   /* the H2 itself went down during the last run */
-    if (!note_read(p, out, cap)) {
-        fprintf(stderr, "library: the H2 stopped during the last run (%s): each item is noted on the card this time\n", what);
-        return 0;
-    }
-    int r = note_again(g_keep_dir, KEEP_PRE, what, out, 1);
-    if (r == 1) fprintf(stderr, "library: the H2 stopped while on %.200s (%s): once more\n", out, what);
-    return r;
-}
-
-/* What a run stopped on twice running (1, its text in out, and forgotten) */
-int library_trying_left(const char *what, char *out, size_t cap)
-{
-    return trying_left(what, out, cap) == 2;
-}
-
-/* A note kept open while a run of files is read: *fd -1 before the first */
-void library_trying(const char *what, int *fd, const char *text)
-{
-    if (g_trying_dir[0]) {
-        if (*fd < 0) {
-            char p[400];
-            note_path(g_trying_dir, RAM_PRE, what, "", p, sizeof p);
-            *fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        }
-        if (*fd >= 0 && pwrite(*fd, text, strlen(text) + 1, 0) < 0) { /* (no note: nothing set aside) */ }
-    }
-    struct keep *k = keep_slot(what);
-    if (!k) return;
-    int made = 0;
-    if (!k->marked) {                                 /* the run's mark on the card, once */
-        char p[400];
-        note_path(g_keep_dir, KEEP_PRE, what, "", p, sizeof p);
-        k->marked = 1;                                /* (a card that can't be written: not tried per item) */
-        k->fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        if (k->fd < 0) return;
-        made = 1;
-        if (!k->careful) {
-            fsync(k->fd);
-            close(k->fd);
-            k->fd = -1;
-            dir_sync(g_keep_dir);
-            return;
-        }
-    }
-    if (k->careful && k->fd >= 0) {
-        if (pwrite(k->fd, text, strlen(text) + 1, 0) < 0) { /* (as above) */ }
-        fsync(k->fd);
-        if (made) dir_sync(g_keep_dir);
-    }
-}
-
-void library_trying_done(const char *what, int *fd)
-{
-    char p[400];
-    if (g_trying_dir[0]) {
-        if (*fd >= 0) close(*fd);
-        *fd = -1;
-        note_path(g_trying_dir, RAM_PRE, what, "", p, sizeof p);
-        unlink(p);
-    }
-    struct keep *k = keep_slot(what);
-    if (!k) return;
-    if (k->fd >= 0) close(k->fd);
-    k->fd = -1;
-    int gone = 0;                                     /* (a run that read nothing left no mark: nothing written) */
-    note_path(g_keep_dir, KEEP_PRE, what, "", p, sizeof p);
-    gone |= unlink(p) == 0;
-    if (k->careful) {                                 /* (a careful run that ended: its "once" forgotten too) */
-        note_path(g_keep_dir, KEEP_PRE, what, ".1", p, sizeof p);
-        gone |= unlink(p) == 0;
-    }
-    if (gone) dir_sync(g_keep_dir);
-    k->marked = k->careful = 0;
 }
 
 /* ---------- scanning ---------- */
@@ -883,13 +528,9 @@ static int pv_push(pathvec_t *pv, const char *p, const struct stat *st)
 {
     /* (in the library as it is: noted there, its name not kept) */
     if (pv->known && st && known_same(pv->known, p, st)) return 0;
-    if (pv->n == pv->cap) {
-        int nc = pv->cap ? pv->cap * 2 : 1024;
-        pent_t *nv = realloc(pv->v, (size_t)nc * sizeof *nv);
-        if (!nv) { pv->failed = 1; return -1; }
-        pv->v = nv;
-        pv->cap = nc;
-    }
+    pent_t *nv = vec_room(pv->v, pv->n, &pv->cap, 1024, sizeof *nv);
+    if (!nv) { pv->failed = 1; return -1; }
+    pv->v = nv;
     pent_t *e = &pv->v[pv->n];
     memset(e, 0, sizeof *e);
     e->p = pa_dup(pv, p);
@@ -904,9 +545,22 @@ static int pv_push(pathvec_t *pv, const char *p, const struct stat *st)
 /* A cover image beside the music (the walk notes them: build_art) */
 static int art_image(const char *path)
 {
-    const char *dot = strrchr(path, '.'), *slash = strrchr(path, '/');
-    if (!dot || (slash && dot < slash) || (slash ? slash[1] : path[0]) == '.') return 0;
-    return !strcasecmp(dot, ".jpg") || !strcasecmp(dot, ".jpeg") || !strcasecmp(dot, ".png");
+    const char *slash = strrchr(path, '/'), *e = path_ext(path);
+    if ((slash ? slash[1] : path[0]) == '.') return 0;   /* (a hidden file) */
+    return !strcasecmp(e, "jpg") || !strcasecmp(e, "jpeg") || !strcasecmp(e, "png");
+}
+
+/* What the listing takes a file for, by its name: music first, as always
+ * (the walk and the fast walk asked the same four questions, each its own way) */
+enum { FILE_OTHER, FILE_MUSIC, FILE_LIST, FILE_SHEET, FILE_IMAGE };
+
+static int file_kind(const char *path)
+{
+    if (tags_supported(path)) return FILE_MUSIC;
+    if (m3u_supported(path)) return FILE_LIST;
+    if (cue_supported(path)) return FILE_SHEET;
+    if (art_image(path)) return FILE_IMAGE;
+    return FILE_OTHER;
 }
 
 static void pv_free(pathvec_t *pv)
@@ -917,6 +571,15 @@ static void pv_free(pathvec_t *pv)
     }
     free(pv->v);
     memset(pv, 0, sizeof *pv);
+}
+
+/* A scan's four lists (music, playlists, sheets, images) freed */
+static void lists_free(pathvec_t *pv, pathvec_t *plv, pathvec_t *cv, pathvec_t *iv)
+{
+    pv_free(pv);
+    pv_free(plv);
+    pv_free(cv);
+    pv_free(iv);
 }
 
 /* The tracks a scan found, by id (a bit each): those left out at the end
@@ -977,9 +640,8 @@ static int g_known = 1;
 
 void library_test_known(int on) { g_known = on; }
 
-static uint64_t fnv(uint64_t hsh, const void *p, size_t n);
 static int cue_in_tags(const char *path);
-#define SIG_SEED 14695981039346656037ULL
+#define SIG_SEED FNV64_START
 #define SIG_MIX 0x9E3779B97F4A7C15ULL
 
 static int cmp_kent(const void *a, const void *b)
@@ -1036,7 +698,7 @@ static known_t *known_build(sqlite3 *db)
          * don't fit 32 bits go the old way) */
         if (!p || id <= 0 || id > UINT32_MAX || mt < 0 || mt > UINT32_MAX || sz < 0 || sz > UINT32_MAX) continue;
         if (!(v >= TAGS_V || (v >= 1 && !cue_in_tags(p))) || k->n >= rows) continue;
-        k->v[k->n++] = (kent_t){fnv(SIG_SEED, p, strlen(p)), (uint32_t)id, (uint32_t)mt, (uint32_t)sz};
+        k->v[k->n++] = (kent_t){fnv64(SIG_SEED, p, strlen(p)), (uint32_t)id, (uint32_t)mt, (uint32_t)sz};
     }
     sqlite3_finalize(q);
     k->rows = got;
@@ -1058,7 +720,7 @@ static int known_same(known_t *k, const char *p, const struct stat *st)
 {
     int64_t mt = (int64_t)st->st_mtime, sz = (int64_t)st->st_size;
     if (!tags_supported(p)) return 0;           /* (only music: playlists and images are listed whole) */
-    uint64_t h = fnv(SIG_SEED, p, strlen(p));
+    uint64_t h = fnv64(SIG_SEED, p, strlen(p));
     int lo = 0, hi = k->n;
     while (lo < hi) {
         int mid = lo + (hi - lo) / 2;
@@ -1070,8 +732,8 @@ static int known_same(known_t *k, const char *p, const struct stat *st)
     if (idset_has(&k->same, id)) return 0;      /* (listed twice?: the second the old way) */
     idset_add(&k->same, id);
     if (!idset_has(&k->same, id)) return 0;     /* (no memory to note it: the old way) */
-    h = fnv(h, &mt, sizeof mt);
-    h = fnv(h, &sz, sizeof sz);
+    h = fnv64(h, &mt, sizeof mt);
+    h = fnv64(h, &sz, sizeof sz);
     k->sum += h * SIG_MIX;
     k->count++;
     k->n_same++;
@@ -1093,7 +755,7 @@ typedef struct { sqlite3 *db; double since; int open, nice; } batch_t;
  * the UI's and the player's writes waited out. Returns the nice to put back
  * (or NO_NICE: nothing changed). */
 #define NO_NICE (-1000)
-static int lock_boost(void)
+int lock_boost(void)
 {
 #ifdef __linux__
     id_t tid = (id_t)syscall(SYS_gettid);
@@ -1104,7 +766,7 @@ static int lock_boost(void)
     return NO_NICE;
 }
 
-static void lock_unboost(int n)
+void lock_unboost(int n)
 {
 #ifdef __linux__
     if (n != NO_NICE) setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), n);
@@ -1115,10 +777,19 @@ static void lock_unboost(int n)
 
 /* Every statement reset (one left on a row keeps its read open, and a
  * write on that old snapshot fails): only where none is being stepped. */
-static void reset_all(sqlite3 *db)
+void reset_all(sqlite3 *db)
 {
     for (sqlite3_stmt *s = sqlite3_next_stmt(db, NULL); s; s = sqlite3_next_stmt(db, s))
         if (sqlite3_stmt_busy(s)) sqlite3_reset(s);
+}
+
+/* COMMIT: 0, or -1 (a full card), the transaction then rolled back if it is
+ * still open: every later write would sit in it, never committed. */
+int db_commit(sqlite3 *db)
+{
+    if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) return 0;
+    if (!sqlite3_get_autocommit(db)) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    return -1;
 }
 
 /* 0, or -1: its commit failed (a full card), and it was rolled back */
@@ -1126,13 +797,20 @@ static int batch_end(batch_t *b)
 {
     if (!b->open) return 0;
     reset_all(b->db);
-    /* (a commit that fails, a full card: rolled back, or every later batch
-     * would sit in this one, never committed) */
-    int rc = sqlite3_exec(b->db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
-    if (rc && !sqlite3_get_autocommit(b->db)) sqlite3_exec(b->db, "ROLLBACK", NULL, NULL, NULL);
+    int rc = db_commit(b->db);
     b->open = 0;
     lock_unboost(b->nice);
     return rc;
+}
+
+/* The batch given up: nothing of it is kept. */
+static void batch_undo(batch_t *b)
+{
+    if (!b->open) return;
+    reset_all(b->db);
+    sqlite3_exec(b->db, "ROLLBACK", NULL, NULL, NULL);
+    b->open = 0;
+    lock_unboost(b->nice);
 }
 
 /* Before a write. IMMEDIATE: the write lock at once (waiting for another
@@ -1144,25 +822,13 @@ static void batch_write(batch_t *b)
     b->nice = lock_boost();   /* (before: once it has the lock, no moment at nice 19) */
     b->open = sqlite3_exec(b->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK;   /* (else: one at a time) */
     if (!b->open) lock_unboost(b->nice);
-    b->since = now_s();
+    b->since = clock_fsec();
 }
 
 /* What a scan left to do, kept across scans (meta.scan_pending): batches
  * are committed as it goes, so one stopped half way (USB drive mode, a
  * shutdown) leaves tracks that albums, search and playlists don't show
  * yet. 1: composers to count again; 2: groups, playlists and search. */
-static int meta_get(sqlite3 *db, const char *key)
-{
-    sqlite3_stmt *s = prep(db, "SELECT value FROM meta WHERE key=?");
-    int v = 0;
-    if (s) {
-        sqlite3_bind_text(s, 1, key, -1, SQLITE_STATIC);
-        if (sqlite3_step(s) == SQLITE_ROW) v = sqlite3_column_int(s, 0);
-    }
-    sqlite3_finalize(s);
-    return v;
-}
-
 static int64_t meta_get64(sqlite3 *db, const char *key)
 {
     sqlite3_stmt *s = prep(db, "SELECT value FROM meta WHERE key=?");
@@ -1175,6 +841,8 @@ static int64_t meta_get64(sqlite3 *db, const char *key)
     return v;
 }
 
+static int meta_get(sqlite3 *db, const char *key) { return (int)meta_get64(db, key); }
+
 static void meta_set64(sqlite3 *db, const char *key, int64_t v)
 {
     sqlite3_stmt *s = prep(db, "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value");
@@ -1186,16 +854,7 @@ static void meta_set64(sqlite3 *db, const char *key, int64_t v)
     sqlite3_finalize(s);
 }
 
-static void meta_set(sqlite3 *db, const char *key, int v)
-{
-    sqlite3_stmt *s = prep(db, "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value");
-    if (s) {
-        sqlite3_bind_text(s, 1, key, -1, SQLITE_STATIC);
-        sqlite3_bind_int(s, 2, v);
-        sqlite3_step(s);
-    }
-    sqlite3_finalize(s);
-}
+static void meta_set(sqlite3 *db, const char *key, int v) { meta_set64(db, key, v); }
 
 /* A folder or file that's there but couldn't be looked at (the card's
  * reads failing, out of memory or file handles), not one that's gone. */
@@ -1213,7 +872,7 @@ static _Thread_local struct { lib_progress_cb cb; void *ctx; int found, checked;
 static void look_tell(int checking)
 {
     if (!t_look.cb) return;
-    double now = now_s();
+    double now = clock_fsec();
     if (now - t_look.at < g_tell_every) return;
     t_look.at = now;
     if (checking) t_look.cb(t_look.checked, 0, "checking", t_look.ctx);
@@ -1245,23 +904,23 @@ static void walk(const char *dir, pathvec_t *pv, pathvec_t *plv, pathvec_t *cv, 
         if (e->d_name[0] == '.') continue;
         snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
         /* the listing says what's a folder: only music, playlists and CUE sheets are looked up */
-        int music = tags_supported(path), list = !music && m3u_supported(path), cue = !music && cue_supported(path);
-        int image = !music && !list && !cue && iv && art_image(path);
-        if (e->d_type != DT_UNKNOWN && e->d_type != DT_DIR && !music && !list && !cue && !image) continue;
+        int kind = file_kind(path);
+        if (kind == FILE_IMAGE && !iv) kind = FILE_OTHER;   /* (no images wanted from here) */
+        if (e->d_type != DT_UNKNOWN && e->d_type != DT_DIR && kind == FILE_OTHER) continue;
         struct stat st;
         if (stat(path, &st)) {
             if (walk_error(errno)) pv->failed = 1;
             continue;
         }
         if (S_ISDIR(st.st_mode)) walk(path, pv, plv, cv, iv, depth + 1, cancel);
-        else if (S_ISREG(st.st_mode) && music) {
+        else if (S_ISREG(st.st_mode) && kind == FILE_MUSIC) {
             pv_push(pv, path, &st);
             t_look.found++;
             look_tell(0);
         }
-        else if (S_ISREG(st.st_mode) && list) pv_push(plv, path, &st);
-        else if (S_ISREG(st.st_mode) && cue) pv_push(cv, path, &st);
-        else if (S_ISREG(st.st_mode) && image) pv_push(iv, path, &st);
+        else if (S_ISREG(st.st_mode) && kind == FILE_LIST) pv_push(plv, path, &st);
+        else if (S_ISREG(st.st_mode) && kind == FILE_SHEET) pv_push(cv, path, &st);
+        else if (S_ISREG(st.st_mode) && kind == FILE_IMAGE) pv_push(iv, path, &st);
     }
     closedir(d);
 }
@@ -1286,14 +945,15 @@ static int fw_file(const char *path, int64_t mtime, int64_t size, void *ctx)
     struct stat st = {0};
     st.st_mtime = (time_t)mtime;
     st.st_size = (off_t)size;
-    if (tags_supported(path)) {
+    int kind = file_kind(path);
+    if (kind == FILE_MUSIC) {
         pv_push(c->pv, path, &st);
         t_look.found++;
         look_tell(0);
     }
-    else if (m3u_supported(path)) pv_push(c->plv, path, &st);
-    else if (cue_supported(path)) pv_push(c->cv, path, &st);
-    else if (art_image(path)) pv_push(c->iv, path, &st);
+    else if (kind == FILE_LIST) pv_push(c->plv, path, &st);
+    else if (kind == FILE_SHEET) pv_push(c->cv, path, &st);
+    else if (kind == FILE_IMAGE) pv_push(c->iv, path, &st);
     return *c->cancel;
 }
 
@@ -1337,7 +997,9 @@ static int fw_check(pent_t *e, int64_t lib_mtime, int64_t lib_size)
 }
 
 static int pv_find(const pathvec_t *pv, const char *p);
-static int cue_in_tags(const char *path);
+
+static int g_test_against_fails;
+void library_test_against_fails(int at_row) { g_test_against_fails = at_row; }
 
 static int against_library(library_t *lib, pathvec_t *pv, pathvec_t *cv, int verify)
 {
@@ -1348,7 +1010,8 @@ static int against_library(library_t *lib, pathvec_t *pv, pathvec_t *cv, int ver
         sqlite3_stmt *s = prep(lib->db, pass == 0 ? "SELECT path, mtime, size, id, tags_v FROM tracks WHERE cue=0"
                                                   : "SELECT path, mtime, size, 0, 0, kind FROM cues");
         if (!s) return -1;
-        while (!bad && sqlite3_step(s) == SQLITE_ROW) {
+        int rc = SQLITE_DONE, rows = 0;
+        while (!bad && (rc = g_test_against_fails && ++rows == g_test_against_fails ? SQLITE_IOERR : sqlite3_step(s)) == SQLITE_ROW) {
             const char *p = (const char *)sqlite3_column_text(s, 0);
             if (!p) continue;
             pent_t *e = NULL;
@@ -1377,6 +1040,15 @@ static int against_library(library_t *lib, pathvec_t *pv, pathvec_t *cv, int ver
             }
         }
         sqlite3_finalize(s);
+        /* The fast walk's list is only as good as this check of it: one that
+         * stopped at a failed step (the card not answering, no memory) has
+         * checked nothing past that row. Ended there as at the table's end,
+         * a list with a folder missing was taken, and that folder's songs
+         * dropped as gone. */
+        if (verify && !bad && rc != SQLITE_DONE) {
+            fprintf(stderr, "library: fast walk: the check against the library stopped (%d): the folders walked\n", rc);
+            bad = 1;
+        }
     }
     if (bad) return -1;
     for (int i = 0; i < pv->n; i++) added += pv->v[i].st == ST_NEW;
@@ -1410,9 +1082,9 @@ static uint64_t listing_sig(const pathvec_t *const *v, int nv)
     for (int k = 0; k < nv; k++)
         for (int i = 0; i < v[k]->n; i++, n++) {
             const pent_t *e = &v[k]->v[i];
-            uint64_t h = fnv(SIG_SEED + (uint64_t)k, e->p, strlen(e->p));
-            h = fnv(h, &e->mtime, sizeof e->mtime);
-            h = fnv(h, &e->size, sizeof e->size);
+            uint64_t h = fnv64(SIG_SEED + (uint64_t)k, e->p, strlen(e->p));
+            h = fnv64(h, &e->mtime, sizeof e->mtime);
+            h = fnv64(h, &e->size, sizeof e->size);
             sum += h * SIG_MIX;
         }
     sum ^= n * 0xC2B2AE3D27D4EB4FULL;
@@ -1450,13 +1122,20 @@ static int fast_walk(library_t *lib, const char *root, pathvec_t *pv, pathvec_t 
         if (known && cv->n) return 1;            /* (a sheet: listed again the old way, by the scan) */
         if (against_library(lib, pv, cv, 1) >= 0) return 1;
     }
-    pv_free(pv);
+    lists_free(pv, plv, cv, iv);
     known_reset(known);
     pv->known = known;
-    pv_free(plv);
-    pv_free(cv);
-    pv_free(iv);
     return 0;
+}
+
+/* The music folder listed: the fast walk if it may be used and will do (1),
+ * else the folder walked (0). */
+static int list_music(library_t *lib, const char *root, int allow_fast, pathvec_t *pv, pathvec_t *plv, pathvec_t *cv,
+                      pathvec_t *iv)
+{
+    int fast = allow_fast ? fast_walk(lib, root, pv, plv, cv, iv) : 0;
+    if (!fast) walk(root, pv, plv, cv, iv, 0, &lib->cancel);
+    return fast;
 }
 
 /* A table's row for key (made if new): its id. The two statements are kept
@@ -1521,7 +1200,7 @@ static void sort_key_ex(const char *in, char *out, size_t cap, int strip_the)
     if (strip_the && !strncmp(out, "the ", 4)) memmove(out, out + 4, strlen(out + 4) + 1);
 }
 
-static void sort_key(const char *in, char *out, size_t cap) { sort_key_ex(in, out, cap, 1); }
+void sort_key(const char *in, char *out, size_t cap) { sort_key_ex(in, out, cap, 1); }
 
 static void sql_sortkey(sqlite3_context *ctx, int argc, sqlite3_value **argv)
 {
@@ -1545,13 +1224,32 @@ static void exec_said(sqlite3 *db, const char *sql)
             return;
         }
         if (q) {
-            double t0 = now_s();
+            double t0 = clock_fsec();
             while (sqlite3_step(q) == SQLITE_ROW) { }
             sqlite3_finalize(q);
-            if (now_s() - t0 >= 1.0) fprintf(stderr, "library: groups: %.1f s: %.90s\n", now_s() - t0, sql);
+            if (clock_fsec() - t0 >= 1.0) fprintf(stderr, "library: groups: %.1f s: %.90s\n", clock_fsec() - t0, sql);
         }
         sql = tail;
     }
+}
+
+/* A step of one of the groups' passes over the songs. A pass has its end at
+ * SQLITE_DONE only: one that stopped at a failed step (a read the card didn't
+ * answer, no memory, busy) has grouped the songs up to there, and nothing of
+ * what it made is kept. (Taken for the end, it left the albums past that point
+ * without year or folder, their artists without a name, their folders deleted,
+ * and the scan noted the groups as done: so they stayed until those songs
+ * changed.) */
+static int g_test_groups_fail, g_test_groups_steps;
+void library_test_groups_fail(int at_step) { g_test_groups_fail = at_step; g_test_groups_steps = 0; }
+
+static int grp_step(sqlite3_stmt *q)
+{
+    if (g_test_groups_fail) {
+        int n = ++g_test_groups_steps;
+        if (g_test_groups_fail > 0 ? n >= g_test_groups_fail : n == -g_test_groups_fail) return SQLITE_IOERR;
+    }
+    return sqlite3_step(q);
 }
 
 /* Rebuild album/artist links from track tags (keys from library/keys.c). */
@@ -1581,7 +1279,63 @@ static int64_t folder_id(sqlite3 *db, sqlite3_stmt *up, sqlite3_stmt *get, const
     sqlite3_step(up);
     sqlite3_reset(get);
     sqlite3_bind_text(get, 1, dir, -1, SQLITE_TRANSIENT);
-    return sqlite3_step(get) == SQLITE_ROW ? sqlite3_column_int64(get, 0) : 0;
+    int64_t id = sqlite3_step(get) == SQLITE_ROW ? sqlite3_column_int64(get, 0) : 0;
+    /* (not left on its row: a statement still reading made the counts'
+     * "DROP TABLE temp.fcount" fail, unsaid; the table stayed, and at this
+     * connection's next full rebuild its making failed and the folders'
+     * counts weren't written: songs added since showed as 0 in Folders) */
+    sqlite3_reset(get);
+    return id;
+}
+
+/* The folder at dir, which is root or below it (a dir shorter than root: root's own): its id */
+static int64_t folder_under(sqlite3 *db, sqlite3_stmt *up, sqlite3_stmt *get, const char *dir, const char *root)
+{
+    return folder_id(db, up, get, strlen(dir) >= strlen(root) ? dir : root, root);
+}
+
+/* What folder_id runs (a folder's row found or made), and a song given its folder */
+#define FOLDER_PUT_SQL "INSERT INTO folders(path, parent, name, sort, seen) VALUES(?,?,?,?,1)" \
+                       " ON CONFLICT(path) DO UPDATE SET parent=excluded.parent, name=excluded.name," \
+                       " sort=excluded.sort, seen=1"
+#define FOLDER_GET_SQL "SELECT id FROM folders WHERE path=?"
+
+typedef struct { sqlite3_stmt *up, *get, *ut; } folder_stmts_t;
+
+static int folder_stmts_prep(sqlite3 *db, folder_stmts_t *f)
+{
+    f->up = prep(db, FOLDER_PUT_SQL);
+    f->get = prep(db, FOLDER_GET_SQL);
+    f->ut = prep(db, "UPDATE tracks SET folder_id=? WHERE id=?");
+    return f->up && f->get && f->ut ? 0 : -1;
+}
+
+static void folder_stmts_free(folder_stmts_t *f)
+{
+    sqlite3_finalize(f->up);
+    sqlite3_finalize(f->get);
+    sqlite3_finalize(f->ut);
+}
+
+/* The song of q's row (its id, path, folder_id) put in folder fid, if it isn't there */
+static void folder_put_track(folder_stmts_t *f, sqlite3_stmt *q, int64_t fid)
+{
+    if (sqlite3_column_type(q, 2) == SQLITE_NULL || sqlite3_column_int64(q, 2) != fid) {
+        sqlite3_reset(f->ut);
+        sqlite3_bind_int64(f->ut, 1, fid);
+        sqlite3_bind_int64(f->ut, 2, sqlite3_column_int64(q, 0));
+        sqlite3_step(f->ut);
+    }
+}
+
+/* What the paths a and b share, up to its last '/', into out ("" if nothing; b may be NULL) */
+static void common_dir(const char *a, const char *b, char *out, size_t cap)
+{
+    size_t n = 0, cut = 0;
+    while (a[n] && b && a[n] == b[n]) { if (a[n] == '/') cut = n; n++; }
+    if (cut >= cap) cut = cap - 1;
+    memcpy(out, a, cut);
+    out[cut] = '\0';
 }
 
 /* The folder all the tracks share (up to its last '/'): "" if none */
@@ -1589,57 +1343,43 @@ static void folders_root(sqlite3 *db, char *root, size_t cap)
 {
     root[0] = '\0';
     sqlite3_stmt *ends = prep(db, "SELECT MIN(path), MAX(path) FROM tracks");
-    if (ends && sqlite3_step(ends) == SQLITE_ROW && sqlite3_column_text(ends, 0)) {
-        const char *a = (const char *)sqlite3_column_text(ends, 0), *b = (const char *)sqlite3_column_text(ends, 1);
-        size_t n = 0, cut = 0;   /* the common part, up to its last '/' */
-        while (a[n] && b && a[n] == b[n]) { if (a[n] == '/') cut = n; n++; }
-        if (cut >= cap) cut = cap - 1;
-        memcpy(root, a, cut);
-        root[cut] = '\0';
-    }
+    if (ends && sqlite3_step(ends) == SQLITE_ROW && sqlite3_column_text(ends, 0))
+        common_dir((const char *)sqlite3_column_text(ends, 0), (const char *)sqlite3_column_text(ends, 1), root, cap);
     sqlite3_finalize(ends);
 }
 
 /* Folders: the tree of the tracks' folders, from the folder they all share.
  * counts_only: every song has its folder already (a first scan that set it
- * as the song was added, from the same root); only the counts are left. */
-static void rebuild_folders(sqlite3 *db, int counts_only)
+ * as the song was added, from the same root); only the counts are left.
+ * 0, or -1: the pass over the songs didn't reach its end (the caller keeps
+ * nothing of it). */
+static int rebuild_folders(sqlite3 *db, int counts_only)
 {
     char root[1024];
     folders_root(db, root, sizeof root);
     sqlite3_stmt *q = prep(db, "SELECT id, path, folder_id FROM tracks ORDER BY path");
-    sqlite3_stmt *up = prep(db, "INSERT INTO folders(path, parent, name, sort, seen) VALUES(?,?,?,?,1)"
-                                " ON CONFLICT(path) DO UPDATE SET parent=excluded.parent, name=excluded.name,"
-                                " sort=excluded.sort, seen=1");
-    sqlite3_stmt *get = prep(db, "SELECT id FROM folders WHERE path=?");
-    sqlite3_stmt *ut = prep(db, "UPDATE tracks SET folder_id=? WHERE id=?");
-    if (q && up && get && ut) {
-        double t0 = now_s();
+    folder_stmts_t f;
+    int rc = folder_stmts_prep(db, &f) == 0 && q ? SQLITE_DONE : SQLITE_NOMEM;
+    if (rc == SQLITE_DONE) {
+        double t0 = clock_fsec();
         if (!counts_only) sqlite3_exec(db, "UPDATE folders SET seen=0", NULL, NULL, NULL);
         char dir[1024], last[1024] = "";
         int64_t fid = 0;
-        while (!counts_only && sqlite3_step(q) == SQLITE_ROW) {
-            const char *path = (const char *)sqlite3_column_text(q, 1);
-            snprintf(dir, sizeof dir, "%s", path ? path : "");
-            char *slash = strrchr(dir, '/');
-            if (slash) *slash = '\0';
+        while (!counts_only && (rc = grp_step(q)) == SQLITE_ROW) {
+            dir_of((const char *)sqlite3_column_text(q, 1), dir, sizeof dir);
             if (strcmp(dir, last)) {
-                fid = folder_id(db, up, get, strlen(dir) >= strlen(root) ? dir : root, root);
+                fid = folder_under(db, f.up, f.get, dir, root);
                 snprintf(last, sizeof last, "%s", dir);
             }
-            if (sqlite3_column_type(q, 2) == SQLITE_NULL || sqlite3_column_int64(q, 2) != fid) {
-                sqlite3_reset(ut);
-                sqlite3_bind_int64(ut, 1, fid);
-                sqlite3_bind_int64(ut, 2, sqlite3_column_int64(q, 0));
-                sqlite3_step(ut);
-            }
+            folder_put_track(&f, q, fid);
         }
-        if (now_s() - t0 >= 1.0) fprintf(stderr, "library: groups: %.1f s: each song's folder\n", now_s() - t0);
+        if (clock_fsec() - t0 >= 1.0) fprintf(stderr, "library: groups: %.1f s: each song's folder\n", clock_fsec() - t0);
         /* Songs in each folder and those below it: every track counted once
          * for its folder and each folder above (one walk up the tree per
          * track, not a pass over all tracks per folder: that re-read the
-         * table from the card for minutes on the H2) */
-        exec_said(db,
+         * table from the card for minutes on the H2). (Not after a pass that
+         * stopped: the folders it didn't come to would go as unseen.) */
+        if (rc == SQLITE_DONE) exec_said(db,
             "DELETE FROM folders WHERE seen=0;"
             "DROP TABLE IF EXISTS temp.fcount;"
             /* (keyed: the UPDATE below read the whole of it for every folder,
@@ -1655,30 +1395,68 @@ static void rebuild_folders(sqlite3 *db, int counts_only)
             "DROP TABLE temp.fcount;");
     }
     sqlite3_finalize(q);
-    sqlite3_finalize(up);
-    sqlite3_finalize(get);
-    sqlite3_finalize(ut);
+    folder_stmts_free(&f);
+    return rc == SQLITE_DONE ? 0 : -1;
 }
 
-/* Composers: by name as tagged, ids kept from scan to scan. On its own when
- * only composers were read (an upgraded library's first scan). */
+/* Genres and Composers are made the same way: by name as tagged, ids kept
+ * from scan to scan. Their SQL, for table T ("genres") of the tracks' column
+ * C ("genre", whose id is C_id):
+ * NAMED_NEW_SQL: the names not there yet made, and each song given its own;
+ * NAMED_COUNT_SQL: their albums counted, the empty ones removed;
+ * NAMED_SPELL_SQL: the spelling as tagged now (names match ignoring case: a
+ *   retag from "j. s. bach" to "J. S. Bach" was the same row, kept as first
+ *   seen; compared exactly, or the column's NOCASE took them as equal);
+ * NAMED_CHANGED_SQL: all three for the changed songs only (temp.g_c, and what
+ *   they belonged to, temp.g_old), their names old and new noted in temp.G;
+ * NAMED_PUT_SQL, NAMED_GET_SQL: one name (?1) made if new, and its id. */
+#define NAMED_NEW_SQL(T, C) \
+    "INSERT OR IGNORE INTO " T "(name) SELECT DISTINCT TRIM(" C ") FROM tracks WHERE TRIM(COALESCE(" C ",''))<>'';" \
+    "UPDATE tracks SET " C "_id=(SELECT id FROM " T " WHERE name=TRIM(tracks." C "))" \
+    " WHERE " C "_id IS NOT (SELECT id FROM " T " WHERE name=TRIM(tracks." C "));"
+#define NAMED_COUNT_SQL(T, C) \
+    "UPDATE " T " SET nalbums=(SELECT COUNT(DISTINCT album_id) FROM tracks WHERE " C "_id=" T ".id)," \
+    " sort=COALESCE(sort, fold(name));" \
+    "DELETE FROM " T " WHERE nalbums=0;"
+#define NAMED_SPELL_SQL(T, C) \
+    "UPDATE " T " SET name=(SELECT TRIM(" C ") FROM tracks WHERE " C "_id=" T ".id ORDER BY path LIMIT 1)" \
+    " WHERE name COLLATE BINARY IS NOT (SELECT TRIM(" C ") FROM tracks WHERE " C "_id=" T ".id ORDER BY path LIMIT 1);"
+#define NAMED_CHANGED_SQL(T, C, G) \
+    "INSERT OR IGNORE INTO main." T "(name) SELECT DISTINCT TRIM(" C ") FROM main.tracks" \
+    " WHERE id IN (SELECT id FROM temp.g_c) AND TRIM(COALESCE(" C ",''))<>'';" \
+    "UPDATE main.tracks SET " C "_id=(SELECT id FROM main." T " WHERE name=TRIM(tracks." C "))" \
+    " WHERE id IN (SELECT id FROM temp.g_c) AND " C "_id IS NOT (SELECT id FROM main." T " WHERE name=TRIM(tracks." C "));" \
+    "CREATE TEMP TABLE " G " AS SELECT " C "_id AS id FROM temp.g_old WHERE " C "_id IS NOT NULL" \
+    " UNION SELECT " C "_id FROM main.tracks WHERE id IN (SELECT id FROM temp.g_c) AND " C "_id IS NOT NULL;" \
+    "UPDATE main." T " SET nalbums=(SELECT COUNT(DISTINCT album_id) FROM main.tracks WHERE " C "_id=" T ".id)," \
+    " sort=COALESCE(sort, fold(name)) WHERE id IN (SELECT id FROM temp." G ");" \
+    "DELETE FROM main." T " WHERE nalbums=0 AND id IN (SELECT id FROM temp." G ");" \
+    "UPDATE main." T " SET name=(SELECT TRIM(" C ") FROM main.tracks WHERE " C "_id=" T ".id ORDER BY path LIMIT 1)" \
+    " WHERE id IN (SELECT id FROM temp." G ") AND name COLLATE BINARY IS NOT" \
+    " (SELECT TRIM(" C ") FROM main.tracks WHERE " C "_id=" T ".id ORDER BY path LIMIT 1);"
+#define NAMED_PUT_SQL(T) "INSERT OR IGNORE INTO " T "(name) SELECT TRIM(?1) WHERE TRIM(COALESCE(?1,''))<>''"
+#define NAMED_GET_SQL(T) "SELECT id FROM " T " WHERE name=TRIM(?1)"
+
+/* A whole table of them (the three statements above, in order); counts_only:
+ * every song has its name's id already, spelled as its first song spells it. */
+static void named_groups(sqlite3 *db, const char *fresh, const char *count, const char *spell, int counts_only)
+{
+    if (!counts_only) exec_said(db, fresh);
+    exec_said(db, count);
+    if (!counts_only) exec_said(db, spell);
+}
+
+static void rebuild_genres(sqlite3 *db, int counts_only)
+{
+    named_groups(db, NAMED_NEW_SQL("genres", "genre"), NAMED_COUNT_SQL("genres", "genre"), NAMED_SPELL_SQL("genres", "genre"),
+                 counts_only);
+}
+
+/* (On its own when only composers were read: an upgraded library's first scan.) */
 static void rebuild_composers(sqlite3 *db, int counts_only)
 {
-    if (!counts_only) exec_said(db,
-        "INSERT OR IGNORE INTO composers(name) SELECT DISTINCT TRIM(composer) FROM tracks"
-        " WHERE TRIM(COALESCE(composer,''))<>'';"
-        "UPDATE tracks SET composer_id=(SELECT id FROM composers WHERE name=TRIM(tracks.composer))"
-        " WHERE composer_id IS NOT (SELECT id FROM composers WHERE name=TRIM(tracks.composer));");
-    exec_said(db,
-        "UPDATE composers SET nalbums=(SELECT COUNT(DISTINCT album_id) FROM tracks WHERE composer_id=composers.id),"
-        " sort=COALESCE(sort, fold(name));"
-        "DELETE FROM composers WHERE nalbums=0;");
-    if (!counts_only) exec_said(db,
-        /* the spelling as tagged now (names match ignoring case: a retag from
-         * "j. s. bach" to "J. S. Bach" was the same row, kept as first seen;
-         * compared exactly, or the column's NOCASE took them as equal) */
-        "UPDATE composers SET name=(SELECT TRIM(composer) FROM tracks WHERE composer_id=composers.id ORDER BY path LIMIT 1)"
-        " WHERE name COLLATE BINARY IS NOT (SELECT TRIM(composer) FROM tracks WHERE composer_id=composers.id ORDER BY path LIMIT 1);");
+    named_groups(db, NAMED_NEW_SQL("composers", "composer"), NAMED_COUNT_SQL("composers", "composer"),
+                 NAMED_SPELL_SQL("composers", "composer"), counts_only);
 }
 
 /* A track's keys, as browsing groups it: its artist (the shuffle's spread),
@@ -1804,6 +1582,17 @@ static int grp_mark(grp_t *g, int64_t artist, unsigned char bit)
 #define GRP_AA 1      /* seen as an album artist (its first spelling there wins) */
 #define GRP_NAMED 2   /* has a name from this pass */
 
+/* An artist's row given its name and sort key (un: g->ur, which keeps a name
+ * it has, or g->ura, which takes this one) */
+static void grp_name(sqlite3_stmt *un, const char *name, const char *key, int64_t artist)
+{
+    sqlite3_reset(un);
+    sqlite3_bind_text(un, 1, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(un, 2, key, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(un, 3, artist);
+    sqlite3_step(un);
+}
+
 /* The row of q: id, artist, album_artist, album, year, path, title, album_id, artist_id */
 static void grp_track(grp_t *g, sqlite3_stmt *q)
 {
@@ -1830,23 +1619,12 @@ static void grp_track(grp_t *g, sqlite3_stmt *q)
         /* (named already, and not for the first time as an album artist: the
          * statement would keep the name it has) */
         int named = grp_mark(g, album_artist, GRP_NAMED);
-        if (first_aa || !named || g_grp_plain) {
-            sqlite3_stmt *un = first_aa ? g->ura : g->ur;
-            sqlite3_reset(un);
-            sqlite3_bind_text(un, 1, k.various ? "Various Artists" : album_artist_name, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(un, 2, k.aakey, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(un, 3, album_artist);
-            sqlite3_step(un);
-        }
+        if (first_aa || !named || g_grp_plain)
+            grp_name(first_aa ? g->ura : g->ur, k.various ? "Various Artists" : album_artist_name, k.aakey, album_artist);
     }
     if (track_artist != album_artist && GRP_MINE(g->artists, track_artist) &&
-        (!grp_mark(g, track_artist, GRP_NAMED) || g_grp_plain)) {
-        sqlite3_reset(g->ur);
-        sqlite3_bind_text(g->ur, 1, *artist ? artist : "Unknown artist", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(g->ur, 2, k.akey, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(g->ur, 3, track_artist);
-        sqlite3_step(g->ur);
-    }
+        (!grp_mark(g, track_artist, GRP_NAMED) || g_grp_plain))
+        grp_name(g->ur, *artist ? artist : "Unknown artist", k.akey, track_artist);
 
     /* The album's row: as the track before left it (the same album, title and
      * artist, and no earlier year): nothing to write */
@@ -1876,9 +1654,7 @@ static void grp_track(grp_t *g, sqlite3_stmt *q)
     }
     if (GRP_MINE(g->albums, album_id) && !album_same) {
         char dir[1024], sort[300];
-        snprintf(dir, sizeof dir, "%s", path ? path : "");
-        char *slash = strrchr(dir, '/');
-        if (slash) *slash = '\0';
+        dir_of(path, dir, sizeof dir);
         sort_key(album, sort, sizeof sort);
         sqlite3_reset(g->ua);
         sqlite3_bind_text(g->ua, 1, album, -1, SQLITE_TRANSIENT);
@@ -1902,13 +1678,7 @@ static void grp_track(grp_t *g, sqlite3_stmt *q)
         int64_t cid = !g_grp_plain && g->k_id[0] > 0 && !strcmp(g->k_key[0], ckey) ? g->k_id[0]
                     : !g_grp_plain && g->k_id[1] > 0 && !strcmp(g->k_key[1], ckey) ? g->k_id[1]
                     : upsert_key(&g->u_art, ckey);
-        if (GRP_MINE(g->artists, cid) && (!grp_mark(g, cid, GRP_NAMED) || g_grp_plain)) {
-            sqlite3_reset(g->ur);
-            sqlite3_bind_text(g->ur, 1, names[i], -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(g->ur, 2, ckey, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(g->ur, 3, cid);
-            sqlite3_step(g->ur);
-        }
+        if (GRP_MINE(g->artists, cid) && (!grp_mark(g, cid, GRP_NAMED) || g_grp_plain)) grp_name(g->ur, names[i], ckey, cid);
         sqlite3_reset(g->uc);
         sqlite3_bind_int64(g->uc, 1, cid);
         sqlite3_bind_int64(g->uc, 2, tid);
@@ -1929,7 +1699,7 @@ static void grp_track(grp_t *g, sqlite3_stmt *q)
     }
 }
 
-static void groups_counts(library_t *lib, double *t_folders, int as_added);
+static int groups_counts(library_t *lib, double *t_folders, int as_added);
 
 /* The albums-and-artists step says it is at work, a few times a second:
  * cb(done, total, "sorting") while it goes through the songs one by one
@@ -1943,7 +1713,7 @@ static _Thread_local struct { lib_progress_cb cb; void *ctx; int tick; double at
 static void grp_tell(int done, int total)
 {
     if (!t_grp.cb) return;
-    double now = now_s();
+    double now = clock_fsec();
     if (now - t_grp.at < g_tell_every) return;
     t_grp.at = now;
     if (total > 0) t_grp.cb(done, total, "sorting", t_grp.ctx);
@@ -1965,7 +1735,7 @@ static void grp_watch(sqlite3 *db, lib_progress_cb cb, void *ctx)
     t_grp.cb = cb;
     t_grp.ctx = ctx;
     t_grp.tick = 0;
-    t_grp.at = now_s();
+    t_grp.at = clock_fsec();
     sqlite3_progress_handler(db, 20000, grp_busy, NULL);
 }
 
@@ -1976,14 +1746,16 @@ static void grp_unwatch(sqlite3 *db)
     t_grp.cb = NULL;
 }
 
-static void rebuild_groups(library_t *lib)
+/* 0, or -1: one of its passes didn't reach its end, and the groups are half
+ * made: the caller rolls back what it runs in. */
+static int rebuild_groups(library_t *lib)
 {
     sqlite3 *db = lib->db;
-    double t0 = now_s(), t1 = t0, t2 = t0;
+    double t0 = clock_fsec(), t1 = t0, t2 = t0;
     sqlite3_stmt *q = prep(db, "SELECT id, artist, album_artist, album, year, path, title, album_id, artist_id"
                                " FROM tracks ORDER BY path");
     grp_t g;
-    if (!q || grp_open(&g, db)) { sqlite3_finalize(q); return; }
+    if (!q || grp_open(&g, db)) { sqlite3_finalize(q); return -1; }
 
     sqlite3_exec(db, "UPDATE albums SET year=0, dir=NULL, first_track=NULL;"
                      "UPDATE tracks SET sort=songkey(COALESCE(title,'')) WHERE sort IS NOT songkey(COALESCE(title,''));",
@@ -1996,16 +1768,22 @@ static void rebuild_groups(library_t *lib)
     sqlite3_exec(db, "UPDATE artists SET name=NULL", NULL, NULL, NULL);
     int total = t_grp.cb ? (int)get_int_col(lib, "SELECT COUNT(*) FROM tracks", 0) : 0, at = 0;
     t_grp.counting = total > 0;
-    while (sqlite3_step(q) == SQLITE_ROW) {
+    int rc;
+    while ((rc = grp_step(q)) == SQLITE_ROW) {
         grp_track(&g, q);
         if (total > 0) grp_tell(++at, total);
     }
     t_grp.counting = 0;
-    t1 = now_s();
+    t1 = clock_fsec();
     sqlite3_finalize(q);
     grp_close(&g);
-    groups_counts(lib, &t2, 0);
-    fprintf(stderr, "library: groups: tracks %.2f s, counts %.2f s, folders %.2f s\n", t1 - t0, t2 - t1, now_s() - t2);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "library: groups: the pass over the songs stopped (%d): none of it kept\n", rc);
+        return -1;
+    }
+    if (groups_counts(lib, &t2, 0)) return -1;
+    fprintf(stderr, "library: groups: tracks %.2f s, counts %.2f s, folders %.2f s\n", t1 - t0, t2 - t1, clock_fsec() - t2);
+    return 0;
 }
 
 /* What follows the tracks' pass: each album's and artist's counts, the ones
@@ -2014,16 +1792,19 @@ static void rebuild_groups(library_t *lib)
  * as_added, 1: each song has its genre and composer already, their names as
  * the first song in path order spells them (what the statements left out
  * here would find, reading every song again: 15 s on the H2 with 50,000);
- * 2: its folder as well. */
-static void groups_counts(library_t *lib, double *t_folders, int as_added)
+ * 2: its folder as well. 0, or -1: a pass didn't reach its end (the caller
+ * rolls back). */
+static int groups_counts(library_t *lib, double *t_folders, int as_added)
 {
     sqlite3 *db = lib->db;
     exec_said(db, "UPDATE albums SET ntracks=(SELECT COUNT(*) FROM tracks WHERE album_id=albums.id)");
     /* Albums gone: their covers too. SQLite gives the next new album the
      * highest id again, and a coverless one showed the old album's cover. */
     sqlite3_stmt *gone = prep(db, "SELECT id FROM albums WHERE ntracks=0");
-    while (gone && sqlite3_step(gone) == SQLITE_ROW) art_del(lib, sqlite3_column_int64(gone, 0));
+    int rc = SQLITE_NOMEM;
+    while (gone && (rc = grp_step(gone)) == SQLITE_ROW) art_del(lib, sqlite3_column_int64(gone, 0));
     sqlite3_finalize(gone);
+    if (rc != SQLITE_DONE) return -1;          /* (an album gone with its covers left: not removed without them) */
     exec_said(db,
         "DELETE FROM albums WHERE ntracks=0;"
         "UPDATE artists SET nalbums=(SELECT COUNT(*) FROM albums WHERE artist_id=artists.id);"
@@ -2031,24 +1812,14 @@ static void groups_counts(library_t *lib, double *t_folders, int as_added)
         " JOIN tracks t ON t.id=c.track_id WHERE c.artist_id=artists.id);"
         "DELETE FROM artists WHERE nalbums=0 AND ncredit_albums=0 AND id NOT IN (SELECT DISTINCT artist_id FROM tracks);");
     /* Genres and Composers: by name as tagged, ids kept from scan to scan */
-    if (!as_added) exec_said(db,
-        "INSERT OR IGNORE INTO genres(name) SELECT DISTINCT TRIM(genre) FROM tracks WHERE TRIM(COALESCE(genre,''))<>'';"
-        "UPDATE tracks SET genre_id=(SELECT id FROM genres WHERE name=TRIM(tracks.genre))"
-        " WHERE genre_id IS NOT (SELECT id FROM genres WHERE name=TRIM(tracks.genre));");
-    exec_said(db,
-        "UPDATE genres SET nalbums=(SELECT COUNT(DISTINCT album_id) FROM tracks WHERE genre_id=genres.id),"
-        " sort=COALESCE(sort, fold(name));"
-        "DELETE FROM genres WHERE nalbums=0;");
-    if (!as_added) exec_said(db,
-        "UPDATE genres SET name=(SELECT TRIM(genre) FROM tracks WHERE genre_id=genres.id ORDER BY path LIMIT 1)"
-        " WHERE name COLLATE BINARY IS NOT (SELECT TRIM(genre) FROM tracks WHERE genre_id=genres.id ORDER BY path LIMIT 1);");
+    rebuild_genres(db, as_added > 0);
     exec_said(db,
         /* search: what a changed name is found by (albums show their artist's) */
         "UPDATE artists SET search=NULL WHERE search IS NOT " SKEY_ARTIST ";"
         "UPDATE albums SET search=NULL WHERE artist_id IN (SELECT id FROM artists WHERE search IS NULL);");
     rebuild_composers(db, as_added > 0);
-    if (t_folders) *t_folders = now_s();
-    rebuild_folders(db, as_added > 1);
+    if (t_folders) *t_folders = clock_fsec();
+    return rebuild_folders(db, as_added > 1);
 }
 
 /* ---------- the groups, without holding the write lock ----------
@@ -2162,7 +1933,7 @@ static int shadow_apply(sqlite3 *db, const char *table, int write)
 static int rebuild_groups_aside(library_t *lib, batch_t *b)
 {
     sqlite3 *db = lib->db;
-    double t0 = now_s();
+    double t0 = clock_fsec();
     shadow_drop(db);
     /* (on the H2 the temp store spills to the card, not RAM: SQLITE_TMPDIR,
      * and its cache stays small. 3 MB for a first scan was tried: with 50,000
@@ -2180,7 +1951,7 @@ static int rebuild_groups_aside(library_t *lib, batch_t *b)
         "CREATE INDEX temp.tracks_composer ON tracks(composer_id);"
         "CREATE INDEX temp.tracks_folder ON tracks(folder_id);");
     for (size_t i = 0; !rc && i < sizeof SHADOWED / sizeof *SHADOWED; i++) rc = shadow_copy(db, SHADOWED[i]);
-    if (!rc) rebuild_groups(lib);              /* (on the copies: temp comes first) */
+    if (!rc) rc = rebuild_groups(lib);         /* (on the copies: temp comes first; half made: not put in) */
     if (rc || shadow_exec(db, "COMMIT") != 0) {
         if (!sqlite3_get_autocommit(db)) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
         shadow_drop(db);
@@ -2198,7 +1969,7 @@ static int rebuild_groups_aside(library_t *lib, batch_t *b)
     for (size_t i = 0; !rc && i < sizeof SHADOWED / sizeof *SHADOWED; i++)
         if (strcmp(SHADOWED[i], "credits")) rc = shadow_apply(db, SHADOWED[i], 0);
     if (rc) { shadow_drop(db); return -1; }
-    double t1 = now_s();
+    double t1 = clock_fsec();
     batch_write(b);
     if (!b->open) { shadow_drop(db); return -1; }
     rc = shadow_exec(db,
@@ -2210,15 +1981,12 @@ static int rebuild_groups_aside(library_t *lib, batch_t *b)
     for (size_t i = 0; !rc && i < sizeof SHADOWED / sizeof *SHADOWED; i++)
         if (strcmp(SHADOWED[i], "credits")) rc = shadow_apply(db, SHADOWED[i], 1);
     if (rc) {                                  /* (nothing of it kept) */
-        reset_all(db);
-        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-        b->open = 0;
-        lock_unboost(b->nice);
+        batch_undo(b);
         shadow_drop(db);
         return -1;
     }
     batch_end(b);
-    double t2 = now_s();
+    double t2 = clock_fsec();
     shadow_drop(db);                           /* (temp only: no need of the lock) */
     sqlite3_exec(db, "PRAGMA temp.cache_size=-256", NULL, NULL, NULL);
     sqlite3_db_release_memory(db);             /* (the copies' pages) */
@@ -2272,9 +2040,10 @@ static int load_idset(sqlite3 *db, const char *sql, idset_t *set)
 {
     sqlite3_stmt *q = prep(db, sql);
     if (!q) return -1;
-    while (sqlite3_step(q) == SQLITE_ROW) idset_add(set, sqlite3_column_int64(q, 0));
+    int rc;
+    while ((rc = grp_step(q)) == SQLITE_ROW) idset_add(set, sqlite3_column_int64(q, 0));
     sqlite3_finalize(q);
-    return set->failed ? -1 : 0;
+    return set->failed || rc != SQLITE_DONE ? -1 : 0;
 }
 
 /* Folders of the changed songs: theirs found or made, and each folder's count
@@ -2284,31 +2053,18 @@ static int folders_where_changed(sqlite3 *db, const char *root)
 {
     sqlite3_stmt *q = prep(db, "SELECT id, path, folder_id FROM main.tracks WHERE id IN (SELECT id FROM temp.g_c)"
                                " ORDER BY path");
-    sqlite3_stmt *up = prep(db, "INSERT INTO folders(path, parent, name, sort, seen) VALUES(?,?,?,?,1)"
-                                " ON CONFLICT(path) DO UPDATE SET parent=excluded.parent, name=excluded.name,"
-                                " sort=excluded.sort, seen=1");
-    sqlite3_stmt *get = prep(db, "SELECT id FROM folders WHERE path=?");
-    sqlite3_stmt *ut = prep(db, "UPDATE tracks SET folder_id=? WHERE id=?");
-    int rc = q && up && get && ut ? 0 : -1;
-    while (!rc && sqlite3_step(q) == SQLITE_ROW) {
-        const char *path = (const char *)sqlite3_column_text(q, 1);
+    folder_stmts_t f;
+    int rc = folder_stmts_prep(db, &f) == 0 && q ? 0 : -1, st = SQLITE_DONE;
+    while (!rc && (st = grp_step(q)) == SQLITE_ROW) {
         char dir[1024];
-        snprintf(dir, sizeof dir, "%s", path ? path : "");
-        char *slash = strrchr(dir, '/');
-        if (slash) *slash = '\0';
-        int64_t fid = folder_id(db, up, get, strlen(dir) >= strlen(root) ? dir : root, root);
+        dir_of((const char *)sqlite3_column_text(q, 1), dir, sizeof dir);
+        int64_t fid = folder_under(db, f.up, f.get, dir, root);
         if (!fid) { rc = -1; break; }
-        if (sqlite3_column_type(q, 2) == SQLITE_NULL || sqlite3_column_int64(q, 2) != fid) {
-            sqlite3_reset(ut);
-            sqlite3_bind_int64(ut, 1, fid);
-            sqlite3_bind_int64(ut, 2, sqlite3_column_int64(q, 0));
-            sqlite3_step(ut);
-        }
+        folder_put_track(&f, q, fid);
     }
+    if (!rc && st != SQLITE_DONE) rc = -1;     /* (stopped: the songs past there keep the folder they had) */
     sqlite3_finalize(q);
-    sqlite3_finalize(up);
-    sqlite3_finalize(get);
-    sqlite3_finalize(ut);
+    folder_stmts_free(&f);
     /* -1 for each song's old folder and those above, +1 for its new one's */
     return rc ? rc : shadow_exec(db,
         "CREATE TEMP TABLE g_fd(folder INTEGER, d INTEGER);"
@@ -2324,12 +2080,13 @@ static int folders_where_changed(sqlite3 *db, const char *root)
 }
 
 /* 0: done; 1: not here (too many songs around them, folders' root moved:
- * nothing written, the full rebuild); -1: failed part way (the full rebuild
- * puts it right). Holds the write lock (b). temp.g_c and g_old filled. */
+ * nothing written, the full rebuild); -1: failed part way, a pass that
+ * stopped before its end too (the caller rolls the batch back, and the full
+ * rebuild follows). Holds the write lock (b). temp.g_c and g_old filled. */
 static int rebuild_groups_where_changed(library_t *lib, batch_t *b)
 {
     sqlite3 *db = lib->db;
-    double t0 = now_s();
+    double t0 = clock_fsec();
     char root[1024], had[1024] = "";
     folders_root(db, root, sizeof root);
     sqlite3_stmt *rq = prep(db, "SELECT path, (SELECT COUNT(*) FROM folders WHERE parent=0) FROM folders WHERE parent=0");
@@ -2361,8 +2118,8 @@ static int rebuild_groups_where_changed(library_t *lib, batch_t *b)
     sqlite3_stmt *ia = prep(db, "INSERT OR IGNORE INTO temp.g_art VALUES(?)");
     sqlite3_stmt *ib = prep(db, "INSERT OR IGNORE INTO temp.g_alb VALUES(?)");
     sqlite3_stmt *nk = prep(db, "INSERT OR IGNORE INTO temp.g_newkey VALUES(?, ?)");
-    int rc = nq && fa && fb && ia && ib && nk ? 0 : 1;
-    while (!rc && sqlite3_step(nq) == SQLITE_ROW) {
+    int rc = nq && fa && fb && ia && ib && nk ? 0 : 1, st = SQLITE_DONE;
+    while (!rc && (st = grp_step(nq)) == SQLITE_ROW) {
         const char *artist = (const char *)sqlite3_column_text(nq, 0), *title = (const char *)sqlite3_column_text(nq, 3);
         tkeys_t k;
         track_keys(artist, (const char *)sqlite3_column_text(nq, 1), (const char *)sqlite3_column_text(nq, 2), &k);
@@ -2394,6 +2151,7 @@ static int rebuild_groups_where_changed(library_t *lib, batch_t *b)
             sqlite3_reset(f);
         }
     }
+    if (!rc && st != SQLITE_DONE) rc = 1;      /* (not every changed song's album and artists known) */
     sqlite3_finalize(nq);
     sqlite3_finalize(fa);
     sqlite3_finalize(fb);
@@ -2416,24 +2174,33 @@ static int rebuild_groups_where_changed(library_t *lib, batch_t *b)
     if (rc) return 1;
 
     /* from here on it writes */
-    double t_found = now_s();
+    double t_found = clock_fsec();
     batch_write(b);
     if (!b->open) return 1;
-    double t_locked = now_s();
+    double t_locked = clock_fsec();
     idset_t A = {0}, R = {0};
     grp_t g;
     sqlite3_stmt *mk = prep(db, "SELECT kind, key FROM temp.g_newkey");
     rc = mk && grp_open(&g, db) == 0 ? 0 : -1;
     if (rc) { sqlite3_finalize(mk); return 1; }
-    while (sqlite3_step(mk) == SQLITE_ROW) {
+    /* (compiled once: with a statement made and run for each new key, an
+     * album of new artists compiled it a dozen times, the write lock held) */
+    sqlite3_stmt *note[2] = {prep(db, "INSERT OR IGNORE INTO temp.g_art VALUES(?)"),
+                             prep(db, "INSERT OR IGNORE INTO temp.g_alb VALUES(?)")};
+    while ((st = grp_step(mk)) == SQLITE_ROW) {
         int album = sqlite3_column_int(mk, 0);
         int64_t id = upsert_key(album ? &g.u_alb : &g.u_art, (const char *)sqlite3_column_text(mk, 1));
-        char *ins = sqlite3_mprintf("INSERT OR IGNORE INTO temp.%s VALUES(%lld)", album ? "g_alb" : "g_art", (long long)id);
-        if (ins) sqlite3_exec(db, ins, NULL, NULL, NULL);
-        sqlite3_free(ins);
+        sqlite3_stmt *ins = note[album != 0];
+        if (!ins) continue;
+        sqlite3_reset(ins);
+        sqlite3_bind_int64(ins, 1, id);
+        sqlite3_step(ins);
+        sqlite3_reset(ins);
     }
+    sqlite3_finalize(note[0]);
+    sqlite3_finalize(note[1]);
     sqlite3_finalize(mk);
-    rc = load_idset(db, "SELECT id FROM temp.g_alb", &A) || load_idset(db, "SELECT id FROM temp.g_art", &R) ? -1 : 0;
+    rc = st != SQLITE_DONE || load_idset(db, "SELECT id FROM temp.g_alb", &A) || load_idset(db, "SELECT id FROM temp.g_art", &R) ? -1 : 0;
     rc = rc ? rc : shadow_exec(db,
         "UPDATE main.albums SET year=0, dir=NULL, first_track=NULL WHERE id IN (SELECT id FROM temp.g_alb);"
         "UPDATE main.tracks SET sort=songkey(COALESCE(title,'')) WHERE id IN (SELECT id FROM temp.g_c)"
@@ -2445,17 +2212,21 @@ static int rebuild_groups_where_changed(library_t *lib, batch_t *b)
     if (!rc && !q) rc = -1;
     g.albums = &A;
     g.artists = &R;
-    while (!rc && sqlite3_step(q) == SQLITE_ROW) grp_track(&g, q);
+    st = SQLITE_DONE;
+    while (!rc && (st = grp_step(q)) == SQLITE_ROW) grp_track(&g, q);
+    if (!rc && st != SQLITE_DONE) rc = -1;
     sqlite3_finalize(q);
     grp_close(&g);
-    double t1 = now_s();
+    double t1 = clock_fsec();
 
     /* A's and R's counts; the empty ones gone (an album's covers with it) */
     rc = rc ? rc : shadow_exec(db,
         "UPDATE main.albums SET ntracks=(SELECT COUNT(*) FROM main.tracks WHERE album_id=albums.id)"
         " WHERE id IN (SELECT id FROM temp.g_alb);");
     sqlite3_stmt *gone = rc ? NULL : prep(db, "SELECT id FROM main.albums WHERE ntracks=0 AND id IN (SELECT id FROM temp.g_alb)");
-    while (gone && sqlite3_step(gone) == SQLITE_ROW) art_del(lib, sqlite3_column_int64(gone, 0));
+    if (!rc && !gone) rc = -1;
+    while (gone && (st = grp_step(gone)) == SQLITE_ROW) art_del(lib, sqlite3_column_int64(gone, 0));
+    if (!rc && st != SQLITE_DONE) rc = -1;
     sqlite3_finalize(gone);
     rc = rc ? rc : shadow_exec(db,
         "DELETE FROM main.albums WHERE ntracks=0 AND id IN (SELECT id FROM temp.g_alb);"
@@ -2465,42 +2236,19 @@ static int rebuild_groups_where_changed(library_t *lib, batch_t *b)
         "DELETE FROM main.artists WHERE id IN (SELECT id FROM temp.g_art) AND nalbums=0 AND ncredit_albums=0"
         " AND NOT EXISTS (SELECT 1 FROM main.tracks WHERE artist_id=artists.id);"
         /* genres and composers of the changed songs, old and new */
-        "INSERT OR IGNORE INTO main.genres(name) SELECT DISTINCT TRIM(genre) FROM main.tracks"
-        " WHERE id IN (SELECT id FROM temp.g_c) AND TRIM(COALESCE(genre,''))<>'';"
-        "UPDATE main.tracks SET genre_id=(SELECT id FROM main.genres WHERE name=TRIM(tracks.genre))"
-        " WHERE id IN (SELECT id FROM temp.g_c) AND genre_id IS NOT (SELECT id FROM main.genres WHERE name=TRIM(tracks.genre));"
-        "CREATE TEMP TABLE g_gen AS SELECT genre_id AS id FROM temp.g_old WHERE genre_id IS NOT NULL"
-        " UNION SELECT genre_id FROM main.tracks WHERE id IN (SELECT id FROM temp.g_c) AND genre_id IS NOT NULL;"
-        "UPDATE main.genres SET nalbums=(SELECT COUNT(DISTINCT album_id) FROM main.tracks WHERE genre_id=genres.id),"
-        " sort=COALESCE(sort, fold(name)) WHERE id IN (SELECT id FROM temp.g_gen);"
-        "DELETE FROM main.genres WHERE nalbums=0 AND id IN (SELECT id FROM temp.g_gen);"
-        "UPDATE main.genres SET name=(SELECT TRIM(genre) FROM main.tracks WHERE genre_id=genres.id ORDER BY path LIMIT 1)"
-        " WHERE id IN (SELECT id FROM temp.g_gen) AND name COLLATE BINARY IS NOT"
-        " (SELECT TRIM(genre) FROM main.tracks WHERE genre_id=genres.id ORDER BY path LIMIT 1);"
-        "INSERT OR IGNORE INTO main.composers(name) SELECT DISTINCT TRIM(composer) FROM main.tracks"
-        " WHERE id IN (SELECT id FROM temp.g_c) AND TRIM(COALESCE(composer,''))<>'';"
-        "UPDATE main.tracks SET composer_id=(SELECT id FROM main.composers WHERE name=TRIM(tracks.composer))"
-        " WHERE id IN (SELECT id FROM temp.g_c)"
-        " AND composer_id IS NOT (SELECT id FROM main.composers WHERE name=TRIM(tracks.composer));"
-        "CREATE TEMP TABLE g_comp AS SELECT composer_id AS id FROM temp.g_old WHERE composer_id IS NOT NULL"
-        " UNION SELECT composer_id FROM main.tracks WHERE id IN (SELECT id FROM temp.g_c) AND composer_id IS NOT NULL;"
-        "UPDATE main.composers SET nalbums=(SELECT COUNT(DISTINCT album_id) FROM main.tracks WHERE composer_id=composers.id),"
-        " sort=COALESCE(sort, fold(name)) WHERE id IN (SELECT id FROM temp.g_comp);"
-        "DELETE FROM main.composers WHERE nalbums=0 AND id IN (SELECT id FROM temp.g_comp);"
-        "UPDATE main.composers SET name=(SELECT TRIM(composer) FROM main.tracks WHERE composer_id=composers.id"
-        " ORDER BY path LIMIT 1) WHERE id IN (SELECT id FROM temp.g_comp) AND name COLLATE BINARY IS NOT"
-        " (SELECT TRIM(composer) FROM main.tracks WHERE composer_id=composers.id ORDER BY path LIMIT 1);"
+        NAMED_CHANGED_SQL("genres", "genre", "g_gen")
+        NAMED_CHANGED_SQL("composers", "composer", "g_comp")
         /* search: what a changed name is found by (albums show their artist's) */
         "UPDATE main.artists SET search=NULL WHERE search IS NOT " SKEY_ARTIST ";"
         "UPDATE main.albums SET search=NULL WHERE artist_id IN (SELECT id FROM main.artists WHERE search IS NULL);");
-    double t2 = now_s();
+    double t2 = clock_fsec();
     rc = rc ? rc : folders_where_changed(db, root);
     free(A.bits);
     free(R.bits);
     fprintf(stderr, "library: groups where songs changed: %lld songs, %s in %.2f s (found %.2f, lock waited %.2f,"
             " tracks %.2f, counts %.2f, folders %.2f: the lock held %.2f s so far)\n", (long long)around,
-            rc ? "failed" : "done", now_s() - t0, t_found - t0, t_locked - t_found, t1 - t_locked, t2 - t1, now_s() - t2,
-            now_s() - t_locked);
+            rc ? "failed" : "done", clock_fsec() - t0, t_found - t0, t_locked - t_found, t1 - t_locked, t2 - t1, clock_fsec() - t2,
+            clock_fsec() - t_locked);
     return rc ? -1 : 0;
 }
 
@@ -2532,22 +2280,6 @@ static int find_cover_file(const char *dir, char *out, size_t cap)
     return out[0] ? best : -1;   /* 0-4: named like a cover; 50: just some image */
 }
 
-/* RGB888 -> RGB565 with a 4x4 ordered dither, so gradients don't band on the panel. */
-static void to_rgb565(const unsigned char *rgb, int size, uint16_t *out)
-{
-    static const int bayer[4][4] = {{0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5}};
-    for (int y = 0; y < size; y++)
-        for (int x = 0; x < size; x++) {
-            const unsigned char *p = rgb + 3 * (y * size + x);
-            int d = bayer[y & 3][x & 3];
-            int r = p[0] + (d >> 1) - 4, g = p[1] + (d >> 2) - 2, b = p[2] + (d >> 1) - 4;
-            r = r < 0 ? 0 : r > 255 ? 255 : r;
-            g = g < 0 ? 0 : g > 255 ? 255 : g;
-            b = b < 0 ? 0 : b > 255 ? 255 : b;
-            out[y * size + x] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
-        }
-}
-
 /* ---- the covers' store ----
  * Two files in the art folder, large.pack and small.pack: each album's cover
  * at its id's place (a slot: 8 bytes, then the pixels), read with one pread.
@@ -2566,13 +2298,7 @@ static int art_idx(int size) { return size == LIB_ART_LARGE ? 0 : size == LIB_AR
 static size_t art_pixels(int size) { return (size_t)size * (size_t)size * 2; }
 static size_t art_slot(int size) { return 8 + art_pixels(size); }
 
-static uint32_t art_sum(const void *px, size_t n)
-{
-    const unsigned char *b = px;
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 16777619u;
-    return h;
-}
+static uint32_t art_sum(const void *px, size_t n) { return fnv32(FNV32_START, px, n); }
 
 static void art_legacy_path(const library_t *lib, int64_t album_id, int size, char *out, size_t cap)
 {
@@ -2687,7 +2413,7 @@ static void art_del(library_t *lib, int64_t album_id)
 static void art_migrate(library_t *lib)
 {
     if (!lib->art_legacy) return;
-    double t0 = now_s();
+    double t0 = clock_fsec();
     int moved = 0, left = 0;
     uint16_t *px = malloc(art_pixels(LIB_ART_LARGE));
     char (*names)[40] = malloc(256 * sizeof *names);
@@ -2727,7 +2453,7 @@ static void art_migrate(library_t *lib)
     free(px);
     free(names);
     if (!lib->cancel && !left) lib->art_legacy = art_legacy_any(lib);
-    fprintf(stderr, "library: covers: %d moved into the store in %.1f s%s\n", moved, now_s() - t0,
+    fprintf(stderr, "library: covers: %d moved into the store in %.1f s%s\n", moved, clock_fsec() - t0,
             lib->art_legacy ? " (more next time)" : "");
 }
 
@@ -2735,156 +2461,6 @@ int library_art_legacy(library_t *lib)
 {
     if (lib->art_legacy) lib->art_legacy = art_legacy_any(lib);   /* (another connection's scan may have moved them) */
     return lib->art_legacy;
-}
-
-/*
- * Shrink a square RGB888 region (side `src`, row stride `stride` bytes) to
- * `dst` x `dst` by averaging the source pixels under each output pixel.
- * Integer only: fast on the H2's FPU-light core, and for downscaling album
- * art it looks the same as a windowed filter.
- */
-static void area_downscale(const unsigned char *in, int src, int stride, unsigned char *out, int dst)
-{
-    for (int oy = 0; oy < dst; oy++) {
-        int y0 = oy * src / dst, y1 = (oy + 1) * src / dst;
-        if (y1 <= y0) y1 = y0 + 1;
-        for (int ox = 0; ox < dst; ox++) {
-            int x0 = ox * src / dst, x1 = (ox + 1) * src / dst;
-            if (x1 <= x0) x1 = x0 + 1;
-            unsigned r = 0, g = 0, b = 0, n = (unsigned)((y1 - y0) * (x1 - x0));
-            for (int y = y0; y < y1; y++) {
-                const unsigned char *p = in + (size_t)y * stride + (size_t)x0 * 3;
-                for (int x = x0; x < x1; x++, p += 3) { r += p[0]; g += p[1]; b += p[2]; }
-            }
-            unsigned char *o = out + 3 * ((size_t)oy * dst + ox);
-            o[0] = (unsigned char)((r + n / 2) / n);
-            o[1] = (unsigned char)((g + n / 2) / n);
-            o[2] = (unsigned char)((b + n / 2) / n);
-        }
-    }
-}
-
-static const art_limits_t ART_LIMITS = {FATHOM_JPEG_MAX_MEMORY, FATHOM_ART_MAX_PIXELS, FATHOM_ART_MAX_FILE, 0};
-
-/* Crop to a square and shrink to size x size RGB565: 0, -1 */
-static int art_square(const unsigned char *img, int w, int h, int size, uint16_t *pixels)
-{
-    int side = w < h ? w : h;
-    const unsigned char *crop = img + 3 * ((size_t)((h - side) / 2) * (size_t)w + (size_t)((w - side) / 2));
-    unsigned char *rs = malloc((size_t)size * (size_t)size * 3);
-    if (!rs) return -1;
-    area_downscale(crop, side, w * 3, rs, size);
-    to_rgb565(rs, size, pixels);
-    free(rs);
-    return 0;
-}
-
-/* Whole inside a size x size square, the rest white (a station's logo: a wide
- * one isn't cut at its sides, and white is what its transparent parts are
- * laid over), as RGB565: 0, -1 */
-static int art_fit(const unsigned char *img, int w, int h, int size, uint16_t *pixels)
-{
-    int big = w > h ? w : h;
-    int dw = (int)((long long)w * size / big), dh = (int)((long long)h * size / big);
-    if (dw < 1) dw = 1;
-    if (dh < 1) dh = 1;
-    unsigned char *rs = malloc((size_t)size * (size_t)size * 3);
-    if (!rs) return -1;
-    memset(rs, 255, (size_t)size * (size_t)size * 3);
-    int ox = (size - dw) / 2, oy = (size - dh) / 2;
-    for (int y = 0; y < dh; y++) {                 /* (each pixel the average of those under it, as area_downscale) */
-        int y0 = (int)((long long)y * h / dh), y1 = (int)((long long)(y + 1) * h / dh);
-        if (y1 <= y0) y1 = y0 + 1;
-        for (int x = 0; x < dw; x++) {
-            int x0 = (int)((long long)x * w / dw), x1 = (int)((long long)(x + 1) * w / dw);
-            if (x1 <= x0) x1 = x0 + 1;
-            unsigned r = 0, g = 0, b = 0, n = (unsigned)((y1 - y0) * (x1 - x0));
-            for (int sy = y0; sy < y1; sy++) {
-                const unsigned char *p = img + 3 * ((size_t)sy * (size_t)w + (size_t)x0);
-                for (int sx = x0; sx < x1; sx++, p += 3) { r += p[0]; g += p[1]; b += p[2]; }
-            }
-            unsigned char *o = rs + 3 * ((size_t)(oy + y) * size + (size_t)(ox + x));
-            o[0] = (unsigned char)((r + n / 2) / n);
-            o[1] = (unsigned char)((g + n / 2) / n);
-            o[2] = (unsigned char)((b + n / 2) / n);
-        }
-    }
-    to_rgb565(rs, size, pixels);
-    free(rs);
-    return 0;
-}
-
-/* A small picture (a site's favicon: under LIB_LOGO_SHARP_MIN on its short
- * side) as a cover: blown up to the square it was a blur, so it was kept for
- * the list alone and Now Playing showed the radio's sign. Drawn sharp instead,
- * each of its pixels a whole number of the screen's (up to half the square's
- * width), in the middle of a square of its own corners' colour when the four
- * agree (an icon on a ground of its own) and white when they don't (what a
- * logo's transparent parts are laid over). One too wide or tall for that is
- * fitted as any logo. 0, -1 */
-static int art_pad(const unsigned char *img, int w, int h, int size, uint16_t *pixels)
-{
-    int big = w > h ? w : h;
-    if (big >= size) return art_fit(img, w, h, size, pixels);
-    int k = LIB_LOGO_SHARP_MIN / big;
-    if (k < 1) k = 1;
-    unsigned char *rs = malloc((size_t)size * (size_t)size * 3);
-    if (!rs) return -1;
-    const unsigned char *c[4] = {img, img + 3 * (size_t)(w - 1), img + 3 * (size_t)(h - 1) * (size_t)w,
-                                 img + 3 * ((size_t)(h - 1) * (size_t)w + (size_t)(w - 1))};
-    int same = 1;
-    for (int i = 1; i < 4 && same; i++)
-        for (int ch = 0; ch < 3; ch++) same &= abs((int)c[i][ch] - (int)c[0][ch]) <= 8;
-    unsigned char bg[3] = {255, 255, 255};
-    if (same) memcpy(bg, c[0], 3);
-    for (size_t i = 0; i < (size_t)size * (size_t)size; i++) memcpy(rs + 3 * i, bg, 3);
-    int dw = w * k, dh = h * k, ox = (size - dw) / 2, oy = (size - dh) / 2;
-    for (int y = 0; y < dh; y++)
-        for (int x = 0; x < dw; x++)
-            memcpy(rs + 3 * ((size_t)(oy + y) * size + (size_t)(ox + x)), img + 3 * ((size_t)(y / k) * (size_t)w + (size_t)(x / k)), 3);
-    to_rgb565(rs, size, pixels);
-    free(rs);
-    return 0;
-}
-
-/* (the large one of a logo: fitted, or a small picture kept sharp) */
-static int logo_large(const unsigned char *img, int w, int h, uint16_t *large)
-{
-    return (w < h ? w : h) < LIB_LOGO_SHARP_MIN ? art_pad(img, w, h, LIB_ART_LARGE, large)
-                                                 : art_fit(img, w, h, LIB_ART_LARGE, large);
-}
-
-/* A station's logo comes from anywhere: less of everything than a cover gets */
-static const art_limits_t LOGO_LIMITS = {1024L * 1024, 400000LL, 512L * 1024, 1};
-
-int library_logo_decode(const unsigned char *enc, size_t len, uint16_t *large, uint16_t *small, int *short_side)
-{
-    unsigned char *img;
-    int w, h;
-    if (art_decode_mem(enc, len, LIB_ART_LARGE * 3 / 2, &LOGO_LIMITS, &img, &w, &h)) return -1;
-    if (short_side) *short_side = w < h ? w : h;
-    int r = art_fit(img, w, h, LIB_ART_SMALL, small);
-    if (r == 0 && large) r = logo_large(img, w, h, large);
-    free(img);
-    return r;
-}
-
-int library_logo_rgb(const unsigned char *rgb, int w, int h, uint16_t *large, uint16_t *small)
-{
-    if (!rgb || w < 1 || h < 1 || w > 1024 || h > 1024) return -1;
-    int r = art_fit(rgb, w, h, LIB_ART_SMALL, small);
-    if (r == 0 && large) r = logo_large(rgb, w, h, large);
-    return r;
-}
-
-int library_art_decode(const unsigned char *enc, size_t len, int size, uint16_t *pixels)
-{
-    unsigned char *img;
-    int w, h;
-    if (art_decode_mem(enc, len, size * 3 / 2, &ART_LIMITS, &img, &w, &h)) return -1;
-    int r = art_square(img, w, h, size, pixels);
-    free(img);
-    return r;
 }
 
 /* Done with a file read for its cover: out of the page cache, where a 20 MB
@@ -2897,12 +2473,33 @@ static void art_done(FILE *f)
     fclose(f);
 }
 
-/* An image file, decoded small (artdec.h). NULL if it isn't one we can read. */
+/* g_art_later: a cover wasn't made, and not for anything the picture is: the
+ * helper was short of memory for it (rd_art), or its file is there and
+ * couldn't be read just now (art_unread). Nothing is concluded about the
+ * album's cover then, and the next scan looks again. */
+static _Thread_local int g_art_later;
+
+/* A picture's file gave no picture: f as it was opened and read (NULL: it
+ * couldn't be opened, and errno says why). A file that is there and couldn't
+ * be opened, or one whose read failed (the card not answering, no memory or
+ * file handles), is not "this isn't a picture": g_art_later. (It was: the
+ * album marked as having no cover, its thumbnails emptied, and not looked at
+ * again until its files changed.) */
+static void art_unread(FILE *f)
+{
+    struct stat st;
+    if (f ? ferror(f) && fstat(fileno(f), &st) == 0 && S_ISREG(st.st_mode) : errno != ENOENT && errno != ENOTDIR)
+        g_art_later = 1;
+}
+
+/* An image file, decoded small (artdec.h). NULL if it isn't one we can read,
+ * or couldn't be read just now (art_unread). */
 static unsigned char *art_from_file(const char *file, int *w, int *h)
 {
     FILE *f = fopen(file, "rbe");
     unsigned char *img = NULL;
     if (f && art_decode(f, 0, -1, LIB_ART_LARGE * 3 / 2, &ART_LIMITS, &img, w, h)) img = NULL;
+    if (!img) art_unread(f);
     if (f) art_done(f);
     return img;
 }
@@ -2925,13 +2522,29 @@ static unsigned char *art_from_track(const char *track, int *w, int *h)
     long off, len;
     unsigned char *img = NULL, *enc;
     size_t n;
+    /* A track of an album in one file (its path the file's and then "::01@...",
+     * cue.h): the picture is the file's. The tags' reader takes such a path;
+     * the file was then opened by it here, which is no file's name, and an
+     * album split by a sheet had no cover unless a picture lay beside it. */
+    char file[1100];
+    const char *of = cue_part_file(track, file, sizeof file);
+    if (of) track = of;
     if (tags_picture_at(track, &off, &len) == 0) {
         FILE *f = fopen(track, "rbe");
         if (f && art_decode(f, off, len, LIB_ART_LARGE * 3 / 2, &ART_LIMITS, &img, w, h)) img = NULL;
+        if (!img) art_unread(f);
         if (f) art_done(f);
-    } else if (tags_picture(track, &enc, &n) == 0) {
+    } else if (strcasecmp(path_ext(track), "flac") && tags_picture(track, &enc, &n) == 0) {
+        /* (not asked of a FLAC: its picture is the one tags_picture_at has just looked for, and not found) */
         if (art_decode_mem(enc, n, LIB_ART_LARGE * 3 / 2, &ART_LIMITS, &img, w, h)) img = NULL;
         free(enc);
+    } else {
+        /* (no picture, the tags' reader says, and says the same of a song it
+         * couldn't open or read: which, asked of the file's first bytes) */
+        char b[16];
+        FILE *f = fopen(track, "rbe");
+        if (!f || fread(b, 1, sizeof b, f) < sizeof b) art_unread(f);
+        if (f) fclose(f);
     }
     return img;
 }
@@ -2941,6 +2554,7 @@ static unsigned char *art_from_track(const char *track, int *w, int *h)
  * image file or from a song's own picture: what a scan runs on files it has
  * never seen. library_reader_do is the helper's side. */
 enum { RD_TAGS = 1, RD_SHEET, RD_ART_FILE, RD_ART_TRACK };
+#define RD_UNREAD (-5)   /* a cover's answer: none, the file being there and not read just now (art_unread) */
 
 int library_reader_do(int op, const char *path, unsigned char **out, size_t *len)
 {
@@ -2964,8 +2578,9 @@ int library_reader_do(int op, const char *path, unsigned char **out, size_t *len
     case RD_ART_FILE:
     case RD_ART_TRACK: {
         int w = 0, h = 0;
+        g_art_later = 0;
         unsigned char *img = op == RD_ART_FILE ? art_from_file(path, &w, &h) : art_from_track(path, &w, &h);
-        if (!img || w <= 0 || h <= 0) { free(img); return -1; }
+        if (!img || w <= 0 || h <= 0) { free(img); return g_art_later ? RD_UNREAD : -1; }
         size_t n = (size_t)w * (size_t)h * 3;
         unsigned char *b = malloc(8 + n);          /* its width and height, then the pixels */
         if (b) {
@@ -2981,8 +2596,6 @@ int library_reader_do(int op, const char *path, unsigned char **out, size_t *len
     default: return -1;
     }
 }
-
-int library_reader_main(void) { return reader_serve(library_reader_do); }
 
 /* What the helper may take for one file: the memory available now less a
  * reserve for everything else (the player, the music it is playing), and at
@@ -3070,8 +2683,8 @@ static int rd_sheet(const char *path, char **text, size_t *len)
 
 /* A cover decoded small (as art_from_file, art_from_track): NULL too when the
  * helper died on it, and the album's cover is looked for elsewhere.
- * g_art_later: one wasn't made while the helper was short of memory. */
-static _Thread_local int g_art_later;
+ * g_art_later: one wasn't made while the helper was short of memory, or the
+ * helper couldn't read its file just now. */
 /* g_rd_nowait: this thread doesn't wait for a helper that's busy (the
  * screen's: library_remove_found_cover) */
 static _Thread_local int g_rd_nowait;
@@ -3084,7 +2697,7 @@ static unsigned char *rd_art(int op, const char *path, int *w, int *h)
         size_t n;
         long budget = rd_budget(&is_short);
         int r = g_rd_nowait ? reader_call_nowait(op, path, budget, &st, &b, &n) : reader_call(op, path, budget, &st, &b, &n);
-        if (r == READER_DIED || (r == 0 && st)) g_art_later |= is_short;
+        if (r == READER_DIED || (r == 0 && st)) g_art_later |= is_short || (r == 0 && st == RD_UNREAD);
         if (r == READER_DIED) {
             fprintf(stderr, "library: the reader stopped on %s: no cover from it\n", path);
             return NULL;
@@ -3188,13 +2801,6 @@ static int make_art(library_t *lib, sqlite3_stmt *others, int64_t album_id, cons
  * its folder (and a disc's album folder) by name, size and date, as the walk
  * saw them, and its tracks (how many, their times, how many have a picture).
  * The same next scan: nothing to look at again. */
-static uint64_t fnv(uint64_t hsh, const void *p, size_t n)
-{
-    const unsigned char *b = p;
-    for (size_t i = 0; i < n; i++) hsh = (hsh ^ b[i]) * 1099511628211ULL;
-    return hsh;
-}
-
 static uint64_t images_sig(const pathvec_t *iv, const char *dir)
 {
     uint64_t sig = 0;
@@ -3209,9 +2815,9 @@ static uint64_t images_sig(const pathvec_t *iv, const char *dir)
     for (int i = lo; i < iv->n && !strncmp(iv->v[i].p, dir, dl) && iv->v[i].p[dl] == '/'; i++) {
         const char *name = iv->v[i].p + dl + 1;
         if (strchr(name, '/')) continue;       /* (in a folder below) */
-        sig = fnv(sig ^ 14695981039346656037ULL, name, strlen(name));
-        sig = fnv(sig, &iv->v[i].size, sizeof iv->v[i].size);
-        sig = fnv(sig, &iv->v[i].mtime, sizeof iv->v[i].mtime);
+        sig = fnv64(sig ^ FNV64_START, name, strlen(name));
+        sig = fnv64(sig, &iv->v[i].size, sizeof iv->v[i].size);
+        sig = fnv64(sig, &iv->v[i].mtime, sizeof iv->v[i].mtime);
     }
     return sig;
 }
@@ -3220,12 +2826,12 @@ static int64_t art_sig(const pathvec_t *iv, sqlite3_stmt *tracks, int64_t album_
 {
     char up[2048];
     uint64_t sig = images_sig(iv, dir);
-    if (disc_folder(dir) && parent_dir(dir, up, sizeof up) == 0) sig = fnv(sig, "^", 1) ^ images_sig(iv, up);
+    if (disc_folder(dir) && parent_dir(dir, up, sizeof up) == 0) sig = fnv64(sig, "^", 1) ^ images_sig(iv, up);
     sqlite3_reset(tracks);
     sqlite3_bind_int64(tracks, 1, album_id);
     if (sqlite3_step(tracks) == SQLITE_ROW) {
         int64_t v[3] = {sqlite3_column_int64(tracks, 0), sqlite3_column_int64(tracks, 1), sqlite3_column_int64(tracks, 2)};
-        sig = fnv(sig, v, sizeof v);
+        sig = fnv64(sig, v, sizeof v);
     }
     sqlite3_reset(tracks);
     return (int64_t)(sig & 0x7fffffffffffffffULL) | 1;   /* (never 0: not looked yet) */
@@ -3239,8 +2845,8 @@ static int64_t art_sig(const pathvec_t *iv, sqlite3_stmt *tracks, int64_t album_
  * cover is made (decoding one can take a second on the H2: never with the
  * write lock held). */
 #define ART_PAGE 32
-
-static int64_t get_int_col(library_t *lib, const char *sql, int64_t id);
+/* (an album's other songs with a picture, up to four: ?1 the album, ?2 its first song's path) */
+#define ART_OTHERS_SQL "SELECT path FROM tracks WHERE album_id=? AND has_pic=1 AND path<>? ORDER BY disc, track LIMIT 4"
 
 static void build_art(library_t *lib, const pathvec_t *iv, batch_t *b, lib_progress_cb cb, void *ctx)
 {
@@ -3248,8 +2854,7 @@ static void build_art(library_t *lib, const pathvec_t *iv, batch_t *b, lib_progr
         "SELECT al.id, al.dir, t.path, al.art, al.art_sig, al.key FROM albums al LEFT JOIN tracks t ON t.id=al.first_track"
         " WHERE al.id>? ORDER BY al.id LIMIT " LIB_STR(ART_PAGE));
     sqlite3_stmt *u = prep(lib->db, "UPDATE albums SET art=?, art_sig=? WHERE id=?");
-    sqlite3_stmt *others = prep(lib->db,
-        "SELECT path FROM tracks WHERE album_id=? AND has_pic=1 AND path<>? ORDER BY disc, track LIMIT 4");
+    sqlite3_stmt *others = prep(lib->db, ART_OTHERS_SQL);
     sqlite3_stmt *tracks = prep(lib->db,
         "SELECT COUNT(*), TOTAL(mtime), TOTAL(has_pic) FROM tracks WHERE album_id=?");
     struct { int64_t id, was, sig; int art, now; char *dir, *first, *key; } page[ART_PAGE];   /* now: the state to write (-1: as it is) */
@@ -3300,7 +2905,7 @@ static void build_art(library_t *lib, const pathvec_t *iv, batch_t *b, lib_progr
                 library_trying("cover", &trying, note);
                 g_art_later = 0;
                 r = id == poison ? -1 : make_art(lib, others, id, dir, page[k].first, page[k].key);
-                if (r < 0 && g_art_later) {         /* (not made with little memory to spare: looked for again next scan) */
+                if (r < 0 && g_art_later) {         /* (not made with little memory to spare, or its file not read just now: as it was, looked for again next scan) */
                     lib->art_later = 1;             /* (...which mustn't settle for the listing being as it was) */
                     made++;
                     continue;
@@ -3389,31 +2994,54 @@ static int probe_range(const probe_t *v, int n, const char *key, int *count)
     return lo;
 }
 
-/* Entries ent[0..n) of m (n <= LOOSE_CHUNK): their tracks into match[]. */
-static void loose_match(sqlite3 *db, const m3u_t *m, const int *ent, int n, int64_t *match)
+/* A step while a playlist is matched or written: what it returned, and
+ * *bad set if it failed (a read the card didn't answer, no memory, busy).
+ * That is not "no such song": the playlist is then left as it was, and read
+ * at the next scan. (An entry whose lookup failed was "not in the library",
+ * and the playlist was written without it, or with its songs cleared and not
+ * all put back, under the file's new date and size: known, so it stayed.) */
+static int g_test_pl_fail, g_test_pl_steps;
+void library_test_playlists_fail(int at_step) { g_test_pl_fail = at_step; g_test_pl_steps = 0; }
+
+static int pl_step(sqlite3_stmt *s, int *bad)
+{
+    int rc = g_test_pl_fail && ++g_test_pl_steps == g_test_pl_fail ? SQLITE_IOERR : sqlite3_step(s);
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE) *bad = 1;
+    return rc;
+}
+
+/* Entries ent[0..n) of m (n <= LOOSE_CHUNK): their tracks into match[].
+ * 0, or -1: the library couldn't be gone through to its end (no memory, a
+ * step that failed), and nothing is said of them. */
+static int loose_match(sqlite3 *db, const m3u_t *m, const int *ent, int n, int64_t *match)
 {
     probe_t *p3 = calloc((size_t)n, sizeof *p3), *p2 = calloc((size_t)n, sizeof *p2), *pt = calloc((size_t)n, sizeof *pt);
     int64_t *best = calloc((size_t)n * 3, sizeof *best);   /* by entry: by 3 components, 2, tags */
     int *diff = calloc((size_t)n, sizeof *diff);
     sqlite3_stmt *q = prep(db, "SELECT id, path, artist, title, duration_ms FROM tracks");
     char key[1024], text[1024];
-    int n3 = 0, n2 = 0, nt = 0;
+    int n3 = 0, n2 = 0, nt = 0, bad = 1;
     if (!p3 || !p2 || !pt || !best || !diff || !q) goto out;
+    bad = 0;
     for (int k = 0; k < n; k++) {
         const int j = ent[k];
         path_loose_key(m->paths[j], 3, key, sizeof key);
         if (*key && (p3[n3].key = strdup(key))) p3[n3++].k = k;
+        else if (*key) bad = 1;
         path_loose_key(m->paths[j], 2, key, sizeof key);
         if (*key && (p2[n2].key = strdup(key))) p2[n2++].k = k;
+        else if (*key) bad = 1;
         if (m->infos[j]) {
             text_loose_key(m->infos[j], key, sizeof key);
             if (*key && (pt[nt].key = strdup(key))) pt[nt++].k = k;
+            else if (*key) bad = 1;
         }
     }
+    if (bad) goto out;
     qsort(p3, (size_t)n3, sizeof *p3, cmp_probe);
     qsort(p2, (size_t)n2, sizeof *p2, cmp_probe);
     qsort(pt, (size_t)nt, sizeof *pt, cmp_probe);
-    while (sqlite3_step(q) == SQLITE_ROW) {
+    while (pl_step(q, &bad) == SQLITE_ROW) {
         int64_t id = sqlite3_column_int64(q, 0);
         const char *path = (const char *)sqlite3_column_text(q, 1);
         int c, at;
@@ -3435,7 +3063,7 @@ static void loose_match(sqlite3 *db, const m3u_t *m, const int *ent, int n, int6
             if (!best[k * 3 + 2] || d < diff[k]) { best[k * 3 + 2] = id; diff[k] = d; }
         }
     }
-    for (int k = 0; k < n; k++)
+    for (int k = 0; !bad && k < n; k++)
         match[ent[k]] = best[k * 3] ? best[k * 3] : best[k * 3 + 1] ? best[k * 3 + 1] : best[k * 3 + 2];
 out:
     sqlite3_finalize(q);
@@ -3447,16 +3075,25 @@ out:
     free(pt);
     free(best);
     free(diff);
+    return bad ? -1 : 0;
 }
 
-static int pv_find(const pathvec_t *pv, const char *p);
+/* How a playlist sorts: by its file's name. */
+void playlist_sort_key(const char *path, char *sort, size_t cap)
+{
+    const char *base = strrchr(path, '/');
+    sort_key(base ? base + 1 : path, sort, cap);
+}
 
 /* Re-read playlists and match their entries to tracks: the exact path,
  * else the tracks of a file a CUE sheet splits, else loose_match's. Read
  * again when their file changed, or when tracks did (an entry may now be
  * found, or gone); otherwise kept as they are, with nothing written. Each
- * one read is written in its batch. */
-static void scan_playlists(library_t *lib, pathvec_t *plv, int tracks_changed, batch_t *b, int64_t pl_before)
+ * one read is written in its batch, whole or not at all: a step that failed
+ * while it was matched or written (pl_step) leaves it as it was. Returns how
+ * many were left so: the scan is then not finished, and the next one reads
+ * them again. */
+static int scan_playlists(library_t *lib, pathvec_t *plv, int tracks_changed, batch_t *b, int64_t pl_before)
 {
     sqlite3 *db = lib->db;
     qsort(plv->v, (size_t)plv->n, sizeof *plv->v, cmp_pent);
@@ -3473,7 +3110,7 @@ static void scan_playlists(library_t *lib, pathvec_t *plv, int tracks_changed, b
     sqlite3_stmt *clear = prep(db, "DELETE FROM playlist_items WHERE playlist_id=?");
     sqlite3_stmt *add = prep(db, "INSERT INTO playlist_items(playlist_id, pos, track_id) VALUES(?,?,?)");
     sqlite3_stmt *count = prep(db, "UPDATE playlists SET ntracks=?, nmissing=? WHERE id=?");
-    int ok = exact && parts && known && upl && pid && clear && add && count;
+    int ok = exact && parts && known && upl && pid && clear && add && count, left = !ok;
 
     for (int i = 0; ok && i < plv->n && !lib->cancel; i++) {
         pent_t *pe = &plv->v[i];
@@ -3487,63 +3124,82 @@ static void scan_playlists(library_t *lib, pathvec_t *plv, int tracks_changed, b
             if (same) { pe->kept = 1; continue; }   /* as it was */
         }
         m3u_t m;
-        if (m3u_read(pe->p, &m)) continue;
+        if (m3u_read(pe->p, &m)) {
+            /* There, and not read just now (the card): as it was, and read
+             * at the next scan. (Dropped with the lists that are gone, it
+             * came back at the next scan as another playlist, under a new
+             * number.) One that is read and refused (too long, not a list)
+             * does go. */
+            if (file_unreadable(pe->p)) {
+                pe->kept = 1;
+                left++;
+            }
+            continue;
+        }
         /* each entry's track (> 0), -1 for a split file's tracks, 0 not found */
         int64_t *match = calloc((size_t)m.n + 1, sizeof *match);
         int *ent = malloc(LOOSE_CHUNK * sizeof *ent);
-        if (!match || !ent) { free(match); free(ent); m3u_free(&m); continue; }
-        int nl = 0;
-        for (int j = 0; j < m.n; j++) {
+        int nl = 0, bad = !match || !ent;       /* (bad: not matched or not written, and left as it was) */
+        for (int j = 0; !bad && j < m.n; j++) {
             sqlite3_reset(exact);
             sqlite3_bind_text(exact, 1, m.paths[j], -1, SQLITE_STATIC);
-            match[j] = sqlite3_step(exact) == SQLITE_ROW ? sqlite3_column_int64(exact, 0) : 0;
+            match[j] = pl_step(exact, &bad) == SQLITE_ROW ? sqlite3_column_int64(exact, 0) : 0;
             sqlite3_reset(exact);
             if (!match[j]) {
                 sqlite3_reset(parts);
                 sqlite3_bind_text(parts, 1, m.paths[j], -1, SQLITE_STATIC);
-                if (sqlite3_step(parts) == SQLITE_ROW) match[j] = -1;
+                if (pl_step(parts, &bad) == SQLITE_ROW) match[j] = -1;
                 sqlite3_reset(parts);
             }
             if (!match[j]) ent[nl++] = j;
             if (nl == LOOSE_CHUNK || (nl && j == m.n - 1)) {
-                loose_match(db, &m, ent, nl, match);
+                if (loose_match(db, &m, ent, nl, match)) bad = 1;
                 nl = 0;
             }
         }
         char sort[256];
-        const char *base = strrchr(pe->p, '/');
-        sort_key(base ? base + 1 : pe->p, sort, sizeof sort);
-        batch_write(b);
-        sqlite3_reset(upl);
-        sqlite3_bind_text(upl, 1, pe->p, -1, SQLITE_STATIC);
-        sqlite3_bind_text(upl, 2, m.name, -1, SQLITE_STATIC);
-        sqlite3_bind_text(upl, 3, sort, -1, SQLITE_STATIC);
-        size_t dl = strlen(lib->pl_dir);
-        sqlite3_bind_int(upl, 4, dl && !strncmp(pe->p, lib->pl_dir, dl) && pe->p[dl] == '/');
-        sqlite3_bind_int64(upl, 5, pe->mtime);
-        sqlite3_bind_int64(upl, 6, pe->size);
-        sqlite3_step(upl);
-        sqlite3_reset(upl);
-        sqlite3_reset(pid);
-        sqlite3_bind_text(pid, 1, pe->p, -1, SQLITE_STATIC);
-        int64_t id = sqlite3_step(pid) == SQLITE_ROW ? sqlite3_column_int64(pid, 0) : 0;
-        sqlite3_reset(pid);
-        if (id) {
+        playlist_sort_key(pe->p, sort, sizeof sort);
+        /* (from a step that failed on, none: SQLite may have ended the batch
+         * itself by then, and each further write would stay) */
+        if (!bad) {
+            batch_write(b);
+            bad = !b->open;                     /* (no batch: nothing to take back) */
+        }
+        if (!bad) {
+            sqlite3_reset(upl);
+            sqlite3_bind_text(upl, 1, pe->p, -1, SQLITE_STATIC);
+            sqlite3_bind_text(upl, 2, m.name, -1, SQLITE_STATIC);
+            sqlite3_bind_text(upl, 3, sort, -1, SQLITE_STATIC);
+            size_t dl = strlen(lib->pl_dir);
+            sqlite3_bind_int(upl, 4, dl && !strncmp(pe->p, lib->pl_dir, dl) && pe->p[dl] == '/');
+            sqlite3_bind_int64(upl, 5, pe->mtime);
+            sqlite3_bind_int64(upl, 6, pe->size);
+            pl_step(upl, &bad);
+            sqlite3_reset(upl);
+        }
+        int64_t id = 0;
+        if (!bad) {
+            sqlite3_reset(pid);
+            sqlite3_bind_text(pid, 1, pe->p, -1, SQLITE_STATIC);
+            if (pl_step(pid, &bad) == SQLITE_ROW) id = sqlite3_column_int64(pid, 0);
+            sqlite3_reset(pid);
+        }
+        if (id && !bad) {
             pe->kept = 1;
             sqlite3_reset(clear);
             sqlite3_bind_int64(clear, 1, id);
-            sqlite3_step(clear);
+            pl_step(clear, &bad);
             int found = 0, missing = 0;
-            for (int j = 0; j < m.n; j++) {
+            for (int j = 0; !bad && j < m.n; j++) {
                 if (match[j] < 0) {             /* a split file: its tracks */
                     sqlite3_reset(parts);
                     sqlite3_bind_text(parts, 1, m.paths[j], -1, SQLITE_STATIC);
-                    while (sqlite3_step(parts) == SQLITE_ROW) {
+                    while (!bad && pl_step(parts, &bad) == SQLITE_ROW) {
                         sqlite3_reset(add);
                         sqlite3_bind_int64(add, 1, id);
                         sqlite3_bind_int(add, 2, found++);
                         sqlite3_bind_int64(add, 3, sqlite3_column_int64(parts, 0));
-                        sqlite3_step(add);
+                        pl_step(add, &bad);
                     }
                     sqlite3_reset(parts);
                     continue;
@@ -3556,25 +3212,33 @@ static void scan_playlists(library_t *lib, pathvec_t *plv, int tracks_changed, b
                 sqlite3_bind_int64(add, 1, id);
                 sqlite3_bind_int(add, 2, found++);
                 sqlite3_bind_int64(add, 3, match[j]);
-                sqlite3_step(add);
+                pl_step(add, &bad);
             }
             sqlite3_reset(add);
-            if (missing) fprintf(stderr, "playlist %s: %d of %d entries not found\n", m.name, missing, m.n);
-            sqlite3_reset(count);
-            sqlite3_bind_int(count, 1, found);
-            sqlite3_bind_int(count, 2, missing);
-            sqlite3_bind_int64(count, 3, id);
-            sqlite3_step(count);
-            sqlite3_reset(count);
+            if (missing && !bad) fprintf(stderr, "playlist %s: %d of %d entries not found\n", m.name, missing, m.n);
+            if (!bad) {
+                sqlite3_reset(count);
+                sqlite3_bind_int(count, 1, found);
+                sqlite3_bind_int(count, 2, missing);
+                sqlite3_bind_int64(count, 3, id);
+                pl_step(count, &bad);
+                sqlite3_reset(count);
+            }
         }
-        batch_end(b);                           /* (before the next is read) */
+        if (bad) batch_undo(b);
+        if (batch_end(b)) bad = 1;              /* (before the next is read) */
+        if (bad) {                              /* its row as it was, and not gone (below) */
+            fprintf(stderr, "playlist %s: couldn't be matched or written: as it was, again next scan\n", m.name);
+            pe->kept = 1;
+            left++;
+        }
         free(match);
         free(ent);
         m3u_free(&m);
     }
     sqlite3_finalize(exact); sqlite3_finalize(parts); sqlite3_finalize(known); sqlite3_finalize(upl); sqlite3_finalize(pid);
     sqlite3_finalize(clear); sqlite3_finalize(add); sqlite3_finalize(count);
-    if (!ok || plv->failed || lib->cancel) return;   /* (stopped: not all of them looked at) */
+    if (!ok || plv->failed || lib->cancel) return left;   /* (stopped: not all of them looked at) */
     /* Playlists gone: not found by the walk, or found and no longer
      * readable. One the walk didn't see whose file is there was made on the
      * player meanwhile (after the walk): it stays; and so does one made
@@ -3589,11 +3253,9 @@ static void scan_playlists(library_t *lib, pathvec_t *plv, int tracks_changed, b
         struct stat st;
         if (j >= 0 ? plv->v[j].kept : (path && stat(path, &st) == 0)) continue;
         if (j < 0 && sqlite3_column_int64(all, 0) > pl_before) continue;
-        if (ng == cap) {
-            int64_t *ngone = realloc(gone, (size_t)(cap = cap ? cap * 2 : 16) * sizeof *gone);
-            if (!ngone) break;
-            gone = ngone;
-        }
+        int64_t *ngone = vec_room(gone, ng, &cap, 16, sizeof *gone);
+        if (!ngone) break;
+        gone = ngone;
         gone[ng++] = sqlite3_column_int64(all, 0);
     }
     sqlite3_finalize(all);
@@ -3614,6 +3276,7 @@ static void scan_playlists(library_t *lib, pathvec_t *plv, int tracks_changed, b
         batch_end(b);
     }
     free(gone);
+    return left;
 }
 
 /* ---------- CUE sheets ---------- */
@@ -3639,8 +3302,8 @@ static int readable(const char *path)
  * read again for it, once. */
 static int cue_in_tags(const char *path)
 {
-    const char *dot = strrchr(path, '.');
-    return dot && (!strcasecmp(dot, ".flac") || !strcasecmp(dot, ".wv") || !strcasecmp(dot, ".ape"));
+    const char *e = path_ext(path);
+    return !strcasecmp(e, "flac") || !strcasecmp(e, "wv") || !strcasecmp(e, "ape");
 }
 
 static int pv_find(const pathvec_t *pv, const char *p)
@@ -3708,6 +3371,20 @@ static int cue_resolve(const pathvec_t *pv, const char *sheet, const char *name,
     return best;
 }
 
+/* The tracks table's upserts (a file's: scan_once; a sheet's track: cue_stmts_prep;
+ * a first scan's: direct_open) start alike: the columns bind_tags fills (?1 to
+ * ?23) with seen and tags_v, their values, and what a row there already takes
+ * from the file again. */
+#define TRACK_COLS "path, mtime, size, title, artist, album_artist, album, genre, year, disc, track," \
+                   " codec, rate, bits, channels, duration_ms, has_pic, seen," \
+                   " rg_state, rg_track, rg_track_peak, rg_album, rg_album_peak, composer, tags_v"
+#define TRACK_VALS "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,2"
+#define TRACK_SET_TAGS "mtime=excluded.mtime, size=excluded.size, title=excluded.title," \
+                       " artist=excluded.artist, album_artist=excluded.album_artist, album=excluded.album," \
+                       " genre=excluded.genre, year=excluded.year, disc=excluded.disc, track=excluded.track," \
+                       " codec=excluded.codec, rate=excluded.rate, bits=excluded.bits, channels=excluded.channels," \
+                       " duration_ms=excluded.duration_ms, has_pic=excluded.has_pic"
+
 /* The scan's statements for CUE sheets. */
 typedef struct {
     sqlite3_stmt *known, *split, *put_sheet, *plain;   /* the .cue files */
@@ -3716,7 +3393,24 @@ typedef struct {
     idset_t *seen;                             /* the tracks found (library_scan) */
     int retry;                                 /* files that couldn't be read are read again (library_scan_retry_unread):
                                                 * 1 the damaged ones, 2 those the reader stopped on as well */
+    int db_failed;                             /* a lookup in the library failed (scan_row): nothing is dropped as gone */
+    int unread;                                /* sheets that changed and couldn't be read just now: as they were, tried again */
 } cue_stmts_t;
+
+/* A step of one of the scan's lookups: 1 a row, 0 none. A step that failed
+ * (a read the card didn't answer, no memory, busy) is neither, and says so:
+ * taken for "not in the library", the song wasn't ticked off as found, and
+ * the scan's end dropped its row as gone, with its plays, its favourite and
+ * its place in playlists. A scan with any such failure drops nothing. */
+static int g_test_lookups_fail;
+void library_test_scan_lookups_fail(int on) { g_test_lookups_fail = on; }
+
+static int scan_row(sqlite3_stmt *s, int *failed)
+{
+    int rc = g_test_lookups_fail ? SQLITE_IOERR : sqlite3_step(s);
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE) *failed = 1;
+    return rc == SQLITE_ROW;
+}
 
 static int cue_stmts_prep(sqlite3 *db, cue_stmts_t *c)
 {
@@ -3742,15 +3436,9 @@ static int cue_stmts_prep(sqlite3 *db, cue_stmts_t *c)
 #define CUE_KEEP_RG "(tracks.mtime IS excluded.mtime AND tracks.size IS excluded.size AND tracks.rg_state IN (2,3)" \
                     " AND excluded.rg_state=0)"
     c->up = prep(db,
-        "INSERT INTO tracks(path, mtime, size, title, artist, album_artist, album, genre, year, disc, track,"
-        " codec, rate, bits, channels, duration_ms, has_pic, seen,"
-        " rg_state, rg_track, rg_track_peak, rg_album, rg_album_peak, composer, tags_v, cue, sort)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,2,?,songkey(?4))"
-        " ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, size=excluded.size, title=excluded.title,"
-        " artist=excluded.artist, album_artist=excluded.album_artist, album=excluded.album,"
-        " genre=excluded.genre, year=excluded.year, disc=excluded.disc, track=excluded.track,"
-        " codec=excluded.codec, rate=excluded.rate, bits=excluded.bits, channels=excluded.channels,"
-        " duration_ms=excluded.duration_ms, has_pic=excluded.has_pic, seen=1,"
+        "INSERT INTO tracks(" TRACK_COLS ", cue, sort)"
+        " VALUES(" TRACK_VALS ",?,songkey(?4))"
+        " ON CONFLICT(path) DO UPDATE SET " TRACK_SET_TAGS ", seen=1,"
         " rg_state=CASE WHEN " CUE_KEEP_RG " THEN rg_state ELSE excluded.rg_state END,"
         " rg_track=CASE WHEN " CUE_KEEP_RG " THEN rg_track ELSE excluded.rg_track END,"
         " rg_track_peak=CASE WHEN " CUE_KEEP_RG " THEN rg_track_peak ELSE excluded.rg_track_peak END,"
@@ -3790,20 +3478,32 @@ static void cue_claim(cue_stmts_t *c, pathvec_t *pv, pathvec_t *cv, cue_sheet_t 
         int same = 0, want = 0, got = 0, had = -1;
         sqlite3_reset(c->known);
         sqlite3_bind_text(c->known, 1, e->p, -1, SQLITE_STATIC);
-        if (sqlite3_step(c->known) == SQLITE_ROW && sqlite3_column_int64(c->known, 0) == e->mtime &&
-            sqlite3_column_int64(c->known, 1) == e->size) {
-            same = 1;
-            want = had = sqlite3_column_int(c->known, 2);
+        int there = scan_row(c->known, &c->db_failed);
+        if (there) had = sqlite3_column_int(c->known, 2);
+        same = there && sqlite3_column_int64(c->known, 0) == e->mtime && sqlite3_column_int64(c->known, 1) == e->size;
+        sqlite3_reset(c->known);
+        /* A sheet that changed and can't be read just now (the card not
+         * answering, no memory for it): as it was at the last scan, and read
+         * at the next. (It claimed nothing and was written down as read, with
+         * no files: its album's songs were dropped, the file became one long
+         * track, and the sheet wasn't read again until something touched it.) */
+        int read_ok = !same && sheet_buf(sheet) && cue_read(e->p, *sheet) > 0;
+        /* (an empty file is read, and says nothing: not this) */
+        int unread = !same && !read_ok && e->size > 0 && (!*sheet || !readable(e->p));
+        if (unread) c->unread++;
+        if (unread && there) same = 1;
+        if (same) {
+            want = had;
             sqlite3_reset(c->split);
             sqlite3_bind_text(c->split, 1, e->p, -1, SQLITE_STATIC);
-            while (sqlite3_step(c->split) == SQLITE_ROW) {
+            while (scan_row(c->split, &c->db_failed)) {
                 int j = pv_find(pv, (const char *)sqlite3_column_text(c->split, 0));
                 if (j >= 0 && pv->v[j].cue < 0) { pv->v[j].cue = k; got++; }
             }
             sqlite3_reset(c->split);
+            read_ok = got < want && sheet_buf(sheet) && cue_read(e->p, *sheet) > 0;
         }
-        sqlite3_reset(c->known);
-        if ((!same || got < want) && sheet_buf(sheet) && cue_read(e->p, *sheet) > 0) {
+        if (read_ok) {
             cue_sheet_t *s = *sheet;
             want = 0;
             for (int f = 0; f < s->nfiles; f++) {
@@ -3816,7 +3516,7 @@ static void cue_claim(cue_stmts_t *c, pathvec_t *pv, pathvec_t *cv, cue_sheet_t 
                     sqlite3_bind_text(c->plain, 1, pv->v[j].p, -1, SQLITE_STATIC);
                     sqlite3_bind_int64(c->plain, 2, pv->v[j].mtime);
                     sqlite3_bind_int64(c->plain, 3, pv->v[j].size);
-                    int plain = sqlite3_step(c->plain) == SQLITE_ROW;
+                    int plain = scan_row(c->plain, &c->db_failed);
                     sqlite3_reset(c->plain);
                     if (plain) continue;
                 }
@@ -3825,7 +3525,7 @@ static void cue_claim(cue_stmts_t *c, pathvec_t *pv, pathvec_t *cv, cue_sheet_t 
         }
         e->cue = !same;
         e->want = want;
-        e->put = !same || want != had;
+        e->put = (!same || want != had) && !(unread && !there);   /* (a new one not read: not noted as read) */
     }
 }
 
@@ -3850,20 +3550,36 @@ static void cue_found(cue_stmts_t *c, const char *path)
 {
     sqlite3_reset(c->id);
     sqlite3_bind_text(c->id, 1, path, -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(c->id) == SQLITE_ROW) idset_add(c->seen, sqlite3_column_int64(c->id, 0));
+    if (scan_row(c->id, &c->db_failed)) idset_add(c->seen, sqlite3_column_int64(c->id, 0));
     sqlite3_reset(c->id);
 }
 
-/* A file that was set aside as unreadable (kind 3) and couldn't be read
- * again just now for want of memory or of the card: it stays set aside as it
- * was. (Tried again because a Rescan asked, it had its row dropped as "no
- * longer true": gone from Files not read, and read again at every scan.) */
+/* File f's row in `cues` stays, and the tracks it is split into are found. */
+static void cue_keep(cue_stmts_t *c, pent_t *f)
+{
+    f->kept = 1;
+    sqlite3_reset(c->parts);
+    sqlite3_bind_text(c->parts, 1, f->p, -1, SQLITE_STATIC);
+    while (scan_row(c->parts, &c->db_failed)) idset_add(c->seen, sqlite3_column_int64(c->parts, 0));
+    sqlite3_reset(c->parts);
+}
+
+/* A file with a row of its own in `cues` that couldn't be read just now for
+ * want of memory or of the card: it stays as it was. One set aside as
+ * unreadable (kind 3) stays set aside. (Tried again because a Rescan asked,
+ * it had its row dropped as "no longer true": gone from Files not read, and
+ * read again at every scan.) One split into its sheet's tracks keeps them:
+ * they are found. (None was, and a changed album that couldn't be read at
+ * that moment lost every track, with their plays; the next scan made them
+ * again as new songs.) */
 static void cue_keep_unread(cue_stmts_t *c, pent_t *f)
 {
     sqlite3_reset(c->look);
     sqlite3_bind_text(c->look, 1, f->p, -1, SQLITE_STATIC);
-    if (sqlite3_step(c->look) == SQLITE_ROW && sqlite3_column_int(c->look, 2) == 3) f->kept = 1;
+    int there = scan_row(c->look, &c->db_failed);
     sqlite3_reset(c->look);
+    if (!there) return;
+    cue_keep(c, f);
 }
 
 /* A split music file (or one that can't be read: kind 3) as it was at the
@@ -3873,7 +3589,7 @@ static int cue_unchanged(cue_stmts_t *c, pent_t *f, int kind, const char *sheet)
 {
     sqlite3_reset(c->look);
     sqlite3_bind_text(c->look, 1, f->p, -1, SQLITE_STATIC);
-    int same = sqlite3_step(c->look) == SQLITE_ROW && sqlite3_column_int64(c->look, 0) == f->mtime &&
+    int same = scan_row(c->look, &c->db_failed) && sqlite3_column_int64(c->look, 0) == f->mtime &&
                sqlite3_column_int64(c->look, 1) == f->size && sqlite3_column_int(c->look, 2) == kind;
     if (same) {
         const char *was = (const char *)sqlite3_column_text(c->look, 3);
@@ -3883,12 +3599,25 @@ static int cue_unchanged(cue_stmts_t *c, pent_t *f, int kind, const char *sheet)
     }
     sqlite3_reset(c->look);
     if (!same) return 0;
-    f->kept = 1;
-    sqlite3_reset(c->parts);
-    sqlite3_bind_text(c->parts, 1, f->p, -1, SQLITE_STATIC);
-    while (sqlite3_step(c->parts) == SQLITE_ROW) idset_add(c->seen, sqlite3_column_int64(c->parts, 0));
-    sqlite3_reset(c->parts);
+    cue_keep(c, f);
     return 1;
+}
+
+/* File f's row in `cues` written (kind 1 or 2: split into tracks, `sheet` the
+ * .cue or NULL; kind 3: not readable, `sheet` why): it stays. */
+static void cue_put_file(cue_stmts_t *c, pent_t *f, int kind, const char *sheet, int nfiles)
+{
+    sqlite3_reset(c->put_file);
+    sqlite3_bind_text(c->put_file, 1, f->p, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(c->put_file, 2, f->mtime);
+    sqlite3_bind_int64(c->put_file, 3, f->size);
+    sqlite3_bind_int(c->put_file, 4, kind);
+    if (sheet) sqlite3_bind_text(c->put_file, 5, sheet, -1, SQLITE_STATIC);
+    else sqlite3_bind_null(c->put_file, 5);
+    sqlite3_bind_int(c->put_file, 6, nfiles);
+    sqlite3_step(c->put_file);
+    sqlite3_reset(c->put_file);
+    f->kept = 1;
 }
 
 /* A music file whose tags can't be read (a damaged or half-copied file):
@@ -3901,17 +3630,7 @@ static int cue_unchanged(cue_stmts_t *c, pent_t *f, int kind, const char *sheet)
 static void cue_unreadable(cue_stmts_t *c, pent_t *f, const char *why)
 {
     if (!why) fprintf(stderr, "library: can't read %s\n", f->p);
-    sqlite3_reset(c->put_file);
-    sqlite3_bind_text(c->put_file, 1, f->p, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(c->put_file, 2, f->mtime);
-    sqlite3_bind_int64(c->put_file, 3, f->size);
-    sqlite3_bind_int(c->put_file, 4, 3);
-    if (why) sqlite3_bind_text(c->put_file, 5, why, -1, SQLITE_STATIC);
-    else sqlite3_bind_null(c->put_file, 5);
-    sqlite3_bind_int(c->put_file, 6, TAGS_READER);
-    sqlite3_step(c->put_file);
-    sqlite3_reset(c->put_file);
-    f->kept = 1;
+    cue_put_file(c, f, 3, why, TAGS_READER);
 }
 
 static void bind_tags(sqlite3_stmt *up, const char *path, const pent_t *f, const tags_t *t);
@@ -3980,17 +3699,7 @@ static int cue_write(cue_stmts_t *c, pent_t *f, const cue_sheet_t *s, int fi, co
         sqlite3_reset(c->up);
         cue_found(c, path);
     }
-    sqlite3_reset(c->put_file);
-    sqlite3_bind_text(c->put_file, 1, f->p, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(c->put_file, 2, f->mtime);
-    sqlite3_bind_int64(c->put_file, 3, f->size);
-    sqlite3_bind_int(c->put_file, 4, kind);
-    if (sheet) sqlite3_bind_text(c->put_file, 5, sheet, -1, SQLITE_STATIC);
-    else sqlite3_bind_null(c->put_file, 5);
-    sqlite3_bind_int(c->put_file, 6, 0);
-    sqlite3_step(c->put_file);
-    sqlite3_reset(c->put_file);
-    f->kept = 1;
+    cue_put_file(c, f, kind, sheet, 0);
     return n;
 }
 
@@ -4047,13 +3756,6 @@ static void bind_tags(sqlite3_stmt *up, const char *path, const pent_t *f, const
     if (t->has_rg_album) sqlite3_bind_double(up, 21, t->rg_album_gain); else sqlite3_bind_null(up, 21);
     if (t->has_rg_album && t->rg_album_peak > 0) sqlite3_bind_double(up, 22, t->rg_album_peak); else sqlite3_bind_null(up, 22);
     sqlite3_bind_text(up, 23, t->composer, -1, SQLITE_TRANSIENT);
-}
-
-static double now_s(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
 /* The files a scan reads tags from, read before their batch begins (no lock
@@ -4136,24 +3838,18 @@ static void direct_open(scan_t *sc, const pathvec_t *pv)
     /* (as scan_once's INSERT, with what rebuild_groups, rebuild_composers,
      * rebuild_folders and index_search would write afterwards) */
     sc->d_ins = prep(db,
-        "INSERT INTO tracks(path, mtime, size, title, artist, album_artist, album, genre, year, disc, track,"
-        " codec, rate, bits, channels, duration_ms, has_pic, seen,"
-        " rg_state, rg_track, rg_track_peak, rg_album, rg_album_peak, composer, tags_v, sort,"
+        "INSERT INTO tracks(" TRACK_COLS ", sort,"
         " id, album_id, artist_id, genre_id, composer_id, folder_id, search)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,2,songkey(?4),"
+        " VALUES(" TRACK_VALS ",songkey(?4),"
         " ?24, ?25, ?26, ?27, ?28, ?29,"
         " " SKEY_TRACK("?4", "?5", "?6", "?7") ")");
-    sc->d_genre = prep(db, "INSERT OR IGNORE INTO genres(name) SELECT TRIM(?1) WHERE TRIM(COALESCE(?1,''))<>''");
-    sc->d_gget = prep(db, "SELECT id FROM genres WHERE name=TRIM(?1)");
-    sc->d_comp = prep(db, "INSERT OR IGNORE INTO composers(name) SELECT TRIM(?1) WHERE TRIM(COALESCE(?1,''))<>''");
-    sc->d_cget = prep(db, "SELECT id FROM composers WHERE name=TRIM(?1)");
-    sc->d_fup = prep(db, "INSERT INTO folders(path, parent, name, sort, seen) VALUES(?,?,?,?,1)"
-                         " ON CONFLICT(path) DO UPDATE SET parent=excluded.parent, name=excluded.name,"
-                         " sort=excluded.sort, seen=1");
-    sc->d_fget = prep(db, "SELECT id FROM folders WHERE path=?");
-    sqlite3_stmt *top = prep(db, "SELECT COALESCE(MAX(id), 0) + 1 FROM tracks");
-    sc->d_next = top && sqlite3_step(top) == SQLITE_ROW ? sqlite3_column_int64(top, 0) : 0;
-    sqlite3_finalize(top);
+    sc->d_genre = prep(db, NAMED_PUT_SQL("genres"));
+    sc->d_gget = prep(db, NAMED_GET_SQL("genres"));
+    sc->d_comp = prep(db, NAMED_PUT_SQL("composers"));
+    sc->d_cget = prep(db, NAMED_GET_SQL("composers"));
+    sc->d_fup = prep(db, FOLDER_PUT_SQL);
+    sc->d_fget = prep(db, FOLDER_GET_SQL);
+    sc->d_next = db_int(db, "SELECT COALESCE(MAX(id), 0) + 1 FROM tracks", 0, 0);
     if (!sc->d_row || !sc->d_ins || !sc->d_genre || !sc->d_gget || !sc->d_comp || !sc->d_cget || !sc->d_fup ||
         !sc->d_fget || sc->d_next != 1) {
         direct_close(sc);
@@ -4162,12 +3858,7 @@ static void direct_open(scan_t *sc, const pathvec_t *pv)
     /* the folder every file is under (as folders_root: the first and last
      * paths' common part; a file that turns out unreadable can move it, and
      * rebuild_folders, run afterwards, puts that right) */
-    const char *a = pv->v[0].p, *b = pv->v[pv->n - 1].p;
-    size_t n = 0, cut = 0;
-    while (a[n] && a[n] == b[n]) { if (a[n] == '/') cut = n; n++; }
-    if (cut >= sizeof sc->d_root) cut = sizeof sc->d_root - 1;
-    memcpy(sc->d_root, a, cut);
-    sc->d_root[cut] = '\0';
+    common_dir(pv->v[0].p, pv->v[pv->n - 1].p, sc->d_root, sizeof sc->d_root);
     sc->d_dir[0] = '\0';
     sc->d_gname[0] = sc->d_cname[0] = '\1';       /* (no name yet: the first one is looked up) */
     sc->d_gname[1] = sc->d_cname[1] = '\0';
@@ -4191,6 +3882,16 @@ static int64_t direct_named(sqlite3_stmt *put, sqlite3_stmt *get, const char *na
     return id;
 }
 
+/* direct_named, the last name asked remembered (in `last`, cap bytes: one too
+ * long for it is looked up each time) */
+static void direct_cached(sqlite3_stmt *put, sqlite3_stmt *get, const char *name, char *last, size_t cap, int64_t *id)
+{
+    if (!strcmp(name, last)) return;
+    *id = direct_named(put, get, name);
+    snprintf(last, cap, "%s", name);
+    if (strcmp(name, last)) last[0] = '\1';
+}
+
 /* The song of file f, tags t: added with its groups (in the batch that's
  * open). 0, or -1: not added, and no more this way (sc->direct is -1). */
 static int direct_track(scan_t *sc, const pent_t *f, const tags_t *t)
@@ -4205,22 +3906,12 @@ static int direct_track(scan_t *sc, const pent_t *f, const tags_t *t)
     if (sqlite3_step(sc->d_row) != SQLITE_ROW) { sqlite3_reset(sc->d_row); sc->direct = -1; return -1; }
     grp_track(&sc->d_g, sc->d_row);
     sqlite3_reset(sc->d_row);
-    if (strcmp(t->genre, sc->d_gname)) {
-        sc->d_gid = direct_named(sc->d_genre, sc->d_gget, t->genre);
-        snprintf(sc->d_gname, sizeof sc->d_gname, "%s", t->genre);
-        if (strcmp(t->genre, sc->d_gname)) sc->d_gname[0] = '\1';   /* (cut: looked up each time) */
-    }
-    if (strcmp(t->composer, sc->d_cname)) {
-        sc->d_cid = direct_named(sc->d_comp, sc->d_cget, t->composer);
-        snprintf(sc->d_cname, sizeof sc->d_cname, "%s", t->composer);
-        if (strcmp(t->composer, sc->d_cname)) sc->d_cname[0] = '\1';
-    }
+    direct_cached(sc->d_genre, sc->d_gget, t->genre, sc->d_gname, sizeof sc->d_gname, &sc->d_gid);
+    direct_cached(sc->d_comp, sc->d_cget, t->composer, sc->d_cname, sizeof sc->d_cname, &sc->d_cid);
     char dir[1024];
-    snprintf(dir, sizeof dir, "%s", path);
-    char *slash = strrchr(dir, '/');
-    if (slash) *slash = '\0';
+    dir_of(path, dir, sizeof dir);
     if (!sc->d_fid || strcmp(dir, sc->d_dir)) {
-        sc->d_fid = folder_id(sc->db, sc->d_fup, sc->d_fget, strlen(dir) >= strlen(sc->d_root) ? dir : sc->d_root, sc->d_root);
+        sc->d_fid = folder_under(sc->db, sc->d_fup, sc->d_fget, dir, sc->d_root);
         snprintf(sc->d_dir, sizeof sc->d_dir, "%s", dir);
     }
     sqlite3_stmt *in = sc->d_ins;
@@ -4276,6 +3967,16 @@ static int stopped_beside(sqlite3 *db, const char *path)
     return r;
 }
 
+/* Track `id`, as it was: the tags read later than its row (its composer), noted. */
+static void scan_later(scan_t *sc, int64_t id, const char *composer)
+{
+    sqlite3_reset(sc->later);
+    sqlite3_bind_int64(sc->later, 1, id);
+    sqlite3_bind_text(sc->later, 2, composer, -1, SQLITE_TRANSIENT);
+    sqlite3_step(sc->later);
+    sqlite3_reset(sc->later);
+}
+
 static void scan_flush(scan_t *sc, pathvec_t *pv)
 {
     if (!sc->npend) return;
@@ -4292,11 +3993,7 @@ static void scan_flush(scan_t *sc, pathvec_t *pv)
         if (e->kind == PEND_BAD) {
             cue_unreadable(&sc->cs, f, f->skip ? UNREAD_STOPPED : NULL);
         } else if (e->kind == PEND_LATER) {
-            sqlite3_reset(sc->later);
-            sqlite3_bind_int64(sc->later, 1, e->id);
-            sqlite3_bind_text(sc->later, 2, e->t.composer, -1, SQLITE_TRANSIENT);
-            sqlite3_step(sc->later);
-            sqlite3_reset(sc->later);
+            scan_later(sc, e->id, e->t.composer);
         } else {
             int added = sc->direct == 1 && direct_track(sc, f, &e->t) == 0;
             if (!added) {
@@ -4319,7 +4016,7 @@ static void scan_flush(scan_t *sc, pathvec_t *pv)
      * of seconds, not every 32 songs. Each one writes again the pages every
      * song touches (albums, artists, the names' index): measured on the H2,
      * 50,000 songs, over a minute of the scan. */
-    if (sc->direct == 1 && now_s() - sc->b.since < FIRST_BATCH_S) return;
+    if (sc->direct == 1 && clock_fsec() - sc->b.since < FIRST_BATCH_S) return;
     batch_end(&sc->b);
 }
 
@@ -4327,8 +4024,8 @@ static void scan_flush(scan_t *sc, pathvec_t *pv)
  * has waited BATCH_S). */
 static pend_t *scan_queue(scan_t *sc, pathvec_t *pv, int i, int kind)
 {
-    if (sc->npend == PEND_MAX || (sc->npend && now_s() - sc->pend_since >= BATCH_S)) scan_flush(sc, pv);
-    if (!sc->npend) sc->pend_since = now_s();
+    if (sc->npend == PEND_MAX || (sc->npend && clock_fsec() - sc->pend_since >= BATCH_S)) scan_flush(sc, pv);
+    if (!sc->npend) sc->pend_since = clock_fsec();
     pend_t *e = &sc->pend[sc->npend++];
     e->i = i;
     e->kind = kind;
@@ -4342,6 +4039,17 @@ static void scan_now(scan_t *sc, pathvec_t *pv)
 {
     scan_flush(sc, pv);
     scan_dirty(sc, 2);
+}
+
+/* A scan's statements and what it noted, freed (its batch is ended by then) */
+static void scan_state_free(scan_t *sc)
+{
+    sqlite3_finalize(sc->later);
+    sqlite3_finalize(sc->up);
+    cue_stmts_free(&sc->cs);
+    free(sc->pend);
+    free(sc->seen.bits);
+    free(sc->wrote.bits);
 }
 
 /* ---- a first scan loads in bulk ----
@@ -4398,32 +4106,41 @@ static int bulk_end(library_t *lib)
     sqlite3_stmt *q = NULL;
     if (sqlite3_prepare_v2(db, "SELECT sql FROM bulk_idx", -1, &q, NULL) != SQLITE_OK) { lib->bulk = 0; return 0; }   /* (no such table: none) */
     char **sql = NULL;
-    int n = 0, cap = 0;
-    while (sqlite3_step(q) == SQLITE_ROW) {
-        if (n == cap) {
-            char **grown = realloc(sql, (size_t)(cap = cap ? cap * 2 : 32) * sizeof *sql);
-            if (!grown) break;
-            sql = grown;
-        }
+    int n = 0, cap = 0, rc, short_of = 0;
+    while ((rc = sqlite3_step(q)) == SQLITE_ROW) {
+        char **grown = vec_room(sql, n, &cap, 32, sizeof *sql);
+        if (!grown) { short_of = 1; break; }
+        sql = grown;
         const char *t = (const char *)sqlite3_column_text(q, 0);
         if (t && (sql[n] = strdup(t))) n++;
+        else short_of = 1;
     }
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE) short_of = 1;
     sqlite3_finalize(q);
-    double t0 = now_s();
+    double t0 = clock_fsec();
     g_up_done = 0;
     g_up_total = n;
     for (int i = 0; i < n; i++) {
         char *err = NULL;
-        if (sqlite3_exec(db, sql[i], NULL, NULL, &err) != SQLITE_OK && !(err && strstr(err, "already exists")))
+        if (sqlite3_exec(db, sql[i], NULL, NULL, &err) != SQLITE_OK && !(err && strstr(err, "already exists"))) {
             fprintf(stderr, "library: %s\n  in: %s\n", err ? err : "?", sql[i]);
+            short_of = 1;
+        }
         sqlite3_free(err);
         free(sql[i]);
         up_tick();
     }
     free(sql);
-    sqlite3_exec(db, "DROP TABLE IF EXISTS bulk_idx", NULL, NULL, NULL);
+    /* The list of what is still to build goes only once all of it is built.
+     * (It went whatever had happened: a list read short, or an index that
+     * couldn't be made on a card that filled during the first scan, and
+     * the songs stayed without those indexes, every list reading the whole
+     * table, with nothing left to say which were missing.) Kept, the next
+     * open builds what's missing: those made already say so and are passed. */
+    if (short_of) fprintf(stderr, "library: not every index could be built: the rest at the next start\n");
+    else sqlite3_exec(db, "DROP TABLE IF EXISTS bulk_idx", NULL, NULL, NULL);
     lib->bulk = 0;
-    if (n) fprintf(stderr, "library: %d indexes built in %.1f s\n", n, now_s() - t0);
+    if (n) fprintf(stderr, "library: %d indexes built in %.1f s\n", n, clock_fsec() - t0);
     return n;
 }
 
@@ -4454,7 +4171,7 @@ int library_scan(library_t *lib, const char *root, lib_progress_cb cb, void *ctx
 
 static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void *ctx, int allow_fast)
 {
-    double t0 = now_s(), t_walk, t_files, t_groups, t_pl, t_art, t_tags = 0, tt;
+    double t0 = clock_fsec(), t_walk, t_files, t_groups, t_pl, t_art, t_tags = 0, tt;
     pathvec_t pv = {0}, plv = {0}, cv = {0}, iv = {0}, none = {0}, nocue = {0};
     /* No music folder (renamed, or the card's away): every track would look
      * deleted, with its play counts. The library stays as it is instead. */
@@ -4462,29 +4179,22 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
     if (stat(root, &rst) != 0 || !S_ISDIR(rst.st_mode)) return -1;
     lib->cancel = 0;
     art_migrate(lib);                              /* (covers from before the store, once) */
-    int64_t pl_before = INT64_MAX;                 /* playlists made from here on are kept */
-    sqlite3_stmt *plmax = prep(lib->db, "SELECT COALESCE(MAX(id), 0) FROM playlists");
-    if (plmax && sqlite3_step(plmax) == SQLITE_ROW) pl_before = sqlite3_column_int64(plmax, 0);
-    sqlite3_finalize(plmax);
+    /* playlists made from here on are kept */
+    int64_t pl_before = db_int(lib->db, "SELECT COALESCE(MAX(id), 0) FROM playlists", 0, INT64_MAX);
     lib->groups_how = 0;
     t_look.cb = cb;                                /* (the listing's own count: look_tell) */
     t_look.ctx = ctx;
     t_look.found = t_look.checked = 0;
-    t_look.at = now_s();
+    t_look.at = clock_fsec();
     /* the library's files as they are aren't held by name (known_build) */
     known_t *known = known_build(lib->db);
     pv.known = known;
-    int fast = allow_fast ? fast_walk(lib, root, &pv, &plv, &cv, &iv) : 0;
-    if (!fast) walk(root, &pv, &plv, &cv, &iv, 0, &lib->cancel);
+    int fast = list_music(lib, root, allow_fast, &pv, &plv, &cv, &iv);
     if (known && cv.n && !lib->cancel) {           /* a sheet where there was none: every file by name, as before */
-        pv_free(&pv);
-        pv_free(&plv);
-        pv_free(&cv);
-        pv_free(&iv);
+        lists_free(&pv, &plv, &cv, &iv);
         known_free(known);
         known = NULL;
-        fast = allow_fast ? fast_walk(lib, root, &pv, &plv, &cv, &iv) : 0;
-        if (!fast) walk(root, &pv, &plv, &cv, &iv, 0, &lib->cancel);
+        fast = list_music(lib, root, allow_fast, &pv, &plv, &cv, &iv);
     }
     lib->quick = fast;
     lib->scan_held = pv.n;
@@ -4493,10 +4203,7 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
     pv_free(&none);
     pv_free(&nocue);
     if (lib->cancel) {
-        pv_free(&pv);
-        pv_free(&plv);
-        pv_free(&cv);
-        pv_free(&iv);
+        lists_free(&pv, &plv, &cv, &iv);
         known_free(known);
         return -1;
     }
@@ -4524,17 +4231,12 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
         !library_needs_tags(lib) && !library_needs_art(lib) &&
         !get_int_col(lib, "SELECT EXISTS(SELECT 1 FROM albums WHERE art_sig=0)", 0) &&   /* (every cover's source noted) */
         get_int_col(lib, "SELECT COUNT(*) FROM playlists", 0) == plv.n) {   /* (none of the player's left without its file) */
-        fprintf(stderr, "library: scan %.1f s: nothing changed (%s%d files)\n", now_s() - t0, fast ? "fast walk, " : "",
+        fprintf(stderr, "library: scan %.1f s: nothing changed (%s%d files)\n", clock_fsec() - t0, fast ? "fast walk, " : "",
                 pv.n + (known ? known->n_same : 0));
         known_free(known);
-        pv_free(&pv);
-        pv_free(&plv);
-        pv_free(&cv);
-        pv_free(&iv);
+        lists_free(&pv, &plv, &cv, &iv);
         lib->scan_changes = 0;
-        sqlite3_stmt *cn = prep(lib->db, "SELECT COUNT(*) FROM tracks");
-        int count = (cn && sqlite3_step(cn) == SQLITE_ROW) ? sqlite3_column_int(cn, 0) : -1;
-        sqlite3_finalize(cn);
+        int count = (int)db_int(lib->db, "SELECT COUNT(*) FROM tracks", 0, -1);
         if (cb) cb(count, count, "done", ctx);
         return count;
     }
@@ -4552,7 +4254,7 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
     t_look.cb = NULL;                              /* (listed: the songs' own count from here) */
     int first = 0;                                 /* a first scan, its indexes set aside just now */
     if (!lib->bulk && pv.n >= g_bulk_min && library_empty(lib)) { bulk_begin(lib); first = lib->bulk; }
-    t_walk = now_s();
+    t_walk = clock_fsec();
 
     /* Nothing is written for a file as it was (the usual case: a scan that
      * finds nothing new writes nothing at all); tracks found are noted in
@@ -4567,15 +4269,9 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
     sqlite3_stmt *look = prep(db, "SELECT id, mtime, size, tags_v FROM tracks WHERE path=? AND cue=0");
     sc.later = prep(db, "UPDATE tracks SET composer=?2, tags_v=2 WHERE id=?1");
     sc.up = prep(db,
-        "INSERT INTO tracks(path, mtime, size, title, artist, album_artist, album, genre, year, disc, track,"
-        " codec, rate, bits, channels, duration_ms, has_pic, seen,"
-        " rg_state, rg_track, rg_track_peak, rg_album, rg_album_peak, composer, tags_v, sort)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,2,songkey(?4))"
-        " ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, size=excluded.size, title=excluded.title,"
-        " artist=excluded.artist, album_artist=excluded.album_artist, album=excluded.album,"
-        " genre=excluded.genre, year=excluded.year, disc=excluded.disc, track=excluded.track,"
-        " codec=excluded.codec, rate=excluded.rate, bits=excluded.bits, channels=excluded.channels,"
-        " duration_ms=excluded.duration_ms, has_pic=excluded.has_pic,"
+        "INSERT INTO tracks(" TRACK_COLS ", sort)"
+        " VALUES(" TRACK_VALS ",songkey(?4))"
+        " ON CONFLICT(path) DO UPDATE SET " TRACK_SET_TAGS ","
         " rg_state=excluded.rg_state, rg_track=excluded.rg_track, rg_track_peak=excluded.rg_track_peak,"
         " rg_album=excluded.rg_album, rg_album_peak=excluded.rg_album_peak,"
         " composer=excluded.composer, tags_v=2, sort=excluded.sort, search=NULL");
@@ -4638,7 +4334,7 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
         }
         sqlite3_reset(look);
         sqlite3_bind_text(look, 1, path, -1, SQLITE_STATIC);
-        int row = sqlite3_step(look) == SQLITE_ROW;
+        int row = scan_row(look, &sc.cs.db_failed);
         int64_t id = row ? sqlite3_column_int64(look, 0) : 0;
         int same = row && sqlite3_column_int64(look, 1) == f->mtime && sqlite3_column_int64(look, 2) == f->size;
         int v = row ? sqlite3_column_int(look, 3) : 0;
@@ -4651,10 +4347,10 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
             /* unchanged, but read before composers or CUE sheets in tags: those, once */
             pend_t *e = scan_queue(&sc, &pv, i, PEND_LATER);
             e->id = id;
-            tt = now_s();
+            tt = clock_fsec();
             library_trying("tags", &trying, path);
             int got = !f->skip && rd_tags(path, &e->t, NULL) == 0;
-            t_tags += now_s() - tt;
+            t_tags += clock_fsec() - tt;
             if (!got) memset(&e->t, 0, sizeof e->t);
             if (got && e->t.has_cuesheet) {
                 tags_t t = e->t;
@@ -4666,11 +4362,7 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
                     changed += n;              /* (and its old row goes) */
                     continue;
                 }
-                sqlite3_reset(sc.later);
-                sqlite3_bind_int64(sc.later, 1, id);
-                sqlite3_bind_text(sc.later, 2, t.composer, -1, SQLITE_TRANSIENT);
-                sqlite3_step(sc.later);
-                sqlite3_reset(sc.later);
+                scan_later(&sc, id, t.composer);
                 batch_end(&sc.b);
                 idset_add(&sc.seen, id);
                 if (t.composer[0] && v < 1) extra++;
@@ -4683,7 +4375,7 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
         if (!row && (cue_unchanged(&sc.cs, f, 2, NULL) || cue_unchanged(&sc.cs, f, 3, NULL)))
             continue;                          /* split by its own sheet, or unreadable, as it was */
         pend_t *e = scan_queue(&sc, &pv, i, PEND_NEW);
-        tt = now_s();
+        tt = clock_fsec();
         library_trying("tags", &trying, path);
         int later = 0;
         int rr = f->skip ? -1 : rd_tags(path, &e->t, &later);
@@ -4693,7 +4385,7 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
         }
         if (rr && later) fprintf(stderr, "library: %s not read with little memory to spare: again at the next scan\n", path);
         int unread = rr != 0;
-        t_tags += now_s() - tt;
+        t_tags += clock_fsec() - tt;
         if (unread) {
             if (!later && (f->skip || readable(path))) { e->kind = PEND_BAD; continue; }
             sc.npend--;                        /* can't be read now (EIO, no memory): next time */
@@ -4734,16 +4426,8 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
     sqlite3_finalize(look);
     if (!ok) {   /* stopped (or the database can't be read): nothing dropped */
         if (sc.marked) fprintf(stderr, "library: scan stopped, %d tracks written, the rest next time\n", changed);
-        sqlite3_finalize(sc.later);
-        sqlite3_finalize(sc.up);
-        cue_stmts_free(&sc.cs);
-        free(sc.pend);
-        free(sc.seen.bits);
-        free(sc.wrote.bits);
-        pv_free(&cv);
-        pv_free(&pv);
-        pv_free(&plv);
-        pv_free(&iv);
+        scan_state_free(&sc);
+        lists_free(&pv, &plv, &cv, &iv);
         return -1;
     }
 
@@ -4752,16 +4436,15 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
     int ngone = 0, gcap = 0;
     char **cgone = NULL;
     int ncgone = 0, ccap = 0;
-    if (!pv.failed && !cv.failed && !sc.seen.failed) {
+    if (sc.cs.db_failed) fprintf(stderr, "library: a lookup failed during the scan: nothing dropped as gone this time\n");
+    if (!pv.failed && !cv.failed && !sc.seen.failed && !sc.cs.db_failed) {
         sqlite3_stmt *all = prep(db, "SELECT id FROM tracks");
         while (all && sqlite3_step(all) == SQLITE_ROW) {
             int64_t id = sqlite3_column_int64(all, 0);
             if (idset_has(&sc.seen, id)) continue;
-            if (ngone == gcap) {
-                int64_t *ng = realloc(gone, (size_t)(gcap = gcap ? gcap * 2 : 64) * sizeof *gone);
-                if (!ng) { ngone = -1; break; }
-                gone = ng;
-            }
+            int64_t *ng = vec_room(gone, ngone, &gcap, 64, sizeof *gone);
+            if (!ng) { ngone = -1; break; }
+            gone = ng;
             gone[ngone++] = id;
         }
         sqlite3_finalize(all);
@@ -4770,11 +4453,9 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
             const char *p = (const char *)sqlite3_column_text(all, 0);
             int j = p ? pv_find(sqlite3_column_int(all, 1) == 0 ? &cv : &pv, p) : -1;
             if (j >= 0 && (sqlite3_column_int(all, 1) == 0 || pv.v[j].kept)) continue;
-            if (ncgone == ccap) {
-                char **ng = realloc(cgone, (size_t)(ccap = ccap ? ccap * 2 : 16) * sizeof *cgone);
-                if (!ng) break;
-                cgone = ng;
-            }
+            char **ng = vec_room(cgone, ncgone, &ccap, 16, sizeof *cgone);
+            if (!ng) break;
+            cgone = ng;
             if ((cgone[ncgone] = strdup(p ? p : ""))) ncgone++;
         }
         sqlite3_finalize(all);
@@ -4796,7 +4477,7 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
     for (size_t k = 0; k < sc.wrote.cap; k++) nwrote += __builtin_popcount(sc.wrote.bits[k]);
     int where_changed = groups && sc.pending < 2 && !sc.dropped && !sc.wrote.failed && !sc.direct &&
                         nwrote + ngone <= GROUPS_INCR_CHANGED && get_int_col(lib, "SELECT EXISTS(SELECT 1 FROM albums)", 0);
-    t_files = now_s();
+    t_files = clock_fsec();
     /* The files' names aren't needed from here (what's gone is listed, the
      * sheets have their own list): with 50,000 songs, 7 MB handed back before
      * the groups and the covers, the steps that most need the room. */
@@ -4866,24 +4547,26 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
          * (the counts read through them), then the counts */
         if (groups && !lib->cancel && sc.direct == 1 && lib->bulk &&
             get_int_col(lib, "SELECT COUNT(*) FROM tracks", 0) == sc.d_n) {
-            double tg = now_s(), ti;
+            double tg = clock_fsec(), ti;
             if (cb) cb(n_files, n_files, "indexes", ctx);
             bulk_end(lib);
-            ti = now_s();
+            ti = clock_fsec();
             batch_write(&sc.b);
             int had = sc.b.open;
             if (had) {
                 char under[1024];              /* (the folder every song is under: as the songs' folders took it?) */
                 folders_root(db, under, sizeof under);
-                groups_counts(lib, NULL, strcmp(under, sc.d_root) ? 1 : 2);
-                index_search(lib, 1);          /* (albums and artists: the songs' was set as they were added) */
+                if (groups_counts(lib, NULL, strcmp(under, sc.d_root) ? 1 : 2)) {
+                    batch_undo(&sc.b);         /* (a pass that stopped: none of it kept; all made now, below) */
+                    had = 0;
+                } else index_search(lib, 1);   /* (albums and artists: the songs' was set as they were added) */
             }
             if (batch_end(&sc.b) == 0 && had) {
                 groups_ok = 1;
                 done = 0;
                 lib->groups_how = 3;
                 fprintf(stderr, "library: groups as the songs were added (%d): indexes %.2f s, counts %.2f s\n",
-                        sc.d_n, ti - tg, now_s() - ti);
+                        sc.d_n, ti - tg, clock_fsec() - ti);
             }
         } else if (groups && sc.direct) {
             fprintf(stderr, "library: groups: not as the songs were added (%d of them so): all made now\n", sc.d_n);
@@ -4891,11 +4574,12 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
         }
         if (groups && !lib->cancel && where_changed) {
             done = rebuild_groups_where_changed(lib, &sc.b);
+            if (done < 0) batch_undo(&sc.b);   /* (stopped part way: none of it kept; all of them, below) */
             if (!done) lib->groups_how = 1;
-            double ts = now_s();
+            double ts = clock_fsec();
             if (!done) index_search(lib, 2);   /* changed tracks (their search cleared), new albums and artists */
             int committed = batch_end(&sc.b) == 0;
-            if (!done) fprintf(stderr, "library: groups: search and commit %.2f s\n", now_s() - ts);
+            if (!done) fprintf(stderr, "library: groups: search and commit %.2f s\n", clock_fsec() - ts);
             if (!done && committed) groups_ok = 1;
             else if (!done) done = 1;          /* (not kept: all of them, below) */
         }
@@ -4905,27 +4589,24 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
             else {
                 batch_write(&sc.b);
                 int had = sc.b.open;
-                if (had) {
-                    rebuild_groups(lib);
-                    index_search(lib, 1);      /* changed tracks (their search cleared), new albums and artists */
+                if (had && rebuild_groups(lib)) {
+                    batch_undo(&sc.b);         /* (half made: none of it kept, and the groups stay to do) */
+                    had = 0;
                 }
+                if (had) index_search(lib, 1); /* changed tracks (their search cleared), new albums and artists */
                 groups_ok = batch_end(&sc.b) == 0 && had;
             }
         }
-        /* (a card too full for them: the songs are in without albums or
-         * artists; scan_pending stays, and the next scan tries again) */
+        /* (a card too full for them, or a pass over the songs that stopped
+         * at a failed read: the songs are in without albums or artists;
+         * scan_pending stays, and the next scan tries again) */
         if (groups && !groups_ok && !lib->cancel) fprintf(stderr, "library: the groups couldn't be written: again next scan\n");
     }
     free(gone);
     for (int k = 0; k < ncgone; k++) free(cgone[k]);
     free(cgone);
     lib->scan_changes = changed + extra + (sc.pending > 0);
-    sqlite3_finalize(sc.later);
-    sqlite3_finalize(sc.up);
-    cue_stmts_free(&sc.cs);
-    free(sc.pend);
-    free(sc.seen.bits);
-    free(sc.wrote.bits);
+    scan_state_free(&sc);
     pv_free(&cv);
     if (lib->bulk && !lib->cancel) {               /* the songs and their groups are in: the indexes, once */
         if (cb) cb(n_files, n_files, "indexes", ctx);
@@ -4933,28 +4614,28 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
         bulk_end(lib);
     }
     grp_unwatch(db);
-    t_groups = now_s();
-    scan_playlists(lib, &plv, groups, &sc.b, pl_before);
+    t_groups = clock_fsec();
+    int pl_left = scan_playlists(lib, &plv, groups, &sc.b, pl_before);   /* (playlists left as they were: again next time) */
     pv_free(&plv);
-    if ((sc.pending || sc.marked) && !lib->cancel && groups_ok) {   /* all done (stopped: playlists again next time) */
+    if ((sc.pending || sc.marked) && !lib->cancel && groups_ok && !pl_left) {   /* all done (stopped: playlists again next time) */
         batch_write(&sc.b);
         meta_set(db, "scan_pending", 0);
         batch_end(&sc.b);
     }
-    t_pl = now_s();
+    t_pl = clock_fsec();
 
     /* every scan: new albums, and any whose folder's images or tracks changed
      * (an image added or replaced doesn't change any track) */
     lib->art_later = 0;
     if (!lib->cancel && !lib->defer_art) build_art(lib, &iv, &sc.b, cb, ctx);
     pv_free(&iv);
-    t_art = now_s();
+    t_art = clock_fsec();
     fprintf(stderr, "library: scan %.1f s, %d changes: %swalk %.1f, files %.1f (tags %.1f), groups %.1f, playlists %.1f, art %.1f\n",
             t_art - t0, changed, fast ? "fast " : "", t_walk - t0, t_files - t_walk, t_tags, t_groups - t_files,
             t_pl - t_groups, t_art - t_pl);
     /* the listing this scan made the library match (none: files still to be read) */
     if (!lib->cancel) {
-        int64_t keep = sc.retry || lib->defer_art || lib->art_later || !groups_ok ? 0 : (int64_t)sig;   /* (covers or groups still to make: not as it should be yet) */
+        int64_t keep = sc.retry || sc.cs.db_failed || sc.cs.unread || lib->defer_art || lib->art_later || !groups_ok || pl_left ? 0 : (int64_t)sig;   /* (covers, groups or playlists still to make: not as it should be yet) */
         if (keep != meta_get64(db, "scan_sig")) {
             batch_write(&sc.b);
             if (sc.b.open) meta_set64(db, "scan_sig", keep);
@@ -4965,342 +4646,9 @@ static int scan_once(library_t *lib, const char *root, lib_progress_cb cb, void 
     pv_free(&pv);
 
     if (lib->cancel) return -1;                /* (stopped while making playlists or covers) */
-    sqlite3_stmt *c = prep(db, "SELECT COUNT(*) FROM tracks");
-    int n = (c && sqlite3_step(c) == SQLITE_ROW) ? sqlite3_column_int(c, 0) : -1;
-    sqlite3_finalize(c);
+    int n = (int)db_int(db, "SELECT COUNT(*) FROM tracks", 0, -1);
     if (cb) cb(n, n, "done", ctx);
     return n;
-}
-
-/* ---------- queries ---------- */
-
-static int64_t g_credit_album;   /* LIB_CREDIT_TRACKS: the album (library_list takes one parent) */
-
-/* A view's SQL (?1 its parent, ?2 g_credit_album); *cut: a smart playlist's
- * "a while" (bound as ?1; 0 none). NULL: no such view. */
-static const char *list_sql(lib_view_t view, int64_t parent, int64_t *cut)
-{
-    const char *sql = NULL;
-    int64_t smart_cut = 0;
-    switch (view) {
-    case LIB_ALBUMS: sql = "SELECT id FROM albums ORDER BY sort, year"; break;
-    case LIB_ALBUM_ARTISTS: sql = "SELECT id FROM artists WHERE nalbums>0 ORDER BY sort"; break;
-    case LIB_ARTISTS: sql = "SELECT id FROM artists WHERE ncredit_albums>0 ORDER BY sort"; break;
-    case LIB_CREDIT_ALBUMS:
-        sql = "SELECT id FROM albums WHERE id IN (SELECT t.album_id FROM credits c JOIN tracks t ON t.id=c.track_id"
-              " WHERE c.artist_id=?1) ORDER BY year, sort";
-        break;
-    case LIB_CREDIT_TRACKS:   /* library_list_credit_tracks() */
-        sql = "SELECT t.id FROM tracks t JOIN credits c ON c.track_id=t.id WHERE c.artist_id=?1 AND t.album_id=?2"
-              " ORDER BY t.disc, t.track, t.path";
-        break;
-    case LIB_ARTIST_ALBUMS: sql = "SELECT id FROM albums WHERE artist_id=?1 ORDER BY year, sort"; break;
-    case LIB_ALBUM_TRACKS: sql = "SELECT id FROM tracks WHERE album_id=?1 ORDER BY disc, track, path"; break;
-    case LIB_SONGS: sql = "SELECT id FROM tracks ORDER BY sort, title COLLATE NOCASE"; break;
-    case LIB_PLAYLISTS: sql = "SELECT id FROM playlists ORDER BY sort"; break;
-    case LIB_PLAYLIST_TRACKS: sql = "SELECT track_id FROM playlist_items WHERE playlist_id=?1 ORDER BY pos"; break;
-    case LIB_FAVOURITES: sql = "SELECT id FROM tracks WHERE favourite=1 ORDER BY sort, title COLLATE NOCASE"; break;
-    case LIB_RECENT_PLAYED: sql = "SELECT id FROM tracks WHERE last_played>0 ORDER BY last_played DESC LIMIT 200"; break;
-    case LIB_MOST_PLAYED:
-        sql = "SELECT id FROM tracks WHERE play_count>0 ORDER BY play_count DESC, last_played DESC LIMIT 200";
-        break;
-    case LIB_RECENT_ADDED:
-        sql = "SELECT album_id FROM tracks WHERE album_id IS NOT NULL GROUP BY album_id ORDER BY MAX(mtime) DESC LIMIT 100";
-        break;
-    case LIB_GENRES: sql = "SELECT id FROM genres ORDER BY sort"; break;
-    case LIB_GENRE_ALBUMS:
-        sql = "SELECT id FROM albums WHERE id IN (SELECT album_id FROM tracks WHERE genre_id=?1) ORDER BY sort, year";
-        break;
-    case LIB_COMPOSERS: sql = "SELECT id FROM composers ORDER BY sort"; break;
-    case LIB_COMPOSER_ALBUMS:
-        sql = "SELECT id FROM albums WHERE id IN (SELECT album_id FROM tracks WHERE composer_id=?1) ORDER BY year, sort";
-        break;
-    case LIB_COMPOSER_TRACKS:   /* library_list_composer_tracks() */
-        sql = "SELECT id FROM tracks WHERE composer_id=?1 AND album_id=?2 ORDER BY disc, track, path";
-        break;
-    case LIB_YEARS: sql = "SELECT DISTINCT year FROM albums WHERE year>0 ORDER BY year DESC"; break;
-    case LIB_YEAR_ALBUMS: sql = "SELECT id FROM albums WHERE year=?1 ORDER BY sort"; break;
-    case LIB_SMART: {   /* ?1: the time before which counts as "a while" */
-        int64_t now = (int64_t)time(NULL);
-        switch ((int)parent) {
-        case LIB_SMART_NEVER:
-            /* (the albums in their order, each one's unplayed songs from tracks_unplayed:
-             * both read from indexes, in order, nothing sorted. CROSS JOIN keeps the
-             * albums outside; the other way round sorted every song: 2.5 s for 50,000) */
-            sql = "SELECT t.id FROM albums a CROSS JOIN tracks t ON t.album_id=a.id"
-                  " WHERE t.play_count=0 AND t.skip_count=0 ORDER BY a.sort, a.year, a.id, t.disc, t.track";
-            break;
-        case LIB_SMART_REPEAT:
-            smart_cut = now - 30 * 86400;
-            sql = "SELECT track_id FROM plays WHERE at>?1 AND track_id IN (SELECT id FROM tracks)"
-                  " GROUP BY track_id HAVING COUNT(*)>=2 ORDER BY COUNT(*) DESC, MAX(at) DESC LIMIT 50";
-            break;
-        case LIB_SMART_NOT_HEARD:
-            smart_cut = now - 90 * 86400;
-            sql = "SELECT id FROM tracks WHERE play_count>0 AND last_played<?1 ORDER BY last_played LIMIT 200";
-            break;
-        case LIB_SMART_FORGOTTEN:
-            smart_cut = now - 60 * 86400;
-            sql = "SELECT id FROM tracks WHERE favourite=1 AND last_played<?1 ORDER BY last_played LIMIT 100";
-            break;
-        case LIB_SMART_SKIPPED:
-            sql = "SELECT id FROM tracks WHERE skip_count>=2 ORDER BY skip_count DESC, sort LIMIT 100";
-            break;
-        default:
-            return NULL;
-        }
-        break;
-    }
-    case LIB_FOLDER:   /* the subfolders (as -id), then the songs; 0: the top folder's */
-        sql = "SELECT x FROM (SELECT -id AS x, 0 AS k, sort AS o FROM folders WHERE parent=?1"
-              " UNION ALL SELECT id, 1, path FROM tracks WHERE folder_id=?1) ORDER BY k, o";
-        break;
-    }
-    (void)parent;
-    *cut = smart_cut;
-    return sql;
-}
-
-int library_list(library_t *lib, lib_view_t view, int64_t parent, lib_list_t *out)
-{
-    int64_t smart_cut = 0;
-    const char *sql = list_sql(view, parent, &smart_cut);
-    if (!sql) {
-        memset(out, 0, sizeof *out);
-        return -1;
-    }
-    if (view == LIB_FOLDER && parent == 0) {   /* (0: the top folder's) */
-        sqlite3_stmt *top = prep(lib->db, "SELECT id FROM folders WHERE parent=0 ORDER BY length(path) LIMIT 1");
-        if (top && sqlite3_step(top) == SQLITE_ROW) parent = sqlite3_column_int64(top, 0);
-        sqlite3_finalize(top);
-    }
-    memset(out, 0, sizeof *out);
-    out->view = view;
-    sqlite3_stmt *s = prep(lib->db, sql);
-    if (!s) return -1;
-    if (view == LIB_ARTIST_ALBUMS || view == LIB_ALBUM_TRACKS || view == LIB_PLAYLIST_TRACKS ||
-        view == LIB_CREDIT_ALBUMS || view == LIB_CREDIT_TRACKS || view == LIB_GENRE_ALBUMS ||
-        view == LIB_COMPOSER_ALBUMS || view == LIB_COMPOSER_TRACKS || view == LIB_YEAR_ALBUMS || view == LIB_FOLDER)
-        sqlite3_bind_int64(s, 1, parent);
-    if (view == LIB_CREDIT_TRACKS || view == LIB_COMPOSER_TRACKS) sqlite3_bind_int64(s, 2, g_credit_album);
-    if (view == LIB_SMART && smart_cut) sqlite3_bind_int64(s, 1, smart_cut);
-    int cap = 0;
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        if (out->n == cap) {
-            cap = cap ? cap * 2 : 256;
-            int64_t *ni = realloc(out->ids, (size_t)cap * sizeof *ni);
-            if (!ni) break;
-            out->ids = ni;
-        }
-        out->ids[out->n++] = sqlite3_column_int64(s, 0);
-    }
-    sqlite3_finalize(s);
-    return out->n;
-}
-
-const char *library_smart_name(int which)
-{
-    /* (N_: listed for translators by tools/lang/strings.py; the UI translates the name it's given) */
-    static const char *const N[LIB_SMART_N] = {"", N_("Never played"), N_("On repeat"), N_("Not heard in a while"),
-                                               N_("Forgotten favourites"), N_("Often skipped")};
-    return which > 0 && which < LIB_SMART_N ? N[which] : "";
-}
-
-int library_list_credit_tracks(library_t *lib, int64_t artist_id, int64_t album_id, lib_list_t *out)
-{
-    g_credit_album = album_id;
-    int n = library_list(lib, LIB_CREDIT_TRACKS, artist_id, out);
-    g_credit_album = 0;
-    return n;
-}
-
-int library_artist_tracks(library_t *lib, int64_t artist_id, int credited, lib_list_t *out)
-{
-    memset(out, 0, sizeof *out);
-    lib_list_t albums;
-    if (library_list(lib, credited ? LIB_CREDIT_ALBUMS : LIB_ARTIST_ALBUMS, artist_id, &albums) < 0) return -1;
-    for (int i = 0; i < albums.n; i++) {
-        lib_list_t t;
-        int n = credited ? library_list_credit_tracks(lib, artist_id, albums.ids[i], &t)
-                         : library_list(lib, LIB_ALBUM_TRACKS, albums.ids[i], &t);
-        if (n > 0) {
-            int64_t *ni = realloc(out->ids, (size_t)(out->n + t.n) * sizeof *ni);
-            if (ni) {
-                out->ids = ni;
-                memcpy(out->ids + out->n, t.ids, (size_t)t.n * sizeof *ni);
-                out->n += t.n;
-            }
-        }
-        library_list_free(&t);
-    }
-    library_list_free(&albums);
-    out->view = credited ? LIB_CREDIT_TRACKS : LIB_ALBUM_TRACKS;
-    return out->n;
-}
-
-static int64_t get_int_col(library_t *lib, const char *sql, int64_t id);
-
-int library_needs_tags(library_t *lib)
-{
-    /* (tags_v<2 first: its index finds the few, or none, at once) */
-    return get_int_col(lib, "SELECT EXISTS(SELECT 1 FROM tracks WHERE tags_v<2 AND (tags_v<1 OR (cue=0 AND"
-                            " (path LIKE '%.flac' OR path LIKE '%.wv' OR path LIKE '%.ape'))))", 0) > 0;
-}
-
-int library_smart_count(library_t *lib, int which)
-{
-    /* as many as library_list(LIB_SMART, which) gives, without listing them */
-    if (which == LIB_SMART_NEVER)
-        return (int)get_int_col(lib, "SELECT COUNT(*) FROM tracks WHERE play_count=0 AND skip_count=0", 0);
-    int64_t cut = 0;
-    const char *sql = list_sql(LIB_SMART, which, &cut);
-    if (!sql) return -1;
-    char *q = sqlite3_mprintf("SELECT COUNT(*) FROM (%s)", sql);
-    sqlite3_stmt *s = q ? prep(lib->db, q) : NULL;
-    sqlite3_free(q);
-    if (!s) return -1;
-    if (cut) sqlite3_bind_int64(s, 1, cut);
-    int n = sqlite3_step(s) == SQLITE_ROW ? sqlite3_column_int(s, 0) : -1;
-    sqlite3_finalize(s);
-    return n;
-}
-
-/* Bytes free where path is (-1: can't tell) */
-static int64_t free_at(const char *path)
-{
-    struct statvfs v;
-    if (!path || !*path || statvfs(path, &v)) return -1;
-    return (int64_t)v.f_bavail * (int64_t)v.f_frsize;
-}
-
-int library_compact(library_t *lib)
-{
-    int64_t size = (int64_t)get_int_col(lib, "PRAGMA page_count", 0) * get_int_col(lib, "PRAGMA page_size", 0);
-    const char *file = sqlite3_db_filename(lib->db, "main");
-    char dir[1024];
-    snprintf(dir, sizeof dir, "%s", file ? file : "");
-    char *slash = strrchr(dir, '/');
-    if (slash) *slash = '\0';
-    else snprintf(dir, sizeof dir, ".");
-    const char *tmp = getenv("SQLITE_TMPDIR");
-    int64_t here = free_at(dir), there = tmp ? free_at(tmp) : here;
-    int same = !tmp || !strcmp(tmp, dir);
-    /* the log beside the database, the temporary copy where SQLite puts it (8 MB to spare) */
-    int64_t spare = 8LL << 20;
-    if (size <= 0 || here < 0 || there < 0 ||
-        (same ? here < 2 * size + spare : (here < size + spare || there < size + spare))) {
-        fprintf(stderr, "library: not compacted: %lld MB, %lld MB free\n", (long long)(size >> 20),
-                (long long)(here >> 20));
-        return -2;
-    }
-    double t0 = now_s();
-    int rc = sqlite3_exec(lib->db, "VACUUM", NULL, NULL, NULL);
-    double t1 = now_s();
-    /* (VACUUM went through the log: the whole database. Back to nothing, or
-     * it stays that size on the card.) */
-    sqlite3_exec(lib->db, "PRAGMA wal_checkpoint(TRUNCATE)", NULL, NULL, NULL);
-    int64_t after = (int64_t)get_int_col(lib, "PRAGMA page_count", 0) * get_int_col(lib, "PRAGMA page_size", 0);
-    fprintf(stderr, "library: compacted in %.1f s, the log emptied in %.1f s: %lld -> %lld KB (%s)\n", t1 - t0,
-            now_s() - t1, (long long)(size >> 10), (long long)(after >> 10),
-            rc == SQLITE_OK ? "ok" : sqlite3_errmsg(lib->db));
-    return rc == SQLITE_OK ? 0 : -1;
-}
-
-/* One query's plan: whether it reads the whole tracks table (a SCAN of it,
- * not through a covering index) or sorts its rows (a temp B-tree for ORDER BY
- * on a query that reads tracks). */
-static int plan_bad(library_t *lib, const char *label, const char *sql, int allowed, FILE *report)
-{
-    char *q = sqlite3_mprintf("EXPLAIN QUERY PLAN %s", sql);
-    sqlite3_stmt *s = q ? prep(lib->db, q) : NULL;
-    sqlite3_free(q);
-    if (!s) return 0;
-    int scan = 0, sort = 0, tracks = strstr(sql, "tracks") != NULL;
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        const char *d = (const char *)sqlite3_column_text(s, 3);
-        if (!d) continue;
-        if ((!strncmp(d, "SCAN tracks", 11) || !strncmp(d, "SCAN t", 6)) && !strstr(d, "COVERING INDEX")) scan = 1;
-        if (tracks && strstr(d, "TEMP B-TREE FOR ORDER BY")) sort = 1;
-    }
-    sqlite3_finalize(s);
-    int bad = (scan || sort) && !allowed;
-    if (report && (scan || sort))
-        fprintf(report, "%s%s: %s%s\n", allowed ? "(allowed) " : "", label, scan ? "reads the whole tracks table" : "",
-                sort ? (scan ? ", sorts" : "sorts its rows") : "");
-    return bad;
-}
-
-static const char *search_sql(const char *table, const char *where, char *sql, size_t cap);
-
-int library_check_plans(library_t *lib, FILE *report)
-{
-    static const struct { lib_view_t v; int which; const char *name; int allowed; } V[] = {
-        /* allowed (1): sorting what one artist, genre, composer or folder holds, or
-         * On repeat's 50 at most, found through an index: a few hundred rows */
-        {LIB_ALBUMS, 0, "Albums", 0}, {LIB_ALBUM_ARTISTS, 0, "Album artists", 0}, {LIB_ARTISTS, 0, "Artists", 0},
-        {LIB_CREDIT_ALBUMS, 0, "an artist's albums (credited)", 1}, {LIB_CREDIT_TRACKS, 0, "an artist's songs on an album", 0},
-        {LIB_ARTIST_ALBUMS, 0, "an album artist's albums", 0}, {LIB_ALBUM_TRACKS, 0, "an album's songs", 0},
-        {LIB_SONGS, 0, "Songs", 0}, {LIB_PLAYLISTS, 0, "Playlists", 0}, {LIB_PLAYLIST_TRACKS, 0, "a playlist's songs", 0},
-        {LIB_FAVOURITES, 0, "Favourites", 0}, {LIB_RECENT_PLAYED, 0, "History", 0}, {LIB_MOST_PLAYED, 0, "Most played", 0},
-        /* (every album's newest file: one pass over a small covering index, then 4,200 groups sorted) */
-        {LIB_RECENT_ADDED, 0, "Recently added", 1},
-        {LIB_GENRES, 0, "Genres", 0}, {LIB_GENRE_ALBUMS, 0, "a genre's albums", 1}, {LIB_COMPOSERS, 0, "Composers", 0},
-        {LIB_COMPOSER_ALBUMS, 0, "a composer's albums", 1}, {LIB_COMPOSER_TRACKS, 0, "a composer's songs on an album", 0},
-        {LIB_YEARS, 0, "Years", 0}, {LIB_YEAR_ALBUMS, 0, "a year's albums", 0},
-        /* (the whole list, in album order across a join: still sorted; its count isn't) */
-        {LIB_SMART, LIB_SMART_NEVER, "Never played", 0},
-        {LIB_SMART, LIB_SMART_REPEAT, "On repeat", 1}, {LIB_SMART, LIB_SMART_NOT_HEARD, "Not heard in a while", 0},
-        {LIB_SMART, LIB_SMART_FORGOTTEN, "Forgotten favourites", 0}, {LIB_SMART, LIB_SMART_SKIPPED, "Often skipped", 0},
-        {LIB_FOLDER, 0, "a folder", 1},
-    };
-    int bad = 0;
-    for (size_t i = 0; i < sizeof V / sizeof V[0]; i++) {
-        int64_t cut;
-        const char *sql = list_sql(V[i].v, V[i].which, &cut);
-        if (sql) bad += plan_bad(lib, V[i].name, sql, V[i].allowed, report);
-    }
-    bad += plan_bad(lib, "Never played's count", "SELECT COUNT(*) FROM tracks WHERE play_count=0 AND skip_count=0", 0, report);
-    bad += plan_bad(lib, "Shuffle all's songs",
-                    "SELECT id, artist_id, album_id, disc, track, duration_ms, last_played, play_count, skip_count, genre, title"
-                    " FROM tracks ORDER BY album_id, disc, track", 0, report);
-    bad += plan_bad(lib, "tags to read again",
-                    "SELECT EXISTS(SELECT 1 FROM tracks WHERE tags_v<2 AND (tags_v<1 OR (cue=0 AND"
-                    " (path LIKE '%.flac' OR path LIKE '%.wv' OR path LIKE '%.ape'))))", 0, report);
-    bad += plan_bad(lib, "any songs", "SELECT NOT EXISTS(SELECT 1 FROM tracks)", 0, report);
-    char sql[160];                                   /* (every key read, from their index) */
-    bad += plan_bad(lib, "a search's songs", search_sql("tracks", "1", sql, sizeof sql), 0, report);
-    return bad;
-}
-
-int64_t library_upgrade_needed(const char *db_path)
-{
-    sqlite3 *d = NULL;
-    int64_t n = 0;
-    if (sqlite3_open_v2(db_path, &d, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-        sqlite3_busy_timeout(d, 2000);
-        sqlite3_stmt *s = NULL;
-        int v = 0;
-        if (sqlite3_prepare_v2(d, "PRAGMA user_version", -1, &s, NULL) == SQLITE_OK && sqlite3_step(s) == SQLITE_ROW)
-            v = sqlite3_column_int(s, 0);
-        sqlite3_finalize(s);
-        s = NULL;
-        int waiting = 0;                           /* (a first scan cut short: its indexes to build) */
-        if (sqlite3_prepare_v2(d, "SELECT COUNT(*) FROM bulk_idx", -1, &s, NULL) == SQLITE_OK && sqlite3_step(s) == SQLITE_ROW)
-            waiting = sqlite3_column_int(s, 0) > 0;
-        sqlite3_finalize(s);
-        s = NULL;
-        if (v > 0 && (v < LIB_SCHEMA_V || waiting) &&
-            sqlite3_prepare_v2(d, "SELECT MAX(rowid) FROM tracks", -1, &s, NULL) == SQLITE_OK && sqlite3_step(s) == SQLITE_ROW)
-            n = sqlite3_column_int64(s, 0);
-        sqlite3_finalize(s);
-    }
-    sqlite3_close(d);
-    return n;
-}
-
-int library_empty(library_t *lib)
-{
-    return get_int_col(lib, "SELECT NOT EXISTS(SELECT 1 FROM tracks)", 1) != 0;
 }
 
 int library_scan_unfinished(library_t *lib)
@@ -5308,320 +4656,20 @@ int library_scan_unfinished(library_t *lib)
     return meta_get(lib->db, "scan_pending") > 0;
 }
 
-int library_needs_art(library_t *lib)
-{
-    /* (art=0: never looked at, a scan's cover pass cut short by a stop or a restart) */
-    return get_int_col(lib, "SELECT EXISTS(SELECT 1 FROM albums WHERE art=0 OR (art=2 AND COALESCE(art_sig, 0)=0))", 0) > 0;
-}
-
-int library_list_composer_tracks(library_t *lib, int64_t composer_id, int64_t album_id, lib_list_t *out)
-{
-    g_credit_album = album_id;
-    int n = library_list(lib, LIB_COMPOSER_TRACKS, composer_id, out);
-    g_credit_album = 0;
-    return n;
-}
-
-void library_artist_counts(library_t *lib, int64_t artist_id, int *nalbums, int *ncredit_albums)
-{
-    *nalbums = *ncredit_albums = 0;
-    sqlite3_stmt *s = prep(lib->db, "SELECT nalbums, ncredit_albums FROM artists WHERE id=?");
-    if (!s) return;
-    sqlite3_bind_int64(s, 1, artist_id);
-    if (sqlite3_step(s) == SQLITE_ROW) {
-        *nalbums = sqlite3_column_int(s, 0);
-        *ncredit_albums = sqlite3_column_int(s, 1);
-    }
-    sqlite3_finalize(s);
-}
-
 int library_scan_changes(const library_t *lib) { return lib->scan_changes; }
-
-/* The music files a scan couldn't read: damaged ones, and those set aside
- * because the player stopped while reading them */
-int library_unread_count(library_t *lib)
-{
-    return lib ? (int)get_int_col(lib, "SELECT COUNT(*) FROM cues WHERE kind=3", 0) : 0;
-}
-
-int library_unread(library_t *lib, int i, char *path, size_t cap)
-{
-    sqlite3_stmt *q = lib && i >= 0 ? prep(lib->db, "SELECT path FROM cues WHERE kind=3 ORDER BY path LIMIT 1 OFFSET ?") : NULL;
-    int r = -1;
-    if (!q) return -1;
-    sqlite3_bind_int(q, 1, i);
-    if (sqlite3_step(q) == SQLITE_ROW && sqlite3_column_text(q, 0)) {
-        snprintf(path, cap, "%s", (const char *)sqlite3_column_text(q, 0));
-        r = 0;
-    }
-    sqlite3_finalize(q);
-    return r;
-}
 
 int library_scan_quick(const library_t *lib) { return lib ? lib->quick : 0; }
 int library_scan_held(const library_t *lib) { return lib ? lib->scan_held : 0; }
-
-/* ---- after a stop that wasn't clean ---- */
-
-int library_check(library_t *lib)
-{
-    sqlite3_stmt *q = NULL;
-    int ok = 0;
-    double t0 = now_s();
-    if (sqlite3_prepare_v2(lib->db, "PRAGMA quick_check(1)", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) {
-        const char *r = (const char *)sqlite3_column_text(q, 0);
-        ok = r && !strcmp(r, "ok");
-        if (!ok) fprintf(stderr, "library: damaged: %.200s\n", r ? r : "?");
-    } else fprintf(stderr, "library: can't be checked: %s\n", sqlite3_errmsg(lib->db));
-    sqlite3_finalize(q);
-    fprintf(stderr, "library: checked in %.1f s: %s\n", now_s() - t0, ok ? "sound" : "damaged");
-    return ok ? 0 : -1;
-}
-
-void library_scan_distrust(library_t *lib)
-{
-    sqlite3_exec(lib->db, "UPDATE meta SET value=0 WHERE key='scan_sig'", NULL, NULL, NULL);
-}
-
-/* (the old file may be damaged: read a stretch of ids at a time, so a page
- * that can't be read loses the songs on it, not everything after it; and
- * through a connection of its own: attached to the library's, the first
- * unreadable page made SQLite refuse the rest of the transaction, the
- * commit included) */
-#define IMPORT_STEP 128
-
-static sqlite3 *import_open(const char *old_db)
-{
-    sqlite3 *o = NULL;
-    /* (to write as well: its log, if it has one, can't be read otherwise) */
-    if (sqlite3_open_v2(old_db, &o, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
-        sqlite3_close(o);
-        o = NULL;
-        if (sqlite3_open_v2(old_db, &o, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) { sqlite3_close(o); return NULL; }
-    }
-    sqlite3_busy_timeout(o, 2000);
-    return o;
-}
-
-static int64_t import_top(sqlite3 *o, const char *table, int64_t otherwise)
-{
-    char *sql = sqlite3_mprintf("SELECT MAX(rowid) FROM %s", table);
-    sqlite3_stmt *q = NULL;
-    int64_t top = otherwise;
-    if (sql && sqlite3_prepare_v2(o, sql, -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW &&
-        sqlite3_column_type(q, 0) != SQLITE_NULL)
-        top = sqlite3_column_int64(q, 0);
-    sqlite3_finalize(q);
-    sqlite3_free(sql);
-    return top;
-}
-
-/* read's rows for ids from..from+IMPORT_STEP-1, each bound to write and run.
- * The rows written; *lost counted up if the stretch couldn't all be read. */
-static int import_stretch(sqlite3 *o, const char *read, sqlite3_stmt *write, int64_t from, int *lost, sqlite3 *db)
-{
-    sqlite3_stmt *rd = NULL;
-    int n = 0, r = SQLITE_ERROR;
-    if (sqlite3_prepare_v2(o, read, -1, &rd, NULL) == SQLITE_OK) {
-        sqlite3_bind_int64(rd, 1, from);
-        sqlite3_bind_int64(rd, 2, from + IMPORT_STEP - 1);
-        while ((r = sqlite3_step(rd)) == SQLITE_ROW) {
-            sqlite3_reset(write);
-            for (int c = 0; c < sqlite3_column_count(rd); c++) sqlite3_bind_value(write, c + 1, sqlite3_column_value(rd, c));
-            if (sqlite3_step(write) == SQLITE_DONE) n += sqlite3_changes(db);
-            sqlite3_reset(write);
-        }
-    }
-    sqlite3_finalize(rd);
-    if (r != SQLITE_DONE) (*lost)++;
-    return n;
-}
-
-int library_import_counts(library_t *lib, const char *old_db)
-{
-    sqlite3 *db = lib->db, *o = access(old_db, F_OK) == 0 ? import_open(old_db) : NULL;
-    if (!o) { fprintf(stderr, "library: %s can't be read: nothing brought over\n", old_db); return -1; }
-    int n = 0, lost = 0;
-    /* (the highest id can't be read, the end of the table damaged: as far as
-     * a library ten times this one's size would go) */
-    int64_t mine = get_int_col(lib, "SELECT COALESCE(MAX(id), 0) FROM tracks", 0);
-    int64_t top = import_top(o, "tracks", mine * 10 + 1000);
-    sqlite3_stmt *up = prep(db,
-        "UPDATE tracks SET play_count=?2, skip_count=?3, last_played=?4, favourite=?5, resume_ms=?6 WHERE path=?1");
-    sqlite3_stmt *ins = prep(db, "INSERT INTO plays(track_id, at) SELECT id, ?2 FROM tracks WHERE path=?1");
-    sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
-    for (int64_t from = 0; up && from <= top; from += IMPORT_STEP)
-        n += import_stretch(o,
-            "SELECT path, play_count, skip_count, last_played, favourite, resume_ms FROM tracks NOT INDEXED"
-            " WHERE id BETWEEN ?1 AND ?2 AND (play_count>0 OR skip_count>0 OR favourite=1 OR resume_ms>0)",
-            up, from, &lost, db);
-    top = import_top(o, "plays", 0);
-    for (int64_t from = 0; ins && from <= top; from += IMPORT_STEP)
-        import_stretch(o,
-            "SELECT t.path, p.at FROM plays p NOT INDEXED JOIN tracks t ON t.id=p.track_id WHERE p.rowid BETWEEN ?1 AND ?2",
-            ins, from, &lost, db);
-    sqlite3_finalize(up);
-    sqlite3_finalize(ins);
-    reset_all(db);
-    if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
-        fprintf(stderr, "library: what was played couldn't be saved: %s\n", sqlite3_errmsg(db));
-        if (!sqlite3_get_autocommit(db)) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-        n = -1;
-    }
-    sqlite3_close(o);
-    fprintf(stderr, "library: plays, skips and favourites of %d songs brought over from %s%s\n", n < 0 ? 0 : n, old_db,
-            lost ? " (parts of it couldn't be read)" : "");
-    return n;
-}
 
 int library_scan_groups(const library_t *lib) { return lib ? lib->groups_how : 0; }
 
 void library_test_rebuild_groups(library_t *lib)
 {
     sqlite3_exec(lib->db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
-    rebuild_groups(lib);
-    sqlite3_exec(lib->db, "COMMIT", NULL, NULL, NULL);
+    sqlite3_exec(lib->db, rebuild_groups(lib) ? "ROLLBACK" : "COMMIT", NULL, NULL, NULL);
 }
 
 void library_scan_cancel(library_t *lib) { lib->cancel = 1; }
-
-void library_list_free(lib_list_t *l)
-{
-    free(l->ids);
-    memset(l, 0, sizeof *l);
-}
-
-int library_row(library_t *lib, lib_view_t view, int64_t id,
-                char *main, size_t main_cap, char *meta, size_t meta_cap)
-{
-    if (view == LIB_FOLDER && id >= 0) view = LIB_SONGS;      /* a song in a folder */
-    sqlite3_stmt *s = view == LIB_ALBUM_ARTISTS ? lib->row_artist
-                    : view == LIB_ARTISTS ? lib->row_credited
-                    : view == LIB_GENRES ? lib->row_genre
-                    : view == LIB_COMPOSERS ? lib->row_composer
-                    : view == LIB_YEARS ? lib->row_year
-                    : view == LIB_FOLDER ? lib->row_folder
-                    : (view == LIB_ALBUM_TRACKS || view == LIB_SONGS || view == LIB_CREDIT_TRACKS ||
-                       view == LIB_COMPOSER_TRACKS) ? lib->row_track
-                    : view == LIB_PLAYLISTS ? lib->row_playlist
-                    : view == LIB_MOST_PLAYED ? lib->row_plays
-                    : (view == LIB_PLAYLIST_TRACKS || view == LIB_FAVOURITES || view == LIB_RECENT_PLAYED ||
-                       view == LIB_SMART) ? lib->row_pl_track
-                    : lib->row_album;   /* albums, artist albums, recently added */
-    sqlite3_reset(s);
-    sqlite3_bind_int64(s, 1, view == LIB_FOLDER ? -id : id);
-    main[0] = meta[0] = '\0';
-    if (sqlite3_step(s) != SQLITE_ROW) { sqlite3_reset(s); return -1; }
-    copy_col(s, 0, main, main_cap);
-    int v = sqlite3_column_int(s, 1);
-    int track_list = view == LIB_ALBUM_TRACKS || view == LIB_SONGS || view == LIB_PLAYLIST_TRACKS || view == LIB_CREDIT_TRACKS ||
-                     view == LIB_FAVOURITES || view == LIB_RECENT_PLAYED || view == LIB_MOST_PLAYED ||
-                     view == LIB_COMPOSER_TRACKS || view == LIB_SMART;
-    if (view == LIB_ARTISTS || view == LIB_ALBUM_ARTISTS || view == LIB_PLAYLISTS || view == LIB_GENRES ||
-        view == LIB_COMPOSERS || view == LIB_YEARS)
-        snprintf(meta, meta_cap, "%d", v);                                                   /* a count */
-    else if (view == LIB_FOLDER || view == LIB_MOST_PLAYED) {                               /* (the UI's words) */
-        char n[16];
-        snprintf(n, sizeof n, "%d", v);
-        if (view == LIB_FOLDER) tr_fill(meta, meta_cap, v == 1 ? "1 song" : "%s songs", n, NULL);
-        else tr_fill(meta, meta_cap, v == 1 ? "1 play" : "%s plays", n, NULL);
-    }
-    else if (track_list) snprintf(meta, meta_cap, "%d:%02d", v / 60000, (v / 1000) % 60);   /* length */
-    else if (library_row_shows_artist(view) && !lib->no_album_artists && sqlite3_column_text(s, 2) &&
-             *sqlite3_column_text(s, 2))
-        copy_col(s, 2, meta, meta_cap);                                                      /* album artist */
-    else if (v > 0) snprintf(meta, meta_cap, "%d", v);                                       /* album year */
-    if (view == LIB_PLAYLIST_TRACKS || view == LIB_FAVOURITES || view == LIB_RECENT_PLAYED ||
-        view == LIB_MOST_PLAYED || view == LIB_SMART) {   /* a mix of artists: "Title · Artist" */
-        const unsigned char *a = sqlite3_column_text(s, 2);
-        size_t l = strlen(main);
-        if (a && *a && l + 4 < main_cap) snprintf(main + l, main_cap - l, " \xC2\xB7 %s", (const char *)a);
-    }
-    /* Done with the row: reset now. A kept statement left on its row keeps
-     * its read transaction open, which in WAL pins this connection to that
-     * snapshot: another connection's commits (a scan, levelling) went unseen,
-     * and this one's own writes failed with SQLITE_BUSY_SNAPSHOT (favourites,
-     * play counts, playlists lost without a word). */
-    sqlite3_reset(s);
-    return 0;
-}
-
-void library_set_album_artists(library_t *lib, int on)
-{
-    if (lib) lib->no_album_artists = !on;
-}
-
-int64_t library_track_album(library_t *lib, int64_t track_id)
-{
-    sqlite3_stmt *s = lib->track_album;
-    sqlite3_reset(s);
-    sqlite3_bind_int64(s, 1, track_id);
-    int64_t a = sqlite3_step(s) == SQLITE_ROW ? sqlite3_column_int64(s, 0) : 0;
-    sqlite3_reset(s);
-    return a;
-}
-
-int library_track(library_t *lib, int64_t id, lib_track_t *t)
-{
-    sqlite3_stmt *s = lib->track_full;
-    sqlite3_reset(s);
-    sqlite3_bind_int64(s, 1, id);
-    memset(t, 0, sizeof *t);
-    if (sqlite3_step(s) != SQLITE_ROW) return -1;
-    t->id = id;
-    copy_col(s, 0, t->path, sizeof t->path);
-    copy_col(s, 1, t->title, sizeof t->title);
-    copy_col(s, 2, t->artist, sizeof t->artist);
-    copy_col(s, 3, t->album, sizeof t->album);
-    t->album_id = sqlite3_column_int64(s, 4);
-    t->artist_id = sqlite3_column_int64(s, 5);
-    t->disc = sqlite3_column_int(s, 6);
-    t->track = sqlite3_column_int(s, 7);
-    t->year = sqlite3_column_int(s, 8);
-    copy_col(s, 9, t->codec, sizeof t->codec);
-    t->sample_rate = (uint32_t)sqlite3_column_int(s, 10);
-    t->bits = (uint8_t)sqlite3_column_int(s, 11);
-    t->channels = (uint8_t)sqlite3_column_int(s, 12);
-    t->duration_ms = (uint32_t)sqlite3_column_int64(s, 13);
-    sqlite3_reset(s);   /* (see library_row) */
-    return 0;
-}
-
-static int name_query(sqlite3_stmt *s, int64_t id, char *out, size_t cap);
-
-int library_genre_name(library_t *lib, int64_t id, char *out, size_t cap) { return name_query(lib->genre_name, id, out, cap); }
-int library_composer_name(library_t *lib, int64_t id, char *out, size_t cap) { return name_query(lib->composer_name, id, out, cap); }
-
-int library_folder_name(library_t *lib, int64_t id, char *out, size_t cap)
-{
-    if (id == 0) { snprintf(out, cap, "Folders"); return 0; }
-    return name_query(lib->folder_name, id, out, cap);
-}
-
-static int name_query(sqlite3_stmt *s, int64_t id, char *out, size_t cap)
-{
-    sqlite3_reset(s);
-    sqlite3_bind_int64(s, 1, id);
-    out[0] = '\0';
-    int ok = sqlite3_step(s) == SQLITE_ROW;
-    if (ok) copy_col(s, 0, out, cap);
-    sqlite3_reset(s);   /* (a statement left on its row keeps a read open: see library_row) */
-    return ok ? 0 : -1;
-}
-
-int library_album_name(library_t *lib, int64_t id, char *out, size_t cap) { return name_query(lib->album_name, id, out, cap); }
-int library_artist_name(library_t *lib, int64_t id, char *out, size_t cap) { return name_query(lib->artist_name, id, out, cap); }
-int library_playlist_name(library_t *lib, int64_t id, char *out, size_t cap) { return name_query(lib->playlist_name, id, out, cap); }
-
-int64_t library_album_artist(library_t *lib, int64_t album_id)
-{
-    sqlite3_stmt *s = prep(lib->db, "SELECT artist_id FROM albums WHERE id=?");
-    if (!s) return 0;
-    sqlite3_bind_int64(s, 1, album_id);
-    int64_t id = sqlite3_step(s) == SQLITE_ROW ? sqlite3_column_int64(s, 0) : 0;
-    sqlite3_finalize(s);
-    return id;
-}
 
 int library_art(library_t *lib, int64_t album_id, int size, uint16_t *pixels)
 {
@@ -5641,23 +4689,29 @@ void library_set_found_covers(const char *dir)
 int library_found_cover_path(const char *key, const char *ext, char *out, size_t cap)
 {
     if (!g_found_dir[0] || !key) return -1;
-    uint64_t h = fnv(14695981039346656037ULL, key, strlen(key));
+    uint64_t h = fnv64(FNV64_START, key, strlen(key));
     snprintf(out, cap, "%s/%016llx.%s", g_found_dir, (unsigned long long)h, ext);
     return 0;
 }
 
-int library_album_cover(library_t *lib, int64_t album_id)
+/* An album's cover state into *art: 0, or -1 if it couldn't be read (which
+ * library_album_cover gives as LIB_COVER_UNKNOWN, an album not looked at yet). */
+static int cover_state(library_t *lib, int64_t album_id, int *art)
 {
     sqlite3_stmt *s = prep(lib->db, "SELECT art FROM albums WHERE id=?");
-    if (!s) return LIB_COVER_UNKNOWN;
+    if (!s) return -1;
     sqlite3_bind_int64(s, 1, album_id);
-    int art = sqlite3_step(s) == SQLITE_ROW ? sqlite3_column_int(s, 0) : LIB_COVER_UNKNOWN;
+    int ok = sqlite3_step(s) == SQLITE_ROW;
+    if (ok) *art = sqlite3_column_int(s, 0);
     sqlite3_finalize(s);
-    return art;
+    return ok ? 0 : -1;
 }
 
-#define ALBUM_INFO_SQL "SELECT al.id, al.key, al.title, al.year, ar.name FROM albums al" \
-                       " LEFT JOIN artists ar ON ar.id=al.artist_id"
+int library_album_cover(library_t *lib, int64_t album_id)
+{
+    int art;
+    return cover_state(lib, album_id, &art) ? LIB_COVER_UNKNOWN : art;
+}
 
 static void album_info_row(sqlite3_stmt *s, lib_album_t *a)
 {
@@ -5671,12 +4725,12 @@ static void album_info_row(sqlite3_stmt *s, lib_album_t *a)
 
 int library_album_info(library_t *lib, int64_t album_id, lib_album_t *out)
 {
-    sqlite3_stmt *s = prep(lib->db, ALBUM_INFO_SQL " WHERE al.id=?");
-    if (!s) return -1;
+    sqlite3_stmt *s = lib->album_info;
+    sqlite3_reset(s);
     sqlite3_bind_int64(s, 1, album_id);
     int ok = sqlite3_step(s) == SQLITE_ROW;
     if (ok) album_info_row(s, out);
-    sqlite3_finalize(s);
+    sqlite3_reset(s);   /* (not left on its row: see library_row) */
     return ok ? 0 : -1;
 }
 
@@ -5688,12 +4742,9 @@ int library_albums_without_cover(library_t *lib, lib_album_t **out)
     int n = 0, cap = 0;
     lib_album_t *v = NULL;
     while (sqlite3_step(s) == SQLITE_ROW) {
-        if (n == cap) {
-            cap = cap ? cap * 2 : 64;
-            lib_album_t *nv = realloc(v, (size_t)cap * sizeof *v);
-            if (!nv) { free(v); sqlite3_finalize(s); return -1; }
-            v = nv;
-        }
+        lib_album_t *nv = vec_room(v, n, &cap, 64, sizeof *v);
+        if (!nv) { free(v); sqlite3_finalize(s); return -1; }
+        v = nv;
         album_info_row(s, &v[n]);
         if (v[n].title[0]) n++;            /* (no album title: nothing to look for) */
     }
@@ -5704,13 +4755,7 @@ int library_albums_without_cover(library_t *lib, lib_album_t **out)
 
 static int set_cover_state(library_t *lib, int64_t album_id, int art)
 {
-    sqlite3_stmt *s = prep(lib->db, "UPDATE albums SET art=? WHERE id=?");
-    if (!s) return -1;
-    sqlite3_bind_int(s, 1, art);
-    sqlite3_bind_int64(s, 2, album_id);
-    int rc = sqlite3_step(s) == SQLITE_DONE ? 0 : -1;
-    sqlite3_finalize(s);
-    return rc;
+    return set_int_col(lib, "UPDATE albums SET art=? WHERE id=?", album_id, art);
 }
 
 int library_store_found_cover(library_t *lib, int64_t album_id, const uint16_t *large, const uint16_t *small)
@@ -5718,7 +4763,11 @@ int library_store_found_cover(library_t *lib, int64_t album_id, const uint16_t *
     lib_album_t a;
     char over[1200];
     if (library_album_info(lib, album_id, &a) || library_found_cover_path(a.key, "over", over, sizeof over)) return -1;
-    int cur = library_album_cover(lib, album_id);
+    /* (its state not read: nothing done. Taken for "no cover of its own", the
+     * found one went over its own without the mark that keeps it ahead, and
+     * Remove cover then left the album with none.) */
+    int cur;
+    if (cover_state(lib, album_id, &cur)) return -1;
     int picked = cur == LIB_COVER_OWN || cur == LIB_COVER_PICKED;   /* over a cover of its own: it stays ahead of it */
     if (picked) {
         FILE *f = fopen(over, "we");
@@ -5736,20 +4785,23 @@ int library_remove_found_cover(library_t *lib, int64_t album_id)
 {
     lib_album_t a;
     char path[1200];
-    if (library_album_info(lib, album_id, &a)) return -1;
-    int picked = library_album_cover(lib, album_id) == LIB_COVER_PICKED;
+    int cur;
+    /* (its state not read: nothing removed. Taken for "not picked over its
+     * own", the album was marked as having no cover, its own never made again.) */
+    if (library_album_info(lib, album_id, &a) || cover_state(lib, album_id, &cur)) return -1;
+    int picked = cur == LIB_COVER_PICKED;
     if (library_found_cover_path(a.key, "jpg", path, sizeof path) == 0) remove(path);
     if (library_found_cover_path(a.key, "over", path, sizeof path) == 0) remove(path);
     if (picked) {                                    /* back to its own cover, made again from where it is */
         sqlite3_stmt *q = prep(lib->db, "SELECT al.dir, t.path FROM albums al LEFT JOIN tracks t ON t.id=al.first_track"
                                         " WHERE al.id=?");
-        sqlite3_stmt *others = prep(lib->db,
-            "SELECT path FROM tracks WHERE album_id=? AND has_pic=1 AND path<>? ORDER BY disc, track LIMIT 4");
+        sqlite3_stmt *others = prep(lib->db, ART_OTHERS_SQL);
         char dir[1024] = "", first[1024] = "";
-        int have = 0;
+        int have = 0, asked = 0;                     /* (asked: where its own cover is, read) */
         if (q) {
             sqlite3_bind_int64(q, 1, album_id);
             if (sqlite3_step(q) == SQLITE_ROW) {
+                asked = 1;
                 copy_col(q, 0, dir, sizeof dir);
                 have = sqlite3_column_type(q, 1) != SQLITE_NULL;
                 copy_col(q, 1, first, sizeof first);
@@ -5762,22 +4814,18 @@ int library_remove_found_cover(library_t *lib, int64_t album_id)
         g_rd_nowait = 1;
         g_art_later = 0;
         int r = make_art(lib, others, album_id, dir, have ? first : NULL, a.key);
-        int later = r < 0 && g_art_later;
+        int later = r < 0 && (g_art_later || !asked);
         g_rd_nowait = 0;
         reader_close_nowait();                     /* (one album's: no helper left waiting; a scan under way starts its own again) */
         sqlite3_finalize(others);
         if (r >= 0) return set_cover_state(lib, album_id, r == 0 ? LIB_COVER_OWN : LIB_COVER_FOUND);
         if (later) {
             /* Its own couldn't be made just now, with little memory to
-             * spare: not "it has none" (marked so, no scan looked again).
+             * spare, or its file (or where it is) not to be read at that
+             * moment: not "it has none" (marked so, no scan looked again).
              * No cover for now, and the next scan makes it. */
             art_del(lib, album_id);
-            sqlite3_stmt *s = prep(lib->db, "UPDATE albums SET art=0, art_sig=0 WHERE id=?");
-            if (!s) return -1;
-            sqlite3_bind_int64(s, 1, album_id);
-            int rc = sqlite3_step(s) == SQLITE_DONE ? 0 : -1;
-            sqlite3_finalize(s);
-            return rc;
+            return db_run_id(lib->db, "UPDATE albums SET art=0, art_sig=0 WHERE id=?", album_id);
         }
         /* (its own is gone meanwhile: no cover, as below) */
     }
@@ -5789,770 +4837,3 @@ int library_remove_found_cover(library_t *lib, int64_t album_id)
     return set_cover_state(lib, album_id, LIB_COVER_NONE);
 }
 
-#define SHUF_COLS "id, artist_id, album_id, disc, track, duration_ms, last_played, play_count, skip_count, genre, title"
-
-/* s's row (SHUF_COLS) in shuffle form; a work's title prefix hashed into unit for shuf_works */
-static void shuf_row(sqlite3_stmt *s, shuf_track_t *t)
-{
-    memset(t, 0, sizeof *t);
-    t->id = (uint32_t)sqlite3_column_int64(s, 0);
-    t->artist = (uint32_t)sqlite3_column_int64(s, 1);
-    t->album = (uint32_t)sqlite3_column_int64(s, 2);
-    t->disc = (uint16_t)sqlite3_column_int(s, 3);
-    t->track = (uint16_t)sqlite3_column_int(s, 4);
-    t->duration_ms = (uint32_t)sqlite3_column_int64(s, 5);
-    t->last_played = sqlite3_column_int64(s, 6);
-    t->play_count = (uint16_t)sqlite3_column_int(s, 7);
-    t->skip_count = (uint16_t)sqlite3_column_int(s, 8);
-    const char *g = (const char *)sqlite3_column_text(s, 9);
-    if (g && (strcasestr(g, "audiobook") || strcasestr(g, "podcast") || strcasestr(g, "spoken")))
-        t->flags |= SHUF_F_SPOKEN;
-    /* A work in several parts ("Symphony No. 5 in C minor: I. Allegro"): the
-     * title before ": ", for shuf_works (kept in unit for now) */
-    const char *ti = (const char *)sqlite3_column_text(s, 10);
-    const char *c = ti ? strstr(ti, ": ") : NULL;
-    if (c && c - ti >= 4) {
-        uint32_t h = 2166136261u;
-        for (const char *q = ti; q < c; q++) h = (h ^ (unsigned char)*q) * 16777619u;
-        t->unit = h ? h : 1;
-    }
-}
-
-/* Works: consecutive tracks of an album with the same title prefix, two or
- * more of them, share a unit (shuffle keeps them together when asked to);
- * a prefix on its own is no work. t is in album, disc, track order. */
-static void shuf_works(shuf_track_t *t, int n)
-{
-    for (int i = 0; i < n;) {
-        int j = i + 1;
-        while (j < n && t[i].unit && t[j].unit == t[i].unit && t[j].album == t[i].album) j++;
-        uint32_t u = j - i >= 2 ? (t[i].id ? t[i].id : 1) : 0;   /* the first part's id: unique */
-        for (int k = i; k < j; k++) t[k].unit = u;
-        i = j;
-    }
-}
-
-int library_shuffle_tracks(library_t *lib, shuf_track_t **out)
-{
-    sqlite3_stmt *s = prep(lib->db, "SELECT " SHUF_COLS " FROM tracks ORDER BY album_id, disc, track");
-    *out = NULL;
-    if (!s) return -1;
-    int n = 0, cap = 0;
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        if (n == cap) {
-            cap = cap ? cap * 2 : 1024;
-            shuf_track_t *nt = realloc(*out, (size_t)cap * sizeof *nt);
-            if (!nt) break;
-            *out = nt;
-        }
-        shuf_row(s, &(*out)[n++]);
-    }
-    sqlite3_finalize(s);
-    shuf_works(*out, n);
-    return n;
-}
-
-int64_t library_top_track(library_t *lib) { return get_int_col(lib, "SELECT COALESCE(MAX(id), 0) FROM tracks", 0); }
-int64_t library_track_from(library_t *lib, int64_t id)
-{
-    sqlite3_stmt *s = prep(lib->db, "SELECT id FROM tracks WHERE id>=? ORDER BY id LIMIT 1");
-    int64_t at = 0;
-    if (s) {
-        sqlite3_bind_int64(s, 1, id);
-        if (sqlite3_step(s) == SQLITE_ROW) at = sqlite3_column_int64(s, 0);
-    }
-    sqlite3_finalize(s);
-    return at;
-}
-
-typedef struct { shuf_track_t t; int at; } shuf_at_t;
-
-static int cmp_shuf_album(const void *a, const void *b)
-{
-    const shuf_track_t *x = &((const shuf_at_t *)a)->t, *y = &((const shuf_at_t *)b)->t;
-    if (x->album != y->album) return x->album < y->album ? -1 : 1;
-    if (x->disc != y->disc) return x->disc < y->disc ? -1 : 1;
-    if (x->track != y->track) return x->track < y->track ? -1 : 1;
-    return x->id < y->id ? -1 : x->id > y->id;
-}
-
-int library_shuffle_tracks_for(library_t *lib, const int64_t *ids, int n, shuf_track_t *out)
-{
-    sqlite3_stmt *s = prep(lib->db, "SELECT " SHUF_COLS " FROM tracks WHERE id=?");
-    shuf_at_t *w = n > 0 ? malloc((size_t)n * sizeof *w) : NULL;
-    if (!s || !w) { sqlite3_finalize(s); free(w); return -1; }
-    for (int i = 0; i < n; i++) {
-        sqlite3_reset(s);
-        sqlite3_bind_int64(s, 1, ids[i]);
-        if (sqlite3_step(s) == SQLITE_ROW) shuf_row(s, &w[i].t);
-        else { memset(&w[i].t, 0, sizeof w[i].t); w[i].t.id = (uint32_t)ids[i]; }   /* (gone: as a song nothing is known of) */
-        w[i].at = i;
-    }
-    sqlite3_finalize(s);
-    /* works, as library_shuffle_tracks finds them: among these songs, in album order */
-    qsort(w, (size_t)n, sizeof *w, cmp_shuf_album);
-    for (int i = 0; i < n;) {
-        int j = i + 1;
-        while (j < n && w[i].t.unit && w[j].t.unit == w[i].t.unit && w[j].t.album == w[i].t.album) j++;
-        uint32_t u = j - i >= 2 ? (w[i].t.id ? w[i].t.id : 1) : 0;
-        for (int k = i; k < j; k++) w[k].t.unit = u;
-        i = j;
-    }
-    for (int i = 0; i < n; i++) out[w[i].at] = w[i].t;
-    free(w);
-    return n;
-}
-
-/* 0, or -1 when the database was busy and nothing of it was written (another
- * connection writing for longer than this one waits). */
-static int played_write(library_t *lib, int64_t track_id, int skipped_early, int64_t now)
-{
-    /* a play: counted, and logged (On repeat), the log kept to a year. One
-     * commit for the lot (they were three, and the year-old plays were looked
-     * for at every track's end: once since the library was opened is enough). */
-    sqlite3 *db = lib->db;
-    int tx = !skipped_early && sqlite3_get_autocommit(db) && sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK;
-    int busy = 0;
-    sqlite3_stmt *s = prep(db, skipped_early
-        ? "UPDATE tracks SET skip_count=skip_count+1 WHERE id=?2"
-        : "UPDATE tracks SET play_count=play_count+1, last_played=?1 WHERE id=?2");
-    if (s) {
-        sqlite3_bind_int64(s, 1, now);
-        sqlite3_bind_int64(s, 2, track_id);
-        int rc = sqlite3_step(s);
-        busy = rc == SQLITE_BUSY || rc == SQLITE_LOCKED;
-        sqlite3_finalize(s);
-    }
-    if (busy) {                                       /* (nothing written: whoever asked may try again) */
-        if (tx) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-        return -1;
-    }
-    if (s && !skipped_early) {
-        s = prep(db, "INSERT INTO plays(track_id, at) VALUES(?2, ?1)");
-        if (s) {
-            sqlite3_bind_int64(s, 1, now);
-            sqlite3_bind_int64(s, 2, track_id);
-            sqlite3_step(s);
-            sqlite3_finalize(s);
-        }
-        if (!lib->plays_trimmed) {
-            lib->plays_trimmed = 1;
-            s = prep(db, "DELETE FROM plays WHERE at<?1");
-            if (s) {
-                sqlite3_bind_int64(s, 1, now - 366 * 86400);
-                sqlite3_step(s);
-                sqlite3_finalize(s);
-            }
-        }
-    }
-    if (tx && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK && !sqlite3_get_autocommit(db))
-        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-    return 0;
-}
-
-void library_played(library_t *lib, int64_t track_id, int skipped_early, int64_t now)
-{
-    played_write(lib, track_id, skipped_early, now);
-}
-
-/* ---- a play written off the caller's thread ----
- * The player takes up a song's end on the UI's thread, and writing the play
- * there held the screen: 51 ms measured on the H2 (an UPDATE, an INSERT and a
- * commit on the card), up to this connection's ten seconds of patience when a
- * scan's connection was writing, and any animation under way stood still for
- * it (2026-11-25: the cover flow's slide, 0.6 s once). library_played_later
- * hands the play to one thread for the whole program, which writes it
- * through a connection of its own to the same file (WAL: the caller's reads
- * go on meanwhile, and see it once it is in). The plays are written in the
- * order given; library_plays_wait waits until all are in; closing a library
- * does that for its file. A database with no file of its own (":memory:"),
- * no thread to be had, or more waiting than there is room for: written at
- * once, by the caller, as before. */
-typedef struct { char db[1024], art[1024]; int64_t id, now; int early; } play_t;
-static struct {
-    pthread_mutex_t mu;
-    pthread_cond_t more, idle;
-    play_t q[32];
-    int n, busy, started;
-    library_t *conn;        /* the thread's own connection, to the file last written to */
-} PW = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER, {{{0}, {0}, 0, 0, 0}}, 0, 0, 0, NULL};
-
-static _Thread_local int t_plays_own;      /* this thread is the plays' own */
-
-static void *plays_thread(void *arg)
-{
-    (void)arg;
-    t_plays_own = 1;
-    pthread_mutex_lock(&PW.mu);
-    for (;;) {
-        while (!PW.n) {
-            PW.busy = 0;
-            pthread_cond_broadcast(&PW.idle);
-            pthread_cond_wait(&PW.more, &PW.mu);
-        }
-        play_t it = PW.q[0];
-        memmove(&PW.q[0], &PW.q[1], (size_t)--PW.n * sizeof PW.q[0]);
-        PW.busy = 1;
-        library_t *c = PW.conn;
-        if (c && strcmp(c->db_path, it.db)) {       /* another library's play: its own file */
-            PW.conn = NULL;
-            pthread_mutex_unlock(&PW.mu);
-            library_close(c);
-            c = NULL;
-            pthread_mutex_lock(&PW.mu);
-        }
-        pthread_mutex_unlock(&PW.mu);
-        if (!c) {
-            c = library_open(it.db, it.art);
-            if (c) c->plays_conn = 1;
-        }
-        int rc = -1;
-        /* (another connection writing: this one waits its ten seconds each time; a scan commits far more often) */
-        for (int tries = 0; c && rc && tries < 6; tries++) rc = played_write(c, it.id, it.early, it.now);
-        if (rc) fprintf(stderr, "library: a play of track %lld couldn't be written (%s)\n", (long long)it.id, c ? "the database stayed busy" : "no connection");
-        pthread_mutex_lock(&PW.mu);
-        PW.conn = c;
-    }
-    return NULL;
-}
-
-void library_played_later(library_t *lib, int64_t track_id, int skipped_early, int64_t now)
-{
-    int later = lib->db_path[0] && lib->db_path[0] != ':' && !lib->plays_conn;
-    pthread_mutex_lock(&PW.mu);
-    if (later && !PW.started) {
-        pthread_t th;
-        pthread_attr_t at;
-        pthread_attr_init(&at);
-        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-        PW.started = pthread_create(&th, &at, plays_thread, NULL) == 0;
-        pthread_attr_destroy(&at);
-    }
-    later = later && PW.started && PW.n < (int)(sizeof PW.q / sizeof PW.q[0]);
-    if (later) {
-        play_t *it = &PW.q[PW.n++];
-        snprintf(it->db, sizeof it->db, "%s", lib->db_path);
-        snprintf(it->art, sizeof it->art, "%s", lib->art_dir);
-        it->id = track_id;
-        it->now = now;
-        it->early = skipped_early;
-        PW.busy = 1;                                 /* (until the thread has said it is idle again) */
-        pthread_cond_signal(&PW.more);
-    }
-    pthread_mutex_unlock(&PW.mu);
-    if (!later) played_write(lib, track_id, skipped_early, now);
-}
-
-void library_plays_wait(void)
-{
-    pthread_mutex_lock(&PW.mu);
-    while (PW.started && (PW.n || PW.busy)) pthread_cond_wait(&PW.idle, &PW.mu);
-    pthread_mutex_unlock(&PW.mu);
-}
-
-/* A library is being closed: the plays given for later are written first, and
- * the thread's connection to its file is closed with it (the card may be
- * about to be unmounted: nothing of ours may hold a file on it open). */
-static void plays_release(const library_t *lib)
-{
-    if (t_plays_own) return;                         /* (its own connection that didn't open: nothing to wait for) */
-    pthread_mutex_lock(&PW.mu);
-    while (PW.started && (PW.n || PW.busy)) pthread_cond_wait(&PW.idle, &PW.mu);
-    library_t *c = PW.conn && !strcmp(PW.conn->db_path, lib->db_path) ? PW.conn : NULL;
-    if (c) PW.conn = NULL;
-    pthread_mutex_unlock(&PW.mu);
-    if (c) library_close(c);
-}
-
-static void set_int_col(library_t *lib, const char *sql, int64_t id, int64_t v)
-{
-    sqlite3_stmt *s = prep(lib->db, sql);
-    if (!s) return;
-    sqlite3_bind_int64(s, 1, v);
-    sqlite3_bind_int64(s, 2, id);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
-}
-
-static int64_t get_int_col(library_t *lib, const char *sql, int64_t id)
-{
-    sqlite3_stmt *s = prep(lib->db, sql);
-    if (!s) return 0;
-    sqlite3_bind_int64(s, 1, id);
-    int64_t v = sqlite3_step(s) == SQLITE_ROW ? sqlite3_column_int64(s, 0) : 0;
-    sqlite3_finalize(s);
-    return v;
-}
-
-void library_set_favourite(library_t *lib, int64_t id, int on)
-{
-    set_int_col(lib, "UPDATE tracks SET favourite=?1 WHERE id=?2", id, on ? 1 : 0);
-}
-
-int library_favourite(library_t *lib, int64_t id)
-{
-    return (int)get_int_col(lib, "SELECT favourite FROM tracks WHERE id=?1", id);
-}
-
-void library_set_resume(library_t *lib, int64_t id, uint32_t ms)
-{
-    set_int_col(lib, "UPDATE tracks SET resume_ms=?1 WHERE id=?2", id, ms);
-}
-
-uint32_t library_resume(library_t *lib, int64_t id)
-{
-    return (uint32_t)get_int_col(lib, "SELECT resume_ms FROM tracks WHERE id=?1", id);
-}
-
-/* ---------- your own playlists ---------- */
-
-void library_set_playlist_dir(library_t *lib, const char *dir)
-{
-    snprintf(lib->pl_dir, sizeof lib->pl_dir, "%s", dir ? dir : "");
-    if (lib->pl_dir[0]) mkdir(lib->pl_dir, 0755);
-}
-
-int library_playlist_writable(library_t *lib, int64_t id)
-{
-    return (int)get_int_col(lib, "SELECT writable FROM playlists WHERE id=?1", id);
-}
-
-int library_playlist_count_writable(library_t *lib)
-{
-    sqlite3_stmt *s = prep(lib->db, "SELECT COUNT(*) FROM playlists WHERE writable=1");
-    int n = s && sqlite3_step(s) == SQLITE_ROW ? sqlite3_column_int(s, 0) : 0;
-    sqlite3_finalize(s);
-    return n;
-}
-
-/* `to` relative to the folder `from_dir` (both absolute): "../../Music/A/B/c.flac". */
-static void rel_path(const char *from_dir, const char *to, char *out, size_t cap)
-{
-    size_t i = 0, common = 0;             /* longest common prefix, ending at a '/' */
-    while (from_dir[i] && to[i] && from_dir[i] == to[i]) {
-        i++;
-        if (to[i - 1] == '/') common = i;
-    }
-    if (!from_dir[i] && to[i] == '/') common = i + 1;   /* `to` is inside from_dir */
-    int ups = 0;                          /* folders of from_dir below the common part */
-    const char *rest = from_dir + common;
-    if (*rest) {
-        ups = 1;
-        for (const char *c = rest; *c; c++) ups += *c == '/';
-    }
-    size_t w = 0;
-    for (int k = 0; k < ups && w + 4 < cap; k++, w += 3) memcpy(out + w, "../", 3);
-    snprintf(out + w, cap - w, "%s", to + common);
-}
-
-/* Write a playlist's file from its rows (atomically). */
-static int write_playlist(library_t *lib, int64_t id)
-{
-    sqlite3_stmt *q = prep(lib->db, "SELECT path, name FROM playlists WHERE id=? AND writable=1");
-    if (!q) return -1;
-    sqlite3_bind_int64(q, 1, id);
-    char path[1100], name[256], dir[1100];
-    if (sqlite3_step(q) != SQLITE_ROW) { sqlite3_finalize(q); return -1; }
-    copy_col(q, 0, path, sizeof path);
-    copy_col(q, 1, name, sizeof name);
-    sqlite3_finalize(q);
-    snprintf(dir, sizeof dir, "%s", path);
-    char *slash = strrchr(dir, '/');
-    if (slash) *slash = '\0';
-
-    char tmp[1200];
-    snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    FILE *f = fopen(tmp, "we");
-    if (!f) return -1;
-    fprintf(f, "#EXTM3U\n#PLAYLIST:%s\n", name);
-    sqlite3_stmt *it = prep(lib->db,
-        "SELECT t.path, t.artist, t.title, t.duration_ms FROM playlist_items i JOIN tracks t ON t.id=i.track_id"
-        " WHERE i.playlist_id=? ORDER BY i.pos");
-    if (it) {
-        sqlite3_bind_int64(it, 1, id);
-        while (sqlite3_step(it) == SQLITE_ROW) {
-            char rel[1200];
-            rel_path(dir, (const char *)sqlite3_column_text(it, 0), rel, sizeof rel);
-            const unsigned char *a = sqlite3_column_text(it, 1), *ti = sqlite3_column_text(it, 2);
-            fprintf(f, "#EXTINF:%lld,%s - %s\n%s\n", (long long)(sqlite3_column_int64(it, 3) / 1000),
-                    a ? (const char *)a : "", ti ? (const char *)ti : "", rel);
-        }
-        sqlite3_finalize(it);
-    }
-    int ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
-    ok = fclose(f) == 0 && ok;
-    if (!ok || file_replace(tmp, path)) { unlink(tmp); return -1; }
-    return 0;
-}
-
-static void renumber(library_t *lib, int64_t id)
-{
-    /* positions 0..n-1 again after a removal */
-    sqlite3_stmt *q = prep(lib->db, "SELECT rowid FROM playlist_items WHERE playlist_id=? ORDER BY pos");
-    sqlite3_stmt *u = prep(lib->db, "UPDATE playlist_items SET pos=? WHERE rowid=?");
-    if (q && u) {
-        sqlite3_bind_int64(q, 1, id);
-        int pos = 0;
-        while (sqlite3_step(q) == SQLITE_ROW) {
-            sqlite3_reset(u);
-            sqlite3_bind_int(u, 1, pos++);
-            sqlite3_bind_int64(u, 2, sqlite3_column_int64(q, 0));
-            sqlite3_step(u);
-        }
-    }
-    sqlite3_finalize(q);
-    sqlite3_finalize(u);
-    set_int_col(lib, "UPDATE playlists SET ntracks=(SELECT COUNT(*) FROM playlist_items WHERE playlist_id=?2)"
-                     " + 0 * ?1 WHERE id=?2", id, 0);
-}
-
-static void playlist_path(library_t *lib, const char *name, const char *keep, char *out, size_t cap);
-
-int64_t library_playlist_create(library_t *lib, const char *name)
-{
-    if (!lib->pl_dir[0]) return 0;
-    char path[1400], fname[256];
-    playlist_path(lib, name, NULL, path, sizeof path);   /* never over another playlist's file */
-    const char *slash = strrchr(path, '/');
-    snprintf(fname, sizeof fname, "%.255s", slash ? slash + 1 : path);
-    sqlite3_stmt *s = prep(lib->db, "INSERT INTO playlists(path, name, sort, ntracks, seen, writable) VALUES(?,?,?,0,1,1)");
-    if (!s) return 0;
-    char sort[256];
-    sort_key(fname, sort, sizeof sort);
-    sqlite3_bind_text(s, 1, path, -1, SQLITE_STATIC);
-    sqlite3_bind_text(s, 2, name, -1, SQLITE_STATIC);
-    sqlite3_bind_text(s, 3, sort, -1, SQLITE_STATIC);
-    int ok = sqlite3_step(s) == SQLITE_DONE;
-    sqlite3_finalize(s);
-    if (!ok) return 0;
-    int64_t id = sqlite3_last_insert_rowid(lib->db);
-    if (write_playlist(lib, id)) { library_playlist_delete(lib, id); return 0; }
-    return id;
-}
-
-int library_playlist_add(library_t *lib, int64_t id, const int64_t *tracks, int n)
-{
-    if (!library_playlist_writable(lib, id)) return -1;
-    int pos = (int)get_int_col(lib, "SELECT COUNT(*) FROM playlist_items WHERE playlist_id=?1", id);
-    sqlite3_stmt *s = prep(lib->db, "INSERT INTO playlist_items(playlist_id, pos, track_id) VALUES(?,?,?)");
-    if (!s) return -1;
-    sqlite3_exec(lib->db, "BEGIN", NULL, NULL, NULL);
-    for (int i = 0; i < n; i++) {
-        sqlite3_reset(s);
-        sqlite3_bind_int64(s, 1, id);
-        sqlite3_bind_int(s, 2, pos++);
-        sqlite3_bind_int64(s, 3, tracks[i]);
-        sqlite3_step(s);
-    }
-    sqlite3_finalize(s);
-    renumber(lib, id);
-    sqlite3_exec(lib->db, "COMMIT", NULL, NULL, NULL);
-    return write_playlist(lib, id);
-}
-
-int library_playlist_remove(library_t *lib, int64_t id, int pos)
-{
-    if (!library_playlist_writable(lib, id)) return -1;
-    sqlite3_stmt *s = prep(lib->db, "DELETE FROM playlist_items WHERE playlist_id=? AND pos=?");
-    if (!s) return -1;
-    sqlite3_bind_int64(s, 1, id);
-    sqlite3_bind_int(s, 2, pos);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
-    renumber(lib, id);
-    return write_playlist(lib, id);
-}
-
-int library_playlist_move(library_t *lib, int64_t id, int pos, int dir)
-{
-    if (!library_playlist_writable(lib, id)) return -1;
-    int other = pos + dir, n = (int)get_int_col(lib, "SELECT COUNT(*) FROM playlist_items WHERE playlist_id=?1", id);
-    if (pos < 0 || other < 0 || pos >= n || other >= n) return -1;
-    /* swap the two positions through a temporary one */
-    sqlite3_stmt *s = prep(lib->db, "UPDATE playlist_items SET pos=?3 WHERE playlist_id=?1 AND pos=?2");
-    if (!s) return -1;
-    int steps[3][2] = {{pos, -1}, {other, pos}, {-1, other}};
-    for (int i = 0; i < 3; i++) {
-        sqlite3_reset(s);
-        sqlite3_bind_int64(s, 1, id);
-        sqlite3_bind_int(s, 2, steps[i][0]);
-        sqlite3_bind_int(s, 3, steps[i][1]);
-        sqlite3_step(s);
-    }
-    sqlite3_finalize(s);
-    return write_playlist(lib, id);
-}
-
-/* A file name for a playlist name, in pl_dir; " 2", " 3"... if taken by another file. */
-static void playlist_path(library_t *lib, const char *name, const char *keep, char *out, size_t cap)
-{
-    char fname[256];
-    size_t w = 0;
-    for (const char *c = name; *c && w + 1 < sizeof fname; c++)
-        fname[w++] = (*c == '/' || *c == '\\' || *c == ':') ? '-' : *c;
-    fname[w] = '\0';
-    for (int n = 1; n < 100; n++) {
-        if (n == 1) snprintf(out, cap, "%s/%s.m3u8", lib->pl_dir, fname);
-        else snprintf(out, cap, "%s/%s %d.m3u8", lib->pl_dir, fname, n);
-        if ((keep && !strcmp(out, keep)) || access(out, F_OK) != 0) return;
-    }
-}
-
-int library_playlist_rename(library_t *lib, int64_t id, const char *name)
-{
-    if (!library_playlist_writable(lib, id) || !name[0]) return -1;
-    sqlite3_stmt *q = prep(lib->db, "SELECT path FROM playlists WHERE id=?");
-    if (!q) return -1;
-    sqlite3_bind_int64(q, 1, id);
-    char old[1100] = "", path[1400];
-    if (sqlite3_step(q) == SQLITE_ROW) copy_col(q, 0, old, sizeof old);
-    sqlite3_finalize(q);
-    if (!old[0]) return -1;
-    playlist_path(lib, name, old, path, sizeof path);
-    if (strcmp(path, old) && rename(old, path)) return -1;
-    char sort[256];
-    const char *base = strrchr(path, '/');
-    sort_key(base ? base + 1 : path, sort, sizeof sort);
-    sqlite3_stmt *u = prep(lib->db, "UPDATE playlists SET path=?, name=?, sort=? WHERE id=?");
-    if (!u) return -1;
-    sqlite3_bind_text(u, 1, path, -1, SQLITE_STATIC);
-    sqlite3_bind_text(u, 2, name, -1, SQLITE_STATIC);
-    sqlite3_bind_text(u, 3, sort, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(u, 4, id);
-    sqlite3_step(u);
-    sqlite3_finalize(u);
-    return write_playlist(lib, id);   /* #PLAYLIST: the new name */
-}
-
-int library_playlist_delete(library_t *lib, int64_t id)
-{
-    sqlite3_stmt *q = prep(lib->db, "SELECT path FROM playlists WHERE id=? AND writable=1");
-    if (!q) return -1;
-    sqlite3_bind_int64(q, 1, id);
-    char path[1100] = "";
-    if (sqlite3_step(q) == SQLITE_ROW) copy_col(q, 0, path, sizeof path);
-    sqlite3_finalize(q);
-    if (!path[0]) return -1;
-    unlink(path);
-    set_int_col(lib, "DELETE FROM playlist_items WHERE playlist_id=?2 AND ?1 = ?1", id, 0);
-    set_int_col(lib, "DELETE FROM playlists WHERE id=?2 AND ?1 = ?1", id, 0);
-    return 0;
-}
-
-/* ---------- search ---------- */
-
-/* One kind's names that what was typed finds, each with how close it is
- * (tier_of_key), the closest first and then by name (a leading The passed
- * over): up to LIB_SEARCH_MAX of them, added to hits. Every key is read (the
- * songs' from their index, tracks_search: library_check_plans) and given to
- * search_keep(), which keeps the closest so far: the whole pass in one
- * sqlite3_step (a step a row took the H2 twice as long: 0.55 s for 50,000
- * songs, where this takes a quarter of a second whatever is typed). */
-static const char *search_sql(const char *table, const char *where, char *sql, size_t cap)
-{
-    snprintf(sql, cap, "SELECT count(search_keep(id, search)) FROM %s WHERE %s", table, where);
-    return sql;
-}
-
-typedef struct { int64_t id; int tier, len; char ord[56]; } found_t;
-typedef struct {
-    const char *words[8];
-    int nw, last_whole, n;
-    found_t top[LIB_SEARCH_MAX];
-} search_run_t;
-
-/* SQL search_keep(id, key): the search under way (the library's), told of a
- * name. */
-static void sql_search_keep(sqlite3_context *ctx, int argc, sqlite3_value **argv)
-{
-    search_run_t *r = *(search_run_t **)sqlite3_user_data(ctx);
-    const char *key = argc == 2 ? (const char *)sqlite3_value_text(argv[1]) : NULL;
-    int tier = r ? tier_of_key(key, r->words, r->nw, r->last_whole) : 0;
-    if (!tier) return;
-    const char *e = strchr(key, SKEY_SEP);
-    if (!e) e = key + strlen(key);
-    if (e - key > 4 && !memcmp(key, "the ", 4)) key += 4;
-    int len = (int)(e - key) < (int)sizeof r->top->ord ? (int)(e - key) : (int)sizeof r->top->ord;
-    /* where it goes among the closest so far (after the ones as close and
-     * named the same: the first read stays first) */
-    int at = r->n;
-    while (at > 0) {
-        const found_t *f = &r->top[at - 1];
-        int c = f->tier - tier;
-        if (!c) c = memcmp(f->ord, key, (size_t)(f->len < len ? f->len : len));
-        if (!c) c = f->len - len;
-        if (c <= 0) break;
-        at--;
-    }
-    if (at == LIB_SEARCH_MAX) return;
-    if (r->n < LIB_SEARCH_MAX) r->n++;
-    memmove(&r->top[at + 1], &r->top[at], (size_t)(r->n - 1 - at) * sizeof *r->top);
-    r->top[at].id = sqlite3_value_int64(argv[0]);
-    r->top[at].tier = tier;
-    r->top[at].len = len;
-    memcpy(r->top[at].ord, key, (size_t)len);
-}
-
-static int search_kind_rows(library_t *lib, int kind, const char *table, const char *where, char words[][64], int nw,
-                            int last_whole, lib_hit_t *hits, int n)
-{
-    char sql[160];
-    search_run_t *r = calloc(1, sizeof *r);
-    sqlite3_stmt *s = r ? prep(lib->db, search_sql(table, where, sql, sizeof sql)) : NULL;
-    if (!s) { free(r); return n; }
-    for (int i = 0; i < nw; i++) r->words[i] = words[i];
-    r->nw = nw;
-    r->last_whole = last_whole;
-    lib->search_run = r;
-    sqlite3_step(s);
-    lib->search_run = NULL;
-    sqlite3_finalize(s);
-    for (int i = 0; i < r->n && n < 3 * LIB_SEARCH_MAX; i++) hits[n++] = (lib_hit_t){kind, r->top[i].id, r->top[i].tier};
-    free(r);
-    return n;
-}
-
-int library_search(library_t *lib, const char *query, lib_search_t *out)
-{
-    memset(out, 0, sizeof *out);
-    char folded[256], words[8][64];
-    text_search_fold(query, folded, sizeof folded);
-    int nw = 0;
-    for (char *save = NULL, *t = strtok_r(folded, " ", &save); t && nw < 8; t = strtok_r(NULL, " ", &save))
-        snprintf(words[nw++], sizeof words[0], "%s", t);
-    if (!nw) return 0;
-    size_t ql = strlen(query);
-    int last_whole = ql > 0 && query[ql - 1] == ' ';         /* (a space after it: the word is finished) */
-    lib_hit_t *all = malloc(3 * LIB_SEARCH_MAX * sizeof *all);
-    if (!all) return 0;
-    int n = 0;
-    n = search_kind_rows(lib, LIB_HIT_ARTIST, "artists", "(nalbums>0 OR ncredit_albums>0)", words, nw, last_whole, all, n);
-    n = search_kind_rows(lib, LIB_HIT_ALBUM, "albums", "1", words, nw, last_whole, all, n);
-    n = search_kind_rows(lib, LIB_HIT_SONG, "tracks", "1", words, nw, last_whole, all, n);
-    int close = 0;
-    for (int i = 0; i < n; i++) close += all[i].tier <= 4;
-    int top = close >= LIB_SEARCH_FEW ? 4 : 6;               /* the looser ones only when few are close */
-    out->hits = malloc(LIB_SEARCH_MAX * sizeof *out->hits);
-    out->songs = malloc(LIB_SEARCH_MAX * sizeof *out->songs);
-    if (!out->hits || !out->songs) { free(all); library_search_free(out); return 0; }
-    /* by tier, then artists, albums, songs, each in the order it came (its list's) */
-    for (int tier = 1; tier <= top && out->n < LIB_SEARCH_MAX; tier++)
-        for (int i = 0; i < n && out->n < LIB_SEARCH_MAX; i++) {
-            if (all[i].tier != tier) continue;
-            out->hits[out->n++] = all[i];
-            if (all[i].kind == LIB_HIT_ARTIST) out->n_artists++;
-            else if (all[i].kind == LIB_HIT_ALBUM) out->n_albums++;
-            else out->songs[out->n_songs++] = all[i].id;
-        }
-    free(all);
-    return out->n;
-}
-
-void library_search_free(lib_search_t *r)
-{
-    free(r->hits);
-    free(r->songs);
-    memset(r, 0, sizeof *r);
-}
-
-/* ---------- volume levelling (ReplayGain) ---------- */
-
-/* (By tracks_rg_todo, which holds only the tracks left: the first of them
- * at once, where a walk in id order went past every one done.) */
-int library_rg_next(library_t *lib, int64_t *id, char *path, size_t cap)
-{
-    sqlite3_stmt *s = prep(lib->db, "SELECT id, path FROM tracks WHERE rg_state=0 ORDER BY id LIMIT 1");
-    int rc = -1;
-    if (s && sqlite3_step(s) == SQLITE_ROW) {
-        *id = sqlite3_column_int64(s, 0);
-        copy_col(s, 1, path, cap);
-        rc = 0;
-    }
-    sqlite3_finalize(s);
-    return rc;
-}
-
-void library_rg_store(library_t *lib, int64_t id, const lib_rg_t *rg)
-{
-    sqlite3_stmt *s = prep(lib->db,
-        "UPDATE tracks SET rg_state=?, rg_track=?, rg_track_peak=?, rg_album=?, rg_album_peak=? WHERE id=?");
-    if (!s) return;
-    sqlite3_bind_int(s, 1, rg->state);
-    if (rg->state == 1 || rg->state == 2) sqlite3_bind_double(s, 2, rg->track_gain); else sqlite3_bind_null(s, 2);
-    if (rg->track_peak > 0) sqlite3_bind_double(s, 3, rg->track_peak); else sqlite3_bind_null(s, 3);
-    if (rg->has_album) sqlite3_bind_double(s, 4, rg->album_gain); else sqlite3_bind_null(s, 4);
-    if (rg->has_album && rg->album_peak > 0) sqlite3_bind_double(s, 5, rg->album_peak); else sqlite3_bind_null(s, 5);
-    sqlite3_bind_int64(s, 6, id);
-    int nice = lock_boost();
-    sqlite3_step(s);
-    lock_unboost(nice);
-    sqlite3_finalize(s);
-}
-
-void library_rg_progress(library_t *lib, int *done, int *total)
-{
-    *done = *total = 0;
-    sqlite3_stmt *s = prep(lib->db, "SELECT COUNT(*) - (SELECT COUNT(*) FROM tracks WHERE rg_state=0), COUNT(*) FROM tracks");
-    if (s && sqlite3_step(s) == SQLITE_ROW) {
-        *done = sqlite3_column_int(s, 0);
-        *total = sqlite3_column_int(s, 1);
-    }
-    sqlite3_finalize(s);
-}
-
-/* The gain (dB) and peak for a track: its own, or its album's (from the album
- * tag, or combined from the album's tracks, each weighted by its length, once
- * all of them are known). -1 if unknown. */
-static int rg_lookup(library_t *lib, int64_t id, int album, double *gain, double *peak)
-{
-    sqlite3_stmt *s = prep(lib->db,
-        "SELECT rg_state, rg_track, rg_track_peak, rg_album, rg_album_peak, album_id FROM tracks WHERE id=?");
-    if (!s) return -1;
-    sqlite3_bind_int64(s, 1, id);
-    int rc = -1;
-    int64_t album_id = 0;
-    if (sqlite3_step(s) == SQLITE_ROW) {
-        int st = sqlite3_column_int(s, 0);
-        album_id = sqlite3_column_int64(s, 5);
-        if (album && sqlite3_column_type(s, 3) != SQLITE_NULL) {
-            *gain = sqlite3_column_double(s, 3);
-            *peak = sqlite3_column_type(s, 4) != SQLITE_NULL ? sqlite3_column_double(s, 4) : 0;
-            rc = 0;
-        } else if (st == 1 || st == 2) {
-            *gain = sqlite3_column_double(s, 1);
-            *peak = sqlite3_column_type(s, 2) != SQLITE_NULL ? sqlite3_column_double(s, 2) : 0;
-            rc = album ? 1 : 0;      /* album mode: try the album's tracks below */
-        }
-    }
-    sqlite3_finalize(s);
-    if (rc != 1) return rc;
-
-    /* the album's loudness: its tracks' mean energy, weighted by length */
-    s = prep(lib->db, "SELECT rg_state, rg_track, duration_ms, rg_track_peak FROM tracks WHERE album_id=?");
-    if (!s) return 0;
-    sqlite3_bind_int64(s, 1, album_id);
-    double energy = 0, ms = 0, apeak = 0;
-    int all = 1;
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        int st = sqlite3_column_int(s, 0);
-        if (st != 1 && st != 2) { all = 0; break; }
-        double d = sqlite3_column_double(s, 2);
-        energy += d * pow(10.0, (-18.0 - sqlite3_column_double(s, 1)) / 10.0);
-        ms += d;
-        if (sqlite3_column_double(s, 3) > apeak) apeak = sqlite3_column_double(s, 3);
-    }
-    sqlite3_finalize(s);
-    if (all && ms > 0 && energy > 0) {
-        *gain = -18.0 - 10.0 * log10(energy / ms);
-        *peak = apeak;
-    }
-    return 0;
-}
-
-float library_rg_gain(library_t *lib, int64_t id, int album)
-{
-    double gain, peak;
-    if (rg_lookup(lib, id, album, &gain, &peak) < 0) return 1.0f;
-    if (peak > 0 && gain > -20.0 * log10(peak)) gain = -20.0 * log10(peak);   /* never clip */
-    return (float)pow(10.0, gain / 20.0);
-}

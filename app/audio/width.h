@@ -21,9 +21,28 @@
 
 #include <stdint.h>
 
+#include "audio/pcm.h"
+
 #define WIDTH_MONO 0
 #define WIDTH_NORMAL 100
 #define WIDTH_MAX 200
+
+/* The widths Settings > Sound > Stereo width stops at, percent (100 is shown
+ * as Off: the samples untouched; wider in tens, as the owner asked,
+ * 2026-11-23). The H2 and the simulator each had this list. */
+static const int WIDTH_STEPS[] = {WIDTH_MONO, 50, 75, WIDTH_NORMAL, 110, 120, 130, 140, 150, 160, 170, 180, 190, WIDTH_MAX};
+#define WIDTH_N_STEPS ((int)(sizeof WIDTH_STEPS / sizeof WIDTH_STEPS[0]))
+
+/* Which of WIDTH_STEPS is nearest to pct (a saved value from before the list changed) */
+static inline int width_step_nearest(int pct)
+{
+    int best = 0;
+    for (int i = 1; i < WIDTH_N_STEPS; i++) {
+        int d = WIDTH_STEPS[i] - pct, b = WIDTH_STEPS[best] - pct;
+        if ((d < 0 ? -d : d) < (b < 0 ? -b : b)) best = i;
+    }
+    return best;
+}
 
 /* The two coefficients for a width (clamped to WIDTH_MONO..WIDTH_MAX). */
 static inline void width_coeffs(int pct, int32_t *ka, int32_t *kb)
@@ -40,8 +59,8 @@ static inline void width_run(int32_t *s, long n, int32_t ka, int32_t kb)
     for (long i = 0; i < n; i++) {
         int64_t l = s[2 * i], r = s[2 * i + 1];
         int64_t nl = (ka * l + kb * r + (1 << 29)) >> 30, nr = (kb * l + ka * r + (1 << 29)) >> 30;
-        s[2 * i] = nl > INT32_MAX ? INT32_MAX : nl < INT32_MIN ? INT32_MIN : (int32_t)nl;
-        s[2 * i + 1] = nr > INT32_MAX ? INT32_MAX : nr < INT32_MIN ? INT32_MIN : (int32_t)nr;
+        s[2 * i] = pcm_sat32(nl);
+        s[2 * i + 1] = pcm_sat32(nr);
     }
 }
 

@@ -5,6 +5,8 @@
 # Which Wi-Fi network the address came from: fathom-wifi status compares it with
 # the network joined now, and asks for a new address when wpa_supplicant has
 # moved to another one (udhcpc alone would keep the old one until it's due).
+# And which access point: two places' networks can share a name, and a join at
+# another access point has fathom-wifi ask udhcpc to renew.
 #
 # And no asking while no network is joined: udhcpc (-A 3) would try again every
 # 12 s for as long as Wi-Fi is on with nothing saved in range, this script and
@@ -28,13 +30,14 @@ OPTIONS="options timeout:3 attempts:3"
 case "$1" in
 bound|renew)
     s=$(/usr/sbin/fathom-wifi ssid); [ -n "$s" ] && printf '%s\n' "$s" > $RUN/lease-ssid
+    b=$(/usr/sbin/fathom-wifi bssid); [ -n "$b" ] && printf '%s\n' "$b" > $RUN/lease-bssid
     have=
     while IFS= read -r l; do [ "$l" = "$OPTIONS" ] && have=1; done 2>/dev/null < $RESOLV
     [ -n "$have" ] || echo "$OPTIONS" >> $RESOLV
     ;;
-deconfig|nak) rm -f $RUN/lease-ssid ;;
+deconfig|nak) rm -f $RUN/lease-ssid $RUN/lease-bssid ;;
 leasefail)
-    rm -f $RUN/lease-ssid
+    rm -f $RUN/lease-ssid $RUN/lease-bssid
     c=; read -r c 2>/dev/null < $CARRIER
     if [ "$c" != 1 ] && [ -f $RUN/udhcpc.pid ]; then
         read -r p < $RUN/udhcpc.pid

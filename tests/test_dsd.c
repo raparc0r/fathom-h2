@@ -13,6 +13,7 @@
 #include "audio/engine.h"
 #include "audio/eq.h"
 #include "audio/output.h"
+#include "core/clock.h"
 #include "library/tags.h"
 
 #include <math.h>
@@ -23,10 +24,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include "tmpdir.h"
 
-static int fails;
-#define CHECK(c, ...) do { if (!(c)) { printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); fails++; } } while (0)
+#include "test_util.h"
 
 #define DSD64 2822400u
 #define FS 176400.0
@@ -157,6 +156,44 @@ static void write_dff(const char *path, uint8_t *const *ch, unsigned nch, size_t
     fclose(f);
 }
 
+/* Files made to be slow to read: a DSF whose blocks are `block` bytes (8 bytes
+ * of sound, one channel), and a DFF with `empty` chunks of no bytes before
+ * its properties and its sound */
+static void write_dsf_block(const char *path, uint32_t block)
+{
+    FILE *f = fopen(path, "wb");
+    fwrite("DSD ", 1, 4, f); put_le(f, 28, 8); put_le(f, 28 + 52 + 12 + 4096, 8); put_le(f, 0, 8);
+    fwrite("fmt ", 1, 4, f); put_le(f, 52, 8); put_le(f, 1, 4); put_le(f, 0, 4);
+    put_le(f, 1, 4); put_le(f, 1, 4); put_le(f, DSD64, 4); put_le(f, 1, 4);
+    put_le(f, 4096 * 8, 8); put_le(f, block, 4); put_le(f, 0, 4);
+    fwrite("data", 1, 4, f); put_le(f, 12 + 4096, 8);
+    for (int i = 0; i < 4096; i++) fputc(0x69, f);
+    fclose(f);
+}
+
+static void write_dff_empty(const char *path, int empty)
+{
+    uint64_t prop = 4 + (12 + 4) + (12 + 2 + 4) + (12 + 4), form = 4 + 12 * (uint64_t)empty + (12 + prop) + (12 + 8);
+    FILE *f = fopen(path, "wb");
+    fwrite("FRM8", 1, 4, f); put_be(f, form, 8); fwrite("DSD ", 1, 4, f);
+    for (int i = 0; i < empty; i++) { fwrite("JUNK", 1, 4, f); put_be(f, 0, 8); }
+    fwrite("PROP", 1, 4, f); put_be(f, prop, 8); fwrite("SND ", 1, 4, f);
+    fwrite("FS  ", 1, 4, f); put_be(f, 4, 8); put_be(f, DSD64, 4);
+    fwrite("CHNL", 1, 4, f); put_be(f, 2 + 4, 8); put_be(f, 1, 2); fwrite("SLFT", 1, 4, f);
+    fwrite("CMPR", 1, 4, f); put_be(f, 4, 8); fwrite("DSD ", 1, 4, f);
+    fwrite("DSD ", 1, 4, f); put_be(f, 8, 8);
+    for (int i = 0; i < 8; i++) fputc(0x69, f);
+    fclose(f);
+}
+
+static int probe_path(const char *path, dsd_info_t *in)
+{
+    FILE *f = fopen(path, "rb");
+    int r = f ? dsd_probe(f, in) : -2;
+    if (f) fclose(f);
+    return r;
+}
+
 /* ---------- measuring ---------- */
 
 static int32_t *decode_all(const char *path, unsigned flags, audio_format_t *fmt, long *frames)
@@ -257,13 +294,6 @@ static void k_describe(void *c, char *o, int cap) { (void)c; snprintf(o, (size_t
 
 /* ---------- the bench ---------- */
 
-static double now_s(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec * 1e-9;
-}
-
 static int bench(void)
 {
     const tone_t t[] = {{1000, 0.5}};
@@ -273,11 +303,11 @@ static int bench(void)
     double host[2];
     /* making a converter: its tables designed (the first of a ratio), then kept */
     for (int r = 0; r < 3; r++) {
-        double t0 = now_s();
+        double t0 = clock_fsec();
         dsd2pcm_t *first = dsd2pcm_new(16u << r, 2);
-        double t1 = now_s();
+        double t1 = clock_fsec();
         dsd2pcm_t *again = dsd2pcm_new(16u << r, 2);
-        double t2 = now_s();
+        double t2 = clock_fsec();
         printf("DSD%d converter made in %.2f ms the first time (tables designed), %.3f ms after (kept)\n", 64 << r,
                (t1 - t0) * 1e3, (t2 - t1) * 1e3);
         dsd2pcm_free(first);
@@ -288,14 +318,14 @@ static int bench(void)
         dsd2pcm_t *c = dsd2pcm_new(ratio, 2);
         double best = 1e9;
         for (int rep = 0; rep < 5; rep++) {
-            double t0 = now_s();
+            double t0 = clock_fsec();
             for (int sec = 0; sec < 4; sec++)
                 for (size_t at = 0; at + (size_t)DSD_CHUNK * g <= n * (1u << r); at += (size_t)DSD_CHUNK * g) {
                     memcpy(dsd2pcm_in(c, 0), bits + at, (size_t)DSD_CHUNK * g);
                     memcpy(dsd2pcm_in(c, 1), bits + at, (size_t)DSD_CHUNK * g);
                     dsd2pcm_run(c, DSD_CHUNK, out);
                 }
-            double dt = (now_s() - t0) / 4;
+            double dt = (clock_fsec() - t0) / 4;
             if (dt < best) best = dt;
         }
         host[r] = best * 100;
@@ -305,8 +335,7 @@ static int bench(void)
     }
     /* the whole decoder: reading (from the page cache here), bit order, interleaving */
     char dir[200], path[2][64];
-    test_tmp(dir, sizeof dir, "fathom-bench-dsd");
-    if (mkdtemp(dir)) {
+    if (t_mkdtemp(dir, sizeof dir, "fathom-bench-dsd")) {
         uint8_t *ch[2] = {bits, bits};
         snprintf(path[0], sizeof path[0], "%s/b.dsf", dir);
         snprintf(path[1], sizeof path[1], "%s/b.dff", dir);
@@ -317,11 +346,11 @@ static int bench(void)
             double best = 1e9;
             for (int rep = 0; rep < 5; rep++) {
                 audio_format_t f;
-                double t0 = now_s();
+                double t0 = clock_fsec();
                 decoder_t *d = decoder_open(path[k], &f);
                 while (d && decoder_read(d, buf, 2048) > 0) {}
                 if (d) decoder_close(d);
-                double dt = (now_s() - t0) / 2;
+                double dt = (clock_fsec() - t0) / 2;
                 if (dt < best) best = dt;
             }
             printf("decoder, DSD64 %s: %.2f ms per second of audio\n", k ? "DFF" : "DSF", best * 1e3);
@@ -339,9 +368,9 @@ static int bench(void)
     for (int i = 0; i < 44100 * 2; i++) s[i] = (int32_t)(sin(i * 0.01) * 1e9);
     double best = 1e9;
     for (int rep = 0; rep < 5; rep++) {
-        double t0 = now_s();
+        double t0 = clock_fsec();
         for (int sec = 0; sec < 4; sec++) eq_run(e, s, 44100);
-        double dt = (now_s() - t0) / 4;
+        double dt = (clock_fsec() - t0) / 4;
         if (dt < best) best = dt;
     }
     eq_destroy(e);
@@ -380,7 +409,7 @@ static void test_kept_tables(void)
             dsd2pcm_keep_tables(v != 0);
             dsd2pcm_t *c = dsd2pcm_new(ratio, 2);
             out[v] = malloc((size_t)frames * 2 * sizeof *out[v]);
-            CHECK(c && out[v], "ratio %u: no converter", ratio);
+            CHECKF(c && out[v], "ratio %u: no converter", ratio);
             if (!c || !out[v]) continue;
             delay[v] = dsd2pcm_delay(c);
             span[v] = dsd2pcm_span(c);
@@ -393,9 +422,9 @@ static void test_kept_tables(void)
         }
         int loud = 0;
         for (long i = 0; i < frames * 2 && !loud; i++) loud = out[0][i] != 0;
-        CHECK(loud, "ratio %u: silence out", ratio);
+        CHECKF(loud, "ratio %u: silence out", ratio);
         for (int v = 1; v < 4; v++)
-            CHECK(!memcmp(out[0], out[v], (size_t)frames * 2 * sizeof *out[0]) && delay[v] == delay[0] && span[v] == span[0],
+            CHECKF(!memcmp(out[0], out[v], (size_t)frames * 2 * sizeof *out[0]) && delay[v] == delay[0] && span[v] == span[0],
                   "ratio %u: converter %d (kept tables) differs from one with its own", ratio, v);
         for (int v = 0; v < 4; v++) free(out[v]);
         free(in[0]);
@@ -403,7 +432,7 @@ static void test_kept_tables(void)
     }
     /* a ratio no file has, with the three kept: its own tables, and still right to free */
     dsd2pcm_t *odd = dsd2pcm_new(48, 1), *odd2 = dsd2pcm_new(48, 2);
-    CHECK(odd && odd2, "ratio 48");
+    CHECKF(odd && odd2, "ratio 48");
     dsd2pcm_free(odd);
     dsd2pcm_free(odd2);
     dsd2pcm_keep_tables(1);
@@ -437,10 +466,10 @@ static void test_tables_race(void)
     for (int i = 0; i < RACERS; i++) {
         void *ok = NULL;
         pthread_join(th[i], &ok);
-        CHECK(ok, "converter %d of %d made at once: none", i, RACERS);
+        CHECKF(ok, "converter %d of %d made at once: none", i, RACERS);
     }
     for (int i = 1; i < RACERS; i++)
-        CHECK(!memcmp(race_out[0], race_out[i], sizeof race_out[0]), "converter %d of %d made at once differs", i, RACERS);
+        CHECKF(!memcmp(race_out[0], race_out[i], sizeof race_out[0]), "converter %d of %d made at once differs", i, RACERS);
 }
 
 static void path_in(char *out, size_t cap, const char *dir, const char *name) { snprintf(out, cap, "%s/%s", dir, name); }
@@ -451,8 +480,7 @@ int main(int argc, char **argv)
     test_tables_race();
     test_kept_tables();
     char dir[200];
-    test_tmp(dir, sizeof dir, "fathom-test-dsd");
-    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    t_mkdtemp(dir, sizeof dir, "fathom-test-dsd");
     char dsf[256], dff[256], a[256], b[256], dst[256], mono[256], d128[256];
     path_in(dsf, sizeof dsf, dir, "sine.dsf");
     path_in(dff, sizeof dff, dir, "sine.dff");
@@ -479,30 +507,30 @@ int main(int argc, char **argv)
     audio_format_t f;
     long frames;
     int32_t *pcm = decode_all(dsf, 0, &f, &frames);
-    CHECK(pcm && f.rate == 176400 && f.channels == 2 && f.total_frames == 176400 && !f.bits && !f.dop &&
+    CHECKF(pcm && f.rate == 176400 && f.channels == 2 && f.total_frames == 176400 && !f.bits && !f.dop &&
           !strcmp(f.codec, "DSD64"), "DSF: %u Hz %u ch %llu frames %u bits %s", f.rate, f.channels,
           (unsigned long long)f.total_frames, f.bits, f.codec);
-    CHECK(frames == 176400, "DSF decoded %ld frames", frames);
+    CHECKF(frames == 176400, "DSF decoded %ld frames", frames);
     if (frames == 176400) {
         double ph, al = tone(pcm, 2, 0, 44100, 88200, 1000, &ph), ar = tone(pcm, 2, 1, 44100, 88200, 1000, NULL);
         double dbl = 20 * log10(al), dbr = 20 * log10(ar);
         printf("1 kHz: left %.3f dBFS (50 %% DSD), right %.3f dBFS (25 %%), phase %.2f deg\n", dbl, dbr, ph * 180 / M_PI);
-        CHECK(fabs(dbl + 6.0206) < 0.02 && fabs(dbr + 12.0412) < 0.02, "levels %.4f %.4f dB", dbl, dbr);
-        CHECK(fabs(ph) * 180 / M_PI < 1.0, "1 kHz delayed by %.2f degrees", ph * 180 / M_PI);  /* < half a frame */
+        CHECKF(fabs(dbl + 6.0206) < 0.02 && fabs(dbr + 12.0412) < 0.02, "levels %.4f %.4f dB", dbl, dbr);
+        CHECKF(fabs(ph) * 180 / M_PI < 1.0, "1 kHz delayed by %.2f degrees", ph * 180 / M_PI);  /* < half a frame */
         double noise = band_db(pcm, 2, 0, 50000, 60000, 88200), audio = band_db(pcm, 2, 0, 50000, 2000, 20000);
         printf("noise: 60-88.2 kHz %.1f dB, 2-20 kHz %.1f dB (the modulator's own)\n", noise, audio);
-        CHECK(noise < -120, "noise above 60 kHz at %.1f dB", noise);
-        CHECK(audio < -80, "noise in the audio band at %.1f dB", audio);
+        CHECKF(noise < -120, "noise above 60 kHz at %.1f dB", noise);
+        CHECKF(audio < -80, "noise in the audio band at %.1f dB", audio);
         /* the start and the end: the filter's delay taken out, nothing missing */
         double head = tone(pcm, 2, 0, 0, 882, 1000, NULL), tail = tone(pcm, 2, 0, 176400 - 882 - 30, 882, 1000, NULL);
-        CHECK(fabs(20 * log10(head / al)) < 0.1 && fabs(20 * log10(tail / al)) < 0.1, "start %.3f, end %.3f", head, tail);
+        CHECKF(fabs(20 * log10(head / al)) < 0.1 && fabs(20 * log10(tail / al)) < 0.1, "start %.3f, end %.3f", head, tail);
     }
 
     /* the same bits as DFF: the same samples */
     long frames2;
     audio_format_t f2;
     int32_t *pcm2 = decode_all(dff, 0, &f2, &frames2);
-    CHECK(pcm2 && frames2 == frames && f2.rate == f.rate && !memcmp(pcm, pcm2, (size_t)frames * 2 * sizeof *pcm),
+    CHECKF(pcm2 && frames2 == frames && f2.rate == f.rate && !memcmp(pcm, pcm2, (size_t)frames * 2 * sizeof *pcm),
           "DFF differs from DSF (%ld frames)", frames2);
     free(pcm2);
 
@@ -512,14 +540,14 @@ int main(int argc, char **argv)
         const long at[] = {100000, 0, 1, 21, 777, 4095, 4096, 50000, 176400 - 3000, 176400 - 5};
         int32_t got[2048 * 2];
         for (size_t i = 0; i < sizeof at / sizeof at[0]; i++) {
-            CHECK(decoder_seek(d, (uint64_t)at[i]) == 0, "seek to %ld", at[i]);
+            CHECKF(decoder_seek(d, (uint64_t)at[i]) == 0, "seek to %ld", at[i]);
             long want = 176400 - at[i] < 2048 ? 176400 - at[i] : 2048, m = 0, r;
             while (m < want && (r = decoder_read(d, got + m * 2, want - m)) > 0) m += r;
-            CHECK(m == want && !memcmp(got, pcm + at[i] * 2, (size_t)m * 2 * sizeof *got), "%s: seek to %ld: %ld frames, differ",
+            CHECKF(m == want && !memcmp(got, pcm + at[i] * 2, (size_t)m * 2 * sizeof *got), "%s: seek to %ld: %ld frames, differ",
                   k ? "DFF" : "DSF", at[i], m);
         }
-        CHECK(decoder_seek(d, 176400) == 0 && decoder_read(d, got, 16) == 0, "seek to the end");
-        CHECK(decoder_seek(d, 176401) != 0, "seek past the end");
+        CHECKF(decoder_seek(d, 176400) == 0 && decoder_read(d, got, 16) == 0, "seek to the end");
+        CHECKF(decoder_seek(d, 176401) != 0, "seek past the end");
         decoder_close(d);
     }
 
@@ -537,14 +565,14 @@ int main(int argc, char **argv)
         decoder_close(da);
         while (m < 176400 + 64 && (r = decoder_read(db, j + m * 2, 1000)) > 0) m += r;
         decoder_close(db);
-        CHECK(fa.total_frames == 40001 && fb.total_frames == 176400 - 40001, "split lengths %llu %llu",
+        CHECKF(fa.total_frames == 40001 && fb.total_frames == 176400 - 40001, "split lengths %llu %llu",
               (unsigned long long)fa.total_frames, (unsigned long long)fb.total_frames);
-        CHECK(m == 176400 && !memcmp(j, pcm, (size_t)m * 2 * sizeof *j), "joined: %ld frames (%ld from a), not the whole", m, ma);
+        CHECKF(m == 176400 && !memcmp(j, pcm, (size_t)m * 2 * sizeof *j), "joined: %ld frames (%ld from a), not the whole", m, ma);
         /* not followed: each on its own, exactly its length */
         long la, lb;
         free(decode_all(a, 0, &fa, &la));
         free(decode_all(b, 0, &fb, &lb));
-        CHECK(la == 40001 && lb == 176400 - 40001, "alone: %ld + %ld frames", la, lb);
+        CHECKF(la == 40001 && lb == 176400 - 40001, "alone: %ld + %ld frames", la, lb);
 
         /* the same through the engine: one open, the whole file's samples */
         keep_t k = {.cap = 176400 + 4096};
@@ -562,7 +590,7 @@ int main(int argc, char **argv)
             usleep(10000);
         }
         engine_free(e);
-        CHECK(st.ended && k.opens == 1 && k.n == 176400 && !memcmp(k.buf, pcm, (size_t)k.n * 2 * sizeof *k.buf),
+        CHECKF(st.ended && k.opens == 1 && k.n == 176400 && !memcmp(k.buf, pcm, (size_t)k.n * 2 * sizeof *k.buf),
               "engine: ended %d, %d opens, %ld frames", st.ended, k.opens, k.n);
         free(k.buf);
         free(j);
@@ -579,16 +607,16 @@ int main(int argc, char **argv)
         long mf;
         audio_format_t fm;
         int32_t *mp = decode_all(mono, 0, &fm, &mf);
-        CHECK(mp && fm.channels == 2 && mf == 88200, "mono: %ld frames, %u ch", mf, fm.channels);   /* (two equal channels: the DAC takes no fewer) */
+        CHECKF(mp && fm.channels == 2 && mf == 88200, "mono: %ld frames, %u ch", mf, fm.channels);   /* (two equal channels: the DAC takes no fewer) */
         for (long i = 0; mp && i < mf; i++)
-            if (mp[2 * i] != mp[2 * i + 1]) { CHECK(0, "mono: the channels differ at frame %ld", i); break; }
+            if (mp[2 * i] != mp[2 * i + 1]) { CHECKF(0, "mono: the channels differ at frame %ld", i); break; }
         if (mp && mf == 88200) {
             double in = bits_tone(mch[0], DSD64, 22050 * 16, 44100 * 16, 20000);
             double t20 = 20 * log10(tone(mp, fm.channels, 0, 22050, 44100, 20000, NULL) / in);
             double t76 = 20 * log10(tone(mp, fm.channels, 0, 22050, 44100, 76400, NULL) / 0.25 + 1e-12);
             printf("20 kHz at %+.5f dB (%.4f in the bits); 100 kHz at %.1f dB\n", t20, in, t76);
-            CHECK(fabs(t20) < 0.001, "20 kHz at %+.5f dB", t20);
-            CHECK(t76 < -110, "100 kHz through at %.1f dB", t76);
+            CHECKF(fabs(t20) < 0.001, "20 kHz at %+.5f dB", t20);
+            CHECKF(t76 < -110, "100 kHz through at %.1f dB", t76);
         }
         free(mp);
         free(mch[0]);
@@ -604,12 +632,12 @@ int main(int argc, char **argv)
         long df;
         audio_format_t fd;
         int32_t *dp = decode_all(d256, 0, &fd, &df);
-        CHECK(dp && fd.rate == 176400 && df == 17640 && !strcmp(fd.codec, "DSD256"), "DSD256: %u Hz, %ld frames, %s",
+        CHECKF(dp && fd.rate == 176400 && df == 17640 && !strcmp(fd.codec, "DSD256"), "DSD256: %u Hz, %ld frames, %s",
               fd.rate, df, fd.codec);
         if (dp && df == 17640) {
             double dbl = 20 * log10(tone(dp, fd.channels, 0, 0, 17640, 1000, NULL));
             printf("DSD256: 1 kHz %.3f dBFS\n", dbl);
-            CHECK(fabs(dbl + 6.0206) < 0.02, "DSD256: %.4f dB", dbl);
+            CHECKF(fabs(dbl + 6.0206) < 0.02, "DSD256: %.4f dB", dbl);
         }
         free(dp);
         free(dch[0]);
@@ -624,17 +652,17 @@ int main(int argc, char **argv)
         long df;
         audio_format_t fd;
         int32_t *dp = decode_all(d128, 0, &fd, &df);
-        CHECK(dp && fd.rate == 176400 && df == 88200 && !strcmp(fd.codec, "DSD128"), "DSD128: %u Hz, %ld frames, %s",
+        CHECKF(dp && fd.rate == 176400 && df == 88200 && !strcmp(fd.codec, "DSD128"), "DSD128: %u Hz, %ld frames, %s",
               fd.rate, df, fd.codec);
         if (dp && df == 88200) {
             double dbl = 20 * log10(tone(dp, 2, 0, 0, 88200, 1000, NULL));
             double noise = band_db(dp, 2, 0, 30000, 60000, 88200);
             printf("DSD128: 1 kHz %.3f dBFS, noise 60-88.2 kHz %.1f dB\n", dbl, noise);
-            CHECK(fabs(dbl + 6.0206) < 0.02 && noise < -120, "DSD128: %.4f dB, noise %.1f dB", dbl, noise);
+            CHECKF(fabs(dbl + 6.0206) < 0.02 && noise < -120, "DSD128: %.4f dB, noise %.1f dB", dbl, noise);
         }
         free(dp);
         tags_t t;
-        CHECK(tags_read(d128, &t) == 0 && !strcmp(t.codec, "DSD128") && t.sample_rate == 2 * DSD64 && t.duration_ms == 500,
+        CHECKF(tags_read(d128, &t) == 0 && !strcmp(t.codec, "DSD128") && t.sample_rate == 2 * DSD64 && t.duration_ms == 500,
               "DSD128 tags: %s %u %u ms", t.codec, t.sample_rate, t.duration_ms);
         free(dch[0]);
         free(dch[1]);
@@ -645,7 +673,7 @@ int main(int argc, char **argv)
         long df;
         audio_format_t fd;
         int32_t *dp = decode_all(dsf, DECODER_DOP, &fd, &df);
-        CHECK(dp && fd.dop && fd.bits == 24 && fd.rate == 176400 && df == 176400, "DoP: %u Hz %u bits, %ld frames",
+        CHECKF(dp && fd.dop && fd.bits == 24 && fd.rate == 176400 && df == 176400, "DoP: %u Hz %u bits, %ld frames",
               fd.rate, fd.bits, df);
         int ok = dp != NULL;
         for (long i = 0; ok && i < df; i++)
@@ -654,7 +682,7 @@ int main(int argc, char **argv)
                 ok &= (v & 0xff) == 0 && v >> 24 == (i & 1 ? 0xFAu : 0x05u) &&
                       (v >> 16 & 0xff) == ch[c][2 * i] && (v >> 8 & 0xff) == ch[c][2 * i + 1];
             }
-        CHECK(ok, "DoP frames aren't the DSD bits");
+        CHECKF(ok, "DoP frames aren't the DSD bits");
 
         /* through the engine: untouched (a balance set, but not for DoP), and
          * back to PCM at once when the output changes */
@@ -671,7 +699,7 @@ int main(int argc, char **argv)
             if (st.ended) break;
             usleep(10000);
         }
-        CHECK(st.ended && k.fmt.dop && k.fmt.bits == 24 && st.untouched && k.n == df && dp &&
+        CHECKF(st.ended && k.fmt.dop && k.fmt.bits == 24 && st.untouched && k.n == df && dp &&
               !memcmp(k.buf, dp, (size_t)df * 2 * sizeof *dp), "engine DoP: %ld frames, dop %d, untouched %d", k.n,
               k.fmt.dop, st.untouched);
         k.n = 0;
@@ -684,7 +712,7 @@ int main(int argc, char **argv)
         }
         engine_switch_output(e, NULL, NULL);          /* (another DAC, say): PCM from here */
         engine_status(e, &st);
-        CHECK(!st.fmt.dop && !k.fmt.dop && st.state == ENG_PAUSED && st.pos_ms >= 400, "after the switch: dop %d %d, %u ms",
+        CHECKF(!st.fmt.dop && !k.fmt.dop && st.state == ENG_PAUSED && st.pos_ms >= 400, "after the switch: dop %d %d, %u ms",
               st.fmt.dop, k.fmt.dop, st.pos_ms);
         engine_set_balance(e, 1.0f, 1.0f);
         k.n = 0;                                      /* (what's played from here: a chunk may have gone out before the pause) */
@@ -695,7 +723,7 @@ int main(int argc, char **argv)
             usleep(10000);
         }
         long from = 176400 - k.n;
-        CHECK(st.ended && from > 0 && !memcmp(k.buf, pcm + from * 2, (size_t)k.n * 2 * sizeof *pcm),
+        CHECKF(st.ended && from > 0 && !memcmp(k.buf, pcm + from * 2, (size_t)k.n * 2 * sizeof *pcm),
               "after the switch: %ld frames, not the PCM from %ld", k.n, from);
         engine_free(e);
         free(k.buf);
@@ -707,32 +735,32 @@ int main(int argc, char **argv)
         audio_format_t fd;
         tags_t t;
         decoder_t *d = decoder_open(dst, &fd);
-        CHECK(!d && tags_read(dst, &t) != 0, "DST accepted");
+        CHECKF(!d && tags_read(dst, &t) != 0, "DST accepted");
         if (d) decoder_close(d);
     }
 
     /* tags: DSF's ID3 at the end, DFF's ID3 chunk; the cover */
     {
         tags_t t;
-        CHECK(tags_supported(dsf) && tags_supported(dff) && tags_supported("/x/Y.DSF"), "not supported");
-        CHECK(tags_read(dsf, &t) == 0, "DSF tags");
-        CHECK(!strcmp(t.codec, "DSD64") && t.sample_rate == DSD64 && t.bits == 1 && t.channels == 2 &&
+        CHECKF(tags_supported(dsf) && tags_supported(dff) && tags_supported("/x/Y.DSF"), "not supported");
+        CHECKF(tags_read(dsf, &t) == 0, "DSF tags");
+        CHECKF(!strcmp(t.codec, "DSD64") && t.sample_rate == DSD64 && t.bits == 1 && t.channels == 2 &&
               t.duration_ms == 1000 && !strcmp(t.title, "Sine") && !strcmp(t.artist, "Fathom") &&
               !strcmp(t.album, "Test Tones") && t.has_picture,
               "DSF: %s %u Hz %u bits %u ch %u ms '%s' '%s' '%s' pic %d", t.codec, t.sample_rate, t.bits, t.channels,
               t.duration_ms, t.title, t.artist, t.album, t.has_picture);
         unsigned char *pic;
         size_t len;
-        CHECK(tags_picture(dsf, &pic, &len) == 0 && len == 10 && pic[0] == 0xFF && pic[9] == 0xD9, "DSF cover");
+        CHECKF(tags_picture(dsf, &pic, &len) == 0 && len == 10 && pic[0] == 0xFF && pic[9] == 0xD9, "DSF cover");
         if (len) free(pic);
-        CHECK(tags_read(dff, &t) == 0 && !strcmp(t.codec, "DSD64") && t.duration_ms == 1000 && !strcmp(t.title, "Sine") &&
+        CHECKF(tags_read(dff, &t) == 0 && !strcmp(t.codec, "DSD64") && t.duration_ms == 1000 && !strcmp(t.title, "Sine") &&
               !strcmp(t.album, "Test Tones"), "DFF: %s %u ms '%s'", t.codec, t.duration_ms, t.title);
-        CHECK(tags_read(a, &t) == 0 && !strcmp(t.title, "a"), "untagged DSF: '%s'", t.title);   /* the file's name */
-        CHECK(tags_read(dst, &t) != 0, "DST tagged");
+        CHECKF(tags_read(a, &t) == 0 && !strcmp(t.title, "a"), "untagged DSF: '%s'", t.title);   /* the file's name */
+        CHECKF(tags_read(dst, &t) != 0, "DST tagged");
         char nodsd[256];
         path_in(nodsd, sizeof nodsd, dir, "plain.dff");
         write_dff(nodsd, ch, 2, 8192, DSD64, 0, 0);
-        CHECK(tags_read(nodsd, &t) == 0 && !strcmp(t.title, "Title in DIIN"), "DIIN title: '%s'", t.title);
+        CHECKF(tags_read(nodsd, &t) == 0 && !strcmp(t.title, "Title in DIIN"), "DIIN title: '%s'", t.title);
         unlink(nodsd);
     }
 
@@ -754,7 +782,7 @@ int main(int argc, char **argv)
             long total = 0, r;
             int32_t buf[2048 * 2];
             while (d && (r = decoder_read(d, buf, 2048)) > 0) total += r;
-            CHECK(!d || total == (long)fc.total_frames, "cut at %ld: %ld of %llu frames", cuts[i], total,
+            CHECKF(!d || total == (long)fc.total_frames, "cut at %ld: %ld of %llu frames", cuts[i], total,
                   (unsigned long long)fc.total_frames);
             if (d) decoder_close(d);
             tags_t t;
@@ -764,12 +792,34 @@ int main(int argc, char **argv)
         free(whole);
     }
 
+    /* A DSF's blocks are 4,096 bytes, the format's one size: with "1" in its
+     * header a file was read a byte at a time, a seek for each. A DFF's chunks
+     * are walked 4,096 of them at most: empty ones by the million had the
+     * whole file read, twelve bytes at a time. */
+    {
+        char slow[256];
+        dsd_info_t in;
+        path_in(slow, sizeof slow, dir, "slow.dsf");
+        write_dsf_block(slow, 4096);
+        CHECKF(probe_path(slow, &in) == 0 && in.block == 4096 && in.bytes == 4096, "a DSF of one block: %u", in.block);
+        write_dsf_block(slow, 1);
+        CHECKF(probe_path(slow, &in) == -1, "a DSF with blocks of 1 byte is refused");
+        write_dsf_block(slow, 8192);
+        CHECKF(probe_path(slow, &in) == -1, "and of 8,192");
+        unlink(slow);
+        path_in(slow, sizeof slow, dir, "slow.dff");
+        write_dff_empty(slow, 1000);
+        CHECKF(probe_path(slow, &in) == 0 && in.rate == DSD64 && in.bytes == 8, "a DFF with 1,000 empty chunks reads");
+        write_dff_empty(slow, 5000);
+        CHECKF(probe_path(slow, &in) == -1, "one with 5,000 before its sound is given up");
+        unlink(slow);
+    }
+
     free(pcm);
     free(ch[0]);
     free(ch[1]);
     const char *made[] = {dsf, dff, a, b, dst, mono, d128};
     for (size_t i = 0; i < sizeof made / sizeof made[0]; i++) unlink(made[i]);
     rmdir(dir);
-    printf(fails ? "%d failures\n" : "dsd ok\n", fails);
-    return fails != 0;
+    return t_result();
 }

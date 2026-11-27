@@ -3,6 +3,7 @@
 /* The station directory: radio-browser.info (radiodir.h). */
 #include "net/radiodir.h"
 #include "net/radioicon.h"
+#include "core/thread.h"
 
 #include <ctype.h>
 #include <pthread.h>
@@ -291,13 +292,13 @@ typedef struct {
 } job_t;
 
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
-static rdir_fetch_fn g_fetch = http_get;
+static http_get_fn g_fetch = http_get;
 static int g_server = -1;        /* the server that answered last (under mu); -1: none yet */
 static job_t *g_job;             /* the request the UI waits for (the UI's thread only) */
 static int g_clicking;           /* (under mu) the click worker is running */
 static char *g_click_url;        /* (under mu) the play it counts next */
 
-void rdir_set_fetch(rdir_fetch_fn fn) { g_fetch = fn ? fn : http_get; }
+void rdir_set_fetch(http_get_fn fn) { g_fetch = fn ? fn : http_get; }
 
 void rdir_result_free(rdir_result_t *r)
 {
@@ -417,17 +418,6 @@ static void *job_run(void *arg)
     return NULL;
 }
 
-static int spawn(void *(*fn)(void *), void *arg)
-{
-    pthread_t t;
-    pthread_attr_t a;
-    pthread_attr_init(&a);
-    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-    int r = pthread_create(&t, &a, fn, arg);
-    pthread_attr_destroy(&a);
-    return r == 0 ? 0 : -1;
-}
-
 int rdir_start(const rdir_query_t *q)
 {
     rdir_cancel();
@@ -435,7 +425,7 @@ int rdir_start(const rdir_query_t *q)
     if (!j) return -1;
     j->stations = q != NULL;
     if (q) j->q = *q;
-    if (spawn(job_run, j)) { free(j); return -1; }
+    if (thread_detached(job_run, j, 0)) { free(j); return -1; }
     g_job = j;
     return 0;
 }
@@ -485,9 +475,7 @@ void rdir_test_click_wait(int ms) { g_click_wait_ms = ms >= 0 ? ms : CLICK_WAIT_
 static void *click_run(void *arg)
 {
     (void)arg;
-#ifdef __linux__
-    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);   /* (this thread only) */
-#endif
+    thread_nice(19);                    /* (this thread only) */
     for (;;) {
         struct timespec ts = {g_click_wait_ms / 1000, (long)(g_click_wait_ms % 1000) * 1000000L};
         nanosleep(&ts, NULL);
@@ -522,7 +510,7 @@ void rdir_count_click(const char *uuid)
     int start = !g_clicking;
     if (start) g_clicking = 1;
     pthread_mutex_unlock(&mu);
-    if (start && spawn(click_run, NULL)) {
+    if (start && thread_detached(click_run, NULL, 0)) {
         pthread_mutex_lock(&mu);
         free(g_click_url);
         g_click_url = NULL;

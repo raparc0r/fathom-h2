@@ -21,18 +21,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #include <zlib.h>
 #include <jpeglib.h>
 #include <sqlite3.h>
 
+#include "core/clock.h"
 #include "library/artdec.h"
 #include "library/library.h"
 #include "library/tags.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: CHECK(%s)\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_util.h"
 
 static char g_tmp[512];
 
@@ -439,6 +440,91 @@ static void test_png(void)
     free(src), free(expect), free(want);
 }
 
+/* ---------- interlaced PNGs: whole, by stb_image, in memory that is counted ---------- */
+
+/* An interlaced PNG of w x h, every sample 0 (colour type ct at d bits), into
+ * b: its length. (All zeros, so only the length of each of Adam7's passes has
+ * to be right, and that packs to very little.) */
+static size_t interlaced_png(unsigned char *b, size_t cap, uint32_t w, uint32_t h, int ct, int d)
+{
+    static const uint32_t x0[7] = {0, 4, 0, 2, 0, 1, 0}, y0[7] = {0, 0, 4, 0, 2, 0, 1},
+                          dx[7] = {8, 8, 4, 4, 2, 2, 1}, dy[7] = {8, 8, 8, 4, 4, 2, 2};
+    int ch = ct == 6 ? 4 : ct == 4 ? 2 : ct == 2 ? 3 : 1;
+    size_t raw = 0;
+    for (int p = 0; p < 7; p++) {
+        size_t pw = (w - x0[p] + dx[p] - 1) / dx[p], ph = (h - y0[p] + dy[p] - 1) / dy[p];
+        if (pw && ph) raw += ((pw * (size_t)ch * (size_t)d + 7) / 8 + 1) * ph;
+    }
+    unsigned char *zeros = calloc(1, raw);
+    uLongf zn = compressBound((uLong)raw);
+    unsigned char *z = malloc(zn);
+    compress2(z, &zn, zeros, (uLong)raw, 1);
+    free(zeros);
+    unsigned char hd[13];
+    put32(hd, w), put32(hd + 4, h);
+    hd[8] = (unsigned char)d, hd[9] = (unsigned char)ct, hd[10] = hd[11] = 0, hd[12] = 1;
+    FILE *f = fmemopen(b, cap, "wb");
+    fwrite("\x89PNG\r\n\x1a\n", 1, 8, f);
+    chunk(f, "IHDR", hd, 13);
+    chunk(f, "IDAT", z, (uint32_t)zn);
+    chunk(f, "IEND", NULL, 0);
+    size_t n = (size_t)ftell(f);
+    fclose(f);
+    free(z);
+    return n;
+}
+
+/* (run first: the memory check needs a process that hasn't held much yet) */
+static void test_whole(void)
+{
+    unsigned char *img = NULL;
+    int w = 0, h = 0;
+    /* a picture already in memory is decoded from there: 24 MB behind it (never
+     * touched, so not yet memory at all) were copied before it was looked at */
+    size_t cap = 24u << 20;
+    unsigned char *b = calloc(1, cap);
+    size_t n = interlaced_png(b, cap, 64, 64, 2, 8);
+    CHECK(n > 0 && n < 4096);
+    long before = t_peak_kb();
+    CHECK(art_decode_mem(b, cap, 204, &BIG, &img, &w, &h) == 0 && w == 64 && h == 64);
+    long grew = t_peak_kb() - before;
+    if (grew >= 12 * 1024) fprintf(stderr, "decoding from memory took %ld KB\n", grew);
+    CHECK(grew < 12 * 1024);
+    free(img), img = NULL;
+
+    /* the H2's 1.2 million pixels are 3.6 MB as 8-bit RGB: that is still read */
+    n = interlaced_png(b, cap, 1000, 1200, 2, 8);
+    CHECK(art_decode_mem(b, n, 204, &H2, &img, &w, &h) == 0 && w == 1000 && h == 1200);
+    free(img), img = NULL;
+    /* the same pixels at 16 bits with transparency are 9.6 MB, three times over: refused
+     * (as many bytes as the limit allows are read: 600 x 750 of them) */
+    n = interlaced_png(b, cap, 1000, 1200, 6, 16);
+    CHECK(art_decode_mem(b, n, 204, &H2, &img, &w, &h) == -1 && img == NULL);
+    free(img), img = NULL;
+    n = interlaced_png(b, cap, 600, 750, 6, 16);
+    CHECK(art_decode_mem(b, n, 204, &H2, &img, &w, &h) == 0 && w == 600 && h == 750);
+    free(img), img = NULL;
+    /* 8-bit with transparency over white (a logo) is 4 bytes a pixel as it's read */
+    n = interlaced_png(b, cap, 1000, 1200, 6, 8);
+    CHECK(art_decode_mem(b, n, 204, &MATTE, &img, &w, &h) == -1 && img == NULL);
+    free(img), img = NULL;
+    n = interlaced_png(b, cap, 1000, 900, 6, 8);
+    CHECK(art_decode_mem(b, n, 204, &MATTE, &img, &w, &h) == 0 && w == 1000 && h == 900 && img[0] == 255);   /* (clear: white) */
+    free(img), img = NULL;
+    /* and from a file, the same limit */
+    char path[600];
+    snprintf(path, sizeof path, "%s/deep.png", g_tmp);
+    n = interlaced_png(b, cap, 1000, 1200, 6, 16);
+    FILE *f = fopen(path, "wb");
+    fwrite(b, 1, n, f);
+    fclose(f);
+    f = fopen(path, "rb");
+    CHECK(art_decode(f, 0, -1, 204, &H2, &img, &w, &h) == -1 && img == NULL);
+    fclose(f);
+    free(img);
+    free(b);
+}
+
 /* ---------- transparency, and logos fitted whole ---------- */
 
 /* A PNG as it is given: colour type ct (3: a palette of n entries with their
@@ -482,6 +568,71 @@ static int decode_file(const char *path, const art_limits_t *lim, unsigned char 
 #define PX(img, w, x, y) ((img) + 3 * ((size_t)(y) * (w) + (x)))
 static int is_rgb(const unsigned char *p, int r, int g, int b) { return p[0] == r && p[1] == g && p[2] == b; }
 #define RGB565(r, g, b) ((uint16_t)((((r) >> 3) << 11) | (((g) >> 2) << 5) | ((b) >> 3)))
+
+/* ---------- files made to take time ---------- */
+
+static void test_slow(void)
+{
+    unsigned char *img = NULL;
+    int w = 0, h = 0;
+    /* A progressive JPEG too big for libjpeg's memory (8000 x 1200: 150,000
+     * blocks a component), then 20,000 scans of 10 bytes, each the first pass
+     * of its first component and no data: each walked every block (3,000
+     * million in all: 8 seconds on a computer, far longer on an H2) before the
+     * file was refused. */
+    size_t cap = 1024 + 20000 * 10, n = 0;
+    unsigned char *b = malloc(cap);
+    static const unsigned char head[] = {
+        0xFF, 0xD8,
+        0xFF, 0xDB, 0, 67, 0,                          /* DQT: table 0 (64 values follow) */
+    };
+    memcpy(b, head, sizeof head), n = sizeof head;
+    memset(b + n, 16, 64), n += 64;
+    static const unsigned char sof[] = {
+        0xFF, 0xC2, 0, 17, 8, 1200 >> 8, 1200 & 255, 8000 >> 8, 8000 & 255, 3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0,
+        0xFF, 0xC4, 0, 20, 0x00, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /* DHT, DC 0: the code "0" is a difference of 0 */
+    };
+    memcpy(b + n, sof, sizeof sof), n += sizeof sof;
+    static const unsigned char sos[] = {0xFF, 0xDA, 0, 8, 1, 1, 0x00, 0, 0, 0x00};   /* component 1, Ss 0, Se 0, Ah 0 */
+    for (int i = 0; i < 20000; i++) memcpy(b + n, sos, sizeof sos), n += sizeof sos;
+    b[n++] = 0xFF, b[n++] = 0xD9;
+    double t0 = clock_fsec();
+    CHECK(art_decode_mem(b, n, 204, &H2, &img, &w, &h) == -1 && img == NULL);
+    double took = clock_fsec() - t0;
+    if (took >= 2.0) fprintf(stderr, "a JPEG of 20,000 empty scans took %.1f s\n", took);
+    CHECK(took < 2.0);
+    free(img), img = NULL;
+    free(b);
+
+    /* A PNG of 9000 x 9000 (1 bit a pixel: 10 MB of rows from a 10 KB file) was
+     * unpacked row by row to make 204 x 204 of it; at the format's 65,535 a
+     * side and 8 bytes a pixel that is 34 GB. Over 64 million pixels: refused. */
+    char path[600];
+    snprintf(path, sizeof path, "%s/vast.png", g_tmp);
+    for (int k = 0; k < 2; k++) {
+        uint32_t side = k ? 8000 : 9000;
+        size_t raw = (size_t)side * (side / 8 + 1);
+        unsigned char *zeros = calloc(1, raw);
+        uLongf zn = compressBound((uLong)raw);
+        unsigned char *z = malloc(zn);
+        compress2(z, &zn, zeros, (uLong)raw, 1);
+        unsigned char hd[13] = {0};
+        put32(hd, side), put32(hd + 4, side);
+        hd[8] = 1;                                     /* 1 bit, grey */
+        FILE *f = fopen(path, "wb");
+        fwrite("\x89PNG\r\n\x1a\n", 1, 8, f);
+        chunk(f, "IHDR", hd, 13);
+        chunk(f, "IDAT", z, (uint32_t)zn);
+        chunk(f, "IEND", NULL, 0);
+        fclose(f);
+        free(zeros), free(z);
+        int r = decode_file(path, &H2, &img, &w, &h);
+        if (k) CHECK(r == 0 && w == 8000 / 39 && h == 8000 / 39);   /* (64 million exactly: still read, shrunk by 39) */
+        else CHECK(r == -1 && img == NULL);
+        free(img), img = NULL;
+    }
+    unlink(path);
+}
 
 static unsigned char *slurp(const char *path, long *n);
 
@@ -614,13 +765,10 @@ static void put24(unsigned char *p, uint32_t v) { p[0] = (unsigned char)(v >> 16
 
 static unsigned char *slurp(const char *path, long *n)
 {
-    FILE *f = fopen(path, "rb");
-    fseek(f, 0, SEEK_END);
-    *n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    unsigned char *b = malloc((size_t)*n);
-    if (fread(b, 1, (size_t)*n, f) != (size_t)*n) *n = 0;
-    fclose(f);
+    size_t len = 0;
+    unsigned char *b = (unsigned char *)t_slurp(path, &len);
+    if (!b) { printf("FAIL: can't read %s\n", path); exit(1); }
+    *n = (long)len;
     return b;
 }
 
@@ -1073,24 +1221,53 @@ static void test_library(void)
     free(src), free(expect);
 }
 
-static void rm_tree(const char *p)
+/* An album in one file, split by its sheet, its cover only in the file's
+ * own tags: found. (Its tracks' paths are the file's and then "::01@...";
+ * the picture's place was asked of the file, and the file then opened by the
+ * track's whole path, which is no file: every such album had no cover unless
+ * a picture lay beside it.) */
+static void test_cue_cover(void)
 {
-    char cmd[700];
-    snprintf(cmd, sizeof cmd, "rm -rf '%s'", p);
-    if (system(cmd)) {}
+    char p[700], db[600], art[600], music[600], red[600];
+    unsigned char *src = picture(400, 400), *expect = malloc(400 * 400 * 3);
+    snprintf(red, sizeof red, "%s/cue-red.png", g_tmp);
+    write_png(red, src, 400, 400, 2, 8, 0, 1 << 20, expect);
+    const int t_front[] = {3};
+    const char *one[] = {red};
+    snprintf(music, sizeof music, "%s/cuemusic", g_tmp);
+    mkdir(music, 0755);
+    snprintf(p, sizeof p, "%s/Q", music);
+    mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/Q/whole.flac", music);
+    write_flac(p, "Album Q", "whole", 1, t_front, one, 1);
+    snprintf(p, sizeof p, "%s/Q/whole.cue", music);
+    FILE *f = fopen(p, "wb");
+    if (f) {
+        fputs("TITLE \"Album Q\"\nFILE \"whole.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"First\"\n    INDEX 01 00:00:00\n"
+              "  TRACK 02 AUDIO\n    TITLE \"Second\"\n    INDEX 01 00:00:15\n", f);
+        fclose(f);
+    }
+    snprintf(db, sizeof db, "%s/cue.db", g_tmp);
+    snprintf(art, sizeof art, "%s/cue-art", g_tmp);
+    mkdir(art, 0755);
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 2);
+    CHECK(album_art(db, "Album Q") == LIB_COVER_OWN);
+    if (lib) library_close(lib);
+    free(src);
+    free(expect);
 }
 
 int main(void)
 {
-    snprintf(g_tmp, sizeof g_tmp, "%s/fathom-art-XXXXXX", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
-    if (!mkdtemp(g_tmp)) { perror("mkdtemp"); return 1; }
-    (void)BIG;
+    t_mkdtemp(g_tmp, sizeof g_tmp, "fathom-art");
+    test_whole();
     test_jpeg();
     test_png();
     test_logo();
+    test_slow();
     test_library();
-    rm_tree(g_tmp);
-    if (failures) { fprintf(stderr, "%d failures\n", failures); return 1; }
-    printf("art: ok\n");
-    return 0;
+    test_cue_cover();
+    t_rm_rf(g_tmp);
+    return t_result();
 }

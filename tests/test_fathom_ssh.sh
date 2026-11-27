@@ -9,14 +9,10 @@
 # stand-ins for chpasswd and dropbear, against a root made here.
 #   sh tests/test_fathom_ssh.sh        (under dash too, when there is one)
 set -u
-here=$(cd "$(dirname "$0")/.." && pwd)
-SRC=${SRC:-$here/buildroot/external/board/h2/rootfs-overlay}
-T=$(mktemp -d)
-R=$T/root
+. "$(dirname "$0")/lib.sh"
 mkdir -p $T/bin $T/st
-sed -E -e "s#(^|[ =\"(<>])/(usr|mnt|sys|tmp|dev|proc|var|root)/#\\1$R/\\2/#g" -e "s#$R/dev/null#/dev/null#g" \
-    -e "s#chmod 700 /root #chmod 700 $R/root #" $SRC/usr/sbin/fathom-ssh > $T/fathom-ssh
-SLEEP=$(command -v sleep)
+ROOTED="$ROOTED|root"
+rooted $SRC/usr/sbin/fathom-ssh $T/fathom-ssh -e "s#chmod 700 /root #chmod 700 $R/root #"
 # chpasswd: what it was asked noted; slow (st/slow), or without -c (st/old: an older busybox)
 cat > $T/bin/chpasswd <<X
 #!/bin/sh
@@ -42,9 +38,6 @@ chmod +x $R/mnt/sd/fathom/ssh/dropbearmulti
 PIDF=$R/var/run/dropbear.pid
 LOCK=$R/var/run/fathom-ssh.lock
 
-ok=0; bad=0
-check() { if eval "$2"; then echo "ok   $1"; ok=$((ok+1)); else echo "FAIL $1"; bad=$((bad+1)); fi; }
-count() { if [ -f "$1" ]; then echo $(($(wc -l < "$1") + 0)); else echo 0; fi; }
 stop_all() { [ -f $T/st/pids ] && kill $(cat $T/st/pids) 2>/dev/null; }
 fresh() {
     stop_all
@@ -121,5 +114,4 @@ check "no lock can be made: SSH started all the same" '[ $rc -eq 0 ] && [ "$(ssh
 done
 stop_all
 rm -rf $T
-echo "$ok passed, $bad failed"
-[ $bad -eq 0 ]
+finish

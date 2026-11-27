@@ -20,6 +20,8 @@
 
 #include <stddef.h>
 
+#include "net/http.h"
+
 #include "player/radio.h"
 
 #define RDIR_MAX_STATIONS RADIO_MAX     /* a list plays as the radio's stations: Next/Prev step through it */
@@ -88,8 +90,7 @@ int  rdir_parse_stream(const char *text, size_t len, char *site, size_t sn, char
 
 /* What fetches: http_get (net/http.h) unless replaced (the simulator and the
  * tests read saved answers). Same contract as http_get. */
-typedef long (*rdir_fetch_fn)(const char *url, char *buf, size_t cap, const volatile int *abort);
-void rdir_set_fetch(rdir_fetch_fn fn);
+void rdir_set_fetch(http_get_fn fn);
 
 /* Start a request (cancelling any still running): stations for q, or (q NULL)
  * the countries. 0 started, -1 not (no memory, no thread). */

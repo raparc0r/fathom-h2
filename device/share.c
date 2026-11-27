@@ -10,6 +10,8 @@
 #include "share.h"
 #include "shell.h"
 #include "tlscert.h"
+#include "core/clock.h"
+#include "core/thread.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -20,6 +22,7 @@
 
 #define FATHOM_SHARE "/usr/sbin/fathom-share"
 #define ACCESS_LOG   "/var/run/fathom-share/access.log"
+#define LIGHTTPD_PID "/var/run/fathom-share/lighttpd.pid"   /* (the script's own "alive") */
 #define HOST         "fathom-h2.local"
 #define USER         "fathom"
 #define CERT_KEY     "/mnt/sd/fathom/keys/drive.key"   /* (fathom-share reads them from there) */
@@ -32,6 +35,7 @@ static struct {
     pthread_cond_t cv;
     char music[512];
     int want, wifi, restart;
+    int down;                   /* share_shutdown: the player is going, nothing is started again */
     unsigned kick;              /* +1 with each of the above changed: the worker looks */
     char password[32];
     /* what the UI sees */
@@ -43,13 +47,6 @@ static struct {
     uint32_t last_change, last_xfer;
     int changed;
 } S = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
-
-static uint32_t ms_now(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (uint32_t)(t.tv_sec * 1000 + t.tv_nsec / 1000000);
-}
 
 static void set_state(int st)
 {
@@ -111,7 +108,7 @@ static void read_log(void)
         if (t) fclose(t);
         log_pos = 0;
     }
-    uint32_t now = ms_now();
+    uint32_t now = clock_ms32();
     pthread_mutex_lock(&S.mu);
     if (change) { S.last_change = now; S.changed = 1; }
     if (xfer) S.last_xfer = now;
@@ -122,6 +119,8 @@ static void *worker(void *arg)
 {
     (void)arg;
     int running = 0, failed = 0;
+    sh_revive_t again = {0};                     /* (see shell.h: lighttpd gone) */
+    uint32_t looked_at = 0;
     unsigned seen = ~0u;
     sh_wait_home(3000);                          /* (Home first: shell.h) */
     /* One left from a player that crashed is stopped first. Here, not in
@@ -145,16 +144,46 @@ static void *worker(void *arg)
         S.restart = 0;
         pthread_mutex_unlock(&S.mu);
 
-        if (!want || !wifi) failed = 0;      /* a new try when it's wanted again */
+        if (!want || !wifi) {                /* a new try when it's wanted again */
+            failed = 0;
+            again = (sh_revive_t){0};
+        }
         if (running && (!want || !wifi || restart)) {
             stop();
             running = 0;
             log_pos = 0;
         }
+        /* lighttpd gone (killed for memory): nothing looked, and the drive
+         * stayed "On" with nothing behind it until it was turned off and on
+         * by hand. Looked for once a minute; gone, what's left of the drive
+         * is stopped and it is started again just below, three times in a
+         * row at most, then left as one that couldn't be started. */
+        if (running && clock_ms32() - looked_at >= SH_LOOK_MS) {
+            looked_at = clock_ms32();
+            int what = sh_revive(&again, sh_pid_alive(LIGHTTPD_PID), looked_at);
+            pthread_mutex_lock(&S.mu);
+            int down = S.down;
+            pthread_mutex_unlock(&S.mu);
+            if (down) {                      /* (stopped by share_shutdown, not gone) */
+                memset(pass, 0, sizeof pass);
+                break;
+            }
+            if (what != SH_WELL) {
+                if (what == SH_REVIVE)
+                    fprintf(stderr, "share: lighttpd is gone: starting the drive again (%d)\n", again.revived);
+                else
+                    fprintf(stderr, "share: lighttpd is gone again: started again three times already, left off\n");
+                stop();
+                running = 0;
+                log_pos = 0;
+                failed = what == SH_GIVE_UP;
+            }
+        }
         if (want && wifi && !running && !failed) {
             set_state(UI_SHARE_STARTING);
             if (start(music, pass) == 0) {
                 running = 1;
+                looked_at = clock_ms32();
                 log_pos = 0;
                 char ip[16];
                 if_ip("wlan0", ip, sizeof ip);
@@ -187,10 +216,8 @@ void share_init(const char *music, int on, const char *password)
     S.want = on;
     S.state = on ? UI_SHARE_WAITING : UI_SHARE_OFF;
     pthread_mutex_unlock(&S.mu);
-    pthread_t th;                       /* (the worker first stops a drive left from a player that crashed) */
-    mono_cond_init(&S.cv);
-    if (pthread_create(&th, NULL, worker, NULL)) return;
-    pthread_detach(th);
+    mono_cond_init(&S.cv);              /* (the worker first stops a drive left from a player that crashed) */
+    thread_detached(worker, NULL, 0);
 }
 
 void share_set_wifi(int connected)
@@ -242,7 +269,7 @@ unsigned share_seq(void)
 int share_take_changes(void)
 {
     pthread_mutex_lock(&S.mu);
-    int take = S.changed && ms_now() - S.last_change >= QUIET_MS;
+    int take = S.changed && clock_ms32() - S.last_change >= QUIET_MS;
     if (take) S.changed = 0;
     pthread_mutex_unlock(&S.mu);
     return take;
@@ -251,12 +278,16 @@ int share_take_changes(void)
 int share_busy(void)
 {
     pthread_mutex_lock(&S.mu);
-    int busy = S.last_xfer && ms_now() - S.last_xfer < BUSY_MS;
+    int busy = S.last_xfer && clock_ms32() - S.last_xfer < BUSY_MS;
     pthread_mutex_unlock(&S.mu);
     return busy;
 }
 
 void share_shutdown(void)
 {
-    if (share_available()) stop();
+    if (!share_available()) return;
+    pthread_mutex_lock(&S.mu);
+    S.down = 1;                 /* (before it's stopped: the worker's look must not take it for gone) */
+    pthread_mutex_unlock(&S.mu);
+    stop();
 }

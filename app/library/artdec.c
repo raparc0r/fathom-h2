@@ -4,6 +4,7 @@
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
 #include "library/artdec.h"
+#include "core/bytes.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -21,20 +22,21 @@
 
 /* ---------- anything stb_image reads: whole, within the limits ---------- */
 
-static int whole(FILE *f, long off, long len, const art_limits_t *lim, unsigned char **rgb, int *w, int *h)
+/* The picture in enc. stb_image holds it several times over as it goes (the
+ * data unpacked, the picture put together, a copy in the form asked for), each
+ * a byte or two for each channel of each pixel: a limit in pixels alone let
+ * 1000 x 1200 at 16 bits with transparency take 24 MB in the player. So the
+ * limit is counted in the bytes an 8-bit RGB picture of max_pixels has. */
+static int whole_mem(const unsigned char *enc, long len, const art_limits_t *lim, unsigned char **rgb, int *w, int *h)
 {
-    if (len < 0) {
-        struct stat st;
-        if (fstat(fileno(f), &st) || st.st_size <= off) return -1;
-        len = (long)st.st_size - off;
-    }
-    if (len < 8 || len > lim->max_file || fseek(f, off, SEEK_SET)) return -1;
-    unsigned char *enc = malloc((size_t)len);
     int ch, r = -1;
-    if (enc && fread(enc, 1, (size_t)len, f) == (size_t)len &&
-        stbi_info_from_memory(enc, (int)len, w, h, &ch) && (long long)*w * *h <= lim->max_pixels) {
+    if (len < 8 || len > lim->max_file) return -1;
+    if (stbi_info_from_memory(enc, (int)len, w, h, &ch) && (long long)*w * *h <= lim->max_pixels) {
         int alpha = lim->matte && (ch == 2 || ch == 4);    /* (with transparency: over white) */
-        *rgb = stbi_load_from_memory(enc, (int)len, w, h, &ch, alpha ? 4 : 3);
+        int want = alpha ? 4 : 3;
+        long long bytes = (long long)*w * *h * (ch > want ? ch : want) * (stbi_is_16_bit_from_memory(enc, (int)len) ? 2 : 1);
+        if (bytes > lim->max_pixels * 3) return -1;
+        *rgb = stbi_load_from_memory(enc, (int)len, w, h, &ch, want);
         r = *rgb ? 0 : -1;
         if (*rgb && alpha) {                               /* RGBA to RGB where it is (each pixel read before it's written over) */
             unsigned char *p = *rgb;
@@ -44,13 +46,25 @@ static int whole(FILE *f, long off, long len, const art_limits_t *lim, unsigned 
             }
         }
     }
+    return r;
+}
+
+static int whole(FILE *f, long off, long len, const art_limits_t *lim, unsigned char **rgb, int *w, int *h)
+{
+    if (len < 0) {
+        struct stat st;
+        if (fstat(fileno(f), &st) || st.st_size <= off) return -1;
+        len = (long)st.st_size - off;
+    }
+    if (len < 8 || len > lim->max_file || fseek(f, off, SEEK_SET)) return -1;
+    unsigned char *enc = malloc((size_t)len);
+    int r = enc && fread(enc, 1, (size_t)len, f) == (size_t)len ? whole_mem(enc, len, lim, rgb, w, h) : -1;
     free(enc);
     return r;
 }
 
 /* ---------- PNG, a row at a time ---------- */
 
-static uint32_t be32(const unsigned char *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
 
 typedef struct {
     uint32_t w, h;
@@ -131,6 +145,8 @@ static void png_row(png_t *p, int filter)
     p->y++;
 }
 
+#define PNG_MAX_PIXELS 64000000LL   /* before it's shrunk: no cover is 8000 x 8000 */
+
 /* 0, -1, or 1: interlaced (not read here) */
 static int png_stream(FILE *f, long off, int min_side, const art_limits_t *lim, unsigned char **rgb, int *w, int *h)
 {
@@ -164,6 +180,9 @@ static int png_stream(FILE *f, long off, int min_side, const art_limits_t *lim, 
             p.k = min_side > 0 && s / (uint32_t)min_side > 1 ? (int)(s / (uint32_t)min_side) : 1;
             p.ow = (int)(p.w / (uint32_t)p.k), p.oh = (int)(p.h / (uint32_t)p.k);
             if ((long long)p.ow * p.oh > lim->max_pixels) goto out;
+            /* (every row is unpacked and filtered, however small the result: 65,535 x
+             * 65,535 packs into a few MB and is 34 GB of rows) */
+            if ((long long)p.w * p.h > PNG_MAX_PIXELS) goto out;
             row = calloc(2, p.rowbytes + 1);
             p.sum = calloc((size_t)p.ow * 3, sizeof *p.sum);
             p.out = malloc((size_t)p.ow * (size_t)p.oh * 3);
@@ -279,8 +298,9 @@ typedef struct {
 
 static int rd16(FILE *f) { int a = getc(f), b = getc(f); return a == EOF || b == EOF ? -1 : a << 8 | b; }
 
-/* The bytes of a coded scan skipped, up to the next marker (not a restart) */
-static int skip_scan(FILE *f)
+/* The bytes of a coded scan passed over, up to the next marker: whatever it
+ * is (restarts: a restart's RSTn among them), or the next that isn't one. */
+static int marker_after(FILE *f, int restarts)
 {
     for (;;) {
         int c = getc(f);
@@ -289,29 +309,20 @@ static int skip_scan(FILE *f)
         int d;
         do d = getc(f); while (d == 0xFF);
         if (d == EOF) return 0xD9;
-        if (d != 0 && (d < 0xD0 || d > 0xD7)) return d;
+        if (d != 0 && (restarts || d < 0xD0 || d > 0xD7)) return d;
     }
 }
 
-/* The next marker, whatever it is (a restart's RSTn among them) */
-static int next_marker(FILE *f)
-{
-    for (;;) {
-        int c = getc(f);
-        if (c == EOF) return 0xD9;
-        if (c != 0xFF) continue;
-        int d;
-        do d = getc(f); while (d == 0xFF);
-        if (d == EOF) return 0xD9;
-        if (d != 0) return d;
-    }
-}
+static int skip_scan(FILE *f) { return marker_after(f, 0); }     /* (the scan skipped: not a restart) */
+static int next_marker(FILE *f) { return marker_after(f, 1); }   /* (the next marker, whatever it is) */
+
+#define JPEG_MAX_SCANS 64
 
 static int jpeg_dc(FILE *f, long off, const art_limits_t *lim, unsigned char **rgb, int *w, int *h)
 {
     jcomp_t c[4];
     huff_t dct[4];
-    int q0[4] = {0}, nf = 0, X = 0, Y = 0, hmax = 1, vmax = 1, ri = 0, adobe_rgb = 0, r = -1;
+    int q0[4] = {0}, nf = 0, X = 0, Y = 0, hmax = 1, vmax = 1, ri = 0, adobe_rgb = 0, r = -1, scans = 0;
     memset(c, 0, sizeof c);
     memset(dct, 0, sizeof dct);
     if (fseek(f, off, SEEK_SET) || getc(f) != 0xFF || getc(f) != 0xD8) return -1;
@@ -392,7 +403,9 @@ static int jpeg_dc(FILE *f, long off, const art_limits_t *lim, unsigned char **r
             unsigned char a[12];
             if (fread(a, 1, 12, f) == 12 && !memcmp(a, "Adobe", 5)) adobe_rgb = a[11] == 0;
         } else if (marker == 0xDA) {                   /* SOS */
-            if (!nf) goto out;
+            /* (a picture is a dozen scans at most, and its first passes come
+             * first: a file can't keep this going with scans by the thousand) */
+            if (!nf || ++scans > JPEG_MAX_SCANS) goto out;
             int ns = getc(f);
             jcomp_t *sc[4];
             if (ns < 1 || ns > nf) goto out;
@@ -408,7 +421,10 @@ static int jpeg_dc(FILE *f, long off, const art_limits_t *lim, unsigned char **r
             if (fseek(f, end, SEEK_SET)) goto out;
             if (ss != 0 || se != 0 || ah != 0) { m = skip_scan(f); continue; }   /* AC or a refinement */
             br_t b = {f, 0, 0, 0, 0};
-            for (int i = 0; i < ns; i++) { sc[i]->pred = 0; if (!dct[sc[i]->td].ok) goto out; }
+            /* (a component's first pass a second time: damaged, or made to be. Each
+             * walks every block, even with no data behind it: thousands of 10-byte
+             * scans kept a thread busy for minutes to hours.) */
+            for (int i = 0; i < ns; i++) { sc[i]->pred = 0; if (sc[i]->done || !dct[sc[i]->td].ok) goto out; }
             int mx, my;
             if (ns == 1) {                             /* one component: its own blocks, one at a time */
                 mx = ((X * sc[0]->hs + hmax - 1) / hmax + 7) / 8;
@@ -552,8 +568,10 @@ static int jpeg_scaled(FILE *f, long off, int min_side, const art_limits_t *lim,
 
 /* ---------- which ---------- */
 
-int art_decode(FILE *f, long off, long len, int min_side, const art_limits_t *lim,
-               unsigned char **rgb, int *w, int *h)
+/* (mem: the same bytes in memory, when that is where they are: what's read
+ * whole is read from there, not from a second copy of them) */
+static int decode(FILE *f, long off, long len, const unsigned char *mem, int min_side, const art_limits_t *lim,
+                  unsigned char **rgb, int *w, int *h)
 {
     unsigned char m[8];
     *rgb = NULL;
@@ -570,7 +588,13 @@ int art_decode(FILE *f, long off, long len, int min_side, const art_limits_t *li
         int r = png_stream(f, off, min_side, lim, rgb, w, h);
         if (r <= 0) return r;
     }
-    return whole(f, off, len, lim, rgb, w, h);
+    return mem ? whole_mem(mem, len, lim, rgb, w, h) : whole(f, off, len, lim, rgb, w, h);
+}
+
+int art_decode(FILE *f, long off, long len, int min_side, const art_limits_t *lim,
+               unsigned char **rgb, int *w, int *h)
+{
+    return decode(f, off, len, NULL, min_side, lim, rgb, w, h);
 }
 
 int art_decode_mem(const unsigned char *enc, size_t len, int min_side, const art_limits_t *lim,
@@ -580,7 +604,7 @@ int art_decode_mem(const unsigned char *enc, size_t len, int min_side, const art
     if (!enc || len < 8) return -1;
     FILE *f = fmemopen((void *)enc, len, "rb");
     if (!f) return -1;
-    int r = art_decode(f, 0, (long)len, min_side, lim, rgb, w, h);
+    int r = decode(f, 0, (long)len, enc, min_side, lim, rgb, w, h);
     fclose(f);
     return r;
 }

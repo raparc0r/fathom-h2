@@ -6,6 +6,7 @@
 #include "crossfeed.h"
 #include "width.h"
 #include "core/lat.h"
+#include "core/clock.h"
 
 #include <errno.h>
 #include <math.h>
@@ -24,13 +25,6 @@
 #define CHUNK_FRAMES 2048
 #define STALL_MS 1500   /* a stream read waiting this long: "connecting" (it reconnects or buffers) */
 
-static uint32_t mono_ms(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    uint32_t ms = (uint32_t)((uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000);
-    return ms ? ms : 1;
-}
 #define MAX_CH 8
 #define OPEN_AGAIN 1    /* open_rc: the device was gone; try again at the resume */
 
@@ -152,13 +146,13 @@ struct engine {
 /* Called with mu held. */
 static void sound_changed(engine_t *e)
 {
-    e->shallow_until = mono_ms() + SHALLOW_AFTER_MS;
+    e->shallow_until = clock_ms32_set() + SHALLOW_AFTER_MS;
     if (!e->shallow_until) e->shallow_until = 1;
 }
 
 static int shallow_now(const engine_t *e)
 {
-    return e->fade != 1.0f || (e->shallow_until && (int32_t)(e->shallow_until - mono_ms()) > 0);
+    return e->fade != 1.0f || (e->shallow_until && (int32_t)(e->shallow_until - clock_ms32_set()) > 0);
 }
 
 /* Called with mu held: the output has more queued than is enough. */
@@ -173,7 +167,7 @@ static int queue_over(engine_t *e)
  * wait for the queue to play down, 0 when that has gone on too long. */
 static int nap(engine_t *e)
 {
-    uint32_t now = mono_ms();
+    uint32_t now = clock_ms32_set();
     if (!e->nap_since) e->nap_since = now ? now : 1;
     if (now - e->nap_since > NAP_MAX_MS) return 0;
     pthread_mutex_unlock(&e->mu);
@@ -471,9 +465,9 @@ static int seek_unlocked(engine_t *e, uint64_t frame, uint32_t ms)
     e->seek_to = ms;
     pthread_mutex_unlock(&e->mu);
     audio_thread_priority(0);
-    uint32_t t0 = mono_ms();
+    uint32_t t0 = clock_ms32_set();
     int rc = decoder_seek(dec, frame);
-    uint32_t took = mono_ms() - t0;
+    uint32_t took = clock_ms32_set() - t0;
     if (took > 300) fprintf(stderr, "engine: a seek to %u:%02u took %u ms\n", ms / 60000, ms / 1000 % 60, took);
     audio_thread_priority(1);
     pthread_mutex_lock(&e->mu);
@@ -772,7 +766,7 @@ static void *run(void *arg)
         int net = e->dec_net;
         decoder_set_next(dec, e->n_next && !decoder_is_stream(e->next[0].path) ? e->next[0].path : NULL);
         pthread_mutex_unlock(&e->mu);
-        if (net) e->net_read_ms = mono_ms();
+        if (net) e->net_read_ms = clock_ms32_set();
         long n = decoder_read(dec, e->buf, CHUNK_FRAMES);
         e->net_read_ms = 0;
         if (n > 0) {
@@ -1239,7 +1233,7 @@ void engine_status(engine_t *e, eng_status_t *st)
     st->width = !e->fmt.dop && e->fmt.channels == 2 ? e->width : WIDTH_NORMAL;
     st->stream = e->connecting || e->dec_net;
     uint32_t since = e->net_read_ms;
-    st->connecting = e->connecting || (e->dec_net && since && mono_ms() - since > STALL_MS);
+    st->connecting = e->connecting || (e->dec_net && since && clock_ms32_set() - since > STALL_MS);
     st->starting |= e->connecting;
     st->meta_seq = e->meta_seq;
     snprintf(st->meta, sizeof st->meta, "%s", e->meta);

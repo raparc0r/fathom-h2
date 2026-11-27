@@ -12,9 +12,7 @@
 #include <unistd.h>
 
 #include "../bootloader/fathom/bootpick.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: CHECK(%s)\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_util.h"
 
 static char g_root[400];
 
@@ -29,9 +27,7 @@ static const char *at(const char *rel)
 
 static void put(const char *rel, const char *text)
 {
-    FILE *f = fopen(at(rel), "wb");
-    fputs(text, f);
-    fclose(f);
+    if (t_write_text(at(rel), text)) { printf("FAIL: can't write %s\n", rel); exit(1); }
 }
 
 static int is(const char *rel, const char *text)
@@ -129,9 +125,6 @@ int main(void)
     put("/uImage", "someone's kernel");
     CHECK(fathom_boot_pick() == 0 && fathom_boot_fall_back() == -1 && is("/uImage", "someone's kernel"));
 
-    snprintf(cmd, sizeof cmd, "rm -rf '%s'", g_root);
-    if (system(cmd)) {}
-    if (failures) { fprintf(stderr, "%d failures\n", failures); return 1; }
-    printf("bootpick: ok\n");
-    return 0;
+    t_rm_rf(g_root);
+    return t_result();
 }

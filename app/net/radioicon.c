@@ -5,6 +5,8 @@
 #define _DARWIN_C_SOURCE
 #define _GNU_SOURCE   /* syscall (glibc, musl) */
 #include "net/radioicon.h"
+#include "core/bytes.h"
+#include "core/thread.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -52,8 +54,8 @@ static struct {
     unsigned seq;
 } R = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
-static ricon_fetch_fn g_fetch = http_get;
-void ricon_set_fetch(ricon_fetch_fn fn) { g_fetch = fn ? fn : http_get; }
+static http_get_fn g_fetch = http_get;
+void ricon_set_fetch(http_get_fn fn) { g_fetch = fn ? fn : http_get; }
 
 void ricon_id(const char *icon_url, char id[13])
 {
@@ -66,10 +68,16 @@ static void id_path(const char *id, const char *ext, char *out, size_t cap)
     snprintf(out, cap, "%s/%s.%s", R.dir, id, ext);
 }
 
-static int exists(const char *path)
+/* A mark of "no use" (ID.none) still stands: one over a week old doesn't,
+ * and its address is asked again. A logo marked so for a network's sign-in
+ * page answered in its place, or a server's "too many requests" (which reads
+ * as "not there"), stayed without its picture for good. For a mark that was
+ * right: one fetch a week. (A clock set back: it stands.) */
+#define NONE_DAYS 7
+static int marked(const char *none)
 {
     struct stat st;
-    return stat(path, &st) == 0;
+    return stat(none, &st) == 0 && (long long)time(NULL) - (long long)st.st_mtime <= NONE_DAYS * 86400LL;
 }
 
 /* A picture's file with both sizes in it. One with the list's alone is a
@@ -228,7 +236,7 @@ void ricon_station_id(const radio_station_t *st, char id[13])
     for (int k = 0; k < 3 && R.dir[0]; k++) {
         if (!ids[k][0]) continue;
         id_path(ids[k], "565", p, sizeof p);
-        if (exists(p)) { which = k; break; }
+        if (file_exists(p)) { which = k; break; }
     }
     memcpy(id, ids[which], 13);
 }
@@ -312,16 +320,8 @@ static void sweep(const job_t *j, char (*ids)[13])
 /* path written whole: beside (path.tmp), on the card, then moved over. 0, -1 */
 static int put(const char *path, const void *a, size_t an, const void *b, size_t bn)
 {
-    char tmp[720];
-    snprintf(tmp, sizeof tmp, "%s.tmp", path);
     mkdir(R.dir, 0755);
-    FILE *f = fopen(tmp, "wbe");
-    if (!f) return -1;
-    int ok = (!an || fwrite(a, 1, an, f) == an) && (!bn || fwrite(b, 1, bn, f) == bn) && fflush(f) == 0;
-    ok &= fsync(fileno(f)) == 0;
-    ok &= fclose(f) == 0;
-    if (!ok || file_replace(tmp, path)) { remove(tmp); return -1; }
-    return 0;
+    return file_write_whole(path, a, an, b, bn);
 }
 
 /* ---- an .ico file: the classic favicon ----
@@ -330,31 +330,29 @@ static int put(const char *path, const void *a, size_t an, const void *b, size_t
  * of 1 bit a pixel). The biggest is taken; bitmaps of 32 or 24 bits a pixel,
  * not compressed (what favicons are; the old 256-colour ones are left). Over
  * white, as a logo's transparent parts are. 0 and *side, or -1. */
-static unsigned rd16(const unsigned char *p) { return (unsigned)p[0] | (unsigned)p[1] << 8; }
-static unsigned long rd32(const unsigned char *p) { return (unsigned long)rd16(p) | (unsigned long)rd16(p + 2) << 16; }
 
 static int ico_decode(const unsigned char *b, size_t n, uint16_t *large, uint16_t *small, int *side)
 {
-    if (n < 6 + 16 || rd16(b) != 0 || rd16(b + 2) != 1) return -1;
-    unsigned count = rd16(b + 4);
+    if (n < 6 + 16 || le16(b) != 0 || le16(b + 2) != 1) return -1;
+    unsigned count = le16(b + 4);
     if (count < 1 || count > 64 || 6 + (size_t)count * 16 > n) return -1;
     const unsigned char *best = NULL;
     int best_w = 0, best_bpp = 0;
     for (unsigned i = 0; i < count; i++) {
         const unsigned char *e = b + 6 + i * 16;
-        int w = e[0] ? e[0] : 256, bpp = (int)rd16(e + 6);
-        unsigned long size = rd32(e + 8), off = rd32(e + 12);
+        int w = e[0] ? e[0] : 256, bpp = (int)le16(e + 6);
+        unsigned long size = le32(e + 8), off = le32(e + 12);
         if (off > n || size > n - off || size < 40) continue;
         if (w > best_w || (w == best_w && bpp > best_bpp)) { best = e; best_w = w; best_bpp = bpp; }
     }
     if (!best) return -1;
-    const unsigned char *d = b + rd32(best + 12);
-    size_t dn = (size_t)rd32(best + 8);
+    const unsigned char *d = b + le32(best + 12);
+    size_t dn = (size_t)le32(best + 8);
     if (dn >= 8 && !memcmp(d, "\x89PNG\r\n\x1a\n", 8)) return library_logo_decode(d, dn, large, small, side);
-    unsigned long hs = rd32(d);
-    long w = (long)rd32(d + 4), h2 = (long)rd32(d + 8);
-    unsigned bpp = rd16(d + 14);
-    if (hs < 40 || hs > dn || w < 1 || w > 256 || h2 < 2 || h2 > 512 || (h2 & 1) || rd32(d + 16) != 0 || (bpp != 32 && bpp != 24))
+    unsigned long hs = le32(d);
+    long w = (long)le32(d + 4), h2 = (long)le32(d + 8);
+    unsigned bpp = le16(d + 14);
+    if (hs < 40 || hs > dn || w < 1 || w > 256 || h2 < 2 || h2 > 512 || (h2 & 1) || le32(d + 16) != 0 || (bpp != 32 && bpp != 24))
         return -1;
     long h = h2 / 2;
     size_t stride = ((size_t)w * bpp + 31) / 32 * 4, mstride = ((size_t)w + 31) / 32 * 4;
@@ -748,12 +746,12 @@ static void run_job(const job_t *j)
                 id_path(was, "565", path, sizeof path);
                 id_path(was, "none", none, sizeof none);
                 if (whole(path)) skip = 1;                        /* it has its picture */
-                else if (!exists(none)) skip = !(pass == 1 && unreached_n(was, 0) > 0);
+                else if (!marked(none)) skip = !(pass == 1 && unreached_n(was, 0) > 0);
             }
             if (skip) continue;
             id_path(id, "565", path, sizeof path);
             id_path(id, "none", none, sizeof none);
-            if (whole(path) || exists(none) || unreached_n(id, 0) >= UNREACHED_MAX) continue;
+            if (whole(path) || marked(none) || unreached_n(id, 0) >= UNREACHED_MAX) continue;
             if (pass == 2 && dir_down) continue;
             int r = pass == 0 ? fetch_one(j->icon[i], id) : pass == 1 ? fetch_site(j->site[i], id)
                                                                       : fetch_stream(j->url[i], j->icon[i], id);
@@ -765,6 +763,7 @@ static void run_job(const job_t *j)
             else if (unreached_n(id, 0) == 0) unreached++;
             if (r < 0 && !R.abort) unreached_n(id, 1);
             if (r == 1) {
+                remove(none);                                     /* (an old mark asked again: wrong, as it turns out) */
                 pthread_mutex_lock(&R.mu);
                 R.seq++;
                 pthread_mutex_unlock(&R.mu);
@@ -784,12 +783,10 @@ static void job_free(job_t *j)
 static void *run(void *arg)
 {
     job_t *j = arg;
-#ifdef __linux__
     /* below the music and the UI (as the scan and the updater): a logo's
      * HTTPS handshake and its decoding are work for the H2's one core, just
      * when a station is likely to be started */
-    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);
-#endif
+    thread_nice(19);
     while (j) {
         if (!R.abort) run_job(j);
         job_free(j);
@@ -826,13 +823,7 @@ void ricon_sync(const radio_station_t *st, int n, int net)
     }
     R.running = 1;
     pthread_mutex_unlock(&R.mu);
-    pthread_t t;
-    pthread_attr_t a;
-    pthread_attr_init(&a);
-    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&a, 128 * 1024);       /* (as the radio's other fetches: device/radiometa.c) */
-    int r = pthread_create(&t, &a, run, j);
-    pthread_attr_destroy(&a);
+    int r = thread_detached(run, j, 128 * 1024);     /* (as the radio's other fetches: device/radiometa.c) */
     if (r) {
         job_free(j);
         pthread_mutex_lock(&R.mu);
@@ -851,7 +842,7 @@ int ricon_start(const char *dir)
     return 0;
 }
 
-void ricon_stop(void)
+void ricon_stop_ask(void)
 {
     pthread_mutex_lock(&R.mu);
     R.started = 0;
@@ -859,8 +850,21 @@ void ricon_stop(void)
     job_free(R.pending);
     R.pending = NULL;
     pthread_mutex_unlock(&R.mu);
-    for (int i = 0; i < 100 && ricon_busy(); i++) {  /* (its fetch ends on the flag; a decode is under a second) */
+}
+
+int ricon_stop_wait(int ms)
+{
+    for (int t = 0; t < ms && ricon_busy(); t += 50) {   /* (its fetch ends on the flag; a decode is under a second) */
         struct timespec ts = {0, 50 * 1000 * 1000L};
         nanosleep(&ts, NULL);
     }
+    /* (a run still there is inside a name lookup, which nothing interrupts:
+     * left to end with the player; the next run removes the .tmp it was at) */
+    return !ricon_busy();
+}
+
+void ricon_stop(void)
+{
+    ricon_stop_ask();
+    ricon_stop_wait(5000);
 }

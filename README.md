@@ -2,7 +2,7 @@
 
 # Fathom
 
-Latest version: [0.21.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.21.0) released November 25th 2026
+Latest version: [0.22.0](https://github.com/raparc0r/fathom-h2/releases/tag/v0.22.0) released November 27th 2026
 
 [Features](#features) · [Compatibility](#compatibility) · [Installing](#installing) · [Navigation](#navigation) · [Licence](#licence) · [How it was made](#how-it-was-made)
 
@@ -58,10 +58,6 @@ I recommend you check it out: [rockbox.org](https://www.rockbox.org).
 - **Battery history**, a sleep timer and automatic power-off.
 - **Updates over Wi-Fi.** It tells you when a new version is out.
 - **SSH and SFTP**, if you like to poke around (off by default).
-
-| | | |
-|---|---|---|
-| ![Pure mode](screenshots/studio-pastel-purenp.png) | ![Signal path](screenshots/studio-mint-signal.png) | ![Internet radio](screenshots/pixel-pastel-radionp.png) |
 
 ## Compatibility
 

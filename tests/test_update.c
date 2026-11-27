@@ -21,9 +21,7 @@
 #include "net/sha256.h"
 #include "net/unzip.h"
 #include "net/update.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_util.h"
 
 /* ---------- files ---------- */
 
@@ -35,10 +33,7 @@ static void put(const char *path, const char *text)
     snprintf(p, sizeof p, "%s", path);
     for (char *s = p + 1; *s; s++)
         if (*s == '/') { *s = '\0'; mkdir(p, 0755); *s = '/'; }
-    FILE *f = fopen(path, "wb");
-    if (!f) { perror(path); exit(1); }
-    fputs(text, f);
-    fclose(f);
+    if (t_write_text(path, text)) { perror(path); exit(1); }
 }
 
 /* The file's contents (static buffer, NUL-terminated), or NULL. */
@@ -57,12 +52,6 @@ static int is(const char *path, const char *text)
 {
     const char *s = get(path);
     return s && !strcmp(s, text);
-}
-
-static int exists(const char *path)
-{
-    struct stat st;
-    return stat(path, &st) == 0;
 }
 
 static const char *at(const char *rel)
@@ -249,8 +238,8 @@ static void check_installed(const char *kernel)
     CHECK(is(at("card/fathom/wifi/modules/brcmfmac.ko"), "new module"));
     CHECK(is(at("card/fathom/assets/radio.txt"), "FIP = https://example.org/fip\n"));
     CHECK(is(at("card/fathom/assets/gone-in-0.8.txt"), "an old release's file"));   /* left, as by hand */
-    CHECK(!exists(at("card/INSTALL.md")));                                          /* only sd/ */
-    CHECK(!exists(at("card/fathom/update")));                                       /* the stage went */
+    CHECK(!t_exists(at("card/INSTALL.md")));                                          /* only sd/ */
+    CHECK(!t_exists(at("card/fathom/update")));                                       /* the stage went */
     check_owner_things();
 }
 
@@ -419,13 +408,13 @@ static void test_stage_and_install(void)
     CHECK(update_stage(at("r.zip"), stage, NULL, NULL, NULL) == UPDATE_OK);
     CHECK(is(at("card/fathom/update/READY"), "fathom-h2-0.8.0"));
     CHECK(is(at("card/fathom/update/sd/uImage"), "new kernel"));
-    CHECK(!exists(at("card/fathom/update/sd/INSTALL.md")));
+    CHECK(!t_exists(at("card/fathom/update/sd/INSTALL.md")));
     CHECK(is(at("card/uImage"), "old kernel"));                  /* nothing on the card yet */
     CHECK(update_install(at("card"), stage) == UPDATE_OK);
     check_installed("new kernel");
     CHECK(is(at("card/uImage.prev"), "old kernel"));
     CHECK(is(at("card/fathom/wifi/modules.prev/brcmfmac.ko"), "old module"));   /* with the old kernel */
-    CHECK(exists(at("card/fathom/boot-new")));                   /* for h2boot: a kernel to try */
+    CHECK(t_exists(at("card/fathom/boot-new")));                   /* for h2boot: a kernel to try */
     CHECK(update_resume(at("card"), stage) == 0);                /* nothing left to do */
 
     /* A second update: uImage.prev is the one before it */
@@ -443,7 +432,7 @@ static void test_stage_and_install(void)
     mkdir(stage, 0755);
     CHECK(update_stage(at("r.zip"), stage, NULL, NULL, NULL) == UPDATE_OK);
     CHECK(update_install(at("card"), stage) == UPDATE_OK);
-    CHECK(!exists(at("card/uImage.failed")) && !exists(at("card/fathom/wifi/modules.failed")));
+    CHECK(!t_exists(at("card/uImage.failed")) && !t_exists(at("card/fathom/wifi/modules.failed")));
 }
 
 static void test_damaged(void)
@@ -460,10 +449,10 @@ static void test_damaged(void)
         int r = update_stage(at("bad.zip"), stage, NULL, NULL, NULL);
         if (r != want[i]) fprintf(stderr, "damaged zip %zu: %d, not %d\n", i, r, want[i]);
         CHECK(r == want[i]);
-        CHECK(!exists(at("card/fathom/update/READY")));
+        CHECK(!t_exists(at("card/fathom/update/READY")));
         CHECK(update_install(at("card"), stage) == UPDATE_ERR_INSTALL);   /* not ready: refused */
         CHECK(is(at("card/uImage"), "old kernel") && is(at("card/fathom/bin/fathom-player"), "old player"));
-        CHECK(!exists(at("evil")) && !exists(at("card/evil")));
+        CHECK(!t_exists(at("evil")) && !t_exists(at("card/evil")));
         update_remove_tree(stage);
     }
     /* cancelled while unpacking */
@@ -472,7 +461,7 @@ static void test_damaged(void)
     mkdir(stage, 0755);
     volatile int stop = 1;
     CHECK(update_stage(at("r.zip"), stage, NULL, NULL, &stop) == UPDATE_ERR_CANCELLED);
-    CHECK(!exists(at("card/fathom/update/READY")));
+    CHECK(!t_exists(at("card/fathom/update/READY")));
 }
 
 /* Power lost during an install, at three points: the next start finishes it. */
@@ -521,7 +510,7 @@ static void test_resume(void)
     mkdir(stage, 0755);
     put(at("card/fathom/update/INSTALLING"), "installing\n");
     CHECK(update_resume(at("card"), stage) == 1);
-    CHECK(!exists(stage) && is(at("card/uImage"), "old kernel"));
+    CHECK(!t_exists(stage) && is(at("card/uImage"), "old kernel"));
 
     /* 5. the same on a card that can't be written any more: not "finished,
      * restart" (the player restarted the H2 at every start, for ever) */
@@ -531,10 +520,10 @@ static void test_resume(void)
     CHECK(chmod(stage, 0555) == 0);
     if (access(at("card/fathom/update/INSTALLING"), W_OK) == 0 && geteuid() != 0) {
         CHECK(update_resume(at("card"), stage) == -1);
-        CHECK(exists(at("card/fathom/update/INSTALLING")));
+        CHECK(t_exists(at("card/fathom/update/INSTALLING")));
     }
     CHECK(chmod(stage, 0755) == 0);
-    CHECK(update_resume(at("card"), stage) == 1 && !exists(stage));
+    CHECK(update_resume(at("card"), stage) == 1 && !t_exists(stage));
 
     /* A download left unfinished (no INSTALLING): removed, nothing installed */
     make_card();
@@ -542,7 +531,7 @@ static void test_resume(void)
     CHECK(update_stage(at("r.zip"), stage, NULL, NULL, NULL) == UPDATE_OK);
     put(at("card/fathom/update/fathom-h2-0.8.0.zip.part"), "half");
     CHECK(update_resume(at("card"), stage) == 0);
-    CHECK(!exists(stage) && is(at("card/uImage"), "old kernel"));
+    CHECK(!t_exists(stage) && is(at("card/uImage"), "old kernel"));
 }
 
 /* The old kernel's copy is made before anything moves (a card that filled
@@ -558,7 +547,7 @@ static void test_kept_first(void)
     CHECK(update_stage(at("r.zip"), stage, NULL, NULL, NULL) == UPDATE_OK);
     CHECK(mkdir(at("card/uImage.prev.part"), 0755) == 0);          /* (in the copy's way) */
     CHECK(update_install(at("card"), stage) != UPDATE_OK);
-    CHECK(!update_install_begun(stage) && exists(at("card/fathom/update/READY")));
+    CHECK(!update_install_begun(stage) && t_exists(at("card/fathom/update/READY")));
     CHECK(is(at("card/uImage"), "old kernel") && is(at("card/fathom/bin/fathom-player"), "old player"));
     CHECK(is(at("card/fathom/wifi/modules/brcmfmac.ko"), "old module"));
     CHECK(is(at("card/fathom/update/sd/uImage"), "new kernel"));
@@ -621,8 +610,7 @@ static void test_real_release(void)
 int main(void)
 {
     for (size_t i = 0; i < sizeof g_big; i++) g_big[i] = (unsigned char)((i * 2654435761u) >> 13 ^ (i % 251 ? 0 : 7));
-    snprintf(g_tmp, sizeof g_tmp, "%s/fathom-update-XXXXXX", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
-    if (!mkdtemp(g_tmp)) { perror("mkdtemp"); return 1; }
+    t_mkdtemp(g_tmp, sizeof g_tmp, "fathom-update");
     test_versions();
     test_release();
     test_sha256();
@@ -633,7 +621,5 @@ int main(void)
     test_kept_first();
     test_real_release();
     update_remove_tree(g_tmp);
-    if (failures) { fprintf(stderr, "%d failures\n", failures); return 1; }
-    printf("update: ok\n");
-    return 0;
+    return t_result();
 }

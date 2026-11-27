@@ -10,9 +10,7 @@
 #include <string.h>
 
 #include "audio/crossfeed.h"
-
-static int fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+#include "test_util.h"
 
 #define FS 2147483648.0
 
@@ -81,21 +79,21 @@ static void test_level(int level, unsigned rate)
     int32_t *buf = malloc((size_t)n * 2 * sizeof *buf);
     double *ref = malloc((size_t)n * 2 * sizeof *ref);
     crossfeed_t *x = crossfeed_new(level, rate);
-    CHECK(x && crossfeed_level(x) == level && crossfeed_rate(x) == rate, "new %d at %u", level, rate);
+    CHECKF(x && crossfeed_level(x) == level && crossfeed_rate(x) == rate, "new %d at %u", level, rate);
     if (!x || !buf || !ref) { crossfeed_free(x); free(buf); free(ref); return; }
 
     /* the bass: one channel reaches the other ear feed dB down */
     sine(buf, n, rate, 60, 0.5, 0);
     crossfeed_run(x, buf, n);
     double sep = db(rms(buf, n / 2, n, 1) / rms(buf, n / 2, n, 0));
-    CHECK(fabs(sep + feed) < 0.6, "%s at %u: 60 Hz separation %.2f dB, not -%.1f", crossfeed_name(level), rate, sep, feed);
+    CHECKF(fabs(sep + feed) < 0.6, "%s at %u: 60 Hz separation %.2f dB, not -%.1f", crossfeed_name(level), rate, sep, feed);
 
     /* the treble: far apart */
     crossfeed_reset(x);
     sine(buf, n, rate, 10000, 0.5, 0);
     crossfeed_run(x, buf, n);
     double hsep = db(rms(buf, n / 2, n, 1) / rms(buf, n / 2, n, 0));
-    CHECK(hsep < -feed - 10, "%s at %u: 10 kHz separation %.2f dB", crossfeed_name(level), rate, hsep);
+    CHECKF(hsep < -feed - 10, "%s at %u: 10 kHz separation %.2f dB", crossfeed_name(level), rate, hsep);
 
     /* mono, in the bass: its own level */
     crossfeed_reset(x);
@@ -103,7 +101,7 @@ static void test_level(int level, unsigned rate)
     double in = rms(buf, n / 2, n, 0);
     crossfeed_run(x, buf, n);
     double gain = db(rms(buf, n / 2, n, 0) / in);
-    CHECK(fabs(gain) < 0.2, "%s at %u: mono 60 Hz comes out %.2f dB", crossfeed_name(level), rate, gain);
+    CHECKF(fabs(gain) < 0.2, "%s at %u: mono 60 Hz comes out %.2f dB", crossfeed_name(level), rate, gain);
 
     /* full-scale noise: as the doubles have it (no wrap-around), within a few
      * hundred-thousandths of full scale; and a reset forgets everything */
@@ -123,14 +121,14 @@ static void test_level(int level, unsigned rate)
         double d = fabs(buf[i] / FS - want);
         if (d > worst) worst = d;
     }
-    CHECK(worst < 2e-6, "%s at %u: differs from the doubles by %.2g of full scale", crossfeed_name(level), rate, worst);
+    CHECKF(worst < 2e-6, "%s at %u: differs from the doubles by %.2g of full scale", crossfeed_name(level), rate, worst);
     if (copy) {
         int32_t *again = malloc((size_t)n * 2 * sizeof *again);
         if (again) {
             memcpy(again, copy, (size_t)n * 2 * sizeof *copy);
             crossfeed_reset(x);
             crossfeed_run(x, again, n);
-            CHECK(!memcmp(again, buf, (size_t)n * 2 * sizeof *buf), "%s at %u: a reset left something behind", crossfeed_name(level), rate);
+            CHECKF(!memcmp(again, buf, (size_t)n * 2 * sizeof *buf), "%s at %u: a reset left something behind", crossfeed_name(level), rate);
             free(again);
         }
         free(copy);
@@ -144,13 +142,12 @@ static void test_level(int level, unsigned rate)
 
 int main(void)
 {
-    CHECK(crossfeed_new(XF_OFF, 44100) == NULL, "off: no filter");
-    CHECK(crossfeed_new(XF_MEDIUM, 0) == NULL, "no rate: no filter");
-    CHECK(!strcmp(crossfeed_name(XF_STRONG), "Strong") && !strcmp(crossfeed_name(99), "Off"), "names");
+    CHECKF(crossfeed_new(XF_OFF, 44100) == NULL, "off: no filter");
+    CHECKF(crossfeed_new(XF_MEDIUM, 0) == NULL, "no rate: no filter");
+    CHECKF(!strcmp(crossfeed_name(XF_STRONG), "Strong") && !strcmp(crossfeed_name(99), "Off"), "names");
     crossfeed_run(NULL, NULL, 0);                    /* (off: nothing to do) */
     static const unsigned RATES[] = {44100, 96000, 192000};
     for (int l = XF_LIGHT; l < XF_LEVELS; l++)
         for (int k = 0; k < 3; k++) test_level(l, RATES[k]);
-    printf("%s (%d failed)\n", fails ? "FAILED" : "crossfeed: ok", fails);
-    return fails != 0;
+    return t_result();
 }

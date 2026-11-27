@@ -16,6 +16,8 @@
 #include "core/lat.h"
 #include "bt.h"
 #include "shell.h"
+#include "core/clock.h"
+#include "core/thread.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -185,13 +187,6 @@ static void poll_pcm(void)
     pthread_mutex_unlock(&B.mu);
 }
 
-static long mono_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
-}
-
 /* A connect that failed this fast was refused, not left unanswered: right
  * after a start the controller can refuse the first try. One that took the
  * page timeout (about 5 s) found no headphones there. */
@@ -229,9 +224,9 @@ static void do_cmd(int cmd, const char *addr)
              * took 5 s to start through 30 s of it). Headphones that come on
              * later connect by themselves. */
             for (int i = 0; i < 4; i++) {
-                long t0 = mono_ms();
+                long t0 = (long)clock_ms();
                 if (sh_run(c, NULL, 0) == 0) break;
-                long took = mono_ms() - t0;
+                long took = (long)clock_ms() - t0;
                 LAT("bt: connect %d failed after %ld ms", i, took);
                 if (took >= BT_REFUSED_MS || i == 3) break;
                 sleep(2);
@@ -301,7 +296,7 @@ static long health_check(void)
     static long revived_at;
     char what[96] = "";
     int st = sh_run_for(FATHOM_BT " health 2>/dev/null", what, sizeof what, 20);
-    long t = mono_ms();
+    long t = (long)clock_ms();
     if (st != 3) {                               /* well (or no answer: nothing is done on a guess) */
         suspect = 0;
         if (st == 0 && revived && t - revived_at >= 5 * 60000L) revived = said = 0;
@@ -351,7 +346,7 @@ static void *worker(void *arg)
                 /* the monitor, a command or a volume wakes us; with no monitor, the look every 5 s;
                  * and the health look when it's due */
                 long ms = B.mon_pid > 0 ? HEALTH_MS : POLL_MS;
-                long left = health_at - mono_ms();
+                long left = health_at - (long)clock_ms();
                 if (health_at && left < ms) ms = left < 0 ? 0 : left;
                 mono_cond_wait_ms(&B.cv, &B.mu, (int)ms);
             }
@@ -376,7 +371,7 @@ static void *worker(void *arg)
         pthread_mutex_lock(&B.mu);
         on = B.on;
         pthread_mutex_unlock(&B.mu);
-        long t = mono_ms();
+        long t = (long)clock_ms();
         if (!on) health_at = 0;
         else if (cmd || !health_at) health_at = t + HEALTH_MS;   /* (just started, or busy for the user: in a minute) */
         else if (health || t >= health_at) health_at = t + health_check();
@@ -482,24 +477,7 @@ static void monitor_kill_strays(void)
     if (d) closedir(d);
 }
 
-void bt_init(int on, const char *last)
-{
-    if (access(FATHOM_BT, X_OK) || access("/mnt/sd/fathom/bt", F_OK)) return;
-    if (addr_ok(last)) snprintf(B.last, sizeof B.last, "%s", last);
-    pthread_t th;
-    mono_cond_init(&B.cv);
-    if (pthread_create(&th, NULL, worker, NULL)) return;
-    pthread_detach(th);
-    monitor_kill_strays();
-    atexit(monitor_kill);
-    if (pthread_create(&th, NULL, monitor, NULL) == 0) pthread_detach(th);
-    if (on) bt_request(CMD_START, NULL);
-    B.seq++;
-}
-
-int bt_available(void) { return !access(FATHOM_BT, X_OK) && !access("/mnt/sd/fathom/bt", F_OK); }
-
-void bt_request(int cmd, const char *addr)
+static void bt_request(int cmd, const char *addr)
 {
     pthread_mutex_lock(&B.mu);
     B.cmd = cmd;
@@ -507,6 +485,21 @@ void bt_request(int cmd, const char *addr)
     pthread_cond_broadcast(&B.cv);   /* (the worker and the monitor wait on it) */
     pthread_mutex_unlock(&B.mu);
 }
+
+void bt_init(int on, const char *last)
+{
+    if (access(FATHOM_BT, X_OK) || access("/mnt/sd/fathom/bt", F_OK)) return;
+    if (addr_ok(last)) snprintf(B.last, sizeof B.last, "%s", last);
+    mono_cond_init(&B.cv);
+    if (thread_detached(worker, NULL, 0)) return;
+    monitor_kill_strays();
+    atexit(monitor_kill);
+    thread_detached(monitor, NULL, 0);
+    if (on) bt_request(CMD_START, NULL);
+    B.seq++;
+}
+
+int bt_available(void) { return !access(FATHOM_BT, X_OK) && !access("/mnt/sd/fathom/bt", F_OK); }
 
 int bt_ui_state(char *busy, size_t cap)
 {

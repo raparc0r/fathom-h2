@@ -11,7 +11,9 @@
  *               has only the small part.
  *   HASH.none   empty: that address has no picture that can be used (the
  *               server says it isn't there, it's over RICON_MAX_FILE, or it
- *               isn't a PNG or a JPEG), so it isn't asked for again.
+ *               isn't a PNG or a JPEG), so it isn't asked for again: for a
+ *               week (what answered may have been a network's sign-in page,
+ *               or a server saying "too many requests").
  *
  * A station whose line names no icon, or one that's no use, but names its own
  * site ("| site: URL") gets the icon that site's page names: the one phones
@@ -37,6 +39,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "net/http.h"
+
 #include "player/radio.h"
 
 #define RICON_MAX_FILE (512 * 1024)   /* a logo's encoded bytes (a PNG, a JPEG or an .ico) */
@@ -45,13 +49,17 @@
 
 /* What fetches: http_get (net/http.h) unless replaced (the tests and the
  * simulator read saved pictures). Same contract as http_get. */
-typedef long (*ricon_fetch_fn)(const char *url, char *buf, size_t cap, const volatile int *abort);
-void ricon_set_fetch(ricon_fetch_fn fn);
+void ricon_set_fetch(http_get_fn fn);
 
 /* The icons are kept in dir (made when the first is written). 0. */
 int  ricon_start(const char *dir);
 /* A run under way gives up (its fetch dropped) and is waited for, a few seconds at most. */
 void ricon_stop(void);
+/* The same in two steps (as podsync_stop_ask and podsync_stop_wait): _ask
+ * only tells the run, _wait waits for it, ms at most. 1: no run is left; 0:
+ * one is, and ends with the player. */
+void ricon_stop_ask(void);
+int  ricon_stop_wait(int ms);
 
 /* Your stations as they are now (st may be freed after): on a short-lived
  * thread of its own, the files of icons no station names any more are

@@ -9,30 +9,15 @@
 #include <time.h>
 
 #include "net/radiodir.h"
-
-static int fails;
-#define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
+#include "test_util.h"
 
 static char *slurp(const char *name, size_t *len)
 {
     char path[256];
     snprintf(path, sizeof path, "tests/fixtures/radiodir/%s", name);
-    FILE *f = fopen(path, "rb");
-    if (!f) { printf("FAIL: no %s\n", path); fails++; *len = 0; return calloc(1, 1); }
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *b = malloc((size_t)n + 1);
-    *len = fread(b, 1, (size_t)n, f);
-    b[*len] = '\0';
-    fclose(f);
+    char *b = t_slurp(path, len);
+    if (!b) { printf("FAIL: no %s\n", path); t_fails++; *len = 0; return calloc(1, 1); }
     return b;
-}
-
-static void nap(int ms)
-{
-    struct timespec t = {ms / 1000, (ms % 1000) * 1000000L};
-    nanosleep(&t, NULL);
 }
 
 /* ---- fetching from the fixtures, as the simulator does ---- */
@@ -48,7 +33,7 @@ static long fixture_fetch(const char *url, char *buf, size_t cap, const volatile
     snprintf(last_url, sizeof last_url, "%s", url);
     pthread_mutex_unlock(&mu);
     if (slow) {                                   /* a server that doesn't answer: until abort */
-        for (int i = 0; i < 300 && !(abort && *abort); i++) nap(10);
+        for (int i = 0; i < 300 && !(abort && *abort); i++) t_sleep_ms(10);
         return -1;
     }
     if (fail_all) return -1;
@@ -74,7 +59,7 @@ static int wait_done(rdir_result_t *r)
     for (int i = 0; i < 500; i++) {
         int p = rdir_poll(r);
         if (p != 0) return p;
-        nap(10);
+        t_sleep_ms(10);
     }
     return 0;
 }
@@ -268,10 +253,10 @@ int main(void)
     slow = 1;
     calls = 0;
     CHECK(rdir_start(&q) == 0);
-    nap(50);
+    t_sleep_ms(50);
     rdir_cancel();
     CHECK(rdir_poll(&r) == -1 && !rdir_busy());
-    nap(200);
+    t_sleep_ms(200);
     CHECK(calls == 1);                            /* aborted: no other server tried */
     slow = 0;
     /* a new request replaces one that's running */
@@ -283,29 +268,28 @@ int main(void)
     calls = 0;
     rdir_test_click_wait(300);
     rdir_count_click("11111111-0601-11e8-ae97-52543be04c81");
-    nap(100);
+    t_sleep_ms(100);
     CHECK(calls == 0);
     rdir_count_click("9617a958-0601-11e8-ae97-52543be04c81");
-    for (int i = 0; i < 300 && !calls; i++) nap(10);
+    for (int i = 0; i < 300 && !calls; i++) t_sleep_ms(10);
     pthread_mutex_lock(&mu);
     CHECK(calls == 1 && strstr(last_url, "/json/url/9617a958-0601-11e8-ae97-52543be04c81"));
     pthread_mutex_unlock(&mu);
-    nap(400);
+    t_sleep_ms(400);
     CHECK(calls == 1);                            /* the first was never asked for */
     /* one chosen while another is being counted is counted after it */
     slow = 1;
     rdir_count_click("22222222-0601-11e8-ae97-52543be04c81");
-    for (int i = 0; i < 300 && calls < 2; i++) nap(10);
+    for (int i = 0; i < 300 && calls < 2; i++) t_sleep_ms(10);
     CHECK(calls == 2);
     rdir_count_click("33333333-0601-11e8-ae97-52543be04c81");
     slow = 0;
-    for (int i = 0; i < 500 && calls < 3; i++) nap(10);
+    for (int i = 0; i < 500 && calls < 3; i++) t_sleep_ms(10);
     pthread_mutex_lock(&mu);
     CHECK(calls == 3 && strstr(last_url, "/json/url/33333333-0601-11e8-ae97-52543be04c81"));
     pthread_mutex_unlock(&mu);
-    nap(400);
+    t_sleep_ms(400);
     rdir_test_click_wait(-1);
 
-    if (!fails) printf("radiodir: ok\n");
-    return fails != 0;
+    return t_result();
 }

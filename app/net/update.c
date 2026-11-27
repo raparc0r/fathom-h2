@@ -146,19 +146,7 @@ const char *update_error_text(int err)
 
 /* ---------- files ---------- */
 
-/* Written data leaves the page cache once it's on the card: the download and
- * the unpacking (50 MB) would otherwise push out the music's cached pages and
- * other programs' code, in 24 MB of RAM. */
-static void drop_cache(int fd)
-{
-#ifdef POSIX_FADV_DONTNEED
-    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-#else
-    (void)fd;
-#endif
-}
-
-int update_file_sha256(const char *path, char hex[65], update_progress_fn progress, void *ctx,
+int update_file_sha256(const char *path, char hex[65], http_progress_fn progress, void *ctx,
                        const volatile int *abort)
 {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -176,12 +164,12 @@ int update_file_sha256(const char *path, char hex[65], update_progress_fn progre
         sha256_update(&s, b, (size_t)k);
         done += (uint64_t)k;
         if ((done & 0xFFFFF) < 32768) {             /* each MB */
-            drop_cache(fd);
+            file_drop_cache(fd, 0, 0);
             if (progress) progress(done, total, ctx);
         }
     }
     if (k < 0) ok = 0;
-    drop_cache(fd);
+    file_drop_cache(fd, 0, 0);
     close(fd);
     free(b);
     if (!ok) return -1;
@@ -270,12 +258,6 @@ static int write_marker(const char *path, const char *text)
     return close(fd) || !ok ? -1 : 0;
 }
 
-static int exists(const char *path)
-{
-    struct stat st;
-    return stat(path, &st) == 0;
-}
-
 /* ---------- the zip's layout ---------- */
 
 /* A name that's safe to write on the card: relative, no . or .. parts, nothing
@@ -351,7 +333,7 @@ typedef struct {
     int werr;
     uint64_t since_sync;
     uint64_t *done, total;
-    update_progress_fn progress;
+    http_progress_fn progress;
     void *ctx;
 } sink_t;
 
@@ -371,7 +353,7 @@ static int to_file(const void *data, size_t len, void *ctx)
     if ((s->since_sync += len) >= (2u << 20)) {
         s->since_sync = 0;
         if (fdatasync(s->fd)) { s->werr = 1; return -1; }
-        drop_cache(s->fd);
+        file_drop_cache(s->fd, 0, 0);
     }
     *s->done += len;
     if (s->progress) s->progress(*s->done, s->total, s->ctx);
@@ -423,7 +405,7 @@ static int parse_sums(char *text, sum_t **out)
     return n;
 }
 
-int update_stage(const char *zip_path, const char *stage, update_progress_fn progress, void *ctx,
+int update_stage(const char *zip_path, const char *stage, http_progress_fn progress, void *ctx,
                  const volatile int *abort)
 {
     zip_t z;
@@ -486,7 +468,7 @@ int update_stage(const char *zip_path, const char *stage, update_progress_fn pro
         sha256_init(&k.sha);
         int r = zip_extract(&z, &e, to_file, &k, abort);
         if (!r && fsync(k.fd)) { r = -1; k.werr = 1; }
-        drop_cache(k.fd);
+        file_drop_cache(k.fd, 0, 0);
         if (close(k.fd)) { r = -1; k.werr = 1; }
         if (abort && *abort) { err = UPDATE_ERR_CANCELLED; goto out; }
         if (r) { err = k.werr ? UPDATE_ERR_WRITE : UPDATE_ERR_DAMAGED; goto out; }
@@ -618,17 +600,17 @@ int update_install(const char *card, const char *stage)
     snprintf(new_mods, sizeof new_mods, "%s/sd/fathom/wifi/modules", stage);
     snprintf(boot_new, sizeof boot_new, "%s/fathom/boot-new", card);
     int kept = 0;
-    if (!exists(mark)) {
+    if (!file_exists(mark)) {
         char ready[1024];
         snprintf(ready, sizeof ready, "%s/READY", stage);
-        if (!exists(ready)) return UPDATE_ERR_INSTALL;
+        if (!file_exists(ready)) return UPDATE_ERR_INSTALL;
         /* The old kernel kept for h2boot's way back, and for a person to go
          * back to by hand (the bootloader always starts uImage). Copied, not
          * moved: uImage never goes missing. Before anything moves: a card
          * that filled since the download (music copied over USB) fails here,
          * with nothing installed, where the copy made after the files had
          * moved left the new player with the old kernel for good. */
-        if (exists(kernel) && exists(now)) {
+        if (file_exists(kernel) && file_exists(now)) {
             if (copy_file(now, prev)) {
                 int full = errno == ENOSPC || errno == EDQUOT;
                 fprintf(stderr, "update: can't keep the old kernel: %s\n", strerror(errno));
@@ -637,7 +619,7 @@ int update_install(const char *card, const char *stage)
             kept = 1;
         }
         /* (once, before anything moves: cut short, the card's are the new ones) */
-        if (exists(kernel) && exists(new_mods) && exists(mods) && keep_modules(mods, mods_prev)) {
+        if (file_exists(kernel) && file_exists(new_mods) && file_exists(mods) && keep_modules(mods, mods_prev)) {
             int full = errno == ENOSPC || errno == EDQUOT;
             fprintf(stderr, "update: can't keep the old modules: %s\n", strerror(errno));
             return full ? UPDATE_ERR_SPACE : UPDATE_ERR_INSTALL;
@@ -651,12 +633,12 @@ int update_install(const char *card, const char *stage)
      * kernel, but nothing loads them before the restart, and a cut-short
      * install is finished at the next start (update_resume). (No sd/ left:
      * cut short while the stage was being removed, all of it installed.) */
-    if (exists(sd) && move_tree(sd, card, "")) return UPDATE_ERR_INSTALL;
+    if (file_exists(sd) && move_tree(sd, card, "")) return UPDATE_ERR_INSTALL;
     sync();
-    if (exists(kernel)) {
+    if (file_exists(kernel)) {
         /* An install begun by a player from before the copy moved up (its
          * marker doesn't say "kept"): made here, as that player would have. */
-        if (!kept && exists(now) && copy_file(now, prev)) return UPDATE_ERR_INSTALL;
+        if (!kept && file_exists(now) && copy_file(now, prev)) return UPDATE_ERR_INSTALL;
         sync();
         /* h2boot starts it twice at most without the player getting up (which
          * deletes this), then goes back to uImage.prev and modules.prev. What
@@ -684,7 +666,7 @@ int update_install(const char *card, const char *stage)
      * the marker still there isn't "installed, restart". The player restarts
      * the H2 after an install finished at its start, and with the marker
      * left it did so at every start, for ever. */
-    if (exists(mark)) {
+    if (file_exists(mark)) {
         fprintf(stderr, "update: the stage can't be removed: %s\n", strerror(errno));
         return UPDATE_ERR_INSTALL;
     }
@@ -695,18 +677,18 @@ int update_install_begun(const char *stage)
 {
     char mark[1024];
     snprintf(mark, sizeof mark, "%s/INSTALLING", stage);
-    return exists(mark);
+    return file_exists(mark);
 }
 
 int update_resume(const char *card, const char *stage)
 {
     char mark[1024];
     snprintf(mark, sizeof mark, "%s/INSTALLING", stage);
-    if (exists(mark)) {
+    if (file_exists(mark)) {
         fprintf(stderr, "update: finishing an install cut short\n");
         return update_install(card, stage) == UPDATE_OK ? 1 : -1;
     }
-    if (exists(stage)) {
+    if (file_exists(stage)) {
         fprintf(stderr, "update: removing an unfinished update\n");
         update_remove_tree(stage);
     }

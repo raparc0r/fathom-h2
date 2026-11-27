@@ -8,8 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-static int fails;
-#define CHECK(c, ...) do { if (!(c)) { printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); fails++; } } while (0)
+#include "test_util.h"
 
 /* Level of frequency f (Hz) in the left channel, dB relative to full scale. */
 static double level_db(const int16_t *s, long n, double f, double fs)
@@ -49,11 +48,11 @@ static double through(unsigned rate, double f, double amp, double f_out)
 
 int main(void)
 {
-    CHECK(btconv_rate_for(44100) == 44100, "44.1");
-    CHECK(btconv_rate_for(96000) == 48000, "96");
-    CHECK(btconv_rate_for(176400) == 44100, "176.4");
-    CHECK(btconv_rate_for(192000) == 48000, "192");
-    CHECK(btconv_rate_for(22050) == 0, "22.05 has no whole ratio up");
+    CHECKF(btconv_rate_for(44100) == 44100, "44.1");
+    CHECKF(btconv_rate_for(96000) == 48000, "96");
+    CHECKF(btconv_rate_for(176400) == 44100, "176.4");
+    CHECKF(btconv_rate_for(192000) == 48000, "192");
+    CHECKF(btconv_rate_for(22050) == 0, "22.05 has no whole ratio up");
 
     double ref = 20 * log10(0.5);
     unsigned rates[] = {88200, 96000, 176400, 192000};
@@ -61,12 +60,12 @@ int main(void)
         unsigned rate = rates[r], out = btconv_rate_for(rate);
         for (double f = 1000; f <= 20000; f += 19000) {
             double d = through(rate, f, 0.5, f) - ref;
-            CHECK(fabs(d) < 0.05, "%u Hz: %.0f Hz off by %.3f dB", rate, f, d);
+            CHECKF(fabs(d) < 0.05, "%u Hz: %.0f Hz off by %.3f dB", rate, f, d);
         }
         /* a tone just above the band: its alias would land at out - f */
         double f = out - 19000.0 + 2000;          /* aliases to 17 kHz */
         double a = through(rate, f, 0.5, out - f) - ref;
-        CHECK(a < -95, "%u Hz: %.0f Hz aliases at %.1f dB", rate, f, a);
+        CHECKF(a < -95, "%u Hz: %.0f Hz aliases at %.1f dB", rate, f, a);
         printf("%u -> %u Hz: taps ok, alias of %.0f Hz at %.1f dB\n", rate, out, f, a);
     }
 
@@ -74,7 +73,7 @@ int main(void)
      * would fold to 16 kHz after it; 75 kHz at 176.4 kHz to 13.2 kHz) */
     double a1 = through(192000, 80000, 0.5, 16000) - ref;
     double a2 = through(176400, 75000, 0.5, 88200 - 75000) - ref;
-    CHECK(a1 < -95 && a2 < -95, "first halving stage: %.1f, %.1f dB", a1, a2);
+    CHECKF(a1 < -95 && a2 < -95, "first halving stage: %.1f, %.1f dB", a1, a2);
     printf("first halving stage: 80 kHz at 192 kHz %.1f dB, 75 kHz at 176.4 kHz %.1f dB\n", a1, a2);
 
     /* across families (the link stays at one rate): flat, and no images or
@@ -83,15 +82,45 @@ int main(void)
     for (int r = 0; r < 4; r++) {
         for (double f = 1000; f <= 20000; f += 19000) {
             double d = through_to(rs[r].in, rs[r].link, f, 0.5, f) - ref;
-            CHECK(fabs(d) < 0.05, "%u -> %u Hz: %.0f Hz off by %.3f dB", rs[r].in, rs[r].link, f, d);
+            CHECKF(fabs(d) < 0.05, "%u -> %u Hz: %.0f Hz off by %.3f dB", rs[r].in, rs[r].link, f, d);
         }
     }
     /* 44.1 -> 48: 1 kHz has an image at 43.1 kHz, which would fold to 4.9 kHz */
     double img = through_to(44100, 48000, 1000, 0.5, 48000 - 43100) - ref;
-    CHECK(img < -95, "44.1 -> 48 kHz: image at %.1f dB", img);
+    CHECKF(img < -95, "44.1 -> 48 kHz: image at %.1f dB", img);
     /* 48 -> 44.1: 21 kHz in folds only above 20 kHz, and is attenuated */
     double fold = through_to(48000, 44100, 21000, 0.5, 21000) - ref;
     printf("48 -> 44.1 kHz: 21 kHz at %.1f dB; 44.1 -> 48: image at %.1f dB\n", fold, img);
+
+    /* 32 kHz sound (and its doubles), and a link at 32 kHz: a rate that can't
+     * carry 20 kHz. Flat as far as it goes (0.45 of the lower rate: 14.4 kHz),
+     * nothing folded below that. Before, no filter came out for these and the
+     * track couldn't play over Bluetooth. */
+    struct { unsigned in, link; } lo[] = {{32000, 44100}, {32000, 48000}, {64000, 44100}, {128000, 32000},
+                                          {64000, 32000}, {44100, 32000}, {48000, 32000}};
+    CHECKF(btconv_rate_for(32000) == 32000 && btconv_rate_for(64000) == 32000, "32 kHz");
+    int made = 1;
+    for (int r = 0; r < 7; r++) {
+        btconv_t *t = btconv_create(lo[r].in, 2, lo[r].link);
+        CHECKF(t != NULL, "%u -> %u Hz: no converter", lo[r].in, lo[r].link);
+        if (!t) made = 0;
+        btconv_destroy(t);
+    }
+    for (int r = 0; r < 7 && made; r++) {
+        for (double f = 1000; f <= 14000; f += 13000) {
+            double d = through_to(lo[r].in, lo[r].link, f, 0.5, f) - ref;
+            CHECKF(fabs(d) < 0.05, "%u -> %u Hz: %.0f Hz off by %.3f dB", lo[r].in, lo[r].link, f, d);
+        }
+    }
+    /* 32 -> 44.1: 1 kHz has an image at 31 kHz, which would fold to 13.1 kHz;
+     * 64 -> 32: 19 kHz would fold to 13 kHz; 48 -> 32: 19 kHz the same */
+    if (made) {
+        double i1 = through_to(32000, 44100, 1000, 0.5, 44100 - 31000) - ref;
+        double i2 = through_to(64000, 32000, 19000, 0.5, 13000) - ref;
+        double i3 = through_to(48000, 32000, 19000, 0.5, 13000) - ref;
+        CHECKF(i1 < -95 && i2 < -95 && i3 < -90, "32 kHz: image at %.1f dB, folds at %.1f and %.1f dB", i1, i2, i3);
+        printf("32 -> 44.1 kHz: image at %.1f dB; 64 -> 32: 19 kHz folds at %.1f dB; 48 -> 32: at %.1f dB\n", i1, i2, i3);
+    }
 
     /* the EQ at the link's rate, after the conversion: 192 kHz in, a 1 kHz
      * peak of +6 dB under a -6 dB preamp: 1 kHz at 0 dB, 100 Hz at -6 dB */
@@ -114,7 +143,7 @@ int main(void)
             eq_destroy(e);
             btconv_destroy(cv);
         }
-        CHECK(fabs(got[0] - want[0]) < 0.05 && fabs(got[1] - want[1]) < 0.05,
+        CHECKF(fabs(got[0] - want[0]) < 0.05 && fabs(got[1] - want[1]) < 0.05,
               "EQ after the conversion: 1 kHz %.2f dB (designed %.2f), 100 Hz %.2f (designed %.2f)", got[0], want[0], got[1], want[1]);
         printf("EQ at the link's rate: 1 kHz %.2f dB, 100 Hz %.2f dB\n", got[0], got[1]);
     }
@@ -124,9 +153,8 @@ int main(void)
     int32_t in[8] = {0x40000000, -0x40000000, 0x40000000, -0x40000000};
     int16_t o[8];
     long w = btconv_run(c, in, 2, o);
-    CHECK(w == 2 && abs(o[0] - 16384) <= 1 && abs(o[1] + 16384) <= 1, "44.1 passthrough: %d %d", o[0], o[1]);
+    CHECKF(w == 2 && abs(o[0] - 16384) <= 1 && abs(o[1] + 16384) <= 1, "44.1 passthrough: %d %d", o[0], o[1]);
     btconv_destroy(c);
 
-    printf(fails ? "%d failures\n" : "btconv ok\n", fails);
-    return fails != 0;
+    return t_result();
 }

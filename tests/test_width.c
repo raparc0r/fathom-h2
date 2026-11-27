@@ -7,15 +7,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <FLAC/stream_encoder.h>
-
 #include "audio/engine.h"
 #include "audio/output.h"
 #include "audio/width.h"
-#include "tmpdir.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_flac.h"
+#include "test_util.h"
 
 static void run(int pct, int32_t l, int32_t r, int32_t *ol, int32_t *or_)
 {
@@ -95,26 +91,16 @@ static void k_nop(void *c) { (void)c; }
 static void k_pause(void *c, int on) { (void)c; (void)on; }
 static void k_describe(void *c, char *o, int cap) { (void)c; snprintf(o, (size_t)cap, "keep"); }
 
-static void sleep_ms(int ms)
+/* A stereo 16-bit FLAC, left at +0.5 of full scale and right silent. */
+static void left_only(FLAC__int32 *pcm, unsigned at, unsigned n)
 {
-    struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000};
-    nanosleep(&t, NULL);
+    (void)at;
+    for (unsigned i = 0; i < n; i++) { pcm[2 * i] = 16384; pcm[2 * i + 1] = 0; }
 }
 
-/* A stereo 16-bit FLAC, left at +0.5 of full scale and right silent. */
 static int write_left(const char *path, unsigned frames)
 {
-    FLAC__StreamEncoder *e = FLAC__stream_encoder_new();
-    FLAC__stream_encoder_set_channels(e, 2);
-    FLAC__stream_encoder_set_bits_per_sample(e, 16);
-    FLAC__stream_encoder_set_sample_rate(e, 44100);
-    if (FLAC__stream_encoder_init_file(e, path, NULL, NULL) != FLAC__STREAM_ENCODER_INIT_STATUS_OK) return -1;
-    static FLAC__int32 pcm[2 * 4096];
-    for (unsigned i = 0; i < 4096; i++) { pcm[2 * i] = 16384; pcm[2 * i + 1] = 0; }
-    for (unsigned at = 0; at < frames; at += 4096) FLAC__stream_encoder_process_interleaved(e, pcm, frames - at < 4096 ? frames - at : 4096);
-    FLAC__stream_encoder_finish(e);
-    FLAC__stream_encoder_delete(e);
-    return 0;
+    return t_write_flac(path, &(t_flac_t){.frames = frames, .fill = left_only});
 }
 
 static void play_at(const char *path, int width, keep_t *k, eng_status_t *st)
@@ -124,7 +110,7 @@ static void play_at(const char *path, int width, keep_t *k, eng_status_t *st)
     engine_t *e = engine_new(&out);
     engine_set_width(e, width);
     engine_play(e, path, 1);
-    for (int i = 0; i < 400 && !k->frames; i++) sleep_ms(5);
+    for (int i = 0; i < 400 && !k->frames; i++) t_sleep_ms(5);
     engine_status(e, st);
     engine_stop(e);
     engine_free(e);
@@ -156,12 +142,9 @@ static void test_engine(const char *dir)
 int main(void)
 {
     char dir[200];
-    test_tmp(dir, sizeof dir, "fathom-test-width");
-    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    t_mkdtemp(dir, sizeof dir, "fathom-test-width");
     test_arithmetic();
     test_engine(dir);
     rmdir(dir);
-    if (failures) fprintf(stderr, "%d failure(s)\n", failures);
-    else printf("width: all checks passed\n");
-    return failures != 0;
+    return t_result();
 }

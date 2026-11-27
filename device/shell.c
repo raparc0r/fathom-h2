@@ -4,6 +4,7 @@
  * fathom-share and fathom-ssh (see shell.h). */
 #define _GNU_SOURCE   /* pipe2 */
 #include "shell.h"
+#include "core/clock.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -22,13 +23,6 @@
 #include <time.h>
 #include <unistd.h>
 
-static long mono_ms(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
-}
-
 extern char **environ;
 
 /* A pipe that a program started meanwhile by another worker doesn't inherit
@@ -43,6 +37,44 @@ static int pipe_cloexec(int fd[2])
     fcntl(fd[1], F_SETFD, FD_CLOEXEC);
     return 0;
 #endif
+}
+
+/* The program a command line runs, for the log: the first unquoted word that
+ * is a path, without its folders (else the first unquoted word). Never the
+ * rest of the line: an argument can be a password (fathom-wifi connect NAME
+ * PASSWORD; the network drive's, printed into fathom-share). */
+static void cmd_name(const char *cmd, char *out, size_t cap)
+{
+    const char *best = "?";
+    size_t best_n = 1;
+    int found = 0;
+    for (const char *w = cmd; *w && found < 2;) {
+        while (*w == ' ') w++;
+        const char *e = w;
+        int plain = 1;
+        while (*e && *e != ' ') {
+            if (*e == '\'' || *e == '"') {           /* (a quoted stretch, spaces and all) */
+                char q = *e++;
+                plain = 0;
+                while (*e && *e != q) e++;
+                if (*e) e++;
+            } else if (*e == '\\') {
+                plain = 0;
+                if (*++e) e++;
+            } else {
+                e++;
+            }
+        }
+        if (plain && e > w && (*w == '/' ? found < 2 : !found)) {
+            found = *w == '/' ? 2 : 1;
+            best = w;
+            best_n = (size_t)(e - w);
+            for (const char *c = w; c < e; c++)
+                if (*c == '/') { best = c + 1; best_n = (size_t)(e - best); }
+        }
+        w = e;
+    }
+    snprintf(out, cap, "%.*s", (int)best_n, best);
 }
 
 /* (not popen: a deadline, and the whole of what it started killed when it
@@ -77,11 +109,11 @@ int sh_run_for(const char *cmd, char *out, size_t cap, int secs)
     posix_spawn_file_actions_destroy(&fa);
     close(fd[1]);
     if (err) { close(fd[0]); return -1; }
-    long end = mono_ms() + (long)secs * 1000;
+    long end = (long)clock_ms() + (long)secs * 1000;
     size_t got = 0;
     int late = 0;
     for (;;) {
-        long left = end - mono_ms();
+        long left = end - (long)clock_ms();
         if (left <= 0) { late = 1; break; }
         struct pollfd p = {.fd = fd[0], .events = POLLIN};
         int r = poll(&p, 1, left > 1000 ? 1000 : (int)left);
@@ -94,18 +126,29 @@ int sh_run_for(const char *cmd, char *out, size_t cap, int secs)
         if (keep) { got += (size_t)n; out[got] = '\0'; }
     }
     close(fd[0]);
-    if (late) {
-        fprintf(stderr, "shell: no answer in %d s, stopped: %.80s\n", secs, cmd);
-        kill(-pid, SIGKILL);
-        kill(pid, SIGKILL);
-    }
     int st = 0;
-    if (late) {                                     /* (one stuck in the kernel can't be reaped: left) */
-        for (int i = 0; i < 50 && waitpid(pid, &st, WNOHANG) == 0; i++) usleep(100000);
-        return 124;
+    /* Its output ended: usually because it did. Not always: a command whose
+     * own output goes elsewhere ("fathom-wifi connect ... >/dev/null": the
+     * H2's shell becomes the command, and nothing holds the pipe) runs on
+     * with the pipe closed. Waited for here with no limit, such a helper
+     * that hung held its caller for good, the deadline never looked at
+     * (found by this file's test on the H2, 2026-11-26). So: until the same
+     * deadline, looked at often at first (most have just ended). */
+    for (useconds_t nap = 500; !late; nap = nap < 50000 ? nap * 2 : 50000) {
+        pid_t w = waitpid(pid, &st, WNOHANG);
+        if (w == pid) return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        if (w < 0 && errno != EINTR) return -1;
+        if (end - (long)clock_ms() <= 0) late = 1;
+        else usleep(nap);
     }
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    char name[40];
+    cmd_name(cmd, name, sizeof name);
+    fprintf(stderr, "shell: no answer in %d s, stopped: %s\n", secs, name);
+    kill(-pid, SIGKILL);
+    kill(pid, SIGKILL);
+    /* (one stuck in the kernel can't be reaped: left) */
+    for (int i = 0; i < 50 && waitpid(pid, &st, WNOHANG) == 0; i++) usleep(100000);
+    return 124;
 }
 
 int sh_run(const char *cmd, char *out, size_t cap) { return sh_run_for(cmd, out, cap, SH_RUN_SECS); }
@@ -128,6 +171,29 @@ int mono_cond_wait_ms(pthread_cond_t *cv, pthread_mutex_t *mu, int ms)
     ts.tv_nsec += (long)(ms % 1000) * 1000000L;
     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
     return pthread_cond_timedwait(cv, mu, &ts);
+}
+
+int sh_pid_alive(const char *pidfile)
+{
+    FILE *f = fopen(pidfile, "re");
+    long pid = 0;
+    if (!f) return 0;
+    if (fscanf(f, "%ld", &pid) != 1) pid = 0;
+    fclose(f);
+    if (pid <= 0) return 0;                            /* (0 and below aren't one process to kill()) */
+    return kill((pid_t)pid, 0) == 0 || errno == EPERM;
+}
+
+int sh_revive(sh_revive_t *r, int alive, uint32_t now_ms)
+{
+    if (alive) {
+        if (r->revived && now_ms - r->revived_at >= 5 * SH_LOOK_MS) r->revived = 0;
+        return SH_WELL;
+    }
+    if (r->revived >= 3) return SH_GIVE_UP;
+    r->revived++;
+    r->revived_at = now_ms;
+    return SH_REVIVE;
 }
 
 void sh_quote(const char *s, char *out, size_t cap)

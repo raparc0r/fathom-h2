@@ -7,8 +7,6 @@
  * when stopped (and never drops music then), and notes a file it can't
  * read. */
 #include <dirent.h>
-#include <FLAC/metadata.h>
-#include <FLAC/stream_encoder.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,84 +22,31 @@
 
 #include <sqlite3.h>
 
+#include "core/clock.h"
 #include "library/library.h"
-#include "tmpdir.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_db.h"
+#include "test_flac.h"
+#include "test_util.h"
 
 static int write_flac(const char *path, const char *title, const char *artist, const char *album, int track)
 {
-    FLAC__StreamEncoder *e = FLAC__stream_encoder_new();
-    FLAC__stream_encoder_set_channels(e, 2);
-    FLAC__stream_encoder_set_bits_per_sample(e, 16);
-    FLAC__stream_encoder_set_sample_rate(e, 44100);
-    FLAC__StreamMetadata *vc = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
     char tr[8];
     snprintf(tr, sizeof tr, "%d", track);
-    const char *kv[][2] = {{"TITLE", title}, {"ARTIST", artist}, {"ALBUM", album}, {"TRACKNUMBER", tr}};
-    for (int i = 0; i < 4; i++) {
-        FLAC__StreamMetadata_VorbisComment_Entry en;
-        FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, kv[i][0], kv[i][1]);
-        FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-    }
-    FLAC__stream_encoder_set_metadata(e, &vc, 1);
-    int rc = -1;
-    if (FLAC__stream_encoder_init_file(e, path, NULL, NULL) == FLAC__STREAM_ENCODER_INIT_STATUS_OK) {
-        static FLAC__int32 pcm[2 * 441];
-        FLAC__stream_encoder_process_interleaved(e, pcm, 441);
-        FLAC__stream_encoder_finish(e);
-        rc = 0;
-    }
-    FLAC__stream_encoder_delete(e);
-    FLAC__metadata_object_delete(vc);
-    return rc;
+    return t_write_flac(path, &(t_flac_t){.frames = 441, .tags = {{"TITLE", title}, {"ARTIST", artist}, {"ALBUM", album},
+                                                                  {"TRACKNUMBER", tr}}});
 }
 
 /* Every tag that groups songs (empty: left out) */
 static int write_flac_tags(const char *path, const char *title, const char *artist, const char *album_artist,
                            const char *album, const char *genre, const char *composer, int year, int track)
 {
-    FLAC__StreamEncoder *e = FLAC__stream_encoder_new();
-    FLAC__stream_encoder_set_channels(e, 2);
-    FLAC__stream_encoder_set_bits_per_sample(e, 16);
-    FLAC__stream_encoder_set_sample_rate(e, 44100);
-    FLAC__StreamMetadata *vc = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
     char tr[8], yr[8];
     snprintf(tr, sizeof tr, "%d", track);
     snprintf(yr, sizeof yr, "%d", year);
-    const char *kv[][2] = {{"TITLE", title}, {"ARTIST", artist}, {"ALBUMARTIST", album_artist}, {"ALBUM", album},
-                           {"GENRE", genre}, {"COMPOSER", composer}, {"DATE", year ? yr : ""}, {"TRACKNUMBER", tr}};
-    for (size_t i = 0; i < sizeof kv / sizeof *kv; i++) {
-        if (!kv[i][1] || !*kv[i][1]) continue;
-        FLAC__StreamMetadata_VorbisComment_Entry en;
-        FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, kv[i][0], kv[i][1]);
-        FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-    }
-    FLAC__stream_encoder_set_metadata(e, &vc, 1);
-    int rc = -1;
-    if (FLAC__stream_encoder_init_file(e, path, NULL, NULL) == FLAC__STREAM_ENCODER_INIT_STATUS_OK) {
-        static FLAC__int32 pcm[2 * 441];
-        FLAC__stream_encoder_process_interleaved(e, pcm, 441);
-        FLAC__stream_encoder_finish(e);
-        rc = 0;
-    }
-    FLAC__stream_encoder_delete(e);
-    FLAC__metadata_object_delete(vc);
-    return rc;
-}
-
-static int64_t db_int(const char *db, const char *sql)
-{
-    sqlite3 *raw = NULL;
-    sqlite3_stmt *q = NULL;
-    int64_t v = -1;
-    if (sqlite3_open(db, &raw) == SQLITE_OK && sqlite3_prepare_v2(raw, sql, -1, &q, NULL) == SQLITE_OK &&
-        sqlite3_step(q) == SQLITE_ROW)
-        v = sqlite3_column_int64(q, 0);
-    sqlite3_finalize(q);
-    sqlite3_close(raw);
-    return v;
+    return t_write_flac(path, &(t_flac_t){.frames = 441, .tags = {
+        {"TITLE", t_flac_some(title)}, {"ARTIST", t_flac_some(artist)}, {"ALBUMARTIST", t_flac_some(album_artist)},
+        {"ALBUM", t_flac_some(album)}, {"GENRE", t_flac_some(genre)}, {"COMPOSER", t_flac_some(composer)},
+        {"DATE", year ? yr : NULL}, {"TRACKNUMBER", tr}}});
 }
 
 /* The groups as they stand (albums, artists, credits, genres, composers,
@@ -138,14 +83,6 @@ static char *groups_text(const char *db)
     return text;
 }
 
-static int db_exec(const char *db, const char *sql)
-{
-    sqlite3 *raw = NULL;
-    int rc = sqlite3_open(db, &raw) == SQLITE_OK ? sqlite3_exec(raw, sql, NULL, NULL, NULL) : -1;
-    sqlite3_close(raw);
-    return rc;
-}
-
 /* Opening: an up-to-date database isn't upgraded again (each connection,
  * the background scan's and levelling's too, re-read the whole tracks table
  * and took the write lock); levelling's next track by its index. */
@@ -175,15 +112,15 @@ static void test_open_and_levelling(const char *dir)
     library_t *lib = library_open(db, art);
     CHECK(lib && library_scan(lib, music, NULL, NULL) == 5);
     library_close(lib);
-    CHECK(db_int(db, "PRAGMA user_version") == 9);
+    CHECK(t_db_int(db, "PRAGMA user_version") == 9);
 
     /* a column an upgrade would fill, emptied: an open of an up-to-date
      * library leaves it (it doesn't look) */
-    CHECK(db_exec(db, "UPDATE tracks SET sort=NULL WHERE title='Song 3'") == SQLITE_OK);
+    CHECK(t_db_exec(db, "UPDATE tracks SET sort=NULL WHERE title='Song 3'") == SQLITE_OK);
     lib = library_open(db, art);
     CHECK(lib != NULL);
     library_close(lib);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE sort IS NULL") == 1);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE sort IS NULL") == 1);
     /* ...and one from before (user_version 4) is upgraded once, saying how far
      * it has got, to the last step; library_upgrade_needed() tells it's
      * coming (about how many songs) and that it's done */
@@ -191,7 +128,7 @@ static void test_open_and_levelling(const char *dir)
     snprintf(none, sizeof none, "%s/no-such.db", dir);
     CHECK(library_upgrade_needed(db) == 0 && library_upgrade_needed(none) == 0);
     CHECK(access(none, F_OK) != 0);                  /* (not made by looking) */
-    CHECK(db_exec(db, "PRAGMA user_version=4") == SQLITE_OK);
+    CHECK(t_db_exec(db, "PRAGMA user_version=4") == SQLITE_OK);
     CHECK(library_upgrade_needed(db) == 5);
     up_calls = up_last_done = up_last_total = 0;
     library_set_upgrade_progress(up_seen, NULL);
@@ -200,23 +137,23 @@ static void test_open_and_levelling(const char *dir)
     CHECK(lib != NULL);
     CHECK(up_calls > 10 && up_last_done == up_last_total && up_calls == up_last_total);
     CHECK(library_upgrade_needed(db) == 0);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE sort IS NULL") == 0);
-    CHECK(db_int(db, "PRAGMA user_version") == 9);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE sort IS NULL") == 0);
+    CHECK(t_db_int(db, "PRAGMA user_version") == 9);
     library_close(lib);
     /* ...and one from 0.16.0 (8: the search text every word in a row, no index
      * of it) gets its search keys (name|artist|album) and their index, and
      * finds its songs */
-    CHECK(db_exec(db, "DROP INDEX tracks_search; UPDATE tracks SET search='song 3 an artist an artist an album';"
+    CHECK(t_db_exec(db, "DROP INDEX tracks_search; UPDATE tracks SET search='song 3 an artist an artist an album';"
                       "UPDATE albums SET search='an album an artist'; UPDATE artists SET search='an artist';"
                       "PRAGMA user_version=8") == SQLITE_OK);
     CHECK(library_upgrade_needed(db) == 5);
     lib = library_open(db, art);
     CHECK(lib != NULL && library_upgrade_needed(db) == 0);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE search LIKE '%|%|%'") == 5);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE search LIKE 'song 3|%'") == 1);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM albums WHERE search NOT LIKE '%|%|'") == 0);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM artists WHERE search NOT LIKE '%||'") == 0);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM sqlite_master WHERE name='tracks_search'") == 1);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE search LIKE '%|%|%'") == 5);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE search LIKE 'song 3|%'") == 1);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM albums WHERE search NOT LIKE '%|%|'") == 0);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM artists WHERE search NOT LIKE '%||'") == 0);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM sqlite_master WHERE name='tracks_search'") == 1);
     {
         lib_search_t found;
         CHECK(library_search(lib, "song 3", &found) >= 1 && found.n_songs >= 1 && found.hits[0].tier == 1);
@@ -254,13 +191,6 @@ static void test_open_and_levelling(const char *dir)
     CHECK(n == 5);
     CHECK(library_rg_next(lib, &id, p, sizeof p) != 0);
     library_close(lib);
-}
-
-static double now(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
 /* count files in folder `name` (made), track numbers from 1 */
@@ -313,7 +243,7 @@ static void *job_run(void *arg)
  * walk's list never matched again. */
 static int64_t files_in_library(const char *db)
 {
-    return db_int(db, "SELECT COUNT(*) FROM (SELECT path FROM tracks WHERE cue=0 UNION SELECT path FROM cues)");
+    return t_db_int(db, "SELECT COUNT(*) FROM (SELECT path FROM tracks WHERE cue=0 UNION SELECT path FROM cues)");
 }
 
 static void test_scans(const char *dir)
@@ -354,12 +284,12 @@ static void test_scans(const char *dir)
     int was = getpriority(PRIO_PROCESS, me);
     setpriority(PRIO_PROCESS, me, 0);
 #endif
-    double worst = 0, t0 = now();
+    double worst = 0, t0 = clock_fsec();
     int writes = 0, kept = 1;
     while (!job.done) {
-        double t = now();
+        double t = clock_fsec();
         library_set_favourite(player, tid, writes & 1);
-        double w = now() - t;
+        double w = clock_fsec() - t;
         if (w > worst) worst = w;
         if (w > 0.25)                             /* (where the scan was: what held the lock) */
             fprintf(stderr, "slow write: %.2f s, %.1f s in, the scan at %s (%d files)\n", w, t - t0, job.where, job.calls);
@@ -371,7 +301,7 @@ static void test_scans(const char *dir)
 #ifdef __linux__
     setpriority(PRIO_PROCESS, me, was);
 #endif
-    double took = now() - t0;
+    double took = clock_fsec() - t0;
     CHECK(job.result == 620);
     CHECK(took > 1.5 && writes > 20);             /* (long enough to tell) */
     /* On the H2 itself (tools/h2-tests.sh says so) the groups of the songs
@@ -383,8 +313,8 @@ static void test_scans(const char *dir)
     CHECK(kept);
     if (worst >= most) fprintf(stderr, "a write waited %.2f s (scan %.1f s)\n", worst, took);
     library_close(job.lib);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE album_id IS NULL") == 0);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM albums") == 32);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE album_id IS NULL") == 0);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM albums") == 32);
 
     /* 2. Nothing changed: the scan writes nothing at all (it rewrote every
      * track's row, twice) */
@@ -416,7 +346,7 @@ static void test_scans(const char *dir)
     CHECK(stop.lib && library_scan(stop.lib, music, job_progress, &stop) == -1);
     library_close(stop.lib);
     library_test_known(1);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks") == 620);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks") == 620);
     CHECK(library_scan(player, music, NULL, NULL) == 615);
 
     /* 4. New music, the scan stopped after reading it: what it read is kept
@@ -426,14 +356,14 @@ static void test_scans(const char *dir)
     stop = (scan_job_t){.lib = library_open(db, art), .music = music, .cancel_after = 2, .cancel_unless = "Aa New"};
     CHECK(stop.lib && library_scan(stop.lib, music, job_progress, &stop) == -1);
     library_close(stop.lib);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks") == 635);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE album LIKE 'Aa New' AND album_id IS NULL") == 20);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE album LIKE 'Aa New' AND sort IS NOT NULL") == 20);   /* (in Songs) */
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks") == 635);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE album LIKE 'Aa New' AND album_id IS NULL") == 20);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE album LIKE 'Aa New' AND sort IS NOT NULL") == 20);   /* (in Songs) */
     bg = library_open(db, art);
     CHECK(bg && library_scan(bg, music, NULL, NULL) == 635 && library_scan_changes(bg) > 0);
     library_close(bg);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE album_id IS NULL") == 0);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM albums WHERE title='Aa New' AND ntracks=20") == 1);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE album_id IS NULL") == 0);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM albums WHERE title='Aa New' AND ntracks=20") == 1);
     lib_search_t hits;
     CHECK(library_search(player, "aa new 7", &hits) > 0 && hits.n_songs == 1);
     library_search_free(&hits);
@@ -445,13 +375,13 @@ static void test_scans(const char *dir)
     FILE *f = fopen(path, "wb");
     if (f) { fputs("not a FLAC file at all", f); fclose(f); }
     CHECK(library_scan(player, music, NULL, NULL) == 635);
-    CHECK(db_int(db, "SELECT kind FROM cues WHERE path LIKE '%/bad.flac'") == 3);
+    CHECK(t_db_int(db, "SELECT kind FROM cues WHERE path LIKE '%/bad.flac'") == 3);
     CHECK(files_in_library(db) == 636);
     CHECK(library_scan(player, music, NULL, NULL) == 635 && library_scan_changes(player) == 0);
     /* ...until it changes: a track then, and the note goes */
     CHECK(write_flac(path, "Fixed", "Some Artist", "Album 00", 99) == 0);
     CHECK(library_scan(player, music, NULL, NULL) == 636);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM cues") == 0);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM cues") == 0);
     CHECK(files_in_library(db) == 636);
 
     /* 6. Playlists made elsewhere: entries found by their last three path
@@ -479,14 +409,14 @@ static void test_scans(const char *dir)
         int n = library_list(player, LIB_PLAYLIST_TRACKS, pls.ids[p], &items);
         if (!strcmp(pname, "other")) {
             CHECK(n == 304);
-            CHECK(db_int(db, "SELECT nmissing FROM playlists WHERE name='other'") == 1);
+            CHECK(t_db_int(db, "SELECT nmissing FROM playlists WHERE name='other'") == 1);
             const char *want[5] = {"Album 01/001", "Album 01/002", "Album 02/003", "Album 03/004", "Album 10/001"};
             for (int k = 0; k < 5 && k < n; k++) {
                 char sql[200];
                 snprintf(sql, sizeof sql, "SELECT id FROM tracks WHERE path LIKE '%%/%s.flac'", want[k]);
-                CHECK(items.ids[k] == db_int(db, sql));
+                CHECK(items.ids[k] == t_db_int(db, sql));
             }
-            if (n == 304) CHECK(items.ids[303] == db_int(db, "SELECT id FROM tracks WHERE path LIKE '%/Album 24/020.flac'"));
+            if (n == 304) CHECK(items.ids[303] == t_db_int(db, "SELECT id FROM tracks WHERE path LIKE '%/Album 24/020.flac'"));
         } else {
             CHECK(!strcmp(pname, "latin") && n == 2);
         }
@@ -517,7 +447,7 @@ static void test_scans(const char *dir)
     bg = library_open(db, art);                   /* (data_version: another connection's commits) */
     CHECK(bg && library_scan(bg, music, NULL, NULL) == 639 && library_scan_changes(bg) == 0);
     library_close(bg);
-    CHECK(v0 == v1 && db_int(db, "SELECT value FROM meta WHERE key='scan_pending'") == 0);
+    CHECK(v0 == v1 && t_db_int(db, "SELECT value FROM meta WHERE key='scan_pending'") == 0);
 
     /* 8. A file that can't be opened just now (here: no permission; on the
      * H2 a read error): not noted as unreadable, read at the next scan */
@@ -526,7 +456,7 @@ static void test_scans(const char *dir)
     chmod(path, 0);
     if (access(path, R_OK) != 0) {                /* (as root it can be read anyway) */
         CHECK(library_scan(player, music, NULL, NULL) == 639);
-        CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE path LIKE '%/later.flac'") == 0);
+        CHECK(t_db_int(db, "SELECT COUNT(*) FROM cues WHERE path LIKE '%/later.flac'") == 0);
     }
     chmod(path, 0644);
     CHECK(library_scan(player, music, NULL, NULL) == 640);
@@ -551,7 +481,7 @@ static void test_scans(const char *dir)
     library_close(bg);
     library_close(player);
     char *aside = groups_text(db);
-    CHECK(db_exec(db, "PRAGMA user_version=3") == SQLITE_OK);   /* (opened: groups made again, all at once) */
+    CHECK(t_db_exec(db, "PRAGMA user_version=3") == SQLITE_OK);   /* (opened: groups made again, all at once) */
     player = library_open(db, art);
     library_close(player);
     char *whole = groups_text(db);
@@ -568,16 +498,16 @@ static void test_scans(const char *dir)
     /* 10. A song removed: its play log goes with it (its id is given to the
      * next new song, which would show in On repeat, never played) */
     snprintf(path, sizeof path, "%s/Album 06/020.flac", music);
-    int64_t gone = db_int(db, "SELECT id FROM tracks WHERE path LIKE '%/Album 06/020.flac'");
+    int64_t gone = t_db_int(db, "SELECT id FROM tracks WHERE path LIKE '%/Album 06/020.flac'");
     player = library_open(db, art);
     CHECK(player && gone > 0);
     if (player && gone > 0) {
         library_played(player, gone, 0, (int64_t)time(NULL) - 60);
         library_played(player, gone, 0, (int64_t)time(NULL));
-        CHECK(db_int(db, "SELECT COUNT(*) FROM plays") >= 2);
+        CHECK(t_db_int(db, "SELECT COUNT(*) FROM plays") >= 2);
         unlink(path);
         CHECK(library_scan(player, music, NULL, NULL) == 623);
-        CHECK(db_int(db, "SELECT COUNT(*) FROM plays WHERE track_id NOT IN (SELECT id FROM tracks)") == 0);
+        CHECK(t_db_int(db, "SELECT COUNT(*) FROM plays WHERE track_id NOT IN (SELECT id FROM tracks)") == 0);
     }
     library_close(player);
 
@@ -594,11 +524,11 @@ static void test_scans(const char *dir)
         int r = library_scan(cut, music, job_progress, &j);
         if (r >= 0) fprintf(stderr, "cut scan: %d tracks, %d progress calls\n", r, j.calls);
         CHECK(r < 0);
-        CHECK(db_int(db2, "SELECT COUNT(*) FROM tracks") > 0);
+        CHECK(t_db_int(db2, "SELECT COUNT(*) FROM tracks") > 0);
         CHECK(library_scan_unfinished(cut));
         CHECK(library_scan(cut, music, NULL, NULL) == 623);
         CHECK(!library_scan_unfinished(cut));
-        CHECK(db_int(db2, "SELECT COUNT(*) FROM albums") > 0);
+        CHECK(t_db_int(db2, "SELECT COUNT(*) FROM albums") > 0);
         library_close(cut);
     }
 }
@@ -636,14 +566,14 @@ static void test_playlist_during_scan(const char *dir)
     /* the player's row, its file not there yet */
     snprintf(sql, sizeof sql, "PRAGMA busy_timeout=5000; INSERT INTO playlists(path, name, sort, seen, writable)"
              " VALUES('%s/New one.m3u', 'New one', 'new one', 1, 1)", pl);
-    CHECK(db_exec(db, sql) == SQLITE_OK);
+    CHECK(t_db_exec(db, sql) == SQLITE_OK);
     pthread_join(th, NULL);
     CHECK(job.result == 200);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM playlists WHERE name='New one'") == 1);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM playlists WHERE name='New one'") == 1);
     library_close(job.lib);
     /* written by then; and if never, the next scan drops it */
     CHECK(library_scan(player, music, NULL, NULL) == 200);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM playlists WHERE name='New one'") == 0);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM playlists WHERE name='New one'") == 0);
     library_close(player);
 }
 
@@ -722,12 +652,12 @@ static void test_quick_listing(const char *dir)
     /* a file the FAT reading misses: the slow walk, and it stays */
     fw_set("Album A/003", NULL, NULL);
     CHECK(library_scan(lib, music, NULL, NULL) == 15 && !library_scan_quick(lib) && library_scan_changes(lib) == 0);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%Album A/003.flac'") == 1);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%Album A/003.flac'") == 1);
 
     /* a name it spells otherwise: the slow walk, and no song under that name */
     fw_set(NULL, "Album B/002", NULL);
     CHECK(library_scan(lib, music, NULL, NULL) == 15 && !library_scan_quick(lib) && library_scan_changes(lib) == 0);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%00Z.flac'") == 0);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%00Z.flac'") == 0);
 
     /* a date it reads otherwise, the file unchanged: the slow walk */
     fw_set(NULL, NULL, "Album A/001");
@@ -742,7 +672,7 @@ static void test_quick_listing(const char *dir)
     struct timeval tv[2] = {{time(NULL) + 60, 0}, {time(NULL) + 60, 0}};
     CHECK(utimes(path, tv) == 0);
     CHECK(library_scan(lib, music, NULL, NULL) == 14 && library_scan_quick(lib) && library_scan_changes(lib) == 2);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE title='Retitled'") == 1);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE title='Retitled'") == 1);
     CHECK(fw_calls == 7);
 
     /* many new files at once (a first copy: not looked up one by one), one of
@@ -752,8 +682,8 @@ static void test_quick_listing(const char *dir)
     make_album(music, "Album D", 300);
     fw_set(NULL, "Album D/150", NULL);
     CHECK(library_scan(lib, music, NULL, NULL) == 314 && !library_scan_quick(lib) && library_scan_changes(lib) > 0);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%Album D/%'") == 300);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%15Z.flac'") == 0);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%Album D/%'") == 300);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%15Z.flac'") == 0);
     /* ...and all read right: the listing alone from then on (the same as the
      * last finished scan's: nothing looked up, nothing written) */
     fw_set(NULL, NULL, NULL);
@@ -768,6 +698,16 @@ static void test_quick_listing(const char *dir)
     make_album(music, "Album E", 300);
     CHECK(library_scan(lib, music, NULL, NULL) == 614 && library_scan_quick(lib) && library_scan_changes(lib) == 300);
     CHECK(library_scan(lib, music, NULL, NULL) == 614 && library_scan_quick(lib) && library_scan_changes(lib) == 0);
+
+    /* the FAT reading misses a folder's file, and the check of its list against
+     * the library stops at a failed step: not "checked" (the folders are
+     * walked, and the file stays; taken as checked, it was dropped as gone) */
+    fw_set("Album A/003", NULL, NULL);
+    library_test_against_fails(2);
+    CHECK(library_scan(lib, music, NULL, NULL) == 614 && !library_scan_quick(lib));
+    library_test_against_fails(0);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%Album A/003.flac'") == 1);
+    fw_set(NULL, NULL, NULL);
 
     library_test_fatwalk(NULL);
     library_close(lib);
@@ -846,7 +786,7 @@ static void test_groups_where_changed(const char *dir)
         }
         CHECK(library_scan(lib, music, NULL, NULL) == gw_n);
         incremental += library_scan_groups(lib) == 1;
-        CHECK(db_int(db, "SELECT (SELECT COUNT(*) FROM tracks WHERE search IS NULL) + (SELECT COUNT(*) FROM albums"
+        CHECK(t_db_int(db, "SELECT (SELECT COUNT(*) FROM tracks WHERE search IS NULL) + (SELECT COUNT(*) FROM albums"
                          " WHERE search IS NULL) + (SELECT COUNT(*) FROM artists WHERE search IS NULL)") == 0);   /* (all findable) */
         char *before = groups_text(db);
         library_test_rebuild_groups(lib);
@@ -889,7 +829,7 @@ static void test_groups_where_changed(const char *dir)
  * next open builds the indexes before anything else. */
 static int64_t track_indexes(const char *db)
 {
-    return db_int(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='tracks' AND sql IS NOT NULL");
+    return t_db_int(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='tracks' AND sql IS NOT NULL");
 }
 
 static void test_bulk_load(const char *dir)
@@ -917,7 +857,7 @@ static void test_bulk_load(const char *dir)
     CHECK(lib && track_indexes(db) == want);
     CHECK(library_scan(lib, music, NULL, NULL) == 60);
     CHECK(track_indexes(db) == want);                                /* all back */
-    CHECK(db_int(db, "SELECT COUNT(*) FROM sqlite_master WHERE name='bulk_idx'") == 0);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM sqlite_master WHERE name='bulk_idx'") == 0);
     CHECK(library_check_plans(lib, NULL) == 0 && library_upgrade_needed(db) == 0);
     library_close(lib);
     char *bulk = groups_text(db);
@@ -938,7 +878,14 @@ static void test_bulk_load(const char *dir)
     CHECK(job.lib != NULL);
     job_run(&job);
     CHECK(job.result == -1);
-    CHECK(track_indexes(db3) == 0 && db_int(db3, "SELECT COUNT(*) FROM bulk_idx") == want);
+    CHECK(track_indexes(db3) == 0 && t_db_int(db3, "SELECT COUNT(*) FROM bulk_idx") == want);
+    /* a song ends while that first scan is still going: its play is written by
+     * the library's own thread, whose connection leaves the indexes aside (as
+     * a whole library opened there, it built them over the half-filled table,
+     * and the rest of the scan paid for every one) */
+    library_played_later(job.lib, t_db_int(db3, "SELECT COALESCE(MIN(id), 1) FROM tracks"), 0, 1795000000);
+    library_plays_wait();
+    CHECK(track_indexes(db3) == 0 && t_db_int(db3, "SELECT COUNT(*) FROM bulk_idx") == want);
     library_close(job.lib);
     CHECK(library_upgrade_needed(db3) > 0);
     up_calls = 0;
@@ -946,9 +893,29 @@ static void test_bulk_load(const char *dir)
     lib = library_open(db3, art);
     library_set_upgrade_progress(NULL, NULL);
     CHECK(lib && track_indexes(db3) == want && up_calls == (int)want);
-    CHECK(db_int(db3, "SELECT COUNT(*) FROM sqlite_master WHERE name='bulk_idx'") == 0);
+    CHECK(t_db_int(db3, "SELECT COUNT(*) FROM sqlite_master WHERE name='bulk_idx'") == 0);
     CHECK(library_upgrade_needed(db3) == 0 && library_scan_unfinished(lib));
     CHECK(library_scan(lib, music, NULL, NULL) == 90 && library_check_plans(lib, NULL) == 0);   /* finished, not in bulk */
+    library_close(lib);
+    /* an index that can't be made at that open (the card full; here, one that
+     * names no table): the list of what is still to build is kept, the others
+     * are built, and the next open, with nothing in the way, finishes and drops it */
+    char db5[300];
+    snprintf(db5, sizeof db5, "%s/bulk-cut2.db", dir);
+    scan_job_t job2 = {.lib = library_open(db5, art), .music = music, .cancel_after = 2};
+    CHECK(job2.lib != NULL);
+    job_run(&job2);
+    library_close(job2.lib);
+    CHECK(t_db_int(db5, "SELECT COUNT(*) FROM bulk_idx") == want);
+    CHECK(t_db_exec(db5, "INSERT INTO bulk_idx(name, sql) VALUES('nope', 'CREATE INDEX nope ON no_such_table(x)')") == SQLITE_OK);
+    lib = library_open(db5, art);
+    CHECK(lib && track_indexes(db5) == want);
+    CHECK(t_db_int(db5, "SELECT COUNT(*) FROM sqlite_master WHERE name='bulk_idx'") == 1 && library_upgrade_needed(db5) > 0);
+    library_close(lib);
+    CHECK(t_db_exec(db5, "DELETE FROM bulk_idx WHERE name='nope'") == SQLITE_OK);
+    lib = library_open(db5, art);
+    CHECK(lib && track_indexes(db5) == want);
+    CHECK(t_db_int(db5, "SELECT COUNT(*) FROM sqlite_master WHERE name='bulk_idx'") == 0 && library_upgrade_needed(db5) == 0);
     library_close(lib);
     library_test_bulk_min(0);
 }
@@ -1019,11 +986,11 @@ static void test_groups_as_added(const char *dir)
     library_test_bulk_min(20);
     library_t *lib = library_open(db, art);
     CHECK(lib && library_scan(lib, music, NULL, NULL) == gw_n && library_scan_groups(lib) == 3);   /* (3: as added) */
-    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE path LIKE '%/C/junk.flac'") == 1);
-    CHECK(db_int(db, "SELECT (SELECT COUNT(*) FROM tracks WHERE search IS NULL) + (SELECT COUNT(*) FROM albums"
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM cues WHERE path LIKE '%/C/junk.flac'") == 1);
+    CHECK(t_db_int(db, "SELECT (SELECT COUNT(*) FROM tracks WHERE search IS NULL) + (SELECT COUNT(*) FROM albums"
                      " WHERE search IS NULL) + (SELECT COUNT(*) FROM artists WHERE search IS NULL)") == 0);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE album_id IS NULL OR artist_id IS NULL OR folder_id IS NULL") == 0);
-    CHECK(db_int(db, "SELECT value FROM meta WHERE key='scan_pending'") == 0);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE album_id IS NULL OR artist_id IS NULL OR folder_id IS NULL") == 0);
+    CHECK(t_db_int(db, "SELECT value FROM meta WHERE key='scan_pending'") == 0);
     CHECK(library_check_plans(lib, NULL) == 0 && track_indexes(db) >= 15);
     char *added = groups_text(db), *added_names = names_text(db);
     library_test_groups_plain(1);
@@ -1035,7 +1002,7 @@ static void test_groups_as_added(const char *dir)
     if (!same && added && all) first_diff("as added", added, all);
     /* a second scan: nothing to do (the unreadable file still noted, not read again) */
     CHECK(library_scan(lib, music, NULL, NULL) == gw_n && library_scan_changes(lib) == 0);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE path LIKE '%/C/junk.flac'") == 1);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM cues WHERE path LIKE '%/C/junk.flac'") == 1);
     library_close(lib);
     /* the same music scanned the way it was before */
     library_test_groups_direct(0);
@@ -1065,8 +1032,8 @@ static void test_groups_as_added(const char *dir)
     lib = library_open(db3, art);
     int n = lib ? library_scan(lib, music, NULL, NULL) : -1;
     CHECK(n >= gw_n + 1 && library_scan_groups(lib) == 2);
-    printf("groups as added: with a sheet, %d tracks (%lld from sheets)\n", n, (long long)db_int(db3, "SELECT COUNT(*) FROM tracks WHERE cue<>0"));
-    CHECK(db_int(db3, "SELECT COUNT(*) FROM tracks WHERE cue<>0") >= 2);
+    printf("groups as added: with a sheet, %d tracks (%lld from sheets)\n", n, (long long)t_db_int(db3, "SELECT COUNT(*) FROM tracks WHERE cue<>0"));
+    CHECK(t_db_int(db3, "SELECT COUNT(*) FROM tracks WHERE cue<>0") >= 2);
     char *cue = groups_text(db3);
     library_test_rebuild_groups(lib);
     char *cue_all = groups_text(db3);
@@ -1142,7 +1109,7 @@ static void test_known_files(const char *dir)
         if (!same && a && b) first_diff("names ticked off", a, b);
         sqlite3_free(a);
         sqlite3_free(b);
-        CHECK(db_int(db, "SELECT value FROM meta WHERE key='scan_sig'") == db_int(db2, "SELECT value FROM meta WHERE key='scan_sig'"));
+        CHECK(t_db_int(db, "SELECT value FROM meta WHERE key='scan_sig'") == t_db_int(db2, "SELECT value FROM meta WHERE key='scan_sig'"));
         if (!same) break;
     }
     /* stopped while reading new files, others removed: nothing dropped; the next scan drops them */
@@ -1152,7 +1119,7 @@ static void test_known_files(const char *dir)
     remove(gw_path[1]);
     scan_job_t stop = {.lib = lib, .music = music, .cancel_after = 2};
     CHECK(library_scan(lib, music, job_progress, &stop) == -1);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks") >= before);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks") >= before);
     CHECK(library_scan(lib, music, NULL, NULL) == gw_n - 2);
     /* a CUE sheet turns up: every file by name again (the sheet's file is looked for among them) */
     snprintf(path, sizeof path, "%s/A/whole.flac", music);
@@ -1166,7 +1133,7 @@ static void test_known_files(const char *dir)
     }
     int n = library_scan(lib, music, NULL, NULL);
     CHECK(n == gw_n - 2 + 2 && library_scan_held(lib) == gw_n - 2 + 1);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE cue<>0") == 2);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE cue<>0") == 2);
     CHECK(library_scan(lib, music, NULL, NULL) == n && library_scan_changes(lib) == 0);
     library_close(lib);
     library_close(old);
@@ -1211,8 +1178,8 @@ static void test_died_on(const char *dir)
     trying_write(notes, "tags", bad);
     lib = library_open(db2, art);
     CHECK(lib && library_scan(lib, music, NULL, NULL) == 5);
-    CHECK(db_int(db2, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%Died/003.flac'") == 0);
-    CHECK(db_int(db2, "SELECT COUNT(*) FROM cues WHERE path LIKE '%Died/003.flac' AND kind=3") == 1);
+    CHECK(t_db_int(db2, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%Died/003.flac'") == 0);
+    CHECK(t_db_int(db2, "SELECT COUNT(*) FROM cues WHERE path LIKE '%Died/003.flac' AND kind=3") == 1);
     CHECK(access(p, F_OK) != 0);
     /* ...and stays so while it's the same file, without being read again */
     CHECK(library_scan(lib, music, NULL, NULL) == 5 && library_scan_changes(lib) == 0);
@@ -1238,7 +1205,7 @@ static void at_start(int done, int total, const char *path, void *ctx)
     (void)total;
     at_start_t *a = ctx;
     if (path && (!strcmp(path, "looking") || !strcmp(path, "checking") || !strcmp(path, "sorting") || !strcmp(path, "working"))) return;
-    if (done == 1 && !a->calls++) a->seen = db_int(a->db, a->sql);   /* (before the first file is read) */
+    if (done == 1 && !a->calls++) a->seen = t_db_int(a->db, a->sql);   /* (before the first file is read) */
 }
 
 static void test_died_side_by_side(const char *dir)
@@ -1267,13 +1234,13 @@ static void test_died_side_by_side(const char *dir)
     if (write_flac(b, "Bad 5", "Some Artist", "Bad Album", 5)) exit(1);
     trying_write(notes, "tags", b);
     CHECK(library_scan(lib, music, NULL, NULL) == 6);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped'") == 2);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%Bad Album/00_.flac'") == 3);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped'") == 2);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%Bad Album/00_.flac'") == 3);
     /* a new file in another folder, once: tried again as ever (and it reads) */
     if (write_flac(c, "Fine 4", "Some Artist", "Fine Album", 4)) exit(1);
     trying_write(notes, "tags", c);
     CHECK(library_scan(lib, music, NULL, NULL) == 7);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3") == 2);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3") == 2);
     /* one named by a note but in the library as it is (the player stopped on
      * something else, after it): never set aside, here beside two that are */
     snprintf(p, sizeof p, "%s/Bad Album/001.flac", music);
@@ -1281,7 +1248,7 @@ static void test_died_side_by_side(const char *dir)
     snprintf(p, sizeof p, "%s/Fine Album/005.flac", music);
     if (write_flac(p, "Fine 5", "Some Artist", "Fine Album", 5)) exit(1);
     CHECK(library_scan(lib, music, NULL, NULL) == 8);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3") == 2);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3") == 2);
     /* and both stay aside at later scans, unread, with nothing written */
     CHECK(library_scan(lib, music, NULL, NULL) == 8 && library_scan_changes(lib) == 0);
     /* a file that simply can't be read isn't one the player stopped on */
@@ -1289,7 +1256,7 @@ static void test_died_side_by_side(const char *dir)
     FILE *f = fopen(p, "wb");
     if (f) { fputs("not a flac at all", f); fclose(f); }
     CHECK(library_scan(lib, music, NULL, NULL) == 8);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet IS NULL") == 1);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet IS NULL") == 1);
     CHECK(library_unread_count(lib) == 3);
     char got[400] = "";
     CHECK(library_unread(lib, 0, got, sizeof got) == 0 && !strcmp(got, a));
@@ -1344,7 +1311,7 @@ static void test_retry_unread(const char *dir)
     CHECK(lib && library_scan(lib, music, NULL, NULL) == 3);
     CHECK(library_unread_count(lib) == 2);
     /* one of them as a file a reader stopped on */
-    CHECK(db_exec(db, "UPDATE cues SET sheet='stopped' WHERE path LIKE '%stopped.flac'") == SQLITE_OK);
+    CHECK(t_db_exec(db, "UPDATE cues SET sheet='stopped' WHERE path LIKE '%stopped.flac'") == SQLITE_OK);
     /* both now good files, of the same date and size: an ordinary scan leaves them out still */
     same_size_file(later, good, when);
     same_size_file(stopped, good, when);
@@ -1354,13 +1321,13 @@ static void test_retry_unread(const char *dir)
      * stopped on stays out (no helper here to take its place) */
     library_scan_retry_unread(lib, 1);
     CHECK(library_scan(lib, music, NULL, NULL) == 4);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%Retry/later.flac' AND title='Late One'") == 1);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%Retry/later.flac' AND title='Late One'") == 1);
     CHECK(library_unread_count(lib) == 1);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped' AND path LIKE '%stopped.flac'") == 1);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped' AND path LIKE '%stopped.flac'") == 1);
     /* asked of that one scan only: the next is an ordinary one, and writes nothing */
     CHECK(library_scan(lib, music, NULL, NULL) == 4 && library_scan_changes(lib) == 0);
     /* and with nothing to try again, a scan asked to is as quick as any (nothing changed) */
-    CHECK(db_exec(db, "DELETE FROM cues WHERE kind=3") == SQLITE_OK);
+    CHECK(t_db_exec(db, "DELETE FROM cues WHERE kind=3") == SQLITE_OK);
     unlink(stopped);
     CHECK(library_scan(lib, music, NULL, NULL) == 4);
     library_scan_retry_unread(lib, 1);
@@ -1495,7 +1462,7 @@ static void test_reset_on(const char *dir)
     if (f) { fwrite(bad, 1, strlen(bad) + 1, f); fclose(f); }
     lib = library_open(db, art);
     CHECK(lib && library_scan(lib, music, NULL, NULL) == 29);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped' AND path LIKE '%Reset/007.flac'") == 1);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped' AND path LIKE '%Reset/007.flac'") == 1);
     CHECK(access(mark, F_OK) != 0 && access(once, F_OK) != 0);
     library_close(lib);
     /* the player died (its note in RAM) with a careful run's mark on the card:
@@ -1536,18 +1503,27 @@ static void test_check_and_import(const char *dir)
     }
     library_t *lib = library_open(db, art);
     CHECK(lib && library_scan(lib, music, NULL, NULL) == 240 && library_check(lib) == 0);
+    {   /* a check that couldn't be made (no memory for it at that moment) says
+         * nothing about the file: not "damaged", which sets the library aside
+         * and reads the whole card again at the next start */
+        library_test_check_fails(SQLITE_NOMEM);
+        CHECK(lib && library_check(lib) == 0);
+        library_test_check_fails(SQLITE_CORRUPT);                /* (the file's own word that it is damaged: that is) */
+        CHECK(lib && library_check(lib) == -1);
+        CHECK(lib && library_check(lib) == 0);                   /* (and the real check again) */
+    }
     library_close(lib);                                          /* (its log emptied into the file) */
-    CHECK(db_exec(db, "UPDATE tracks SET play_count=7, last_played=1700000000, favourite=1 WHERE path LIKE '%Check 03/005.flac';"
+    CHECK(t_db_exec(db, "UPDATE tracks SET play_count=7, last_played=1700000000, favourite=1 WHERE path LIKE '%Check 03/005.flac';"
                       "UPDATE tracks SET skip_count=2, resume_ms=61000 WHERE path LIKE '%Check 07/001.flac';"
                       "INSERT INTO plays(track_id, at) SELECT id, 1700000000 FROM tracks WHERE path LIKE '%Check 03/005.flac'") == SQLITE_OK);
     /* a new library of the same music: what was played comes over by path */
     lib = library_open(db2, art);
     CHECK(lib && library_scan(lib, music, NULL, NULL) == 240);
     CHECK(library_import_counts(lib, db) == 2);
-    CHECK(db_int(db2, "SELECT play_count*1000 + favourite FROM tracks WHERE path LIKE '%Check 03/005.flac'") == 7001);
-    CHECK(db_int(db2, "SELECT skip_count*100000 + resume_ms FROM tracks WHERE path LIKE '%Check 07/001.flac'") == 261000);
-    CHECK(db_int(db2, "SELECT COUNT(*) FROM plays p JOIN tracks t ON t.id=p.track_id WHERE t.path LIKE '%Check 03/005.flac'") == 1);
-    CHECK(db_int(db2, "SELECT COUNT(*) FROM tracks WHERE play_count>0 OR skip_count>0 OR favourite=1") == 2);
+    CHECK(t_db_int(db2, "SELECT play_count*1000 + favourite FROM tracks WHERE path LIKE '%Check 03/005.flac'") == 7001);
+    CHECK(t_db_int(db2, "SELECT skip_count*100000 + resume_ms FROM tracks WHERE path LIKE '%Check 07/001.flac'") == 261000);
+    CHECK(t_db_int(db2, "SELECT COUNT(*) FROM plays p JOIN tracks t ON t.id=p.track_id WHERE t.path LIKE '%Check 03/005.flac'") == 1);
+    CHECK(t_db_int(db2, "SELECT COUNT(*) FROM tracks WHERE play_count>0 OR skip_count>0 OR favourite=1") == 2);
     CHECK(library_import_counts(lib, "/no/such/file.db") <= 0);  /* (nothing to bring: no harm) */
     library_close(lib);
     /* a file with a stretch of it overwritten (a card's bad write): found damaged */
@@ -1572,7 +1548,7 @@ static void test_check_and_import(const char *dir)
     char one[300], db4[300];
     snprintf(one, sizeof one, "%s/check-one.db", dir);
     snprintf(db4, sizeof db4, "%s/check-new2.db", dir);
-    CHECK(db_exec(db, "UPDATE tracks SET play_count=3") == SQLITE_OK);
+    CHECK(t_db_exec(db, "UPDATE tracks SET play_count=3") == SQLITE_OK);
     in = fopen(db, "rb");
     out = fopen(one, "wb");
     int hit = 0;
@@ -1591,15 +1567,446 @@ static void test_check_and_import(const char *dir)
     int got = library_import_counts(lib, one);
     printf("check: plays brought over from a file with a page lost: %d of 240\n", got);
     CHECK(got >= 100 && got < 240);
-    CHECK(db_int(db4, "SELECT COUNT(*) FROM tracks WHERE play_count=3") == got);
+    CHECK(t_db_int(db4, "SELECT COUNT(*) FROM tracks WHERE play_count=3") == got);
+    library_close(lib);
+    /* A library set aside: its plays are owed until a scan of the new one has
+     * finished, across restarts. The first scan cut short, the player started
+     * again: still owed, brought over once the music is all read, once. */
+    char db5[300], bad5[320], mark5[320], bad2[320];
+    snprintf(db5, sizeof db5, "%s/check-owed.db", dir);
+    snprintf(bad5, sizeof bad5, "%s.bad", db5);
+    snprintf(mark5, sizeof mark5, "%s.bad.owed", db5);
+    snprintf(bad2, sizeof bad2, "%s.bad2", db5);
+    lib = library_open(db5, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 240);
+    library_close(lib);
+    CHECK(t_db_exec(db5, "UPDATE tracks SET play_count=4, favourite=1 WHERE path LIKE '%Check 03/%'") == SQLITE_OK);
+    {   /* (a file that is no database at all: damaged; one that is, or isn't there: not known to be) */
+        char junk[300];
+        snprintf(junk, sizeof junk, "%s/check-junk.db", dir);
+        FILE *j = fopen(junk, "wb");
+        if (j) { for (int i = 0; i < 4096; i++) fputc(0x5a, j); fclose(j); }
+        CHECK(!library_file_damaged(db5) && library_file_damaged(junk) && !library_file_damaged("/no/such/file.db"));
+        CHECK(library_file_damaged(hurt));                       /* (a database still, a stretch of it overwritten) */
+    }
+    library_set_aside(db5);
+    CHECK(access(db5, F_OK) != 0 && access(bad5, F_OK) == 0 && access(mark5, F_OK) == 0);
+    scan_job_t cut = {.lib = library_open(db5, art), .music = music, .cancel_after = 2};
+    CHECK(cut.lib != NULL);
+    job_run(&cut);
+    CHECK(cut.result == -1 && library_import_owed(cut.lib) == 0 && access(mark5, F_OK) == 0);   /* (not all read: not yet) */
+    library_close(cut.lib);
+    lib = library_open(db5, art);                                /* (the next start) */
+    CHECK(lib && library_import_owed(lib) == 0 && access(mark5, F_OK) == 0);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 240);
+    CHECK(t_db_exec(db5, "UPDATE tracks SET play_count=1 WHERE path LIKE '%Check 03/001.flac'") == SQLITE_OK);   /* (played meanwhile) */
+    CHECK(lib && library_import_owed(lib) == 20 && access(mark5, F_OK) != 0);
+    CHECK(t_db_int(db5, "SELECT COUNT(*) FROM tracks WHERE play_count=4 AND favourite=1") == 19);
+    CHECK(t_db_int(db5, "SELECT play_count FROM tracks WHERE path LIKE '%Check 03/001.flac'") == 5);
+    CHECK(lib && library_import_owed(lib) == 0);                 /* (once) */
+    CHECK(t_db_int(db5, "SELECT SUM(play_count) FROM tracks") == 19 * 4 + 5);
+    library_close(lib);
+    /* set aside again while the first is still owed: the first is kept */
+    library_set_aside(db5);                                      /* (not owed any more: this one becomes .bad) */
+    CHECK(access(mark5, F_OK) == 0 && access(bad2, F_OK) != 0);
+    lib = library_open(db5, art);
+    library_close(lib);
+    int64_t first = t_db_int(bad5, "SELECT SUM(play_count) FROM tracks");
+    library_set_aside(db5);
+    CHECK(access(bad2, F_OK) == 0 && t_db_int(bad5, "SELECT SUM(play_count) FROM tracks") == first && first == 19 * 4 + 5);
+}
+
+/* ---- a playlist whose file can't be read just now stays ----
+ * As it was, under its number, until it reads again. (It went with the
+ * playlists that are gone, and came back at the next scan as a new one.) */
+static void test_playlist_unread(const char *dir)
+{
+    char music[300], db[300], art[300], list[400];
+    snprintf(music, sizeof music, "%s/pumusic", dir);
+    mkdir(music, 0755);
+    snprintf(db, sizeof db, "%s/pu.db", dir);
+    snprintf(art, sizeof art, "%s/pu-art", dir);
+    make_album(music, "One", 3);
+    snprintf(list, sizeof list, "%s/mine.m3u8", music);
+    FILE *f = fopen(list, "wb");
+    if (f) { fputs("One/001.flac\nOne/003.flac\n", f); fclose(f); }
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 3);
+    int64_t id = t_db_int(db, "SELECT id FROM playlists WHERE name='mine'");
+    CHECK(id > 0 && t_db_int(db, "SELECT COUNT(*) FROM playlist_items") == 2);
+    if (geteuid() != 0) {                                        /* (root reads a file whatever its mode) */
+        struct timeval tv[2] = {{1700000300, 0}, {1700000300, 0}};
+        utimes(list, tv);
+        chmod(list, 0);
+        CHECK(library_scan(lib, music, NULL, NULL) == 3);
+        CHECK(t_db_int(db, "SELECT id FROM playlists WHERE name='mine'") == id);
+        CHECK(t_db_int(db, "SELECT COUNT(*) FROM playlist_items") == 2);
+        chmod(list, 0644);
+        CHECK(library_scan(lib, music, NULL, NULL) == 3);
+        CHECK(t_db_int(db, "SELECT id FROM playlists WHERE name='mine'") == id);
+        CHECK(t_db_int(db, "SELECT COUNT(*) FROM playlist_items") == 2);
+    }
+    library_close(lib);
+}
+
+/* ---- the folders' counts at a connection's second full rebuild ----
+ * Written again each time: the first rebuild left its work table behind (a
+ * statement of its own still open when it was dropped), the second couldn't
+ * make it and stopped before the counts. */
+static void test_folder_counts_again(const char *dir)
+{
+    char music[300], db[300], art[300];
+    snprintf(music, sizeof music, "%s/fcmusic", dir);
+    mkdir(music, 0755);
+    snprintf(db, sizeof db, "%s/fc.db", dir);
+    snprintf(art, sizeof art, "%s/fc-art", dir);
+    make_album(music, "One", 4);
+    make_album(music, "Two", 2);                     /* (two folders: with one, it is the tree's top itself) */
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 6);
+    library_test_rebuild_groups(lib);
+    CHECK(t_db_int(db, "SELECT ntracks FROM folders WHERE name='One'") == 4);
+    make_album(music, "Three", 3);
+    CHECK(library_scan(lib, music, NULL, NULL) == 9);
+    CHECK(t_db_exec(db, "UPDATE folders SET ntracks=99") == SQLITE_OK);   /* (whatever they were: to be written) */
+    library_test_rebuild_groups(lib);
+    CHECK(t_db_int(db, "SELECT ntracks FROM folders WHERE name='One'") == 4);
+    CHECK(t_db_int(db, "SELECT ntracks FROM folders WHERE name='Three'") == 3);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM folders WHERE ntracks=99") == 0);
+    library_close(lib);
+}
+
+/* ---- what can't be read or looked up for a moment is not gone ----
+ * An album in one file, split by its sheet, with plays. Its file changed and
+ * can't be read just now; its sheet changed and can't be read just now; a
+ * lookup in the library failing during a scan: each time the tracks stay, with
+ * their plays, and are read again when they can be. (Each of the three dropped
+ * them: the next scan made them again as new songs, or left the file as one
+ * long track.) */
+static void test_unread_is_not_gone(const char *dir)
+{
+    char music[300], db[300], art[300], whole[400], sheet[400], other[400];
+    snprintf(music, sizeof music, "%s/umusic", dir);
+    mkdir(music, 0755);
+    snprintf(db, sizeof db, "%s/unread.db", dir);
+    snprintf(art, sizeof art, "%s/unread-art", dir);
+    make_album(music, "Plain", 3);
+    snprintf(other, sizeof other, "%s/Plain/001.flac", music);
+    snprintf(whole, sizeof whole, "%s/Plain/whole.flac", music);
+    CHECK(write_flac(whole, "Whole", "Alpha", "Sheet", 1) == 0);
+    snprintf(sheet, sizeof sheet, "%s/Plain/whole.cue", music);
+    FILE *f = fopen(sheet, "wb");
+    if (f) {
+        fputs("PERFORMER \"Alpha\"\nTITLE \"Sheet\"\nFILE \"whole.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"First\"\n"
+              "    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Second\"\n    INDEX 01 00:00:01\n", f);
+        fclose(f);
+    }
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 5);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE cue<>0") == 2);
+    CHECK(t_db_exec(db, "UPDATE tracks SET play_count=5, favourite=1 WHERE cue<>0") == SQLITE_OK);
+    const char *kept = "SELECT COUNT(*) FROM tracks WHERE cue<>0 AND play_count=5 AND favourite=1";
+    int64_t ids = t_db_int(db, "SELECT SUM(id) FROM tracks WHERE cue<>0");
+    if (geteuid() != 0) {                                        /* (root reads a file whatever its mode) */
+        struct timeval tv[2] = {{1700000100, 0}, {1700000100, 0}};
+        /* the music file: changed, and not to be read */
+        utimes(whole, tv);
+        chmod(whole, 0);
+        CHECK(library_scan(lib, music, NULL, NULL) == 5);
+        CHECK(t_db_int(db, kept) == 2 && t_db_int(db, "SELECT SUM(id) FROM tracks WHERE cue<>0") == ids);
+        chmod(whole, 0644);
+        CHECK(library_scan(lib, music, NULL, NULL) == 5);
+        CHECK(t_db_int(db, kept) == 2 && t_db_int(db, "SELECT SUM(id) FROM tracks WHERE cue<>0") == ids);
+        /* the sheet: changed, and not to be read */
+        utimes(sheet, tv);
+        chmod(sheet, 0);
+        CHECK(library_scan(lib, music, NULL, NULL) == 5);
+        CHECK(t_db_int(db, kept) == 2 && t_db_int(db, "SELECT SUM(id) FROM tracks WHERE cue<>0") == ids);
+        CHECK(t_db_int(db, "SELECT mtime FROM cues WHERE kind=0") != 1700000100);   /* (not written down as read) */
+        chmod(sheet, 0644);
+        CHECK(library_scan(lib, music, NULL, NULL) == 5);
+        CHECK(t_db_int(db, kept) == 2 && t_db_int(db, "SELECT SUM(id) FROM tracks WHERE cue<>0") == ids);
+        CHECK(t_db_int(db, "SELECT mtime FROM cues WHERE kind=0") == 1700000100);
+    }
+    {   /* every lookup of a scan failing (a song changed, so there is one to run) */
+        struct timeval tv[2] = {{1700000200, 0}, {1700000200, 0}};
+        utimes(other, tv);
+        library_test_scan_lookups_fail(1);
+        library_scan(lib, music, NULL, NULL);
+        library_test_scan_lookups_fail(0);
+        CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks") == 5 && t_db_int(db, kept) == 2);
+        CHECK(t_db_int(db, "SELECT SUM(id) FROM tracks WHERE cue<>0") == ids);
+        CHECK(library_scan(lib, music, NULL, NULL) == 5 && t_db_int(db, kept) == 2);   /* (and the scan after it, whole) */
+    }
+    library_close(lib);
+}
+
+/* ---- a groups' pass that stops before its end makes nothing ----
+ * The passes over the songs that make albums, artists and folders, each
+ * stopped at every step in turn (the card not answering, no memory): the
+ * groups stay as they were, the scan is left unfinished, and the next one
+ * makes them, as a full rebuild would. (A pass that stopped was taken for one
+ * that ended: albums past that point without year or folder, their artists
+ * without a name, folders deleted, and the scan noted as done.) */
+static int gs_n;
+
+static void gs_retag(const char *song, int n)
+{
+    char album[32], artist[32];
+    snprintf(album, sizeof album, "Other %d", n);
+    snprintf(artist, sizeof artist, "New %d feat. Guest %d", n, n % 3);
+    CHECK(write_flac_tags(song, "Song", artist, n % 2 ? "Main" : "", album, n % 2 ? "Rock" : "Jazz", "Ravel", 1970 + n, 1) == 0);
+    struct timeval tv[2] = {{1700002000 + gs_n, 0}, {1700002000 + gs_n, 0}};
+    gs_n++;
+    utimes(song, tv);
+}
+
+/* a full rebuild on top changes nothing */
+static int gs_right(library_t *lib, const char *db)
+{
+    char *before = groups_text(db);
+    library_test_rebuild_groups(lib);
+    char *after = groups_text(db);
+    int same = before && after && !strcmp(before, after);
+    if (!same && before && after) first_diff("groups stopped", before, after);
+    sqlite3_free(before);
+    sqlite3_free(after);
+    return same;
+}
+
+static void test_groups_stopped(const char *dir)
+{
+    static const char *const folders[] = {"K", "K/L", "M", "N", "N/O"};
+    enum { N = 15 };
+    char music[300], db[300], art[300], song[N][400];
+    snprintf(music, sizeof music, "%s/gsmusic", dir);
+    mkdir(music, 0755);
+    snprintf(db, sizeof db, "%s/stopped.db", dir);
+    snprintf(art, sizeof art, "%s/stopped-art", dir);
+    for (int i = 0; i < N; i++) {
+        char d[400], album[32];
+        snprintf(d, sizeof d, "%s/%s", music, folders[i / 3]);
+        mkdir(d, 0755);
+        snprintf(song[i], sizeof song[i], "%s/%02d.flac", d, i);
+        snprintf(album, sizeof album, "Album %d", i / 3);
+        CHECK(write_flac_tags(song[i], "Song", i % 3 ? "Main" : "Main feat. Guest", "Main", album, "Rock", "Bach",
+                              1990 + i / 3, i % 3 + 1) == 0);
+    }
+    const char *sig = "SELECT value FROM meta WHERE key='scan_sig'";
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == N && !library_scan_unfinished(lib) && t_db_int(db, sig) != 0);
+    int at, bit = 0;
+    /* where songs changed: every step from one on failing, so the full rebuild after it too */
+    for (at = 1; at < 200; at++) {
+        gs_retag(song[at % N], at);
+        char *before = groups_text(db);
+        library_test_groups_fail(at);
+        CHECK(library_scan(lib, music, NULL, NULL) == N);
+        library_test_groups_fail(0);
+        if (!library_scan_unfinished(lib)) { sqlite3_free(before); break; }   /* (past the last step: a scan as any) */
+        char *after = groups_text(db);
+        int same = before && after && !strcmp(before, after);
+        CHECK(same);
+        if (!same && before && after) first_diff("stopped where changed", before, after);
+        sqlite3_free(before);
+        sqlite3_free(after);
+        CHECK(t_db_int(db, sig) == 0);
+        CHECK(library_scan(lib, music, NULL, NULL) == N && !library_scan_unfinished(lib) && t_db_int(db, sig) != 0);
+        CHECK(gs_right(lib, db));
+        if (!same) break;
+        bit++;
+    }
+    CHECK(bit >= 5 && gs_right(lib, db));
+    /* where songs changed: one step failing, and the full rebuild of the same scan puts it right */
+    for (at = 1, bit = 0; at < 200; at++) {
+        gs_retag(song[at % N], 300 + at);
+        library_test_groups_fail(-at);
+        CHECK(library_scan(lib, music, NULL, NULL) == N && !library_scan_unfinished(lib));
+        library_test_groups_fail(0);
+        int right = gs_right(lib, db);
+        CHECK(right);
+        if (library_scan_groups(lib) == 1 || !right) break;                   /* (1: past the last step) */
+        bit++;
+    }
+    CHECK(bit >= 5);
+    /* all of them (a scan before left them to do): made aside, then in place */
+    for (at = 1, bit = 0; at < 200; at++) {
+        CHECK(t_db_exec(db, "INSERT INTO meta(key, value) VALUES('scan_pending', 2)"
+                          " ON CONFLICT(key) DO UPDATE SET value=2") == SQLITE_OK);
+        char *before = groups_text(db);
+        library_test_groups_fail(at);
+        CHECK(library_scan(lib, music, NULL, NULL) == N);
+        library_test_groups_fail(0);
+        int unfinished = library_scan_unfinished(lib);
+        char *after = groups_text(db);
+        int same = before && after && !strcmp(before, after);
+        CHECK(same);
+        if (!same && before && after) first_diff("stopped, all of them", before, after);
+        sqlite3_free(before);
+        sqlite3_free(after);
+        if (!unfinished || !same) break;
+        CHECK(t_db_int(db, sig) == 0);
+        CHECK(library_scan(lib, music, NULL, NULL) == N && !library_scan_unfinished(lib) && t_db_int(db, sig) != 0);
+        bit++;
+    }
+    CHECK(bit >= 2 * N);                               /* (the songs' pass and the folders' pass, each step) */
+    /* ...and in place, each step (the rebuild a scan falls back to) */
+    for (at = 1; at <= 2 * N + 4; at++) {
+        char *before = groups_text(db);
+        library_test_groups_fail(at);
+        library_test_rebuild_groups(lib);
+        library_test_groups_fail(0);
+        char *after = groups_text(db);
+        int same = before && after && !strcmp(before, after);
+        CHECK(same);
+        if (!same && before && after) first_diff("stopped in place", before, after);
+        sqlite3_free(before);
+        sqlite3_free(after);
+        if (!same) break;
+    }
+    library_close(lib);
+    /* a library from before names were spelled as tagged, opened: its groups are made
+     * again then. Stopped: as they were, and the next scan's to do */
+    CHECK(t_db_exec(db, "PRAGMA user_version=3") == SQLITE_OK);
+    char *before = groups_text(db);
+    library_test_groups_fail(4);
+    lib = library_open(db, art);
+    library_test_groups_fail(0);
+    char *after = groups_text(db);
+    CHECK(lib && before && after && !strcmp(before, after));
+    if (before && after && strcmp(before, after)) first_diff("stopped at an upgrade", before, after);
+    CHECK(library_scan_unfinished(lib));
+    CHECK(library_scan(lib, music, NULL, NULL) == N && !library_scan_unfinished(lib) && gs_right(lib, db));
+    sqlite3_free(before);
+    sqlite3_free(after);
+    library_close(lib);
+}
+
+/* ---- a playlist whose matching or writing stops at a failed step is left as it was ----
+ * One playlist, its entries found each way (by path, a split file's tracks,
+ * the looser match, one not there), read again because its file changed, then
+ * because a song did: each step of that failing in turn (the card not
+ * answering, no memory), the playlist stays as it was, songs, date and all,
+ * the scan is not finished, and the next one reads it. (A failed lookup was
+ * "not in the library": the playlist written without the song, or cleared and
+ * not all put back, under the file's new date, so it stayed that way.) */
+static char *pl_text(const char *db, int dated)
+{
+    sqlite3 *raw = NULL;
+    sqlite3_stmt *q = NULL;
+    char *text = NULL;
+    if (sqlite3_open(db, &raw) == SQLITE_OK && sqlite3_prepare_v2(raw,
+            "SELECT CASE WHEN ?1 THEN p.mtime||' '||p.size||' ' ELSE '' END || p.id||' '||p.ntracks||' '||p.nmissing||':'"
+            " || COALESCE((SELECT group_concat(track_id, ',') FROM (SELECT track_id FROM playlist_items"
+            " WHERE playlist_id=p.id ORDER BY pos)), '') FROM playlists p WHERE p.name='mix'", -1, &q, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(q, 1, dated);
+        if (sqlite3_step(q) == SQLITE_ROW) text = sqlite3_mprintf("%s", (const char *)sqlite3_column_text(q, 0));
+    }
+    sqlite3_finalize(q);
+    sqlite3_close(raw);
+    return text;
+}
+
+static void pl_write(const char *path, int variant, int n)
+{
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fputs(variant ? "#EXTM3U\nPA/004.flac\nPA/whole.flac\nD:\\away\\PA\\001.flac\n#EXTINF:1,Some Artist - PA 2\nZ:\\renamed\\zzz.flac\n"
+                      : "#EXTM3U\nPA/001.flac\nPA/002.flac\nPA/whole.flac\nX:\\elsewhere\\PA\\003.flac\nmissing/none.flac\n", f);
+        fclose(f);
+    }
+    struct timeval tv[2] = {{1700003000 + n, 0}, {1700003000 + n, 0}};
+    utimes(path, tv);
+}
+
+static void test_playlists_stopped(const char *dir)
+{
+    char music[300], db[300], art[300], whole[400], sheet[400], mix[400], song[400];
+    snprintf(music, sizeof music, "%s/psmusic", dir);
+    mkdir(music, 0755);
+    snprintf(db, sizeof db, "%s/plstopped.db", dir);
+    snprintf(art, sizeof art, "%s/plstopped-art", dir);
+    make_album(music, "PA", 4);
+    snprintf(song, sizeof song, "%s/PA/003.flac", music);
+    snprintf(whole, sizeof whole, "%s/PA/whole.flac", music);
+    CHECK(write_flac(whole, "Whole", "Some Artist", "Sheet", 1) == 0);
+    snprintf(sheet, sizeof sheet, "%s/PA/whole.cue", music);
+    FILE *f = fopen(sheet, "wb");
+    if (f) {
+        fputs("PERFORMER \"Some Artist\"\nTITLE \"Sheet\"\nFILE \"whole.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"First\"\n"
+              "    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Second\"\n    INDEX 01 00:00:01\n", f);
+        fclose(f);
+    }
+    snprintf(mix, sizeof mix, "%s/mix.m3u8", music);
+    const char *sig = "SELECT value FROM meta WHERE key='scan_sig'";
+    library_t *lib = library_open(db, art);
+    char *want[2] = {NULL, NULL};                      /* the playlist as each of its two files makes it */
+    int n = 0;
+    for (int v = 1; v >= 0; v--) {
+        pl_write(mix, v, n++);
+        CHECK(lib && library_scan(lib, music, NULL, NULL) == 6 && t_db_int(db, sig) != 0);
+        want[v] = pl_text(db, 0);
+    }
+    CHECK(want[0] && want[1] && strcmp(want[0], want[1]));
+    CHECK(t_db_int(db, "SELECT ntracks*10 + nmissing FROM playlists WHERE name='mix'") == 51);
+    int at, bit = 0, v = 0;
+    /* its file changed (more steps than there are: past the last, a scan as any) */
+    for (at = 1; at <= 60; at++) {
+        char *before = pl_text(db, 1);
+        pl_write(mix, v = !v, n++);
+        library_test_playlists_fail(at);
+        CHECK(library_scan(lib, music, NULL, NULL) == 6);
+        library_test_playlists_fail(0);
+        char *after = pl_text(db, 1), *now = pl_text(db, 0);
+        int left = before && after && !strcmp(before, after) && t_db_int(db, sig) == 0;
+        int read = now && !strcmp(now, want[v]) && t_db_int(db, sig) != 0;
+        CHECK(left || read);                           /* as it was and to be read again, or read whole */
+        if (!left && !read) fprintf(stderr, "step %d: %s\n  was: %s\n  to be: %s\n", at, after, before, want[v]);
+        CHECK(t_db_int(db, "SELECT COUNT(*) FROM playlists") == 1);
+        CHECK(library_scan(lib, music, NULL, NULL) == 6 && t_db_int(db, sig) != 0);
+        sqlite3_free(now);
+        now = pl_text(db, 0);
+        CHECK(now && !strcmp(now, want[v]));
+        bit += left;
+        sqlite3_free(before);
+        sqlite3_free(after);
+        sqlite3_free(now);
+    }
+    CHECK(bit >= 20 && bit < 60);                      /* (the lookups, the pass of the looser match, the writes) */
+    /* a song changed: every playlist is matched again */
+    for (at = 1, bit = 0; at <= 60; at++) {
+        char *before = pl_text(db, 1);
+        CHECK(write_flac(song, "PA 3", "Some Artist", "PA", 3 + at) == 0);
+        /* (two seconds on each time: the H2's card is FAT, whose times go in twos. A
+         * second on was no change there every other round, and nothing was matched) */
+        struct timeval tv[2] = {{1700004000 + 2 * at, 0}, {1700004000 + 2 * at, 0}};
+        utimes(song, tv);
+        library_test_playlists_fail(at);
+        CHECK(library_scan(lib, music, NULL, NULL) == 6);
+        library_test_playlists_fail(0);
+        char *after = pl_text(db, 1);
+        CHECK(before && after && !strcmp(before, after));   /* (left as it was, or matched to the same) */
+        if (before && after && strcmp(before, after)) fprintf(stderr, "step %d: %s\n  was: %s\n", at, after, before);
+        sqlite3_free(before);
+        sqlite3_free(after);
+        int left = library_scan_unfinished(lib);
+        CHECK(left ? t_db_int(db, sig) == 0 : t_db_int(db, sig) != 0);
+        CHECK(library_scan(lib, music, NULL, NULL) == 6 && !library_scan_unfinished(lib) && t_db_int(db, sig) != 0);
+        char *now = pl_text(db, 0);
+        CHECK(now && !strcmp(now, want[v]));
+        sqlite3_free(now);
+        bit += left;
+    }
+    CHECK(bit >= 20 && bit < 60);
+    sqlite3_free(want[0]);
+    sqlite3_free(want[1]);
     library_close(lib);
 }
 
 int main(void)
 {
     char dir[200];
-    test_tmp(dir, sizeof dir, "fathom-test-scan");
-    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    t_mkdtemp(dir, sizeof dir, "fathom-test-scan");
     test_open_and_levelling(dir);
     test_scans(dir);
     test_playlist_during_scan(dir);
@@ -1613,8 +2020,11 @@ int main(void)
     test_retry_unread(dir);
     test_progress_told(dir);
     test_reset_on(dir);
+    test_playlist_unread(dir);
+    test_folder_counts_again(dir);
+    test_unread_is_not_gone(dir);
+    test_groups_stopped(dir);
+    test_playlists_stopped(dir);
     test_check_and_import(dir);
-    if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
-    printf("scan: all good\n");
-    return 0;
+    return t_result();
 }

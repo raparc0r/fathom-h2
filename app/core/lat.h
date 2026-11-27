@@ -14,12 +14,7 @@
 #include <time.h>
 #include <unistd.h>
 
-static inline uint32_t lat_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000);
-}
+#include "core/clock.h"
 
 static inline int lat_on(void)
 {
@@ -28,6 +23,6 @@ static inline int lat_on(void)
     return on;
 }
 
-#define LAT(...) do { if (lat_on()) { fprintf(stderr, "lat %u: ", lat_ms()); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+#define LAT(...) do { if (lat_on()) { fprintf(stderr, "lat %u: ", clock_ms32()); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
 #endif

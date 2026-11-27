@@ -5,6 +5,7 @@
  * Q31, coefficients Q30, sums 64-bit (MIPS madd). The filters are designed in
  * floating point once; the 48 <-> 44.1 kHz table is designed once per process. */
 #include "audio/btconv.h"
+#include "audio/pcm.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -60,24 +61,30 @@ static double bessel_i0(double x)
     return s;
 }
 
-/* Taps a Kaiser low-pass needs at rate fs: flat to PASS_HZ, ATTEN_DB down from stop. */
-static int taps_for(double fs, double stop)
+/* What is kept flat of sound whose lowest rate on its way is `rate`: 20 kHz,
+ * or 0.45 of the rate where it can't carry that (32 kHz: to 14.4 kHz). With
+ * 20 kHz for every rate, a 32 kHz filter's stop band fell below its pass band:
+ * no filter came out, and 32 kHz sound couldn't play over Bluetooth. */
+static double pass_for(double rate) { return rate / 2 > PASS_HZ ? PASS_HZ : 0.45 * rate; }
+
+/* Taps a Kaiser low-pass needs at rate fs: flat to pass, ATTEN_DB down from stop. */
+static int taps_for(double fs, double pass, double stop)
 {
-    double dw = 2 * M_PI * (stop - PASS_HZ) / fs;
+    double dw = 2 * M_PI * (stop - pass) / fs;
     return ((int)ceil((ATTEN_DB - 8) / (2.285 * dw)) + 1) | 1;
 }
 
-/* Kaiser-windowed sinc low-pass at rate fs, flat to PASS_HZ, ATTEN_DB down
+/* Kaiser-windowed sinc low-pass at rate fs, flat to pass, ATTEN_DB down
  * from stop: n taps (odd; taps_for(), or n_force) into h as Q30, scaled to
  * gain. Returns n. */
-static int lowpass(int32_t *h, int max, double fs, double stop, double gain, int n_force)
+static int lowpass(int32_t *h, int max, double fs, double pass, double stop, double gain, int n_force)
 {
-    int n = n_force ? n_force : taps_for(fs, stop);
+    int n = n_force ? n_force : taps_for(fs, pass, stop);
     if (n > max) n = max;
     n |= 1;
     if (n > max) n -= 2;
     double beta = 0.1102 * (ATTEN_DB - 8.7), i0b = bessel_i0(beta);
-    double fc = (PASS_HZ + stop) / 2 / fs, sum = 0;
+    double fc = (pass + stop) / 2 / fs, sum = 0;
     double *v = malloc((size_t)n * sizeof *v);
     if (!v) return 0;
     for (int i = 0; i < n; i++) {
@@ -90,11 +97,6 @@ static int lowpass(int32_t *h, int max, double fs, double stop, double gain, int
     for (int i = 0; i < n; i++) h[i] = (int32_t)lrint(v[i] / sum * gain * (double)(1 << Q));
     free(v);
     return n;
-}
-
-static inline int32_t sat32(int64_t v)
-{
-    return v > INT32_MAX ? INT32_MAX : v < INT32_MIN ? INT32_MIN : (int32_t)v;
 }
 
 /* The two inner loops. On MIPS32 the running sum stays in HI/LO (madd) for the
@@ -190,10 +192,10 @@ static const int32_t *rational_table(unsigned fam, unsigned link, int *L, int *M
             return cache[i].poly;
         }
     double fs = (double)fam * *L;                          /* the upsampled rate */
-    double lower = fam < link ? fam : link;
+    double lower = fam < link ? fam : link, pass = pass_for(lower);
     int max = *L * 96;
     int32_t *h = malloc((size_t)max * sizeof *h);
-    int n = h ? lowpass(h, max, fs, lower - PASS_HZ, *L, 0) : 0;
+    int n = h ? lowpass(h, max, fs, pass, lower - pass, *L, 0) : 0;
     int k = (n + *L - 1) / *L;
     int32_t *poly = n ? calloc((size_t)*L * k, sizeof *poly) : NULL;
     if (poly)
@@ -216,13 +218,13 @@ static const int32_t *rational_table(unsigned fam, unsigned link, int *L, int *M
     return poly;
 }
 
-static void hb_design(struct halfband *b, double fs)
+static void hb_design(struct halfband *b, double fs, double pass)
 {
     int32_t h[HB_TAPS];
-    int n = taps_for(fs, fs / 2 - PASS_HZ);
+    int n = taps_for(fs, pass, fs / 2 - pass);
     while ((n - 3) % 4) n += 2;                    /* 4m + 3: the outermost taps aren't zero */
     if (n > HB_TAPS) n = HB_TAPS - (HB_TAPS - 3) % 4;
-    n = lowpass(h, HB_TAPS, fs, fs / 2 - PASS_HZ, 1.0, n);
+    n = lowpass(h, HB_TAPS, fs, pass, fs / 2 - pass, 1.0, n);
     b->n = n;
     b->c = (n - 1) / 2;
     b->mid = h[b->c];
@@ -243,7 +245,7 @@ static int hb_run(struct halfband *b, const int32_t x[2], int32_t y[2])
     for (int ch = 0; ch < 2; ch++) {
         const int32_t *s = &b->hist[ch][b->pos];   /* the window, oldest first */
         int64_t acc = (int64_t)s[b->c] * b->mid + dot_sym(&s[b->c - 1], &s[b->c + 1], b->k, b->nk);
-        y[ch] = sat32(acc >> (Q - 1));             /* Q30 x Q30 back to Q31 */
+        y[ch] = pcm_sat32(acc >> (Q - 1));             /* Q30 x Q30 back to Q31 */
     }
     return 1;
 }
@@ -263,9 +265,10 @@ btconv_t *btconv_create(unsigned in_rate, int channels, unsigned link_rate)
     /* 1: halving stages. Each is a halfband (cutoff at a quarter of its input
      * rate: every other tap is zero, and the taps are symmetric). The last
      * stops at fam - 20 kHz, where aliases would land below 20 kHz; a first
-     * one (from 4 x fam) stops at 2 fam - 20 kHz, beyond what the last removes. */
-    if (c->factor == 4) hb_design(&c->hb[c->n_hb++], 4.0 * fam);
-    if (c->factor >= 2) hb_design(&c->hb[c->n_hb++], 2.0 * fam);
+     * one (from 4 x fam) stops at 2 fam - 20 kHz, beyond what the last removes.
+     * (20 kHz, or what fam can carry: pass_for.) */
+    if (c->factor == 4) hb_design(&c->hb[c->n_hb++], 4.0 * fam, pass_for(fam));
+    if (c->factor >= 2) hb_design(&c->hb[c->n_hb++], 2.0 * fam, pass_for(fam));
     /* 2 */
     if (fam != link_rate) {
         c->poly = rational_table(fam, link_rate, &c->L, &c->M, &c->K);
@@ -327,7 +330,7 @@ static inline int16_t to16(btconv_t *c, int32_t x)
 /* Sum of n Q31 samples times Q30 taps, back to Q31. */
 static inline int32_t fir(const int32_t *s, const int32_t *h, int n)
 {
-    return sat32(dot(s, h, n) >> Q);
+    return pcm_sat32(dot(s, h, n) >> Q);
 }
 
 /* Step 2 for one family-rate frame: outputs as many frames as fall due. */

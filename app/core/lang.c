@@ -3,6 +3,7 @@
 /* Translations of the UI (lang.h): an open-addressing hash table over one
  * buffer holding the file's text. */
 #include "core/lang.h"
+#include "core/hash.h"
 
 #include <dirent.h>
 #include <stdint.h>
@@ -18,12 +19,7 @@ static struct {
     int n;
 } L;
 
-static uint32_t hash(const char *s)
-{
-    uint32_t h = 2166136261u;                 /* FNV-1a */
-    while (*s) h = (h ^ (uint8_t)*s++) * 16777619u;
-    return h;
-}
+static uint32_t hash(const char *s) { return fnv32(FNV32_START, s, strlen(s)); }   /* FNV-1a */
 
 static void clear(void)
 {

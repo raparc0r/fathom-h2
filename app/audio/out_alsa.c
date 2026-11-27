@@ -20,6 +20,7 @@
 
 #include <sound/asound.h>
 
+#include "audio/alsa_hw.h"
 #include "audio/output.h"
 #include "audio/pcmring.h"
 #include "core/lat.h"
@@ -46,44 +47,6 @@ typedef struct {
 #define HIST_MAX_BYTES (256 * 1024)
 
 /* ---- hw_params helpers (what alsa-lib's snd_pcm_hw_params_any/set_* do) ---- */
-
-static struct snd_mask *hp_mask(struct snd_pcm_hw_params *p, int n)
-{
-    return &p->masks[n - SNDRV_PCM_HW_PARAM_FIRST_MASK];
-}
-
-static struct snd_interval *hp_int(struct snd_pcm_hw_params *p, int n)
-{
-    return &p->intervals[n - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
-}
-
-static void hp_any(struct snd_pcm_hw_params *p)
-{
-    memset(p, 0, sizeof *p);
-    for (int n = SNDRV_PCM_HW_PARAM_FIRST_MASK; n <= SNDRV_PCM_HW_PARAM_LAST_MASK; n++)
-        memset(hp_mask(p, n)->bits, 0xff, sizeof hp_mask(p, n)->bits);
-    for (int n = SNDRV_PCM_HW_PARAM_FIRST_INTERVAL; n <= SNDRV_PCM_HW_PARAM_LAST_INTERVAL; n++) {
-        struct snd_interval *i = hp_int(p, n);
-        i->min = 0;
-        i->max = UINT_MAX;
-    }
-    p->rmask = ~0u;
-    p->info = ~0u;
-}
-
-static void hp_mask_set(struct snd_pcm_hw_params *p, int n, unsigned v)
-{
-    struct snd_mask *m = hp_mask(p, n);
-    memset(m->bits, 0, sizeof m->bits);
-    m->bits[v >> 5] |= 1u << (v & 31);
-}
-
-static void hp_int_set(struct snd_pcm_hw_params *p, int n, unsigned v)
-{
-    struct snd_interval *i = hp_int(p, n);
-    i->min = i->max = v;
-    i->integer = 1;
-}
 
 /* ---- the output ---- */
 
@@ -231,8 +194,7 @@ static int a_open(void *ctx, const audio_format_t *fmt)
     a->lat_thr = sp.start_threshold;
     a->lat_queued = 0;
     sp.xfer_align = 1;
-    unsigned long boundary = a->buffer;
-    while (boundary * 2 <= LONG_MAX - a->buffer) boundary *= 2;
+    unsigned long boundary = alsa_boundary(a->buffer);
     sp.boundary = boundary;
     /* Zero each part of the ring as soon as it has played. Stopping (drain,
      * underrun) is only noticed at the next period interrupt, and until then

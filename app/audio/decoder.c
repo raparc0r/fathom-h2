@@ -590,6 +590,8 @@ static long fetch_text(decoder_t *d, const char *url, char *buf, size_t cap)
     AVDictionary *opt = NULL;
     av_dict_set(&opt, "rw_timeout", NET_TIMEOUT, 0);
     av_dict_set(&opt, "user_agent", NET_UA, 0);
+    /* (only the network, as net/http.c: a playlist's address is what a server said) */
+    av_dict_set(&opt, "protocol_whitelist", "http,https,tls,tcp,httpproxy", 0);
     ff_tls_options(&opt);
     LAT("decoder: fetching %s", url);
     int r = avio_open2(&pb, url, AVIO_FLAG_READ, &icb, &opt);

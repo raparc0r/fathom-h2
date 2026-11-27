@@ -2,6 +2,7 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Crossfeed for headphones: Bauer's filter in whole numbers (crossfeed.h). */
 #include "audio/crossfeed.h"
+#include "audio/pcm.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -76,11 +77,6 @@ void crossfeed_reset(crossfeed_t *x)
 int crossfeed_level(const crossfeed_t *x) { return x ? x->level : XF_OFF; }
 unsigned crossfeed_rate(const crossfeed_t *x) { return x ? x->rate : 0; }
 
-static inline int32_t sat(int64_t v)
-{
-    return v > INT32_MAX ? INT32_MAX : v < INT32_MIN ? INT32_MIN : (int32_t)v;
-}
-
 /* (a product sum, rounded back to the samples' scale) */
 static inline int64_t back(int64_t acc) { return (acc + (1LL << (Q - 1))) >> Q; }
 static inline int64_t back28(int64_t acc) { return (acc + (1LL << 27)) >> 28; }
@@ -93,16 +89,20 @@ void crossfeed_run(crossfeed_t *x, int32_t *buf, long n)
      * every product below fits 64 (Q30 x 33 bits, Q28 x 34 bits). */
     int64_t lo0 = x->lo[0], lo1 = x->lo[1], hi0 = x->hi[0], hi1 = x->hi[1];
     int32_t p0 = x->prev[0], p1 = x->prev[1];
+    /* (the coefficients in locals, as the equalizer has its own: read through
+     * x in the loop, each had to be read again after every store to buf, which
+     * the compiler can't tell from them) */
+    const int32_t a0_lo = x->a0_lo, b1_lo = x->b1_lo, a0_hi = x->a0_hi, a1_hi = x->a1_hi, b1_hi = x->b1_hi, gain = x->gain;
     for (long i = 0; i < n; i++) {
         int32_t l = buf[2 * i], r = buf[2 * i + 1];
-        lo0 = back((int64_t)x->a0_lo * l + (int64_t)x->b1_lo * lo0);
-        lo1 = back((int64_t)x->a0_lo * r + (int64_t)x->b1_lo * lo1);
-        hi0 = back((int64_t)x->a0_hi * l + (int64_t)x->a1_hi * p0 + (int64_t)x->b1_hi * hi0);
-        hi1 = back((int64_t)x->a0_hi * r + (int64_t)x->a1_hi * p1 + (int64_t)x->b1_hi * hi1);
+        lo0 = back((int64_t)a0_lo * l + (int64_t)b1_lo * lo0);
+        lo1 = back((int64_t)a0_lo * r + (int64_t)b1_lo * lo1);
+        hi0 = back((int64_t)a0_hi * l + (int64_t)a1_hi * p0 + (int64_t)b1_hi * hi0);
+        hi1 = back((int64_t)a0_hi * r + (int64_t)a1_hi * p1 + (int64_t)b1_hi * hi1);
         p0 = l;
         p1 = r;
-        buf[2 * i] = sat(back28((int64_t)x->gain * (hi0 + lo1)));
-        buf[2 * i + 1] = sat(back28((int64_t)x->gain * (hi1 + lo0)));
+        buf[2 * i] = pcm_sat32(back28((int64_t)gain * (hi0 + lo1)));
+        buf[2 * i + 1] = pcm_sat32(back28((int64_t)gain * (hi1 + lo0)));
     }
     x->lo[0] = lo0; x->lo[1] = lo1; x->hi[0] = hi0; x->hi[1] = hi1; x->prev[0] = p0; x->prev[1] = p1;
 }

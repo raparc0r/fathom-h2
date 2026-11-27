@@ -4,6 +4,7 @@
 #define _GNU_SOURCE                    /* pipe2 */
 #endif
 #include "reader.h"
+#include "core/clock.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -128,20 +129,13 @@ static int write_all(int fd, const void *p, size_t n)
     return 0;
 }
 
-static long now_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
 /* n bytes by `deadline`: 0; -1 the helper is gone (or sent nonsense); -2
  * time's up; -4 *stop was set meanwhile (looked at 5 times a second) */
 static int read_all(int fd, void *p, size_t n, long deadline, const volatile int *stop)
 {
     unsigned char *b = p;
     while (n) {
-        long left = deadline - now_ms();
+        long left = (long)(deadline - clock_ms());
         if (stop && *stop) return -4;
         if (left <= 0) return -2;
         if (stop && left > 200) left = 200;
@@ -172,7 +166,7 @@ static int ask_locked(int op, const char *path, long budget_kb, int timeout_ms, 
         stop_locked(1, "gone before it was asked");
         return -1;
     }
-    long deadline = now_ms() + timeout_ms;
+    long deadline = (long)(clock_ms() + timeout_ms);
     int32_t reply[2];
     int r = read_all(g_from, reply, sizeof reply, deadline, stop);
     unsigned char *b = NULL;
@@ -276,6 +270,19 @@ static void limit_memory(long budget_kb)
     setrlimit(RLIMIT_AS, &rl);
 }
 
+/* n bytes of the player's request: 0, or -1 (it closed its end, or is gone) */
+static int read_request(void *p, size_t n)
+{
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = read(0, (char *)p + got, n - got);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return -1;
+        got += (size_t)r;
+    }
+    return 0;
+}
+
 int reader_serve(reader_fn fn)
 {
     /* The answers go out on what was stdout; anything else this program or
@@ -290,21 +297,9 @@ int reader_serve(reader_fn fn)
     if (!path) return 1;
     for (;;) {
         int32_t head[3];
-        size_t got = 0;
-        while (got < sizeof head) {
-            ssize_t r = read(0, (char *)head + got, sizeof head - got);
-            if (r < 0 && errno == EINTR) continue;
-            if (r <= 0) { free(path); return 0; }      /* the player closed it, or is gone */
-            got += (size_t)r;
-        }
+        if (read_request(head, sizeof head)) { free(path); return 0; }      /* the player closed it, or is gone */
         if (head[1] < 0 || head[1] >= PATH_MAX_SENT) { free(path); return 1; }
-        got = 0;
-        while (got < (size_t)head[1]) {
-            ssize_t r = read(0, path + got, (size_t)head[1] - got);
-            if (r < 0 && errno == EINTR) continue;
-            if (r <= 0) { free(path); return 0; }
-            got += (size_t)r;
-        }
+        if (read_request(path, (size_t)head[1])) { free(path); return 0; }
         path[head[1]] = '\0';
         limit_memory(head[2]);
         unsigned char *b = NULL;

@@ -37,6 +37,7 @@
 
 #include <zlib.h>
 
+#include "core/clock.h"
 #include "net/radiodir.h"
 #include "net/radioicon.h"
 #include "player/radio.h"
@@ -79,12 +80,7 @@ static void died(int sig)
 void __asan_on_error(void);
 void __asan_on_error(void) { say_case("a bad read or write"); }
 
-static double now_ms(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
-}
+static double now_ms(void) { return clock_fsec() * 1e3; }
 
 /* ---------- the same numbers every time ---------- */
 

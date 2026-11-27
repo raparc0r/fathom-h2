@@ -8,14 +8,11 @@
 # no network, and no real waiting.
 #   sh tests/test_fathom_ntp.sh        (in the build container too: docker/run.sh sh tests/test_fathom_ntp.sh)
 set -u
-here=$(cd "$(dirname "$0")/.." && pwd)
-SRC=${SRC:-$here/buildroot/external/board/h2/rootfs-overlay}
-T=$(mktemp -d)
+. "$(dirname "$0")/lib.sh"
 mkdir -p $T/run $T/st $T/bin
 sed -e "s#^RUN=.*#RUN=$T/run#" -e "s#^CARRIER=.*#CARRIER=$T/carrier#" \
     $SRC/usr/share/udhcpc/default.script.d/fathom-ntp > $T/hook
 chmod +x $T/hook
-SLEEP=$(command -v sleep)
 # ntpd: answers once st/answer_after tries have gone unanswered (none: never)
 cat > $T/bin/ntpd <<X
 #!/bin/sh
@@ -38,12 +35,8 @@ chmod +x $T/bin/*
 export PATH=$T/bin:$PATH
 LOCK=$T/run/fathom-ntp.lock
 
-ok=0; bad=0
-check() { if eval "$2"; then echo "ok   $1"; ok=$((ok+1)); else echo "FAIL $1"; bad=$((bad+1)); fi; }
-# until $1 holds (a few seconds at most)
-until_() { i=0; while ! eval "$1" && [ $i -lt 200 ]; do $SLEEP 0.02; i=$((i+1)); done; }
+UNTIL_TRIES=200       # (until_: a few seconds at most)
 fresh() { until_ '[ ! -d $LOCK ]'; rm -rf $T/st/* $T/run/*; }
-lines() { [ -f "$1" ] && tr '\n' ' ' < "$1" | sed 's/ $//'; }
 
 # 1. An answer at once: the clock set, the player told, nothing waiting
 echo 1 > $T/carrier; echo 0 > $T/st/answer_after
@@ -126,5 +119,4 @@ check "a stale lock: tried anyway" '[ -s $T/run/fathom-clock ]'
 
 until_ '[ ! -d $LOCK ] && ! kill -0 $pid 2>/dev/null'
 rm -rf $T
-echo "$ok passed, $bad failed"
-[ $bad -eq 0 ]
+finish

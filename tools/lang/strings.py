@@ -19,14 +19,22 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SOURCES = ['app/ui/ui.c', 'app/net/radiodir.c', 'device/main.c', 'device/bt.c', 'device/wifi.c',
-           'device/share.c', 'device/ssh.c']
+SOURCES = ['app/ui/ui_internal.h', 'app/ui/ui.c', 'app/ui/ui_graphs.c', 'app/ui/sound_text.h', 'app/net/radiodir.c',
+           # (fathom-player's own pieces: main.c and the files cut out of it)
+           'device/main.c', 'device/early.c', 'device/output.c', 'device/usbmode.c', 'device/clockset.c',
+           'device/updates.c', 'device/radiohooks.c', 'device/power.c', 'device/bgscan.c', 'device/packs.c',
+           'device/levelling.c',
+           'device/bt.c', 'device/wifi.c', 'device/share.c', 'device/ssh.c']
 # Sources whose other strings are SQL, logs or file formats: only the texts on
 # a line that translates (or, in the updater, says why an update failed)
-TR_ONLY = ['app/library/library.c', 'app/net/update.c', 'app/net/netclock.c', 'device/updater.c', 'app/sys/hibyupt.c', 'app/sys/uninstall.c']
+TR_ONLY = ['app/library/library.c', 'app/net/update.c', 'app/net/packfetch.c', 'app/net/netclock.c', 'device/updater.c', 'app/sys/hibyupt.c',
+           'app/sys/uninstall.c']
 TRANSLATES = re.compile(r'\b(tr|tr_fill|tr_num|N_|fail_locked)\(')
 PRINTF = re.compile(r'%[-+ #0]*\d*(\.\d+)?(hh|h|ll|l|z)?[diouxXeEfgGcp%\[]')
 LITERAL = re.compile(r'"((?:[^"\\\n]|\\.)*)"')
+# A piece of a source kept in a file of its own (#include "ui/ui_show.inc"): read
+# where it is included, so its texts stay where they were in the list
+PIECE = re.compile(r'\s*#include "(\w+/\w+\.inc)"')
 
 
 def decode(lit):
@@ -114,14 +122,46 @@ def code_of(line):
     return ''.join(out)
 
 
+def lines_of(rel):
+    """A source's lines, each piece of it (PIECE) in its place."""
+    path = os.path.join(ROOT, rel)
+    if not os.path.exists(path):
+        return
+    for line in open(path, encoding='utf-8'):
+        piece = PIECE.match(line)
+        if piece:
+            yield from lines_of(os.path.join('app', piece.group(1)))
+        else:
+            yield line
+
+
+def statements(rel):
+    """A source's lines without their comments, a text written as two or more
+    literals on lines that follow each other ("... charging" then " and not
+    playing.") joined into the one text the program holds: each half was
+    listed by itself, and neither is what the player looks up. (Not a text
+    of several lines, each ending in \\n: those are looked up line by line.)"""
+    held = None
+    for line in lines_of(rel):
+        code = code_of(line).rstrip()
+        if held is not None:
+            if code.lstrip().startswith('"'):
+                code = held[:-1] + code.lstrip()[1:]
+            else:
+                yield held
+        held = None
+        if code.endswith('"') and not code.endswith(('\\n"', '\\"')) and LITERAL.search(code):
+            held = code
+        else:
+            yield code
+    if held is not None:
+        yield held
+
+
 def texts():
     seen = []
     for rel in SOURCES + TR_ONLY:
-        path = os.path.join(ROOT, rel)
-        if not os.path.exists(path):
-            continue
-        for line in open(path, encoding='utf-8'):
-            code = code_of(line)
+        for code in statements(rel):
             if code.lstrip().startswith(('#include', '/*', '*', 'fprintf', 'perror')) or 'fprintf(' in code:
                 continue
             translated = bool(TRANSLATES.search(code))

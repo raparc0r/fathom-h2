@@ -52,9 +52,11 @@ start)
     # One loop only: a card put in during the start (fathom-sdcard's add) can
     # start it before rcS does, and two players would fight over everything
     [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null && exit 0
-    # No player to start: root's password, and SSH if it's on, all the same
-    # (the way in to see why)
-    [ -x "$bin" ] || { /usr/sbin/fathom-ssh boot; echo "fathom: $bin not found"; exit 0; }
+    # No player to start: the card-out screen ("No/bad card"; Power held
+    # switches off), as when a card without Fathom is put in later. Without
+    # it the logo stayed for ever, with no way to switch off. Root's password,
+    # and SSH if it's on, all the same (the way in to see why)
+    [ -x "$bin" ] || { card_wait; /usr/sbin/fathom-ssh boot; echo "fathom: $bin not found"; exit 0; }
     [ -e /mnt/sd/fathom/no-autostart ] && { /usr/sbin/fathom-ssh boot; echo "fathom: autostart disabled"; exit 0; }
     (
         cd /                            # not on the card: USB drive mode unmounts it

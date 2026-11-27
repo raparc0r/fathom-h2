@@ -13,6 +13,7 @@
  * the output saturates instead of wrapping.
  */
 #include "audio/eq.h"
+#include "audio/pcm.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -184,11 +185,6 @@ void eq_reset(eq_t *e) { if (e) memset(e->s, 0, sizeof e->s); }
 unsigned eq_rate(const eq_t *e) { return e->rate; }
 int eq_channels(const eq_t *e) { return e->channels; }
 
-static inline int32_t sat32(int64_t v)
-{
-    return v > INT32_MAX ? INT32_MAX : v < INT32_MIN ? INT32_MIN : (int32_t)v;
-}
-
 void eq_run(eq_t *e, int32_t *s, long frames)
 {
     const int ch = e->channels;
@@ -196,7 +192,7 @@ void eq_run(eq_t *e, int32_t *s, long frames)
     for (int c = 0; c < ch; c++) {
         int32_t *x = s + c;
         if (!unity)
-            for (long i = 0; i < frames; i++) x[i * ch] = sat32(((int64_t)x[i * ch] * e->pre) >> 30);
+            for (long i = 0; i < frames; i++) x[i * ch] = pcm_sat32(((int64_t)x[i * ch] * e->pre) >> 30);
         for (int b = 0; b < e->n; b++) {
             const coef_t k = e->c[b];
             state_t st = e->s[b][c];
@@ -225,7 +221,7 @@ void eq_run(eq_t *e, int32_t *s, long frames)
                             - (int64_t)k.a1 * st.y1 - (int64_t)k.a2 * st.y2 + st.err;
                 int64_t y = acc >> FRAC;                       /* floor */
                 st.err = acc & ((1LL << FRAC) - 1);           /* the remainder (y is the floor), into the next sum */
-                out = sat32(y);
+                out = pcm_sat32(y);
 #endif
                 st.x2 = st.x1; st.x1 = in;
                 st.y2 = st.y1; st.y1 = out;

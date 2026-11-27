@@ -13,6 +13,8 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 set(ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
+set(FATHOM_ROOT ${ROOT})
+include(${ROOT}/cmake/fathom_sources.cmake)       # (the app's files, listed once: the Mac's build reads it too)
 
 include(FetchContent)
 set(LV_CONF_PATH ${CMAKE_CURRENT_SOURCE_DIR}/lv_conf.h CACHE FILEPATH "LVGL config" FORCE)
@@ -51,61 +53,22 @@ endif()
 set(FATHOM_BOARD_SOURCES disp_drm.c audio_route.c)
 
 add_executable(fathom-player
-  main.c input.c uac_relay.c bt.c wifi.c share.c ssh.c shell.c tlscert.c radiometa.c out_router.c ff_trim.c jpeg_trim.c updater.c uninstaller.c ${ROOT}/app/audio/out_bt.c ${FATHOM_BOARD_SOURCES}
-  ${ROOT}/app/core/rng.c
-  ${ROOT}/app/core/settings.c
-  ${ROOT}/app/core/fsafe.c
-  ${ROOT}/app/core/lang.c
-  ${ROOT}/app/core/batlog.c
-  ${ROOT}/app/core/wifitxt.c
-  ${ROOT}/app/core/datetime.c
-  ${ROOT}/app/core/tz.c
-  ${ROOT}/app/core/intern.c
-  ${ROOT}/app/library/keys.c
-  ${ROOT}/app/library/tags.c
-  ${ROOT}/app/library/cue.c
-  ${ROOT}/app/library/library.c
-  ${ROOT}/app/library/reader.c
-  ${ROOT}/app/library/artdec.c
-  ${ROOT}/app/library/fatwalk.c
-  ${ROOT}/app/library/playlist.c
-  ${ROOT}/app/library/stb_impl.c
-  ${ROOT}/app/shuffle/shuffle.c
-  ${ROOT}/app/audio/decoder.c
-  ${ROOT}/app/audio/dsd.c
-  ${ROOT}/app/audio/vorbis.c
-  ${ROOT}/app/audio/streamlist.c
-  ${ROOT}/app/audio/ff_util.c
-  ${ROOT}/app/net/http.c
-  ${ROOT}/app/net/json.c
-  ${ROOT}/app/net/radiodir.c
-  ${ROOT}/app/net/radioicon.c
-  ${ROOT}/app/net/podcast.c
-  ${ROOT}/app/net/podsync.c
-  ${ROOT}/app/net/coverfind.c
-  ${ROOT}/app/net/netclock.c
-  ${ROOT}/app/net/sha256.c
-  ${ROOT}/app/net/unzip.c
-  ${ROOT}/app/net/update.c
+  main.c early.c output.c usbmode.c clockset.c updates.c radiohooks.c power.c bgscan.c packs.c levelling.c input.c uac_relay.c bt.c wifi.c share.c ssh.c shell.c tlscert.c radiometa.c out_router.c ff_trim.c jpeg_trim.c updater.c uninstaller.c ${ROOT}/app/audio/out_bt.c ${FATHOM_BOARD_SOURCES}
+  ${FATHOM_SRC_CORE}
+  ${FATHOM_SRC_LIBRARY_BASE} ${FATHOM_SRC_LIBRARY}
+  ${FATHOM_SRC_SHUFFLE}
+  ${FATHOM_SRC_DECODE} ${FATHOM_SRC_FFMPEG}
+  ${FATHOM_SRC_NET}
   ${ROOT}/app/sys/hibyupt.c
   ${ROOT}/app/sys/md5.c
   ${ROOT}/app/sys/uninstall.c
-  ${ROOT}/app/audio/engine.c
-  ${ROOT}/app/audio/loudness.c
-  ${ROOT}/app/audio/btconv.c ${ROOT}/app/audio/eq.c ${ROOT}/app/audio/tempo.c ${ROOT}/app/audio/crossfeed.c
-  ${ROOT}/app/audio/out_null.c
-  ${ROOT}/app/audio/out_clock.c
+  ${FATHOM_SRC_ENGINE}
   ${ROOT}/app/audio/out_alsa.c
   ${ROOT}/app/audio/pcmring.c
   ${ROOT}/app/audio/mixer_alsa.c
-  ${ROOT}/app/player/player.c
-  ${ROOT}/app/player/radio.c
-  ${ROOT}/app/player/rfmeta.c
-  ${ROOT}/app/ui/theme.c
-  ${ROOT}/app/ui/coverflow.c
-  ${ROOT}/app/ui/fonts.c
-  ${ROOT}/app/ui/assets.c
-  ${ROOT}/app/ui/ui.c)
+  ${FATHOM_SRC_PLAYER}
+  ${FATHOM_SRC_UI_BASE}
+  ${FATHOM_SRC_UI})
 target_include_directories(fathom-player PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${ROOT}/app ${ROOT}/third_party ${DEPS_STATIC_INCLUDE_DIRS})
 # 32 MiB of RAM: JPEG covers decode pre-scaled (libjpeg); PNGs are capped; small SQLite cache.
 # The version shown in Settings > About: git describe of the tree being built.
@@ -133,15 +96,16 @@ set_source_files_properties(${ROOT}/app/library/stb_impl.c PROPERTIES COMPILE_OP
 # builds and fills them, a little work per key; LVGL draws them). Decoding,
 # the engine and outputs, the display, input, the scan's walk and cover
 # scaling, and image decoding stay at -O2.
-set_property(SOURCE main.c bt.c wifi.c share.c ssh.c shell.c tlscert.c radiometa.c updater.c
+set_property(SOURCE main.c early.c output.c usbmode.c clockset.c updates.c radiohooks.c power.c bgscan.c packs.c levelling.c bt.c wifi.c share.c ssh.c shell.c tlscert.c radiometa.c updater.c
   ${ROOT}/app/core/settings.c ${ROOT}/app/core/lang.c
   ${ROOT}/app/library/tags.c ${ROOT}/app/library/cue.c ${ROOT}/app/library/playlist.c
   ${ROOT}/app/shuffle/shuffle.c
   ${ROOT}/app/net/http.c ${ROOT}/app/net/json.c ${ROOT}/app/net/radiodir.c ${ROOT}/app/net/radioicon.c
   ${ROOT}/app/net/podcast.c ${ROOT}/app/net/podsync.c ${ROOT}/app/net/coverfind.c ${ROOT}/app/net/netclock.c
-  ${ROOT}/app/net/unzip.c ${ROOT}/app/net/update.c
+  ${ROOT}/app/net/unzip.c ${ROOT}/app/net/update.c ${ROOT}/app/net/packfetch.c
   ${ROOT}/app/player/player.c ${ROOT}/app/player/radio.c ${ROOT}/app/player/rfmeta.c
   ${ROOT}/app/ui/theme.c ${ROOT}/app/ui/fonts.c ${ROOT}/app/ui/assets.c ${ROOT}/app/ui/ui.c
+  ${ROOT}/app/ui/ui_graphs.c
   APPEND PROPERTY COMPILE_OPTIONS -Os)
 # Link-time optimisation of the player's own code (the libraries are plain
 # objects): calls across its files inlined or dropped, 22 KB less. Each file
@@ -169,15 +133,7 @@ install(TARGETS fathom-player RUNTIME DESTINATION bin)
 # and ALSA output, recording what reaches the card. Not installed; copied by hand.
 add_executable(fathom-bitperfect
   ${ROOT}/tools/bitperfect/bp_play.c
-  ${ROOT}/app/audio/decoder.c
-  ${ROOT}/app/library/cue.c
-  ${ROOT}/app/audio/dsd.c
-  ${ROOT}/app/audio/vorbis.c
-  ${ROOT}/app/audio/streamlist.c
-  ${ROOT}/app/audio/ff_util.c
-  ${ROOT}/app/net/http.c
-  ${ROOT}/app/core/fsafe.c
-  ${ROOT}/app/net/json.c
+  ${FATHOM_SRC_DECODE_TOOL}
   ${ROOT}/app/audio/engine.c
   ${ROOT}/app/audio/eq.c
   ${ROOT}/app/audio/tempo.c
@@ -198,22 +154,10 @@ add_executable(fathom-scan
   ${ROOT}/app/core/intern.c
   ${ROOT}/app/core/lang.c
   ${ROOT}/app/core/rng.c
-  ${ROOT}/app/library/keys.c
-  ${ROOT}/app/library/tags.c
-  ${ROOT}/app/library/cue.c
-  ${ROOT}/app/library/library.c
-  ${ROOT}/app/library/reader.c
   ${ROOT}/app/core/fsafe.c
-  ${ROOT}/app/library/artdec.c
-  ${ROOT}/app/library/fatwalk.c
-  ${ROOT}/app/library/playlist.c
-  ${ROOT}/app/library/stb_impl.c
-  ${ROOT}/app/shuffle/shuffle.c
-  ${ROOT}/app/audio/decoder.c
-  ${ROOT}/app/audio/dsd.c
-  ${ROOT}/app/audio/vorbis.c
-  ${ROOT}/app/audio/streamlist.c
-  ${ROOT}/app/audio/ff_util.c
+  ${FATHOM_SRC_LIBRARY_BASE} ${FATHOM_SRC_LIBRARY}
+  ${FATHOM_SRC_SHUFFLE}
+  ${FATHOM_SRC_DECODE} ${FATHOM_SRC_FFMPEG}
   ${ROOT}/app/audio/loudness.c)
 target_include_directories(fathom-scan PRIVATE ${ROOT}/app ${ROOT}/third_party ${DEPS_STATIC_INCLUDE_DIRS})
 # (the player's cover limits: what it measures is what the player does)
@@ -229,15 +173,7 @@ add_executable(fathom-rg-bench
   ${ROOT}/tools/rg-bench/loudness_v1.c
   ${ROOT}/tools/rg-bench/loudness_ref.c
   ${ROOT}/app/audio/loudness.c
-  ${ROOT}/app/library/cue.c
-  ${ROOT}/app/audio/decoder.c
-  ${ROOT}/app/audio/dsd.c
-  ${ROOT}/app/audio/vorbis.c
-  ${ROOT}/app/audio/streamlist.c
-  ${ROOT}/app/audio/ff_util.c
-  ${ROOT}/app/net/http.c
-  ${ROOT}/app/core/fsafe.c
-  ${ROOT}/app/net/json.c)
+  ${FATHOM_SRC_DECODE_TOOL})
 target_include_directories(fathom-rg-bench PRIVATE ${ROOT}/app ${DEPS_STATIC_INCLUDE_DIRS})
 target_compile_options(fathom-rg-bench PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_compile_definitions(fathom-rg-bench PRIVATE FATHOM_HAVE_FFMPEG FATHOM_HAVE_VORBIS FATHOM_VORBIS_TREMOR)
@@ -249,15 +185,7 @@ target_link_libraries(fathom-rg-bench PRIVATE ${DEPS_STATIC_LDFLAGS} pthread m)
 add_executable(fathom-decode-check
   ${ROOT}/tools/decode-check/main.c
   ${ROOT}/app/net/dnscache.c
-  ${ROOT}/app/library/cue.c
-  ${ROOT}/app/audio/decoder.c
-  ${ROOT}/app/audio/dsd.c
-  ${ROOT}/app/audio/vorbis.c
-  ${ROOT}/app/audio/streamlist.c
-  ${ROOT}/app/audio/ff_util.c
-  ${ROOT}/app/net/http.c
-  ${ROOT}/app/core/fsafe.c
-  ${ROOT}/app/net/json.c)
+  ${FATHOM_SRC_DECODE_TOOL})
 target_include_directories(fathom-decode-check PRIVATE ${ROOT}/app ${DEPS_STATIC_INCLUDE_DIRS})
 target_compile_options(fathom-decode-check PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_compile_definitions(fathom-decode-check PRIVATE FATHOM_HAVE_FFMPEG FATHOM_HAVE_VORBIS FATHOM_VORBIS_TREMOR)
@@ -296,12 +224,11 @@ target_link_options(fathom-hcitest PRIVATE -static)
 pkg_check_modules(DBUS QUIET dbus-1)
 if(DBUS_FOUND)
   add_executable(fathom-avrcp avrcp.c)
+  target_include_directories(fathom-avrcp PRIVATE ${ROOT}/app)       # (core/clock.h)
   target_compile_options(fathom-avrcp PRIVATE -Wall -Wextra ${DBUS_CFLAGS})
   target_link_libraries(fathom-avrcp PRIVATE ${DBUS_LDFLAGS})
 endif()
 
-# USB-C port role (TCS1421 CFG pins): sink, or dual role to find USB DACs.
-# Installed into the root filesystem, so it runs without the SD card.
-add_executable(fathom-usbrole usbrole.c)
-target_compile_options(fathom-usbrole PRIVATE -Wall -Wextra)
-target_link_options(fathom-usbrole PRIVATE -static)
+# (The USB-C port's role, usbrole.c, and the screen for a card that is out,
+# cardout.c, are built by the fathom-system package: they live in the root
+# filesystem. A static fathom-usbrole was built here too and installed nowhere.)

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 #include "rfmeta.h"
+#include "core/utf8.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,11 +91,7 @@ static int read_string(const char *p, char *out, size_t cap)
                     if (lo >= 0xdc00 && lo < 0xe000) { v = 0x10000 + ((v - 0xd800) << 10) + (lo - 0xdc00); p += 6; }
                 }
                 char u[4];
-                int k = 0;
-                if (v < 0x80) u[k++] = (char)v;
-                else if (v < 0x800) { u[k++] = (char)(0xc0 | v >> 6); u[k++] = (char)(0x80 | (v & 0x3f)); }
-                else if (v < 0x10000) { u[k++] = (char)(0xe0 | v >> 12); u[k++] = (char)(0x80 | (v >> 6 & 0x3f)); u[k++] = (char)(0x80 | (v & 0x3f)); }
-                else { u[k++] = (char)(0xf0 | v >> 18); u[k++] = (char)(0x80 | (v >> 12 & 0x3f)); u[k++] = (char)(0x80 | (v >> 6 & 0x3f)); u[k++] = (char)(0x80 | (v & 0x3f)); }
+                int k = (int)utf8_encode((uint32_t)v, u);
                 for (int i = 0; i < k && n + 1 < cap; i++) out[n++] = u[i];
                 continue;
             }
@@ -180,6 +177,9 @@ int rf_parse(const char *json, char *artist, size_t an, char *title, size_t tn, 
     }
     const char *v = member(step, "visual");
     if (visual && vn && (!v || read_string(v, visual, vn))) visual[0] = '\0';
+    /* (it goes to a fetch as it is: only an address on the network, not a
+     * file's path or another scheme) */
+    if (visual && vn && strncmp(visual, "http://", 7) && strncmp(visual, "https://", 8)) visual[0] = '\0';
     return 0;
 }
 
@@ -212,4 +212,9 @@ int rf_next_fetch_s(int64_t now, int64_t start, int64_t end)
     if (start <= 0 || end <= start || end - start > 4 * 3600 || now < start - 30 || now >= end) return RF_POLL_S;
     int64_t in = end + 3 - now;
     return in < RF_POLL_S ? RF_POLL_S : in > RF_POLL_MAX_S ? RF_POLL_MAX_S : (int)in;
+}
+
+int rf_retry_s(int fails)
+{
+    return fails <= 1 ? 5 : fails == 2 ? 15 : fails == 3 ? 60 : RF_POLL_MAX_S;
 }

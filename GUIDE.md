@@ -74,7 +74,7 @@ playlists as it is now.
 
 Plug it in and choose **Use as a USB DAC** (or Settings → USB connection → USB DAC mode). The
 computer then plays through the H2's headphone or line out, at the H2's volume. On a Mac,
-the first time, allow the accessory to connect when macOS asks, then choose "Fathom H2"
+the first time, allow the accessory to connect when macOS asks, then choose "Fathom Audio"
 as the output. Play, Prev and Next on the H2 control the computer's player; Back ends it.
 
 Settings → USB connection → On a computer chooses what happens when you plug in: ask
@@ -116,6 +116,20 @@ takes a found one away: back to the album's own cover if it had one; if it had n
 missing covers then leaves that album alone. Your music files are never changed, so other
 players still show their own covers. Finding covers needs Wi-Fi, and sends the album's
 artist and title.
+
+**Names in Japanese, Korean and Chinese.** Fathom's own fonts don't hold these
+characters, so such names show as boxes until you get a language pack. Settings →
+Interface → **Language packs** lists four: Japanese, Korean, Chinese (Simplified) and
+Chinese (Traditional). **Play** on one downloads it over Wi-Fi, once (2.4 to 6.3 MB each),
+and the names appear at once, with no restart; **Menu** on an installed pack removes it.
+When your library has such names, Home shows **Get language packs**, and the page's first
+row, **Needed by your library**, downloads what your songs need in one press (**Hide from
+Home** takes the row off Home; the packs stay in Settings). Chinese and Japanese share
+many characters, drawn a little differently: with packs for both, **Shared characters**
+chooses whose shapes are used. Without Wi-Fi, download a pack's zip on a computer from
+[Language packs](https://github.com/raparc0r/fathom-h2/releases/tag/packs-1), unzip it and
+copy its `.bin` file into the card's `fathom/packs/` folder; Fathom uses it from its next
+start. Packs stay through updates.
 
 Translations go in `fathom/lang/`, one `English text = translation` per line.
 `python3 tools/lang/strings.py` in the source lists every text, and
@@ -372,8 +386,8 @@ Update** as in [INSTALL.md](INSTALL.md). Your settings and library are where you
 ## What's in the `fathom` folder
 
 Fathom keeps its settings, library and cover cache in the card's `fathom` folder, and
-that's where you add things of your own: `radio.txt`, `eq/`, `themes/` and `lang/` (all
-above). `podcasts/` holds your shows, their episodes' downloads and where you left each;
+that's where you add things of your own: `radio.txt`, `eq/`, `themes/`, `lang/` and
+`packs/` (all above). `podcasts/` holds your shows, their episodes' downloads and where you left each;
 `radio-icons/` your stations' logos and what the station directory said about them, fetched and asked again if you delete them. Wi-Fi passwords and the network drive's password are kept there too, so anyone
 holding the card can read them.
 

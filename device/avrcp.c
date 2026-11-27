@@ -33,6 +33,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "core/clock.h"
+
 #define NOW_FILE "/tmp/fathom-now"
 #define OBJ      "/org/fathom/player"
 #define MPRIS    "org.mpris.MediaPlayer2.Player"
@@ -48,13 +50,6 @@ typedef struct {
 static int ui_fd = -1;
 static now_t cur;                /* as last told to BlueZ */
 static uint32_t cur_at;          /* when (ms) */
-
-static uint32_t ms_now(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
-}
 
 /* ---- commands to the player: a small keyboard ---- */
 
@@ -394,7 +389,7 @@ int main(int argc, char **argv)
     dbus_connection_get_unix_fd(c, &dfd);
 
     read_now(&cur);
-    cur_at = ms_now();
+    cur_at = clock_ms32();
     int registered = 0;
     uint32_t tried = 0;
     for (;;) {
@@ -415,7 +410,7 @@ int main(int argc, char **argv)
                     if (ie->len && !strcmp(ie->name, NOW_FILE + 5)) look = 1;   /* (past "/tmp/") */
                 }
         }
-        uint32_t t = ms_now();
+        uint32_t t = clock_ms32();
         if (!registered) {
             if (t - tried >= 2000 || !tried) { tried = t; registered = register_player(c); }
             if (!registered) { read_now(&cur); cur_at = t; continue; }

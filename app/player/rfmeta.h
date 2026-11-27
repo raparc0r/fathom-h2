@@ -18,7 +18,7 @@ int rf_station(const char *info);
 /* The API's URL for station n. */
 void rf_url(int n, char *out, size_t cap);
 /* From the API's answer: the step on now. 0 = found (artist may be "");
- * visual: its cover's URL, or "" (may be NULL). */
+ * visual: its cover's URL (http or https only), or "" (may be NULL). */
 int rf_parse(const char *json, char *artist, size_t an, char *title, size_t tn, char *visual, size_t vn);
 /* The same step's "start" and "end" (Unix seconds): 0 when it has both. */
 int rf_step_times(const char *json, int64_t *start, int64_t *end);
@@ -32,5 +32,11 @@ int rf_step_times(const char *json, int64_t *start, int64_t *end);
 #define RF_POLL_S 15
 #define RF_POLL_MAX_S 180
 int rf_next_fetch_s(int64_t now, int64_t start, int64_t end);
+
+/* When to ask again after `fails` requests in a row that gave nothing (no
+ * network, no answer, an answer with no step on now): 5 s, 15, 60, then every
+ * RF_POLL_MAX_S. Every 5 s for as long as they failed was a new TLS
+ * connection each time, the screen off included. */
+int rf_retry_s(int fails);
 
 #endif

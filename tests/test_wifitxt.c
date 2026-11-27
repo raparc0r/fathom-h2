@@ -5,9 +5,7 @@
 #include <string.h>
 
 #include "core/wifitxt.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_util.h"
 
 static int parse(const char *t, wifitxt_net_t *n, int *bad)
 {
@@ -49,7 +47,5 @@ int main(void)
     for (int i = 0; i < 12; i++) snprintf(many + strlen(many), sizeof many - strlen(many), "network = n%d\n", i);
     CHECK(parse(many, n, &bad) == WIFITXT_MAX);
 
-    if (failures) fprintf(stderr, "%d failure(s)\n", failures);
-    else printf("wifitxt: all checks passed\n");
-    return failures != 0;
+    return t_result();
 }

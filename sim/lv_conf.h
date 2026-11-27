@@ -12,7 +12,13 @@
 #define LV_USE_OS LV_OS_NONE
 #define LV_DEF_REFR_PERIOD 16             /* ~60 fps; the H2's smart LCD may cap this (measure on device) */
 
+/* (FATHOM_SIM_HEADLESS: built with no SDL at all, for the headless checks
+ * under the sanitizers: sim/CMakeLists.txt) */
+#ifdef FATHOM_SIM_HEADLESS
+#define LV_USE_SDL 0
+#else
 #define LV_USE_SDL 1
+#endif
 #define LV_SDL_INCLUDE_PATH <SDL.h>
 #define LV_SDL_RENDER_MODE LV_DISPLAY_RENDER_MODE_DIRECT
 #define LV_SDL_BUF_COUNT 1

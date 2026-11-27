@@ -17,22 +17,9 @@
 
 #include "audio/ff_util.h"
 #include "net/tls_wrap.h"
-#include "tmpdir.h"
-
-static int fails;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
+#include "test_util.h"
 
 static char dir[256], bundle[300];
-
-static void copy(const char *from, const char *to)
-{
-    FILE *a = fopen(from, "rb"), *b = fopen(to, "wb");
-    char buf[4096];
-    size_t n;
-    while (a && b && (n = fread(buf, 1, sizeof buf, a)) > 0) fwrite(buf, 1, n, b);
-    if (a) fclose(a);
-    if (b) fclose(b);
-}
 
 static void load(mbedtls_x509_crt *c, const char *name)
 {
@@ -49,18 +36,12 @@ static tls_wrap_stats_t stats(void)
     return s;
 }
 
-static void ms_sleep(int ms)
-{
-    struct timespec t = {ms / 1000, (ms % 1000) * 1000000L};
-    nanosleep(&t, NULL);
-}
-
 /* The flags a verification of leaf against ca leaves (0: trusted). */
 static uint32_t verify(mbedtls_x509_crt *leaf, mbedtls_x509_crt *ca, const char *host)
 {
     uint32_t flags = 0;
     int r = mbedtls_x509_crt_verify(leaf, ca, NULL, host, &flags, NULL, NULL);
-    if ((r == 0) != (flags == 0)) { fprintf(stderr, "verify returned %d with flags %x\n", r, flags); fails++; }
+    if ((r == 0) != (flags == 0)) { fprintf(stderr, "verify returned %d with flags %x\n", r, flags); t_fails++; }
     return flags;
 }
 
@@ -72,8 +53,8 @@ static void *hammer(void *arg)
     for (int i = 0; i < 200; i++) {
         mbedtls_x509_crt ca;
         mbedtls_x509_crt_init(&ca);
-        if (mbedtls_x509_crt_parse_file(&ca, bundle)) { fails++; break; }
-        if (verify(&ok_crt, &ca, "localhost")) fails++;
+        if (mbedtls_x509_crt_parse_file(&ca, bundle)) { t_fails++; break; }
+        if (verify(&ok_crt, &ca, "localhost")) t_fails++;
         mbedtls_x509_crt_free(&ca);
     }
     return NULL;
@@ -81,10 +62,9 @@ static void *hammer(void *arg)
 
 int main(void)
 {
-    test_tmp(dir, sizeof dir, "test_tls_wrap");
-    if (!mkdtemp(dir)) return 1;
+    t_mkdtemp(dir, sizeof dir, "test_tls_wrap");
     snprintf(bundle, sizeof bundle, "%s/ca.pem", dir);
-    copy("tests/tls/bundle.pem", bundle);
+    t_copy("tests/tls/bundle.pem", bundle);
     ff_set_ca_file(bundle);
 
     mbedtls_x509_crt ok, future, expired, stranger;
@@ -126,7 +106,7 @@ int main(void)
     mbedtls_x509_crt_init(&a);
     CHECK(mbedtls_x509_crt_parse_file(&a, bundle) == 0 && stats().parses == 1);   /* within it: no parse */
     mbedtls_x509_crt_free(&a);
-    ms_sleep(600);
+    t_sleep_ms(600);
     CHECK(stats().chains == 0);
     mbedtls_x509_crt_init(&a);
     CHECK(mbedtls_x509_crt_parse_file(&a, bundle) == 0 && stats().parses == 2);
@@ -149,13 +129,13 @@ int main(void)
     /* other files: their own parse, as ever */
     char other[300];
     snprintf(other, sizeof other, "%s/other.pem", dir);
-    copy("tests/tls/bundle.pem", other);
+    t_copy("tests/tls/bundle.pem", other);
     mbedtls_x509_crt_init(&a);
     CHECK(mbedtls_x509_crt_parse_file(&a, other) == 0 && stats().parses == 3 && stats().lent == 0);
     mbedtls_x509_crt_free(&a);
 
     /* the bundle gone: the same error as mbedTLS gives, nothing kept */
-    ms_sleep(400);
+    t_sleep_ms(400);
     unlink(bundle);
     mbedtls_x509_crt_init(&a);
     int r = mbedtls_x509_crt_parse_file(&a, bundle);
@@ -171,20 +151,20 @@ int main(void)
 
     /* parsed ahead (tls_wrap_warm): in the background, kept for the grace
      * period like a connection's, so the next connection doesn't parse */
-    copy("tests/tls/bundle.pem", bundle);
+    t_copy("tests/tls/bundle.pem", bundle);
     unsigned warm0 = stats().parses;
     tls_wrap_warm();
-    for (int i = 0; i < 200 && stats().parses == warm0; i++) ms_sleep(10);
-    ms_sleep(20);
+    for (int i = 0; i < 200 && stats().parses == warm0; i++) t_sleep_ms(10);
+    t_sleep_ms(20);
     s = stats();
     CHECK(s.parses == warm0 + 1 && s.chains == 1 && s.lent == 0);
     tls_wrap_warm();                     /* parsed already: only kept on */
-    ms_sleep(50);
+    t_sleep_ms(50);
     mbedtls_x509_crt_init(&a);
     CHECK(mbedtls_x509_crt_parse_file(&a, bundle) == 0 && stats().parses == warm0 + 1);
     CHECK(verify(&ok, &a, "localhost") == 0);
     mbedtls_x509_crt_free(&a);
-    ms_sleep(600);
+    t_sleep_ms(600);
     CHECK(stats().chains == 0);
     /* a connection right after: one parse in all (its own, or the one under way) */
     warm0 = stats().parses;
@@ -195,7 +175,7 @@ int main(void)
     CHECK(s.parses == warm0 + 1 && s.chains == 1 && s.lent == 1);
     CHECK(verify(&ok, &a, "localhost") == 0);
     mbedtls_x509_crt_free(&a);
-    ms_sleep(600);
+    t_sleep_ms(600);
     CHECK(stats().chains == 0);
 
     /* threads: parse, verify, free at once from several; one parse in all */
@@ -215,7 +195,5 @@ int main(void)
     unlink(bundle);
     unlink(other);
     rmdir(dir);
-    if (fails) { fprintf(stderr, "%d failed\n", fails); return 1; }
-    printf("tls_wrap: ok\n");
-    return 0;
+    return t_result();
 }

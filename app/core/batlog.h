@@ -51,6 +51,7 @@ typedef struct {
     int pct, flags;          /* the last recorded (-1: none) */
     int64_t mono;            /* the last note's monotonic seconds */
     int64_t flushed;         /* when it was last written (monotonic) */
+    int off;                 /* switched off (batlog_off): nothing more is noted in this start */
 } batlog_t;
 
 /* At start (the clock as good as it gets: restored or set): trims the file if
@@ -62,7 +63,8 @@ void batlog_open(batlog_t *b, const char *path, int64_t wall_now, int64_t mono_n
 void batlog_note(batlog_t *b, int64_t mono_now, int pct, int flags);
 /* The wall clock was just set (NTP): this start's records move to it. */
 void batlog_clock_set(batlog_t *b, int64_t wall_now, int64_t mono_now);
-/* Switching off: noted and written. */
+/* Switching off: noted and written, and the log closed: nothing is noted
+ * after it until batlog_open (should the H2 stay on after all). */
 void batlog_off(batlog_t *b, int64_t mono_now);
 /* Write what's held: 0, or -1 (the card's away: kept for the next try). */
 int  batlog_flush(batlog_t *b);
@@ -107,5 +109,16 @@ typedef struct {
 
 /* records (from batlog_load, in order, the last at now) into a report */
 void batlog_report(const batrec_t *r, int n, int days, batrep_t *rep);
+
+/* ---------- an empty battery, before the player is up ---------- */
+
+/* One reading for the screens that come before the player (device/main.c
+ * early_battery), by the player's own rule: low is under low_uv and not
+ * charging. status and volt: the PMIC's "status" and "voltage_now" as read
+ * (NULL: couldn't be). A reading that isn't whole (either one missing, or a
+ * voltage that isn't a number above 0) is not a low one. *run: the low
+ * readings in a row so far (0 before the first). 1 at the third in a row,
+ * once; 0 otherwise. */
+int batlog_low_step(int *run, const char *status, const char *volt, long low_uv);
 
 #endif

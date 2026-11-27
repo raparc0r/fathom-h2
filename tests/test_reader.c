@@ -15,19 +15,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
-#include <FLAC/metadata.h>
-#include <FLAC/stream_encoder.h>
 #include <sqlite3.h>
 
+#include "core/clock.h"
 #include "library/library.h"
 #include "library/reader.h"
-#include "tmpdir.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_db.h"
+#include "test_flac.h"
+#include "test_util.h"
 
 static int helper_do(int op, const char *path, unsigned char **out, size_t *len)
 {
@@ -38,30 +37,10 @@ static int helper_do(int op, const char *path, unsigned char **out, size_t *len)
 
 static int write_flac(const char *path, const char *title, const char *album, int track)
 {
-    FLAC__StreamEncoder *e = FLAC__stream_encoder_new();
-    FLAC__stream_encoder_set_channels(e, 2);
-    FLAC__stream_encoder_set_bits_per_sample(e, 16);
-    FLAC__stream_encoder_set_sample_rate(e, 44100);
-    FLAC__StreamMetadata *vc = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
     char tr[8];
     snprintf(tr, sizeof tr, "%d", track);
-    const char *kv[][2] = {{"TITLE", title}, {"ARTIST", "Some Artist"}, {"ALBUM", album}, {"TRACKNUMBER", tr}};
-    for (int i = 0; i < 4; i++) {
-        FLAC__StreamMetadata_VorbisComment_Entry en;
-        FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, kv[i][0], kv[i][1]);
-        FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-    }
-    FLAC__stream_encoder_set_metadata(e, &vc, 1);
-    int rc = -1;
-    if (FLAC__stream_encoder_init_file(e, path, NULL, NULL) == FLAC__STREAM_ENCODER_INIT_STATUS_OK) {
-        static FLAC__int32 pcm[2 * 441];
-        FLAC__stream_encoder_process_interleaved(e, pcm, 441);
-        FLAC__stream_encoder_finish(e);
-        rc = 0;
-    }
-    FLAC__stream_encoder_delete(e);
-    FLAC__metadata_object_delete(vc);
-    return rc;
+    return t_write_flac(path, &(t_flac_t){.frames = 441, .tags = {{"TITLE", title}, {"ARTIST", "Some Artist"}, {"ALBUM", album},
+                                                                  {"TRACKNUMBER", tr}}});
 }
 
 static void song(const char *music, const char *album, const char *file, int track)
@@ -83,19 +62,6 @@ static void copy_file(const char *from, const char *to)
     while ((n = fread(b, 1, sizeof b, in)) > 0) fwrite(b, 1, n, out);
     fclose(in);
     fclose(out);
-}
-
-static int64_t db_int(const char *db, const char *sql)
-{
-    sqlite3 *d = NULL;
-    sqlite3_stmt *s = NULL;
-    int64_t v = -1;
-    if (sqlite3_open_v2(db, &d, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK &&
-        sqlite3_prepare_v2(d, sql, -1, &s, NULL) == SQLITE_OK && sqlite3_step(s) == SQLITE_ROW)
-        v = sqlite3_column_int64(s, 0);
-    sqlite3_finalize(s);
-    sqlite3_close(d);
-    return v;
 }
 
 /* A long request given up when its caller's stop is set: the helper, in the
@@ -120,14 +86,12 @@ static void test_stopped(const char *music)
     unsigned char *b = NULL;
     size_t n = 0;
     pthread_t th;
-    struct timespec t0, t1;
     g_stop = 0;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    double t0 = clock_fsec();
     pthread_create(&th, NULL, stop_soon, NULL);
     int r = reader_call_long(1, hang, 0, 60000, &g_stop, &st, &b, &n);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double took = clock_fsec() - t0;
     pthread_join(th, NULL);
-    double took = (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
     CHECK(r == READER_STOPPED && b == NULL);
     CHECK(took > 0.3 && took < 2.0);                             /* (not the minute it was given) */
     CHECK(reader_deaths() == deaths);                            /* (nobody's fault) */
@@ -170,7 +134,7 @@ static void test_remove_cover(const char *dir, const char *music)
     reader_set_timeout_ms(1500);
     library_t *lib = library_open(db, art);
     CHECK(lib && library_scan(lib, music, NULL, NULL) > 0);
-    int64_t id = db_int(db, "SELECT id FROM albums WHERE title='Good Two'");
+    int64_t id = t_db_int_ro(db, "SELECT id FROM albums WHERE title='Good Two'");
     CHECK(library_album_cover(lib, id) == LIB_COVER_OWN);
     uint16_t *lg = calloc((size_t)LIB_ART_LARGE * LIB_ART_LARGE, 2), *sm = calloc((size_t)LIB_ART_SMALL * LIB_ART_SMALL, 2);
     CHECK(lg && sm && library_store_found_cover(lib, id, lg, sm) == 0 && library_album_cover(lib, id) == LIB_COVER_PICKED);
@@ -180,11 +144,9 @@ static void test_remove_cover(const char *dir, const char *music)
     pthread_t th;
     pthread_create(&th, NULL, keep_busy, NULL);
     usleep(300 * 1000);
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    double t0 = clock_fsec();
     CHECK(library_remove_found_cover(lib, id) == 0);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double took = (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    double took = clock_fsec() - t0;
     CHECK(took < 1.0);                                           /* (not when the helper is free again) */
     if (took >= 1.0) fprintf(stderr, "Remove cover waited %.1f s for the helper\n", took);
     CHECK(library_album_cover(lib, id) == LIB_COVER_OWN);        /* its own, made here */
@@ -199,10 +161,136 @@ static void test_remove_cover(const char *dir, const char *music)
     library_test_reader_budget(1000);
     CHECK(library_remove_found_cover(lib, id) == 0);
     CHECK(library_album_cover(lib, id) == LIB_COVER_UNKNOWN);
-    CHECK(db_int(db, "SELECT art_sig FROM albums WHERE title='Good Two'") == 0);
+    CHECK(t_db_int_ro(db, "SELECT art_sig FROM albums WHERE title='Good Two'") == 0);
     library_test_reader_budget(-1);
     CHECK(rename(q, p) == 0);
     CHECK(library_scan(lib, music, NULL, NULL) > 0 && library_album_cover(lib, id) == LIB_COVER_OWN);   /* the next scan makes it */
+    free(lg);
+    free(sm);
+    library_close(lib);
+    library_set_found_covers(NULL);
+    reader_close();
+}
+
+/* ---- a cover that couldn't be read just now is not "this album has none" ----
+ * An album's image there and not to be opened (the card not answering, no
+ * memory or file handles: here, its permissions): the album's cover stays as
+ * it was, thumbnails and all, and the next scan looks again; so for a new
+ * album (not looked at yet), and for Remove cover on one picked over its own
+ * (no cover for now). Each was "it has none": the thumbnails emptied, the
+ * album marked so and not looked at again until its files changed. A file
+ * that is read and is no picture is still none. And a cover's state that
+ * can't be read is not "no cover of its own": nothing is stored or removed.
+ * self: through the helper (NULL: read in this process). */
+static int db_run(const char *db, const char *sql)
+{
+    sqlite3 *d = NULL;
+    int rc = sqlite3_open(db, &d) == SQLITE_OK ? sqlite3_exec(d, sql, NULL, NULL, NULL) : -1;
+    sqlite3_close(d);
+    return rc;
+}
+
+static void touch_at(const char *path, long when)
+{
+    struct timeval tv[2] = {{when, 0}, {when, 0}};
+    utimes(path, tv);
+}
+
+static void test_cover_unread(const char *dir, const char *self)
+{
+    char music[700], db[700], art[700], found[700], cover[800], p[900], over[1200], jpg[1200], none[1200];
+    snprintf(music, sizeof music, "%s/cmusic%d", dir, self != NULL);
+    mkdir(music, 0755);
+    snprintf(db, sizeof db, "%s/unread%d.db", dir, self != NULL);
+    snprintf(art, sizeof art, "%s/art-unread%d", dir, self != NULL);
+    snprintf(found, sizeof found, "%s/found-unread%d", dir, self != NULL);
+    mkdir(found, 0755);
+    library_set_found_covers(found);
+    reader_set_helper(self);
+    song(music, "Has Cover", "01.flac", 1);
+    song(music, "Has Cover", "02.flac", 2);
+    song(music, "Plain", "01.flac", 1);
+    snprintf(cover, sizeof cover, "%s/Has Cover/cover.jpg", music);
+    copy_file("tests/data/covers/cover.jpg", cover);
+    const char *scan_sig = "SELECT value FROM meta WHERE key='scan_sig'";
+    const char *art_sig = "SELECT art_sig FROM albums WHERE title='Has Cover'";
+    library_t *lib = library_open(db, art);
+    CHECK(lib && library_scan(lib, music, NULL, NULL) == 3);
+    int64_t id = t_db_int_ro(db, "SELECT id FROM albums WHERE title='Has Cover'");
+    lib_album_t a;
+    CHECK(library_album_info(lib, id, &a) == 0);
+    CHECK(library_found_cover_path(a.key, "over", over, sizeof over) == 0 && library_found_cover_path(a.key, "jpg", jpg, sizeof jpg) == 0 &&
+          library_found_cover_path(a.key, "none", none, sizeof none) == 0);
+    size_t n = (size_t)LIB_ART_SMALL * LIB_ART_SMALL * 2;
+    uint16_t *was = malloc(n), *px = malloc(n);
+    uint16_t *lg = calloc((size_t)LIB_ART_LARGE * LIB_ART_LARGE, 2), *sm = calloc((size_t)LIB_ART_SMALL * LIB_ART_SMALL, 2);
+    CHECK(was && px && lg && sm);
+    CHECK(library_album_cover(lib, id) == LIB_COVER_OWN && library_art(lib, id, LIB_ART_SMALL, was) == 0);
+    CHECK(t_db_int_ro(db, scan_sig) != 0);
+    if (geteuid() != 0) {                                        /* (root opens a file whatever its mode) */
+        /* its image changed, and can't be opened */
+        int64_t sig0 = t_db_int_ro(db, art_sig);
+        touch_at(cover, 1700005000);
+        chmod(cover, 0);
+        CHECK(library_scan(lib, music, NULL, NULL) == 3);
+        CHECK(library_album_cover(lib, id) == LIB_COVER_OWN && t_db_int_ro(db, art_sig) == sig0);
+        CHECK(library_art(lib, id, LIB_ART_SMALL, px) == 0 && !memcmp(px, was, n));
+        CHECK(t_db_int_ro(db, scan_sig) == 0);                        /* (the next scan looks again) */
+        chmod(cover, 0644);
+        CHECK(library_scan(lib, music, NULL, NULL) == 3);
+        CHECK(library_album_cover(lib, id) == LIB_COVER_OWN && t_db_int_ro(db, art_sig) != sig0 && t_db_int_ro(db, scan_sig) != 0);
+        /* a new album's */
+        song(music, "New One", "01.flac", 1);
+        snprintf(p, sizeof p, "%s/New One/cover.jpg", music);
+        copy_file("tests/data/covers/cover.jpg", p);
+        chmod(p, 0);
+        CHECK(library_scan(lib, music, NULL, NULL) == 4);
+        int64_t nid = t_db_int_ro(db, "SELECT id FROM albums WHERE title='New One'");
+        CHECK(library_album_cover(lib, nid) == LIB_COVER_UNKNOWN && t_db_int_ro(db, scan_sig) == 0);
+        chmod(p, 0644);
+        CHECK(library_scan(lib, music, NULL, NULL) == 4);
+        CHECK(library_album_cover(lib, nid) == LIB_COVER_OWN && t_db_int_ro(db, scan_sig) != 0);
+        /* Remove cover on one picked over its own, its own not to be opened */
+        CHECK(library_store_found_cover(lib, id, lg, sm) == 0 && library_album_cover(lib, id) == LIB_COVER_PICKED);
+        chmod(cover, 0);
+        CHECK(library_remove_found_cover(lib, id) == 0);
+        CHECK(library_album_cover(lib, id) == LIB_COVER_UNKNOWN && t_db_int_ro(db, art_sig) == 0 && access(none, F_OK) != 0);
+        chmod(cover, 0644);
+        CHECK(library_scan(lib, music, NULL, NULL) == 4 && library_album_cover(lib, id) == LIB_COVER_OWN);
+    }
+    /* read, and no picture: none, its thumbnails gone; a picture again: its own */
+    FILE *f = fopen(cover, "wb");
+    if (f) { fputs("named like a picture, and not one: more than a few bytes of it\n", f); fclose(f); }
+    touch_at(cover, 1700005100);
+    CHECK(library_scan(lib, music, NULL, NULL) > 0);
+    CHECK(library_album_cover(lib, id) == LIB_COVER_NONE && library_art(lib, id, LIB_ART_SMALL, px) != 0 && t_db_int_ro(db, scan_sig) != 0);
+    copy_file("tests/data/covers/cover.jpg", cover);
+    touch_at(cover, 1700005200);
+    CHECK(library_scan(lib, music, NULL, NULL) > 0);
+    CHECK(library_album_cover(lib, id) == LIB_COVER_OWN && library_art(lib, id, LIB_ART_SMALL, was) == 0);
+    /* its state can't be read (a column it names away for a moment): a found
+     * cover is not put over its own... */
+    CHECK(db_run(db, "ALTER TABLE albums RENAME COLUMN art TO art_away") == SQLITE_OK);
+    CHECK(library_store_found_cover(lib, id, lg, sm) != 0);
+    CHECK(db_run(db, "ALTER TABLE albums RENAME COLUMN art_away TO art") == SQLITE_OK);
+    CHECK(library_album_cover(lib, id) == LIB_COVER_OWN);
+    CHECK(library_art(lib, id, LIB_ART_SMALL, px) == 0 && !memcmp(px, was, n));
+    /* ...nor is one picked over its own removed */
+    CHECK(library_store_found_cover(lib, id, lg, sm) == 0 && library_album_cover(lib, id) == LIB_COVER_PICKED);
+    copy_file("tests/data/covers/cover.jpg", jpg);               /* (as the search keeps it) */
+    CHECK(db_run(db, "ALTER TABLE albums RENAME COLUMN art TO art_away") == SQLITE_OK);
+    CHECK(library_remove_found_cover(lib, id) != 0);
+    CHECK(db_run(db, "ALTER TABLE albums RENAME COLUMN art_away TO art") == SQLITE_OK);
+    CHECK(library_album_cover(lib, id) == LIB_COVER_PICKED && access(over, F_OK) == 0 && access(jpg, F_OK) == 0);
+    CHECK(access(none, F_OK) != 0 && library_art(lib, id, LIB_ART_SMALL, px) == 0);
+    /* where its own cover is can't be read: no cover for now, and the next scan makes it */
+    CHECK(db_run(db, "ALTER TABLE albums RENAME COLUMN first_track TO first_away") == SQLITE_OK);
+    CHECK(library_remove_found_cover(lib, id) == 0);
+    CHECK(db_run(db, "ALTER TABLE albums RENAME COLUMN first_away TO first_track") == SQLITE_OK);
+    CHECK(library_album_cover(lib, id) == LIB_COVER_UNKNOWN && t_db_int_ro(db, art_sig) == 0 && access(none, F_OK) != 0);
+    CHECK(library_scan(lib, music, NULL, NULL) > 0 && library_album_cover(lib, id) == LIB_COVER_OWN);
+    free(was);
+    free(px);
     free(lg);
     free(sm);
     library_close(lib);
@@ -216,8 +304,7 @@ int main(int argc, char **argv)
 
     char self[PATH_MAX], dir[300], music[400], p[700], db[400], db2[400], db3[400], art[400], art2[400], art3[400];
     if (!realpath(argv[0], self)) { perror(argv[0]); return 1; }
-    test_tmp(dir, sizeof dir, "fathom-test-reader");
-    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    t_mkdtemp(dir, sizeof dir, "fathom-test-reader");
     snprintf(music, sizeof music, "%s/music", dir);
     mkdir(music, 0755);
     snprintf(db, sizeof db, "%s/helper.db", dir);
@@ -252,16 +339,16 @@ int main(int argc, char **argv)
     library_t *lib = library_open(db, art);
     int n = lib ? library_scan(lib, music, NULL, NULL) : -1;
     CHECK(n == 6 + 4 + 2 + 1 + 1);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped'") == 4);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped' AND path LIKE '%KILL.flac'") == 3);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped' AND path LIKE '%HANG.flac'") == 1);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%KILL.flac' OR path LIKE '%HANG.flac'") == 0);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE title='Good One 3' AND album='Good One' AND track=3 AND rate=44100") == 1);
+    CHECK(t_db_int_ro(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped'") == 4);
+    CHECK(t_db_int_ro(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped' AND path LIKE '%KILL.flac'") == 3);
+    CHECK(t_db_int_ro(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped' AND path LIKE '%HANG.flac'") == 1);
+    CHECK(t_db_int_ro(db, "SELECT COUNT(*) FROM tracks WHERE path LIKE '%KILL.flac' OR path LIKE '%HANG.flac'") == 0);
+    CHECK(t_db_int_ro(db, "SELECT COUNT(*) FROM tracks WHERE title='Good One 3' AND album='Good One' AND track=3 AND rate=44100") == 1);
     /* the songs it died on: two tries each; the one it hung on: one; the
      * cover that killed it: two, and that album simply has none */
     CHECK(reader_deaths() == 3 * 2 + 1 + 2);
-    CHECK(db_int(db, "SELECT art FROM albums WHERE title='Good Two'") == LIB_COVER_OWN);
-    CHECK(db_int(db, "SELECT art FROM albums WHERE title='Cover Trouble'") == LIB_COVER_NONE);
+    CHECK(t_db_int_ro(db, "SELECT art FROM albums WHERE title='Good Two'") == LIB_COVER_OWN);
+    CHECK(t_db_int_ro(db, "SELECT art FROM albums WHERE title='Cover Trouble'") == LIB_COVER_NONE);
     CHECK(library_unread_count(lib) == 4);
     /* A scan asked to try the unread files again (Rescan), with a helper to
      * do the reading: those a reader stopped on are tried too. They stop it
@@ -270,7 +357,7 @@ int main(int argc, char **argv)
     library_scan_retry_unread(lib, 1);
     CHECK(library_scan(lib, music, NULL, NULL) == n);
     CHECK(reader_deaths() == deaths + 3 * 2 + 1);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped'") == 4);
+    CHECK(t_db_int_ro(db, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped'") == 4);
     /* nothing more to do at the next scan, and no helper started for it */
     int starts = reader_starts();
     CHECK(library_scan(lib, music, NULL, NULL) == n && library_scan_changes(lib) == 0);
@@ -279,6 +366,9 @@ int main(int argc, char **argv)
 
     test_stopped(music);
     test_remove_cover(dir, music);
+    test_cover_unread(dir, self);
+    test_cover_unread(dir, NULL);
+    reader_set_helper(self);
     reader_set_timeout_ms(1500);
 
     /* the same music read in this process (no file kills this test: the
@@ -289,7 +379,7 @@ int main(int argc, char **argv)
     lib = library_open(db2, art2);
     CHECK(lib && library_scan(lib, music, NULL, NULL) == 6 + 4 + 5 + 2 + 1);
     library_close(lib);
-    CHECK(db_int(db2, "SELECT COUNT(*) FROM cues WHERE kind=3") == 0);
+    CHECK(t_db_int_ro(db2, "SELECT COUNT(*) FROM cues WHERE kind=3") == 0);
     static const char *const same[] = {
         "SELECT COUNT(*) FROM albums",
         "SELECT COUNT(*) FROM tracks WHERE album='Good One'",
@@ -297,7 +387,7 @@ int main(int argc, char **argv)
         "SELECT SUM(length(title) + track + bits + channels) FROM tracks WHERE album IN ('Good One', 'Good Two')",
         "SELECT art FROM albums WHERE title='Good Two'",
     };
-    for (size_t i = 0; i < sizeof same / sizeof same[0]; i++) CHECK(db_int(db, same[i]) == db_int(db2, same[i]));
+    for (size_t i = 0; i < sizeof same / sizeof same[0]; i++) CHECK(t_db_int_ro(db, same[i]) == t_db_int_ro(db2, same[i]));
 
     /* a helper that can't be started: said once, and the scan does the work itself */
     reader_set_helper("/no/such/program");
@@ -317,20 +407,20 @@ int main(int argc, char **argv)
     library_test_reader_budget(1000);
     lib = library_open(db4, art4);
     CHECK(lib && library_scan(lib, music, NULL, NULL) == 6 + 4 + 2 + 1 + 1);
-    CHECK(db_int(db4, "SELECT COUNT(*) FROM cues WHERE kind=3") == 0);
-    CHECK(db_int(db4, "SELECT art FROM albums WHERE title='Cover Trouble'") == LIB_COVER_UNKNOWN);
-    CHECK(db_int(db4, "SELECT art FROM albums WHERE title='Good Two'") == LIB_COVER_OWN);
+    CHECK(t_db_int_ro(db4, "SELECT COUNT(*) FROM cues WHERE kind=3") == 0);
+    CHECK(t_db_int_ro(db4, "SELECT art FROM albums WHERE title='Cover Trouble'") == LIB_COVER_UNKNOWN);
+    CHECK(t_db_int_ro(db4, "SELECT art FROM albums WHERE title='Good Two'") == LIB_COVER_OWN);
     library_test_reader_budget(8000);
     CHECK(library_scan(lib, music, NULL, NULL) == 6 + 4 + 2 + 1 + 1);
-    CHECK(db_int(db4, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped'") == 4);
-    CHECK(db_int(db4, "SELECT art FROM albums WHERE title='Cover Trouble'") == LIB_COVER_NONE);
+    CHECK(t_db_int_ro(db4, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped'") == 4);
+    CHECK(t_db_int_ro(db4, "SELECT art FROM albums WHERE title='Cover Trouble'") == LIB_COVER_NONE);
     /* An album that has its answer already (no cover), then an image in its
      * folder, looked at while memory is short: left for later, and the next
      * scan does look (it took the listing being as it was for "nothing to
      * do", and the cover never came) */
     snprintf(p, sizeof p, "%s/Good One/KILL.jpg", music);
     copy_file("tests/data/covers/cover.jpg", p);
-    CHECK(db_int(db4, "SELECT art FROM albums WHERE title='Good One'") == LIB_COVER_NONE);
+    CHECK(t_db_int_ro(db4, "SELECT art FROM albums WHERE title='Good One'") == LIB_COVER_NONE);
     library_test_reader_budget(1000);
     CHECK(library_scan(lib, music, NULL, NULL) == 6 + 4 + 2 + 1 + 1);
     deaths = reader_deaths();
@@ -347,14 +437,11 @@ int main(int argc, char **argv)
     library_scan_retry_unread(lib, 1);
     CHECK(library_scan(lib, music, NULL, NULL) == 6 + 4 + 2 + 1 + 1);
     CHECK(library_unread_count(lib) == 4);
-    CHECK(db_int(db4, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped'") == 4);
+    CHECK(t_db_int_ro(db4, "SELECT COUNT(*) FROM cues WHERE kind=3 AND sheet='stopped'") == 4);
     library_close(lib);
     library_test_reader_budget(-1);
     reader_set_helper(NULL);
 
-    snprintf(p, sizeof p, "rm -rf '%s'", dir);
-    if (system(p)) { /* (left behind: no harm) */ }
-    if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
-    printf("reader: all good\n");
-    return 0;
+    t_rm_rf(dir);                             /* (left behind if it can't be: no harm) */
+    return t_result();
 }

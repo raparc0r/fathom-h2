@@ -3,8 +3,7 @@
 # for bluetoothctl, the daemons and the chip; and of fathom-bluetooth's wait for the chip.
 #   sh tests/test_fathom_bt.sh         (in the build container too: docker/run.sh sh tests/test_fathom_bt.sh)
 set -u
-here=$(cd "$(dirname "$0")/.." && pwd)
-T=$(mktemp -d); SRC=${SRC:-$here/buildroot/external/board/h2/rootfs-overlay}
+. "$(dirname "$0")/lib.sh"
 mkdir -p $T/bt/usr/bin $T/run $T/bin
 # timeout (busybox's on the H2; macOS has none): its command run as it is
 printf '#!/bin/sh\n[ "$1" = -s ] && shift 2\nshift\nexec "$@"\n' > $T/bin/timeout; chmod +x $T/bin/timeout; export PATH=$T/bin:$PATH
@@ -25,6 +24,7 @@ cat > $T/bt/usr/bin/bluetoothctl <<X
 #!/bin/sh
 D=$T/devs; echo "\$*" >> $T/calls
 [ "\$1" = --timeout ] && shift 2
+[ "\$1" = --agent ] && shift 2
 info() {   # as bluetoothctl prints it; \$2 what each line starts with
     awk -F';' -v a="\$1" -v p="\$2" '\$1 == a { print p "Device " a " (public)"; print p "\tName: " \$2; print p "\tAlias: " \$2
         if (\$3 != "") print p "\tIcon: " \$3; print p "\tPaired: " \$4; print p "\tConnected: " \$5
@@ -38,6 +38,11 @@ devices)
     if [ "\${2:-}" = Paired ]; then awk -F';' '\$4=="yes"{print "Device "\$1" "\$2}' \$D
     else awk -F';' '{print "Device "\$1" "\$2}' \$D; fi ;;
 info) info "\$2" "" ;;
+pair)   # (st/pair-fails: refused; st/pair-slow: after a second; else the new pairing's key is in bluetoothd's folder)
+    [ -f $T/st/pair-slow ] && sleep 1
+    if [ -f $T/st/pair-fails ]; then echo "Failed to pair: org.bluez.Error.AuthenticationFailed"
+    else mkdir -p $T/varlib/bluetooth/ctl/new; echo key > $T/varlib/bluetooth/ctl/new/info; echo "Pairing successful"; fi ;;
+connect) echo "Connection successful" ;;
 "")     # interactive, fed on its input: prompts, echo, carriage returns, colours, news
     printf 'Agent registered\r\n[\033[0;94mbluetooth\033[0m]# '
     printf '[\001\033[0;93m\002NEW\001\033[0m\002] Device AA:00:00:00:00:02 Kitchen speaker\r\n'
@@ -52,8 +57,6 @@ esac
 X
 chmod +x $T/bt/usr/bin/bluetoothctl
 sleep 300 & echo $! > $T/run/bluetoothd.pid
-ok=0; bad=0
-check() { if eval "$2"; then echo "ok   $1"; ok=$((ok+1)); else echo "FAIL $1"; bad=$((bad+1)); fi; }
 
 out=$($T/fathom-bt paired); calls=$(wc -l < $T/calls)
 check "paired: audio devices only, with their icons and connected flags" '[ "$out" = "$(printf "AA:00:00:00:00:01|Anna’s AirPods|audio-headphones|1\nAA:00:00:00:00:04|Buds | Pro|audio-headset|0")" ]'
@@ -93,17 +96,17 @@ Available BT audio codecs:
   a2dp-source:	SBC, AAC, aptX
   a2dp-sink:	SBC
 X
-controller() { printf 'Controller 00:11:22:33:44:55 (public)\n\tName: Fathom H2\n\tPowered: %s\n\tDiscoverable: no\n\tPairable: %s\n' $1 $2 > $T/st/show; }
+controller() { printf 'Controller 00:11:22:33:44:55 (public)\n\tName: Fathom\n\tPowered: %s\n\tDiscoverable: no\n\tPairable: %s\n' $1 $2 > $T/st/show; }
 alive() { for d in "$@"; do kill -0 "$(cat $T/run/$d.pid 2>/dev/null)" 2>/dev/null || return 1; done; }
 begin() { : > $T/calls; : > $T/st/ba; : > $T/st/chip; echo 0 > $T/st/shows; }
 
-# 1. A first start: bluetoothd has powered the controller and made it pairable by itself
-# (AutoEnable, AlwaysPairable): nothing more asked of it; bluealsa's help read once
-controller yes yes; echo 0 > $T/st/show-after; echo "bluetooth.range = 0" > $T/sd/settings.ini; begin
+# 1. A first start: bluetoothd has powered the controller by itself (AutoEnable) and left
+# it not pairable, as BlueZ does: nothing more asked of it; bluealsa's help read once
+controller yes no; echo 0 > $T/st/show-after; echo "bluetooth.range = 0" > $T/sd/settings.ini; begin
 out=$($T/fathom-bt start 2>$T/st/err); rc=$?; sleep 0.2
 check "start: on, everything running" '[ "$out" = on ] && [ $rc = 0 ] && alive dbus bluetoothd bluealsa avrcp'
 check "start: the chip turned on once" '[ "$(cat $T/st/chip)" = on ]'
-check "start: already on and pairable: neither asked for" '! grep -q "power on" $T/calls && ! grep -q "pairable on" $T/calls'
+check "start: already on and not pairable: nothing asked for" '! grep -q "power on" $T/calls && ! grep -q "pairable" $T/calls'
 check "start: bluealsa asked what it can do, then run with aptX and real-time IO" '[ "$(cat $T/st/ba)" = "$(printf "%s\n%s" "-h" "-p a2dp-source -c aptX --io-rt-priority=10 --a2dp-force-audio-cd --a2dp-volume")" ]'
 check "start: already running: answered at once" '[ "$($T/fathom-bt start)" = on ] && [ "$(cat $T/st/chip)" = on ]'
 $T/fathom-bt stop >/dev/null 2>&1; sleep 0.2
@@ -132,25 +135,28 @@ begin; $T/fathom-bt start >/dev/null 2>&1; sleep 0.2
 check "an answer that isn't its help isn't kept" 'grep -qx -- "-h" $T/st/ba'
 $T/fathom-bt stop >/dev/null 2>&1
 
-# 5. The controller off and not pairable when bluetoothd shows it: both asked for, as before
+# 5. The controller off when bluetoothd shows it: asked for, as before. Pairable (anything
+# in range could pair with the H2, nobody agreeing): never asked for at start, and a
+# controller that shows it is told off
 controller no no; begin
 $T/fathom-bt start >/dev/null 2>&1
-check "start: not on, not pairable: both asked for" 'grep -qx "power on" $T/calls && grep -qx "pairable on" $T/calls'
+check "start: not on, not pairable: only on asked for" 'grep -qx "power on" $T/calls && ! grep -q "pairable" $T/calls'
 $T/fathom-bt stop >/dev/null 2>&1
-controller yes no; begin
+controller yes yes; begin
 $T/fathom-bt start >/dev/null 2>&1
-check "start: on, not pairable: only that asked for" '! grep -q "power on" $T/calls && grep -qx "pairable on" $T/calls'
+check "start: on, and pairable all the same: turned off, never on" '! grep -q "power on" $T/calls && grep -qx "pairable off" $T/calls && ! grep -q "pairable on" $T/calls'
 $T/fathom-bt stop >/dev/null 2>&1
+check "the configuration doesn't keep it pairable either" '! grep -q AlwaysPairable $SRC/etc/fathom/bluetooth.conf && grep -qx "AutoEnable = true" $SRC/etc/fathom/bluetooth.conf'
 
 # 6. The controller only there at the fourth look (the firmware patch still loading): waited for
-controller yes yes; echo 3 > $T/st/show-after; begin
+controller yes no; echo 3 > $T/st/show-after; begin
 out=$($T/fathom-bt start 2>/dev/null)
-check "start: the controller waited for" '[ "$out" = on ] && [ "$(cat $T/st/shows)" = 4 ] && ! grep -q "power on" $T/calls'
+check "start: the controller waited for" '[ "$out" = on ] && [ "$(cat $T/st/shows)" = 4 ] && ! grep -q "power on" $T/calls && ! grep -q "pairable" $T/calls'
 $T/fathom-bt stop >/dev/null 2>&1
-# ...never there (14 looks): started all the same, and both asked for, as before
+# ...never there (14 looks): started all the same, on asked for as before, and not pairable
 echo 99 > $T/st/show-after; begin
 out=$($T/fathom-bt start 2>/dev/null)
-check "start: no controller in the wait: carried on, 14 looks, both asked for" '[ "$out" = on ] && [ "$(cat $T/st/shows)" = 14 ] && grep -qx "power on" $T/calls && grep -qx "pairable on" $T/calls'
+check "start: no controller in the wait: carried on, 14 looks, on and not pairable asked for" '[ "$out" = on ] && [ "$(cat $T/st/shows)" = 14 ] && grep -qx "power on" $T/calls && grep -qx "pairable off" $T/calls && ! grep -q "pairable on" $T/calls'
 $T/fathom-bt stop >/dev/null 2>&1; echo 0 > $T/st/show-after
 
 # 7. bluetoothd dies as it starts (no controller is ever shown, then); the chip won't
@@ -200,6 +206,107 @@ health; check "health: no AVRCP helper on the card: not counted" '[ $rc = 0 ] &&
 $T/fathom-bt stop >/dev/null 2>&1; mv $T/sd/bin/fathom-avrcp.away $T/sd/bin/fathom-avrcp
 health; check "health: after stop: \"stopped\"" '[ $rc = 3 ] && [ "$out" = stopped ]'
 
+# 9. stop waits for its daemons (they run from the card, and USB drive mode unmounts it
+# right after): one that takes half a second to end is gone when stop returns; one that
+# won't end is killed, after 2 s. (A pid that has ended and only waits for its parent
+# doesn't count: it has no command line.)
+printf '#!/bin/sh\necho "$*" >> %s/st/ba\nif [ "$1" = -h ]; then cat %s/st/ba-help; exit 0; fi\n[ -f %s/st/ba-slow ] && trap "sleep 0.5; exit 0" TERM\n[ -f %s/st/ba-deaf ] && trap "" TERM\n%s\n' \
+    $T $T $T $T "$stay" > $T/bt/usr/bin/bluealsad
+pids_of() { cat $T/run/avrcp.pid $T/run/bluealsa.pid $T/run/bluetoothd.pid $T/run/dbus.pid 2>/dev/null; }
+none_left() {
+    for p in $1; do
+        kill -0 $p 2>/dev/null || continue
+        [ -r /proc/$p/cmdline ] && [ -z "$(tr -d '\0' < /proc/$p/cmdline 2>/dev/null)" ] && continue
+        return 1
+    done
+    return 0
+}
+: > $T/st/ba-slow; begin
+$T/fathom-bt start >/dev/null 2>&1; sleep 0.2; was=$(pids_of)
+$T/fathom-bt stop >/dev/null 2>&1
+check "stop: a daemon that takes its time to end is waited for" '[ $(echo $was | wc -w) = 4 ] && none_left "$was"'
+for p in $was; do kill -9 $p 2>/dev/null; done
+rm -f $T/st/ba-slow; : > $T/st/ba-deaf; begin
+$T/fathom-bt start >/dev/null 2>&1; sleep 0.2; was=$(pids_of)
+t0=$(date +%s); $T/fathom-bt stop >/dev/null 2>&1; t1=$(date +%s)
+check "stop: one that won't end is killed, after about 2 s" '[ $(echo $was | wc -w) = 4 ] && none_left "$was" && [ $((t1 - t0)) -ge 1 ] && [ $((t1 - t0)) -le 5 ]'
+for p in $was; do kill -9 $p 2>/dev/null; done
+rm -f $T/st/ba-deaf
+
+# 10. The pairings' archive: one that is there and can't be unpacked at start (and the one
+# before neither) isn't "no pairings": nothing is saved over either file until a pairing is
+# made (the stop that followed wrote the empty list over the archive, the save after that
+# over the one before). A card with no archive at all starts and saves as before.
+S=$T/sd/bluetooth-pairings.tar; M=$T/run/pairings-unread
+TAR=$(command -v tar)   # (st/no-untar: nothing can be unpacked for now, as with no memory left)
+printf '#!/bin/sh\n[ -f %s/st/no-untar ] && case "$1" in -x*) exit 1 ;; esac\nexec %s "$@"\n' $T $TAR > $T/bin/tar; chmod +x $T/bin/tar
+controller yes yes
+go() { begin; out=$($T/fathom-bt start 2>/dev/null); sleep 0.2; }
+end() { $T/fathom-bt stop >/dev/null 2>&1; }
+rm -rf $T/varlib $S $S.bak; go
+check "no archive (a new card): started, nothing held back" '[ "$out" = on ] && [ ! -e $M ]'
+end
+check "...and stop writes one" '[ -s $S ] && tar -tf $S >/dev/null 2>&1'
+# two pairings saved, the archive and the one before
+mkdir -p $T/mk/bluetooth/ctl/old1 $T/mk/bluetooth/ctl/old2; echo k1 > $T/mk/bluetooth/ctl/old1/info; echo k2 > $T/mk/bluetooth/ctl/old2/info
+tar -cf $S -C $T/mk bluetooth; cp $S $S.bak
+rm -rf $T/varlib; go
+check "a sound archive: its pairings back at start" '[ "$(cat $T/varlib/bluetooth/ctl/old1/info 2>/dev/null)" = k1 ] && [ ! -e $M ]'
+end; cp $S $T/st/a1; cp $S.bak $T/st/a2
+# sound archives that can't be unpacked at this start (a passing reason)
+rm -rf $T/varlib; : > $T/st/no-untar; go
+check "archives there, none unpacked: started all the same, and marked" '[ "$out" = on ] && [ -e $M ] && grep -q "nothing saved over" $T/st/log'
+$T/fathom-bt forget AA:00:00:00:00:01
+end
+check "...forget and stop save nothing over them: both as they were" 'cmp -s $S $T/st/a1 && cmp -s $S.bak $T/st/a2'
+rm -rf $T/varlib; go; end
+check "...nor a second such start and stop" 'cmp -s $S $T/st/a1 && cmp -s $S.bak $T/st/a2'
+rm -f $T/st/no-untar; rm -rf $T/varlib; go
+check "...and the start after has every pairing, the mark gone" '[ "$(cat $T/varlib/bluetooth/ctl/old2/info 2>/dev/null)" = k2 ] && [ ! -e $M ]'
+end
+# archives that aren't archives any more
+awk 'BEGIN { for (i = 0; i < 300; i++) print "not an archive: " i }' > $S; awk 'BEGIN { for (i = 0; i < 200; i++) print "nor this: " i }' > $S.bak
+cp $S $T/st/g1; cp $S.bak $T/st/g2
+rm -rf $T/varlib; go; end
+check "archives tar can't read, start, stop: both byte for byte as they were" 'cmp -s $S $T/st/g1 && cmp -s $S.bak $T/st/g2'
+rm -rf $T/varlib; go; : > $T/st/pair-fails
+$T/fathom-bt pair AA:00:00:00:00:02 2>/dev/null; rc=$?
+check "...a pairing that fails changes nothing" '[ $rc = 1 ] && [ -e $M ] && cmp -s $S $T/st/g1 && cmp -s $S.bak $T/st/g2'
+rm -f $T/st/pair-fails
+$T/fathom-bt pair AA:00:00:00:00:02 2>/dev/null; rc=$?
+check "...a pairing made: started over on purpose: saved, the mark gone" '[ $rc = 0 ] && [ ! -e $M ] && tar -tf $S 2>/dev/null | grep -q "ctl/new/info"'
+end
+check "...and stop saves as before" 'tar -tf $S 2>/dev/null | grep -q "ctl/new/info" && tar -tf $S.bak 2>/dev/null | grep -q "ctl/new/info"'
+# an empty file where the archive should be (a write cut short), no other: as a new card
+: > $S; rm -f $S.bak; rm -rf $T/varlib; go
+check "an empty archive file and no other: as a new card" '[ "$out" = on ] && [ ! -e $M ]'
+end
+check "...stop writes one" '[ -s $S ] && tar -tf $S >/dev/null 2>&1'
+rm -f $T/bin/tar
+
+# 11. Pairable only while the H2 itself pairs with the device the user chose: on just
+# before, off again whatever came of it, also when the script is ended part-way
+A2=AA:00:00:00:00:02; rm -f $S $S.bak; rm -rf $T/varlib; controller yes no; go
+check "start: no pairable on" '! grep -q "pairable on" $T/calls'
+: > $T/calls
+$T/fathom-bt pair $A2 2>/dev/null; rc=$?
+check "pair: pairable on, the pairing, pairable off, then trusted and connected" '[ $rc = 0 ] && [ "$(tr "\n" "|" < $T/calls)" = "pairable on|--agent NoInputNoOutput pair $A2|pairable off|trust $A2|connect $A2|" ]'
+: > $T/calls; : > $T/st/pair-fails
+$T/fathom-bt pair $A2 2>$T/st/err; rc=$?
+check "pair: a pairing that fails: off again all the same, said as before" '[ $rc = 1 ] && grep -q "pairing failed" $T/st/err && [ "$(tr "\n" "|" < $T/calls)" = "pairable on|--agent NoInputNoOutput pair $A2|pairable off|" ]'
+: > $T/calls; : > $T/st/pair-slow
+$T/fathom-bt pair $A2 2>/dev/null & P=$!
+sleep 0.5; kill -TERM $P; wait $P; rc=$?
+check "pair: ended part-way (TERM): off again before it goes" '[ $rc != 0 ] && [ "$(tr "\n" "|" < $T/calls)" = "pairable on|--agent NoInputNoOutput pair $A2|pairable off|" ]'
+rm -f $T/st/pair-fails; : > $T/calls
+$T/fathom-bt pair $A2 2>/dev/null & P=$!
+sleep 0.5; kill -TERM $P; wait $P; rc=$?
+check "pair: the same as the pairing succeeds: off, once" '[ $rc != 0 ] && [ "$(grep -c "pairable off" $T/calls)" = 1 ] && [ "$(tail -1 $T/calls)" = "pairable off" ]'
+rm -f $T/st/pair-slow; : > $T/calls
+$T/fathom-bt connect $A2; $T/fathom-bt paired >/dev/null; $T/fathom-bt scan 1 >/dev/null; $T/fathom-bt forget $A2
+check "connect, paired, scan, forget: pairable not touched" '! grep -q pairable $T/calls'
+end
+
 # --- fathom-bluetooth: hci0 looked for ten times a second, no fixed wait after it ---
 mkdir -p $T/drv
 sed -e "s#^DRV=.*#DRV=$T/drv#" -e "s#^FW=.*#FW=$T/patch.hcd#" -e "s#^HCI=.*#HCI=$T/hci0#" -e "s#^HCIWAIT=[^ ]*#HCIWAIT=8#" \
@@ -220,4 +327,4 @@ rm -rf $T/drv
 out=$($T/fathom-bluetooth on); rc=$?
 check "chip on: no driver: said, exit 1" '[ $rc = 1 ] && [ "$out" = "bluetooth: no driver" ]'
 
-echo "$ok passed, $bad failed"; [ $bad = 0 ]
+finish

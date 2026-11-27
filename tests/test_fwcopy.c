@@ -9,9 +9,7 @@
 #include <string.h>
 
 #include "fwcopy.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_util.h"
 
 /* The stock partition (64 MiB): its first MiB held, the rest erased (0xFF).
  * (All of it in RAM was more than the H2 has: the test crashed there.) */
@@ -196,7 +194,5 @@ int main(void)
 
     test_kernel_note();
 
-    if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
-    printf("fwcopy: all good\n");
-    return 0;
+    return t_result();
 }

@@ -1,27 +1,17 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 #include "library/cue.h"
+#include "core/path.h"
+#include "core/utf8.h"
 
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 
 /* ---------- text encodings ---------- */
-
-static size_t put_utf8(char *o, uint32_t u)
-{
-    if (u < 0x80) { o[0] = (char)u; return 1; }
-    if (u < 0x800) { o[0] = (char)(0xC0 | u >> 6); o[1] = (char)(0x80 | (u & 0x3F)); return 2; }
-    if (u < 0x10000) {
-        o[0] = (char)(0xE0 | u >> 12); o[1] = (char)(0x80 | ((u >> 6) & 0x3F)); o[2] = (char)(0x80 | (u & 0x3F));
-        return 3;
-    }
-    o[0] = (char)(0xF0 | u >> 18); o[1] = (char)(0x80 | ((u >> 12) & 0x3F));
-    o[2] = (char)(0x80 | ((u >> 6) & 0x3F)); o[3] = (char)(0x80 | (u & 0x3F));
-    return 4;
-}
 
 /* Well-formed UTF-8 (no overlong forms, surrogates or values past U+10FFFF):
  * a Latin-1 sheet almost never passes by chance. */
@@ -68,7 +58,7 @@ char *cue_to_utf8(const char *text, size_t len, size_t *out_len)
             }
             if (u >= 0xD800 && u < 0xE000) u = 0xFFFD;   /* an unpaired surrogate */
             if (u == 0) break;
-            w += put_utf8(o + w, u);
+            w += utf8_encode(u, o + w);
         }
     } else if (len >= 3 && s[0] == 0xEF && s[1] == 0xBB && s[2] == 0xBF) {   /* UTF-8 with a BOM */
         if (!(o = malloc(len - 2))) return NULL;
@@ -81,7 +71,7 @@ char *cue_to_utf8(const char *text, size_t len, size_t *out_len)
     } else {                                     /* 8-bit */
         if (!(o = malloc(len * 3 + 1))) return NULL;
         for (size_t i = 0; i < len; i++)
-            w += put_utf8(o + w, s[i] >= 0x80 && s[i] < 0xA0 ? CP1252[s[i] - 0x80] : s[i]);
+            w += utf8_encode(s[i] >= 0x80 && s[i] < 0xA0 ? CP1252[s[i] - 0x80] : s[i], o + w);
     }
     o[w] = '\0';
     if (out_len) *out_len = w;
@@ -169,6 +159,20 @@ static void rg_value(const char *p, const char *end, float *v)
     *v = (float)strtod(b, NULL);
 }
 
+/* A TRACK's number, 1 to 99 as on a CD, or 0: none on its line, or one a
+ * track's path has no room for (two digits; see cue_part_path). */
+static int track_number(const char *p, const char *end)
+{
+    int v = 0;
+    while (p < end && (*p == ' ' || *p == '\t')) p++;
+    if (p >= end || !isdigit((unsigned char)*p)) return 0;
+    while (p < end && isdigit((unsigned char)*p)) {
+        v = v * 10 + (*p++ - '0');
+        if (v > 99) return 0;
+    }
+    return v;
+}
+
 int cue_parse(const char *text, size_t len, cue_sheet_t *out)
 {
     memset(out, 0, sizeof *out);
@@ -198,7 +202,7 @@ int cue_parse(const char *text, size_t len, cue_sheet_t *out)
             if (out->n < CUE_MAX_TRACKS) {
                 tr = &out->tracks[out->n];
                 memset(tr, 0, sizeof *tr);
-                tr->number = atoi(rest);
+                tr->number = track_number(rest, end);   /* (not atoi: it read on into the next line) */
                 tr->file = cur_file;
                 has0[out->n] = has1[out->n] = 0;
                 out->n++;
@@ -254,6 +258,15 @@ int cue_parse(const char *text, size_t len, cue_sheet_t *out)
     }
     free(t);
 
+    /* A track numbered 0, over 99 or not at all (a sheet made by hand) takes
+     * its place in the sheet for a number, if no other track has it; else it
+     * is left out. Its path as it was ("::00@", "::100@") is not a track's:
+     * it was listed, never played, and the whole file was no track either. */
+    int used[CUE_MAX_TRACKS + 1] = {0};
+    for (int i = 0; i < out->n; i++) used[out->tracks[i].number] = 1;
+    for (int i = 0; i < out->n; i++)
+        if (!out->tracks[i].number && !used[i + 1]) { out->tracks[i].number = i + 1; used[i + 1] = 1; }
+
     /* Keep the tracks that can be played: in a file, with an INDEX 01 (or
      * only an INDEX 00: then that), later than the one before in that file. */
     int kept = 0;
@@ -262,7 +275,7 @@ int cue_parse(const char *text, size_t len, cue_sheet_t *out)
     for (int i = 0; i < out->n; i++) {
         cue_track_t *c = &out->tracks[i];
         if (!has1[i] && has0[i]) { c->start = idx0[i]; has1[i] = 1; }
-        if (!has1[i] || c->file < 0) continue;
+        if (!has1[i] || c->file < 0 || !c->number) continue;
         if (any[c->file] && c->start <= last[c->file]) continue;
         any[c->file] = 1;
         last[c->file] = c->start;
@@ -277,8 +290,26 @@ int cue_read(const char *path, cue_sheet_t *out)
 {
     FILE *f = fopen(path, "rbe");
     if (!f) return -1;
-    char *b = malloc(CUE_MAX_BYTES);
-    size_t n = b ? fread(b, 1, CUE_MAX_BYTES, f) : 0;
+    /* Room for the file as it says it is, and a byte to see that it ends
+     * there (a sheet is a kilobyte or two: CUE_MAX_BYTES, 256 KB, was asked
+     * for each one read). One that turns out longer than it said is read on
+     * with all the room, as before. */
+    struct stat st;
+    size_t cap = CUE_MAX_BYTES;
+    if (fstat(fileno(f), &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 && (uint64_t)st.st_size < CUE_MAX_BYTES)
+        cap = (size_t)st.st_size + 1;
+    char *b = malloc(cap);
+    size_t n = b ? fread(b, 1, cap, f) : 0;
+    if (b && n == cap && cap < CUE_MAX_BYTES) {
+        char *more = realloc(b, CUE_MAX_BYTES);
+        if (more) {
+            b = more;
+            n += fread(b + n, 1, CUE_MAX_BYTES - n, f);
+        } else {
+            free(b);
+            b = NULL;
+        }
+    }
     int r = -1;
     if (b && n > 0 && n < CUE_MAX_BYTES) r = cue_parse(b, n, out);
     free(b);
@@ -288,8 +319,7 @@ int cue_read(const char *path, cue_sheet_t *out)
 
 int cue_supported(const char *path)
 {
-    const char *dot = strrchr(path, '.');
-    return dot && !strcasecmp(dot, ".cue");
+    return !strcasecmp(path_ext(path), "cue");
 }
 
 int cue_file_tracks(const cue_sheet_t *s, int f)
@@ -338,6 +368,16 @@ const char *cue_part_suffix(const char *path)
     int t;
     uint32_t s, e;
     return last && last > path && suffix_parse(last + 2, &t, &s, &e) ? last : NULL;
+}
+
+const char *cue_part_file(const char *path, char *buf, size_t cap)
+{
+    const char *sfx = cue_part_suffix(path);
+    if (!sfx) return path;
+    if ((size_t)(sfx - path) >= cap) return NULL;
+    memcpy(buf, path, (size_t)(sfx - path));
+    buf[sfx - path] = '\0';
+    return buf;
 }
 
 int cue_part_parse(const char *path, char *file, size_t cap, uint32_t *start, uint32_t *end)

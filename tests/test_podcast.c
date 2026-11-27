@@ -8,42 +8,32 @@
 #include <unistd.h>
 
 #include "net/podcast.h"
-#include "tmpdir.h"
-
-static int fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+#include "test_util.h"
 
 static char *slurp(const char *path, size_t *len)
 {
-    FILE *f = fopen(path, "rb");
-    if (!f) { printf("FAIL: can't read %s\n", path); exit(1); }
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *b = malloc((size_t)n + 1);
-    *len = fread(b, 1, (size_t)n, f);
-    b[*len] = '\0';
-    fclose(f);
+    char *b = t_slurp(path, len);
+    if (!b) { printf("FAIL: can't read %s\n", path); exit(1); }
     return b;
 }
 
 static void dates(void)
 {
-    CHECK(pod_parse_date("Tue, 19 Nov 2026 05:00:00 +0000") == 1795064400LL, "rfc822 %lld",
+    CHECKF(pod_parse_date("Tue, 19 Nov 2026 05:00:00 +0000") == 1795064400LL, "rfc822 %lld",
           (long long)pod_parse_date("Tue, 19 Nov 2026 05:00:00 +0000"));
-    CHECK(pod_parse_date("19 Nov 2026 05:00:00 GMT") == 1795064400LL, "no weekday");
-    CHECK(pod_parse_date("Tue, 19 Nov 2026 00:00:00 -0500") == 1795064400LL, "offset");
-    CHECK(pod_parse_date("Mon, 18 Nov 2026 21:00:00 PST") == 1795064400LL, "PST");
-    CHECK(pod_parse_date("2026-11-19T05:00:00Z") == 1795064400LL, "ISO 8601");
-    CHECK(pod_parse_date("Tue, 19 Nov 26 05:00:00 +0000") == 1795064400LL, "two-digit year");
-    CHECK(pod_parse_date("") == 0 && pod_parse_date("soon") == 0 && pod_parse_date(NULL) == 0, "not a date");
+    CHECKF(pod_parse_date("19 Nov 2026 05:00:00 GMT") == 1795064400LL, "no weekday");
+    CHECKF(pod_parse_date("Tue, 19 Nov 2026 00:00:00 -0500") == 1795064400LL, "offset");
+    CHECKF(pod_parse_date("Mon, 18 Nov 2026 21:00:00 PST") == 1795064400LL, "PST");
+    CHECKF(pod_parse_date("2026-11-19T05:00:00Z") == 1795064400LL, "ISO 8601");
+    CHECKF(pod_parse_date("Tue, 19 Nov 26 05:00:00 +0000") == 1795064400LL, "two-digit year");
+    CHECKF(pod_parse_date("") == 0 && pod_parse_date("soon") == 0 && pod_parse_date(NULL) == 0, "not a date");
     /* nonsense lengths: 0, never negative or past 32-bit milliseconds (UBSan: overflow) */
-    CHECK(pod_parse_duration("99999999999999999999:00:00") == 0 && pod_parse_duration("-5:00") == 0 &&
+    CHECKF(pod_parse_duration("99999999999999999999:00:00") == 0 && pod_parse_duration("-5:00") == 0 &&
           pod_parse_duration("1193047:00:00") == 0 && pod_parse_duration("3000000") == 0 &&
           pod_parse_duration("596:31:23") == 2147483, "nonsense lengths");
-    CHECK(pod_parse_date("2026-11-19T99999999999:00:00Z") >= 0 && pod_parse_date("19 Nov 99999999999 05:00:00") == 0 &&
+    CHECKF(pod_parse_date("2026-11-19T99999999999:00:00Z") >= 0 && pod_parse_date("19 Nov 99999999999 05:00:00") == 0 &&
           pod_parse_date("Tue, 19 Nov 2026 99999999999:00:00 +0000") >= 0, "nonsense dates");
-    CHECK(pod_parse_duration("3600") == 3600 && pod_parse_duration("59:12") == 3552 &&
+    CHECKF(pod_parse_duration("3600") == 3600 && pod_parse_duration("59:12") == 3552 &&
           pod_parse_duration("1:02:03") == 3723 && pod_parse_duration("") == 0 && pod_parse_duration("x") == 0,
           "durations");
 }
@@ -56,47 +46,47 @@ static void feed(void)
     memset(&s, 0, sizeof s);
     pod_episode_t e[10];
     int n = pod_parse_feed(xml, len, &s, e, 10);
-    CHECK(n == 3, "episodes: %d", n);
-    CHECK(!strcmp(s.title, "The Slow & Steady Show"), "title [%s]", s.title);
-    CHECK(!strcmp(s.author, "Ana & Bo"), "author [%s]", s.author);
-    CHECK(!strcmp(s.image, "https://example.com/cover.jpg"), "itunes:image wins [%s]", s.image);
+    CHECKF(n == 3, "episodes: %d", n);
+    CHECKF(!strcmp(s.title, "The Slow & Steady Show"), "title [%s]", s.title);
+    CHECKF(!strcmp(s.author, "Ana & Bo"), "author [%s]", s.author);
+    CHECKF(!strcmp(s.image, "https://example.com/cover.jpg"), "itunes:image wins [%s]", s.image);
     if (n == 3) {
-        CHECK(!strcmp(e[0].title, "Episode 3 (newest, listed out of order)"), "newest first [%s]", e[0].title);
-        CHECK(e[0].date == pod_parse_date("Wed, 20 Nov 2026 09:30:00 PST") && e[0].dur_s == 3600, "ep3 date/length");
-        CHECK(!strcmp(e[0].url, "https://cdn.example.com/ep3.m4a") && !strcmp(pod_ext(&e[0]), ".m4a"), "ep3 url [%s]", e[0].url);
-        CHECK(!strcmp(e[1].title, "Episode 2: Caf\xc3\xa9 \xe2\x80\x94 \"Live\""), "entities [%s]", e[1].title);
-        CHECK(!strcmp(e[1].url, "https://cdn.example.com/ep2.mp3?src=rss&x=1"), "url entity [%s]", e[1].url);
-        CHECK(e[1].size == 61234567 && e[1].dur_s == 3723, "size/duration");
-        CHECK(!strcmp(e[1].chapters, "https://example.com/ep2/chapters.json"), "chapters [%s]", e[1].chapters);
+        CHECKF(!strcmp(e[0].title, "Episode 3 (newest, listed out of order)"), "newest first [%s]", e[0].title);
+        CHECKF(e[0].date == pod_parse_date("Wed, 20 Nov 2026 09:30:00 PST") && e[0].dur_s == 3600, "ep3 date/length");
+        CHECKF(!strcmp(e[0].url, "https://cdn.example.com/ep3.m4a") && !strcmp(pod_ext(&e[0]), ".m4a"), "ep3 url [%s]", e[0].url);
+        CHECKF(!strcmp(e[1].title, "Episode 2: Caf\xc3\xa9 \xe2\x80\x94 \"Live\""), "entities [%s]", e[1].title);
+        CHECKF(!strcmp(e[1].url, "https://cdn.example.com/ep2.mp3?src=rss&x=1"), "url entity [%s]", e[1].url);
+        CHECKF(e[1].size == 61234567 && e[1].dur_s == 3723, "size/duration");
+        CHECKF(!strcmp(e[1].chapters, "https://example.com/ep2/chapters.json"), "chapters [%s]", e[1].chapters);
         char k[13];
         pod_hash("ep-2", k);
-        CHECK(!strcmp(e[1].key, k), "key from the guid");
+        CHECKF(!strcmp(e[1].key, k), "key from the guid");
         pod_hash("https://cdn.example.com/ep1.mp3", k);
-        CHECK(!strcmp(e[2].key, k) && e[2].dur_s == 3552, "no guid: key from the url");
-        CHECK(!strcmp(pod_ext(&e[2]), ".mp3"), "ext");
+        CHECKF(!strcmp(e[2].key, k) && e[2].dur_s == 3552, "no guid: key from the url");
+        CHECKF(!strcmp(pod_ext(&e[2]), ".mp3"), "ext");
     }
     /* whole or cut off: the fixture stops mid-item (no </rss>); with its end, whole */
-    CHECK(!pod_feed_complete(xml, len), "the fixture is cut off");
-    CHECK(pod_feed_complete("<rss><channel></channel></rss>\n", 31), "</rss>");
-    CHECK(pod_feed_complete("<feed xmlns=\"x\"></FEED>", 24), "</feed>, any case");
-    CHECK(pod_feed_complete("<rdf:RDF></rdf:RDF>", 19), "</rdf:RDF>");
-    CHECK(!pod_feed_complete("<rss><channel><item>", 20) && !pod_feed_complete("", 0), "cut");
+    CHECKF(!pod_feed_complete(xml, len), "the fixture is cut off");
+    CHECKF(pod_feed_complete("<rss><channel></channel></rss>\n", 31), "</rss>");
+    CHECKF(pod_feed_complete("<feed xmlns=\"x\"></FEED>", 24), "</feed>, any case");
+    CHECKF(pod_feed_complete("<rdf:RDF></rdf:RDF>", 19), "</rdf:RDF>");
+    CHECKF(!pod_feed_complete("<rss><channel><item>", 20) && !pod_feed_complete("", 0), "cut");
     {   /* over a KB after the end (a comment, whitespace): still complete */
         char tail[4200];
         int k = snprintf(tail, sizeof tail, "<rss><channel></channel></rss>\n<!--");
         memset(tail + k, 'x', 4000);
         memcpy(tail + k + 4000, "-->", 4);
-        CHECK(pod_feed_complete(tail, strlen(tail)), "</rss> then 4 KB");
+        CHECKF(pod_feed_complete(tail, strlen(tail)), "</rss> then 4 KB");
     }
     /* cut anywhere: never a crash, whole episodes only */
     for (size_t cut = 0; cut < len; cut += 7) {
         int m = pod_parse_feed(xml, cut, &s, e, 10);
-        CHECK(m <= 3, "cut %zu: %d", cut, m);
+        CHECKF(m <= 3, "cut %zu: %d", cut, m);
     }
     /* at most max, the newest */
     n = pod_parse_feed(xml, len, &s, e, 1);
-    CHECK(n == 1 && !strncmp(e[0].title, "Episode 3", 9), "max 1");
-    CHECK(pod_parse_feed("<html><body>Not a feed</body></html>", 36, &s, e, 10) == -1, "not a feed");
+    CHECKF(n == 1 && !strncmp(e[0].title, "Episode 3", 9), "max 1");
+    CHECKF(pod_parse_feed("<html><body>Not a feed</body></html>", 36, &s, e, 10) == -1, "not a feed");
     free(xml);
 }
 
@@ -106,57 +96,127 @@ static void opml_search_chapters(void)
     char *x = slurp("tests/data/podcasts/subs.opml", &len);
     pod_show_t s[8];
     int n = pod_parse_opml(x, len, s, 8);
-    CHECK(n == 2, "opml shows: %d", n);
+    CHECKF(n == 2, "opml shows: %d", n);
     if (n == 2) {
-        CHECK(!strcmp(s[0].title, "First & Best") && !strcmp(s[0].url, "https://feeds.example.com/first.xml"), "opml 1");
-        CHECK(!strcmp(s[1].title, "Only a title") && !strcmp(s[1].url, "http://feeds.example.com/second"), "opml 2");
+        CHECKF(!strcmp(s[0].title, "First & Best") && !strcmp(s[0].url, "https://feeds.example.com/first.xml"), "opml 1");
+        CHECKF(!strcmp(s[1].title, "Only a title") && !strcmp(s[1].url, "http://feeds.example.com/second"), "opml 2");
     }
     free(x);
 
     x = slurp("tests/data/podcasts/search.json", &len);
     n = pod_parse_search(x, len, s, 8);
-    CHECK(n == 2, "search: %d", n);
+    CHECKF(n == 2, "search: %d", n);
     if (n == 2) {
-        CHECK(!strcmp(s[0].title, "Radiolab") && !strcmp(s[0].author, "WNYC Studios") && s[0].episodes == 575, "search 1");
-        CHECK(!strcmp(s[1].title, "Caf\xc3\xa9 Talk") && s[1].episodes == 12, "search 2 [%s]", s[1].title);
+        CHECKF(!strcmp(s[0].title, "Radiolab") && !strcmp(s[0].author, "WNYC Studios") && s[0].episodes == 575, "search 1");
+        CHECKF(!strcmp(s[1].title, "Caf\xc3\xa9 Talk") && s[1].episodes == 12, "search 2 [%s]", s[1].title);
         /* its picture: the 600 px one when there is one */
-        CHECK(!strcmp(s[0].image, "https://is1.example/600x600bb.jpg"), "search 1's picture [%s]", s[0].image);
-        CHECK(!strcmp(s[1].image, "https://is2.example/100x100bb.jpg"), "search 2's picture [%s]", s[1].image);
+        CHECKF(!strcmp(s[0].image, "https://is1.example/600x600bb.jpg"), "search 1's picture [%s]", s[0].image);
+        CHECKF(!strcmp(s[1].image, "https://is2.example/100x100bb.jpg"), "search 2's picture [%s]", s[1].image);
     }
-    CHECK(pod_parse_search("{}", 2, s, 8) == -1, "not an answer");
+    CHECKF(pod_parse_search("{}", 2, s, 8) == -1, "not an answer");
     static const char odd[] = "{\"results\":[{\"feedUrl\":\"https://a.example/f\",\"artworkUrl600\":\"\","
                               "\"artworkUrl100\":\"https://a.example/100.jpg\"},"
                               "{\"feedUrl\":\"https://b.example/f\",\"artworkUrl600\":\"file:///etc/passwd\"}]}";
     n = pod_parse_search(odd, sizeof odd - 1, s, 8);
-    CHECK(n == 2 && !strcmp(s[0].image, "https://a.example/100.jpg") && !s[1].image[0], "an empty or odd 600: the 100, or none");
+    CHECKF(n == 2 && !strcmp(s[0].image, "https://a.example/100.jpg") && !s[1].image[0], "an empty or odd 600: the 100, or none");
     char p1[700], p2[700];
     pod_cover_path("/d", "0123456789ab", p1, sizeof p1);
     pod_thumb_path("/d", "0123456789ab", p2, sizeof p2);
-    CHECK(!strcmp(p1, "/d/0123456789ab/cover.565") && !strcmp(p2, "/d/0123456789ab/thumb.565"), "cover and thumbnail paths");
+    CHECKF(!strcmp(p1, "/d/0123456789ab/cover.565") && !strcmp(p2, "/d/0123456789ab/thumb.565"), "cover and thumbnail paths");
     free(x);
     char url[512];
     pod_search_url(url, sizeof url, "slow & steady");
-    CHECK(!strcmp(url, "https://itunes.apple.com/search?media=podcast&entity=podcast&limit=25&term=slow+%26+steady"),
+    CHECKF(!strcmp(url, "https://itunes.apple.com/search?media=podcast&entity=podcast&limit=25&term=slow+%26+steady"),
           "search url [%s]", url);
 
     x = slurp("tests/data/podcasts/chapters.json", &len);
     pod_chapter_t c[8];
     n = pod_parse_chapters(x, len, c, 8);
-    CHECK(n == 3, "chapters: %d (toc:false left out)", n);
+    CHECKF(n == 3, "chapters: %d (toc:false left out)", n);
     if (n == 3) {
-        CHECK(c[0].start_ms == 0 && !strcmp(c[0].title, "Intro"), "chapter 1");
-        CHECK(c[1].start_ms == 95500 && !strcmp(c[1].title, "The \xe2\x80\x9c" "big\xe2\x80\x9d story"), "chapter 2 [%s]", c[1].title);
-        CHECK(c[2].start_ms == 1800000, "chapter 3");
+        CHECKF(c[0].start_ms == 0 && !strcmp(c[0].title, "Intro"), "chapter 1");
+        CHECKF(c[1].start_ms == 95500 && !strcmp(c[1].title, "The \xe2\x80\x9c" "big\xe2\x80\x9d story"), "chapter 2 [%s]", c[1].title);
+        CHECKF(c[2].start_ms == 1800000, "chapter 3");
     }
     free(x);
     /* times that aren't: left out (UBSan: 1e25 * 1000 doesn't fit 32 bits) */
     static const char bad[] = "{\"chapters\":[{\"startTime\":1e25,\"title\":\"a\"},{\"startTime\":-5,\"title\":\"b\"},"
                               "{\"startTime\":\"nan\",\"title\":\"c\"},{\"startTime\":12.5,\"title\":\"d\"}]}";
     n = pod_parse_chapters(bad, sizeof bad - 1, c, 8);
-    CHECK(n == 1 && c[0].start_ms == 12500 && !strcmp(c[0].title, "d"), "nonsense chapter times: %d", n);
+    CHECKF(n == 1 && c[0].start_ms == 12500 && !strcmp(c[0].title, "d"), "nonsense chapter times: %d", n);
 }
 
 /* A long feed listed oldest first: the newest episodes are the ones kept */
+/* An address too long to keep whole is no address: cut short it would be
+ * fetched as another one (an enclosure's over 639 bytes, an image's over
+ * 383, a chapters file's over 255) */
+static void long_addresses(void)
+{
+    static char xml[8192], pad[700];
+    pod_show_t s;
+    pod_episode_t e[4];
+    memset(pad, 'a', sizeof pad - 1);
+    snprintf(xml, sizeof xml,
+             "<rss><channel><title>Long</title>"
+             "<image><url>https://img.example/%.360s.png</url></image>"
+             "<itunes:image href=\"https://img.example/%.360s.jpg\"/>"
+             "<item><title>Cut</title><guid>g1</guid>"
+             "<enclosure url=\"https://cdn.example/%.640s.mp3\" type=\"audio/mpeg\"/></item>"
+             "<item><title>Second</title><guid>g2</guid>"
+             "<enclosure url=\"https://cdn.example/%.640s.mp3\" type=\"audio/mpeg\"/>"
+             "<enclosure url=\"https://cdn.example/short.mp3\" type=\"audio/mpeg\"/></item>"
+             "<item><title>Fits</title><guid>g3</guid>"
+             "<podcast:chapters url=\"https://cdn.example/%.250s.json\"/>"
+             "<enclosure url=\"https://cdn.example/%.615s.mp3\" type=\"audio/mpeg\"/></item>"
+             "</channel></rss>", pad, pad, pad, pad, pad, pad);
+    memset(&s, 0, sizeof s);
+    int n = pod_parse_feed(xml, strlen(xml), &s, e, 4);
+    CHECKF(n == 2, "long addresses: the episode whose only address is cut isn't one (%d)", n);
+    int fits = -1, second = -1;
+    for (int i = 0; i < n; i++) {
+        if (!strcmp(e[i].title, "Fits")) fits = i;
+        if (!strcmp(e[i].title, "Second")) second = i;
+    }
+    CHECKF(second >= 0 && !strcmp(e[second].url, "https://cdn.example/short.mp3"), "a cut enclosure passed over for the next");
+    CHECKF(fits >= 0 && strlen(e[fits].url) == 639 && !strcmp(e[fits].url + 635, ".mp3"), "639 bytes: kept whole");
+    CHECKF(fits >= 0 && !e[fits].chapters[0], "a cut chapters address: none");
+    CHECKF(!s.image[0], "a cut image address: none [%.40s...]", s.image);
+
+    /* one image too long, one that fits: the one that fits */
+    snprintf(xml, sizeof xml,
+             "<rss><channel><title>Long</title>"
+             "<image><url>https://img.example/ok.png</url></image>"
+             "<itunes:image href=\"https://img.example/%.360s.jpg\"/>"
+             "</channel></rss>", pad);
+    memset(&s, 0, sizeof s);
+    pod_parse_feed(xml, strlen(xml), &s, e, 4);
+    CHECKF(!strcmp(s.image, "https://img.example/ok.png"), "the image that fits kept [%.40s]", s.image);
+
+    /* the same in an OPML file and in the directory's answer: a feed's
+     * address over 511 bytes is no show, a picture's over 383 no picture */
+    pod_show_t f[4];
+    snprintf(xml, sizeof xml,
+             "<opml><body><outline text=\"Cut\" xmlUrl=\"https://feeds.example/%.486s.xml\"/>"
+             "<outline text=\"Fits\" xmlUrl=\"https://feeds.example/%.485s.xml\"/></body></opml>", pad, pad);
+    n = pod_parse_opml(xml, strlen(xml), f, 4);
+    CHECKF(n == 1 && !strcmp(f[0].title, "Fits") && strlen(f[0].url) == 511 && !strcmp(f[0].url + 507, ".xml"),
+          "OPML: a cut feed address is no show, 511 bytes kept whole (%d)", n);
+    snprintf(xml, sizeof xml,
+             "{\"results\":[{\"collectionName\":\"Cut\",\"feedUrl\":\"https://feeds.example/%.486s.xml\"},"
+             "{\"collectionName\":\"Fits\",\"feedUrl\":\"https://feeds.example/%.485s.xml\","
+             "\"artworkUrl600\":\"https://is1.example/%.360s.jpg\",\"artworkUrl100\":\"https://is1.example/%.360s.jpg\"},"
+             "{\"collectionName\":\"Whole\",\"feedUrl\":\"https://feeds.example/w.xml\","
+             "\"artworkUrl600\":\"https://is1.example/%.359s.jpg\"},"
+             "{\"collectionName\":\"Small\",\"feedUrl\":\"https://feeds.example/s.xml\","
+             "\"artworkUrl600\":\"https://is1.example/%.360s.jpg\",\"artworkUrl100\":\"https://is1.example/100.jpg\"}]}",
+             pad, pad, pad, pad, pad, pad);
+    n = pod_parse_search(xml, strlen(xml), f, 4);
+    CHECKF(n == 3 && !strcmp(f[0].title, "Fits") && strlen(f[0].url) == 511, "search: a cut feed address is no show (%d)", n);
+    CHECKF(n == 3 && !f[0].image[0], "search: both pictures' addresses cut: none [%.40s...]", f[0].image);
+    CHECKF(n == 3 && strlen(f[1].image) == 383 && !strcmp(f[1].image + 379, ".jpg"), "search: 383 bytes: kept whole");
+    CHECKF(n == 3 && !strcmp(f[2].image, "https://is1.example/100.jpg"), "search: a cut 600, the 100 that fits [%.40s]", f[2].image);
+}
+
 static void oldest_first(void)
 {
     size_t cap = 400 * 200 + 200, w = 0;
@@ -171,7 +231,7 @@ static void oldest_first(void)
     pod_show_t show;
     pod_episode_t e[10];
     int n = pod_parse_feed(x, w, &show, e, 10);
-    CHECK(n == 10 && !strcmp(e[0].title, "Ep 300") && !strcmp(e[9].title, "Ep 291"), "oldest first: %d, newest [%s], 10th [%s]",
+    CHECKF(n == 10 && !strcmp(e[0].title, "Ep 300") && !strcmp(e[9].title, "Ep 291"), "oldest first: %d, newest [%s], 10th [%s]",
           n, n > 0 ? e[0].title : "", n > 9 ? e[9].title : "");
     free(x);
 }
@@ -179,8 +239,7 @@ static void oldest_first(void)
 static void card(void)
 {
     char tmpl[512], dir[600];
-    test_tmp(tmpl, sizeof tmpl, "podcast");
-    if (!mkdtemp(tmpl)) { printf("FAIL: mkdtemp\n"); fails++; return; }
+    t_mkdtemp(tmpl, sizeof tmpl, "podcast");
     snprintf(dir, sizeof dir, "%s/podcasts", tmpl);
 
     pod_show_t a = {0}, b = {0}, got[8];
@@ -188,11 +247,11 @@ static void card(void)
     snprintf(a.url, sizeof a.url, "https://a.example/feed");
     snprintf(b.title, sizeof b.title, "Show B");
     snprintf(b.url, sizeof b.url, "http://b.example/rss?x=1");
-    CHECK(pod_shows_load(dir, got, 8) == 0, "no shows yet");
-    CHECK(pod_shows_add(dir, &a) == 1 && pod_shows_add(dir, &b) == 1, "added");
-    CHECK(pod_shows_add(dir, &a) == 0, "already there");
+    CHECKF(pod_shows_load(dir, got, 8) == 0, "no shows yet");
+    CHECKF(pod_shows_add(dir, &a) == 1 && pod_shows_add(dir, &b) == 1, "added");
+    CHECKF(pod_shows_add(dir, &a) == 0, "already there");
     int n = pod_shows_load(dir, got, 8);
-    CHECK(n == 2 && !strcmp(got[0].title, "Show = A") && !strcmp(got[0].url, a.url) && !strcmp(got[1].url, b.url),
+    CHECKF(n == 2 && !strcmp(got[0].title, "Show = A") && !strcmp(got[0].url, a.url) && !strcmp(got[1].url, b.url),
           "loaded in order: %d [%s] [%s]", n, n > 0 ? got[0].title : "", n > 1 ? got[1].url : "");
 
     /* details and episodes */
@@ -200,9 +259,9 @@ static void card(void)
     snprintf(d.author, sizeof d.author, "Someone");
     d.refreshed = 1795064400;
     d.seen = 1795054400;
-    CHECK(pod_show_save(dir, &d) == 0 && pod_show_seen(dir, d.id, d.seen) == 0, "show saved");
+    CHECKF(pod_show_save(dir, &d) == 0 && pod_show_seen(dir, d.id, d.seen) == 0, "show saved");
     n = pod_shows_load(dir, got, 8);
-    CHECK(n == 2 && !strcmp(got[0].author, "Someone") && got[0].refreshed == 1795064400 && got[0].seen == 1795054400,
+    CHECKF(n == 2 && !strcmp(got[0].author, "Someone") && got[0].refreshed == 1795064400 && got[0].seen == 1795054400,
           "details read back");
 
     size_t len;
@@ -211,17 +270,17 @@ static void card(void)
     pod_episode_t e[10], back[10];
     int ne = pod_parse_feed(xml, len, &f, e, 10);
     free(xml);
-    CHECK(pod_episodes_save(dir, d.id, e, ne) == 0, "episodes saved");
-    CHECK(pod_episodes_load(dir, d.id, back, 10) == ne, "episodes read back");
+    CHECKF(pod_episodes_save(dir, d.id, e, ne) == 0, "episodes saved");
+    CHECKF(pod_episodes_load(dir, d.id, back, 10) == ne, "episodes read back");
     for (int i = 0; i < ne; i++)
-        CHECK(!memcmp(&e[i], &back[i], sizeof e[i]), "episode %d the same", i);
+        CHECKF(!memcmp(&e[i], &back[i], sizeof e[i]), "episode %d the same", i);
     if (ne > 0) {   /* a key that isn't hex (the file edited by hand): that episode left out */
         pod_episode_t bad[10];
         memcpy(bad, e, sizeof bad[0] * (size_t)ne);
         snprintf(bad[0].key, sizeof bad[0].key, "../../../../");
-        CHECK(pod_episodes_save(dir, d.id, bad, ne) == 0, "episodes saved, one key bad");
-        CHECK(pod_episodes_load(dir, d.id, back, 10) == ne - 1, "the bad key left out");
-        CHECK(pod_episodes_save(dir, d.id, e, ne) == 0, "episodes saved again");
+        CHECKF(pod_episodes_save(dir, d.id, bad, ne) == 0, "episodes saved, one key bad");
+        CHECKF(pod_episodes_load(dir, d.id, back, 10) == ne - 1, "the bad key left out");
+        CHECKF(pod_episodes_save(dir, d.id, e, ne) == 0, "episodes saved again");
     }
 
     /* state */
@@ -229,20 +288,20 @@ static void card(void)
     snprintf(s.key, sizeof s.key, "%s", e[1].key);
     s.pos_ms = 123456;
     s.len_ms = 3723000;
-    CHECK(pod_state_put(dir, d.id, &s) == 0, "state saved");
+    CHECKF(pod_state_put(dir, d.id, &s) == 0, "state saved");
     s.pos_ms = 0;
     s.played = 1;
     s.played_at = 1795064400;
     snprintf(s.key, sizeof s.key, "%s", e[0].key);
-    CHECK(pod_state_put(dir, d.id, &s) == 0, "second state");
+    CHECKF(pod_state_put(dir, d.id, &s) == 0, "second state");
     n = pod_state_load(dir, d.id, st, 8);
-    CHECK(n == 2, "states: %d", n);
+    CHECKF(n == 2, "states: %d", n);
     pod_state_find(st, n, e[1].key, &one);
-    CHECK(one.pos_ms == 123456 && one.len_ms == 3723000 && !one.played, "position kept");
+    CHECKF(one.pos_ms == 123456 && one.len_ms == 3723000 && !one.played, "position kept");
     pod_state_find(st, n, e[0].key, &one);
-    CHECK(one.played && one.played_at == 1795064400, "played kept");
+    CHECKF(one.played && one.played_at == 1795064400, "played kept");
     pod_state_find(st, n, e[2].key, &one);
-    CHECK(!one.played && !one.pos_ms && !strcmp(one.key, e[2].key), "none: zero, its key");
+    CHECKF(!one.played && !one.pos_ms && !strcmp(one.key, e[2].key), "none: zero, its key");
 
     /* a damaged state.txt: numbers as long as they go, on every line, then one more put */
     {
@@ -254,27 +313,27 @@ static void card(void)
         if (sf) fclose(sf);
         s.pos_ms = 5;
         snprintf(s.key, sizeof s.key, "%s", e[3].key);
-        CHECK(pod_state_put(dir, d.id, &s) == 0, "a put over a damaged state");
-        CHECK(pod_state_load(dir, d.id, st, 8) == 8, "its lines kept");
+        CHECKF(pod_state_put(dir, d.id, &s) == 0, "a put over a damaged state");
+        CHECKF(pod_state_load(dir, d.id, st, 8) == 8, "its lines kept");
     }
 
     /* a download */
     char p[800];
     pod_episode_path(dir, d.id, &e[0], p, sizeof p);
-    CHECK(!pod_downloaded(dir, d.id, &e[0]), "not downloaded");
+    CHECKF(!pod_downloaded(dir, d.id, &e[0]), "not downloaded");
     FILE *w = fopen(p, "wb");
     if (w) { fputs("ID3", w); fclose(w); }
-    CHECK(pod_downloaded(dir, d.id, &e[0]), "downloaded");
-    CHECK(pod_delete_download(dir, d.id, &e[0]) == 0 && !pod_downloaded(dir, d.id, &e[0]), "deleted");
+    CHECKF(pod_downloaded(dir, d.id, &e[0]), "downloaded");
+    CHECKF(pod_delete_download(dir, d.id, &e[0]) == 0 && !pod_downloaded(dir, d.id, &e[0]), "deleted");
 
     /* unsubscribe: its line and folder go, the other stays */
-    CHECK(pod_shows_remove(dir, a.url) == 0, "removed");
+    CHECKF(pod_shows_remove(dir, a.url) == 0, "removed");
     n = pod_shows_load(dir, got, 8);
-    CHECK(n == 1 && !strcmp(got[0].url, b.url), "one left");
+    CHECKF(n == 1 && !strcmp(got[0].url, b.url), "one left");
     struct stat sb;
     char sd[700];
     snprintf(sd, sizeof sd, "%s/%s", dir, d.id);
-    CHECK(stat(sd, &sb) != 0, "its folder gone");
+    CHECKF(stat(sd, &sb) != 0, "its folder gone");
 
     /* a hand-edited list: notes, blank lines, odd spacing */
     char path[700];
@@ -285,7 +344,7 @@ static void card(void)
         fclose(w);
     }
     n = pod_shows_load(dir, got, 8);
-    CHECK(n == 2 && !strcmp(got[0].title, "Hand Added") && !strcmp(got[0].url, "https://h.example/feed") &&
+    CHECKF(n == 2 && !strcmp(got[0].title, "Hand Added") && !strcmp(got[0].url, "https://h.example/feed") &&
           !strcmp(got[1].url, "https://bare.example/rss") && !strcmp(got[1].title, "https://bare.example/rss"),
           "hand-edited: %d [%s] [%s]", n, n > 0 ? got[0].title : "", n > 1 ? got[1].title : "");
 
@@ -299,24 +358,24 @@ static void card(void)
     snprintf(o[1].title, sizeof o[1].title, "Proxied");
     snprintf(o[2].url, sizeof o[2].url, "https://c.example/rss");
     snprintf(o[2].title, sizeof o[2].title, "Notes on http://old.example = https://new.example");
-    for (int i = 0; i < 3; i++) CHECK(pod_shows_add(dir, &o[i]) == 1, "outline %d added", i);
-    CHECK(pod_shows_add(dir, &o[0]) == 0, "an outline's address not added twice");
+    for (int i = 0; i < 3; i++) CHECKF(pod_shows_add(dir, &o[i]) == 1, "outline %d added", i);
+    CHECKF(pod_shows_add(dir, &o[0]) == 0, "an outline's address not added twice");
     n = pod_shows_load(dir, got, 8);
-    CHECK(n == 3, "outlines: %d", n);
+    CHECKF(n == 3, "outlines: %d", n);
     for (int i = 0; i < n && i < 3; i++)
-        CHECK(!strcmp(got[i].url, o[i].url) && !strcmp(got[i].title, o[i].title), "outline %d read back: [%s] [%s]", i,
+        CHECKF(!strcmp(got[i].url, o[i].url) && !strcmp(got[i].title, o[i].title), "outline %d read back: [%s] [%s]", i,
               got[i].title, got[i].url);
     w = fopen(path, "a");
     if (w) { fputs("Proxy Hand=https://p.example/f?u=http://q.example/r\n", w); fclose(w); }
     n = pod_shows_load(dir, got, 8);
-    CHECK(n == 4 && !strcmp(got[3].url, "https://p.example/f?u=http://q.example/r") && !strcmp(got[3].title, "Proxy Hand"),
+    CHECKF(n == 4 && !strcmp(got[3].url, "https://p.example/f?u=http://q.example/r") && !strcmp(got[3].title, "Proxy Hand"),
           "hand-written with an address inside: [%s] [%s]", n > 3 ? got[3].title : "", n > 3 ? got[3].url : "");
 
     /* a bare address with another in its query: the whole line, not split at its '=' */
     w = fopen(path, "w");
     if (w) { fputs("https://feeds.example.com/rss?src=https://other.example.org/x\n", w); fclose(w); }
     n = pod_shows_load(dir, got, 8);
-    CHECK(n == 1 && !strcmp(got[0].url, "https://feeds.example.com/rss?src=https://other.example.org/x") &&
+    CHECKF(n == 1 && !strcmp(got[0].url, "https://feeds.example.com/rss?src=https://other.example.org/x") &&
           !strcmp(got[0].title, got[0].url), "bare with an address inside: [%s] [%s]", n ? got[0].title : "", n ? got[0].url : "");
 
     /* added before 0.13, when such a line was read as its inner address: the
@@ -329,9 +388,9 @@ static void card(void)
     w = fopen(path, "w");
     if (w) { fputs("Old = https://a.example/f?u=http://b.example/r\n", w); fclose(w); }
     n = pod_shows_load(dir, got, 8);
-    CHECK(n == 1 && !strcmp(got[0].url, "https://a.example/f?u=http://b.example/r") && !strcmp(got[0].id, old_id),
+    CHECKF(n == 1 && !strcmp(got[0].url, "https://a.example/f?u=http://b.example/r") && !strcmp(got[0].id, old_id),
           "an older show keeps its folder: [%s] %s", n ? got[0].url : "", n ? got[0].id : "");
-    CHECK(pod_shows_remove(dir, "https://a.example/f?u=http://b.example/r") == 0 && stat(od, &sb) != 0,
+    CHECKF(pod_shows_remove(dir, "https://a.example/f?u=http://b.example/r") == 0 && stat(od, &sb) != 0,
           "...and an unsubscribe removes it");
     /* a show named by its address (an OPML outline without a name), and one
      * whose address ends with another's: each unsubscribe takes its own line */
@@ -343,20 +402,83 @@ static void card(void)
               "Short = https://e.example/feed  \r\n", w);
         fclose(w);
     }
-    CHECK(pod_shows_load(dir, got, 8) == 3, "three shows");
-    CHECK(pod_shows_remove(dir, "https://e.example/feed") == 0, "the short one removed");
+    CHECKF(pod_shows_load(dir, got, 8) == 3, "three shows");
+    CHECKF(pod_shows_remove(dir, "https://e.example/feed") == 0, "the short one removed");
     n = pod_shows_load(dir, got, 8);
-    CHECK(n == 2 && !strcmp(got[1].url, "https://d.example/x?next=https://e.example/feed"),
+    CHECKF(n == 2 && !strcmp(got[1].url, "https://d.example/x?next=https://e.example/feed"),
           "the longer address keeps its line: %d [%s]", n, n > 1 ? got[1].url : "");
-    CHECK(pod_shows_remove(dir, "https://c.example/feed") == 0, "the one named by its address removed");
+    CHECKF(pod_shows_remove(dir, "https://c.example/feed") == 0, "the one named by its address removed");
     n = pod_shows_load(dir, got, 8);
-    CHECK(n == 1 && !strcmp(got[0].title, "Longer"), "its line gone: %d [%s]", n, n ? got[0].title : "");
+    CHECKF(n == 1 && !strcmp(got[0].title, "Longer"), "its line gone: %d [%s]", n, n ? got[0].title : "");
     char *left = NULL;
     size_t cap = 0;
     w = fopen(path, "r");
-    CHECK(w && getline(&left, &cap, w) > 0 && !strcmp(left, "# mine\n"), "the note kept");
+    CHECKF(w && getline(&left, &cap, w) > 0 && !strcmp(left, "# mine\n"), "the note kept");
     if (w) fclose(w);
     free(left);
+}
+
+/* shows.txt, or a show's state.txt, that is there and can't be read is not
+ * "none yet": nothing is written over it (every subscription went at the
+ * next Subscribe; a show's played marks and places at the next 15 s of play) */
+static void unreadable(void)
+{
+    char tmpl[512], dir[600], path[700], sd[700];
+    t_mkdtemp(tmpl, sizeof tmpl, "podunread");
+    if (geteuid() == 0) { printf("unreadable files: not tried (root reads anything)\n"); return; }
+    snprintf(dir, sizeof dir, "%s/podcasts", tmpl);
+    pod_show_t s[3], more = {0}, got[8];
+    memset(s, 0, sizeof s);
+    for (int i = 0; i < 3; i++) {
+        snprintf(s[i].title, sizeof s[i].title, "Show %d", i);
+        snprintf(s[i].url, sizeof s[i].url, "https://s%d.example/feed", i);
+        CHECKF(pod_shows_add(dir, &s[i]) == 1, "show %d added", i);
+    }
+    snprintf(more.title, sizeof more.title, "One more");
+    snprintf(more.url, sizeof more.url, "https://more.example/feed");
+    CHECKF(pod_shows_load(dir, got, 8) == 3, "three shows");
+    snprintf(path, sizeof path, "%s/shows.txt", dir);
+    snprintf(sd, sizeof sd, "%s/%s", dir, got[0].id);
+    size_t was_n, now_n;
+    char *was = slurp(path, &was_n);
+    struct stat sb;
+
+    chmod(path, 0);
+    CHECKF(pod_shows_add(dir, &more) == -1, "shows.txt can't be read: nothing added");
+    CHECKF(pod_shows_remove(dir, s[0].url) == -1 && stat(sd, &sb) == 0, "...nor removed, its folder left");
+    CHECKF(pod_shows_load(dir, got, 8) == 0, "(and no shows to list)");
+    chmod(path, 0644);
+    char *now = slurp(path, &now_n);
+    CHECKF(now_n == was_n && !memcmp(now, was, was_n), "shows.txt as it was (%zu bytes, were %zu)", now_n, was_n);
+    free(now);
+    free(was);
+    CHECKF(pod_shows_add(dir, &more) == 1 && pod_shows_load(dir, got, 8) == 4, "readable again: added");
+
+    /* a show's state.txt */
+    pod_state_t st = {0}, back[8];
+    snprintf(st.key, sizeof st.key, "0123456789ab");
+    st.pos_ms = 60000;
+    st.played = 1;
+    st.played_at = 1795064400;
+    CHECKF(pod_state_put(dir, got[0].id, &st) == 0, "a place kept");
+    snprintf(st.key, sizeof st.key, "ba9876543210");
+    CHECKF(pod_state_put(dir, got[0].id, &st) == 0 && pod_state_load(dir, got[0].id, back, 8) == 2, "and another");
+    snprintf(path, sizeof path, "%s/%s/state.txt", dir, got[0].id);
+    was = slurp(path, &was_n);
+    chmod(path, 0);
+    snprintf(st.key, sizeof st.key, "aaaaaaaaaaaa");
+    CHECKF(pod_state_put(dir, got[0].id, &st) == -1, "state.txt can't be read: nothing kept over it");
+    CHECKF(pod_state_load(dir, got[0].id, back, 8) == 0, "(and no places to show)");
+    chmod(path, 0644);
+    now = slurp(path, &now_n);
+    CHECKF(now_n == was_n && !memcmp(now, was, was_n), "state.txt as it was (%zu bytes, were %zu)", now_n, was_n);
+    free(now);
+    free(was);
+    CHECKF(pod_state_put(dir, got[0].id, &st) == 0 && pod_state_load(dir, got[0].id, back, 8) == 3, "readable again: kept");
+    /* (no state.txt yet is still "none yet") */
+    CHECKF(pod_state_put(dir, got[1].id, &st) == 0 && pod_state_load(dir, got[1].id, back, 8) == 1, "a show's first place kept");
+
+    t_rm_rf(tmpl);
 }
 
 /* An MP3 with chapters in its ID3 tag (CHAP frames, as podcast tools write
@@ -388,8 +510,7 @@ static size_t chap_frame(unsigned char *out, const char *id, uint32_t start, uin
 static void embedded_chapters(void)
 {
     char tmpl[512], path[600];
-    test_tmp(tmpl, sizeof tmpl, "podchap");
-    if (!mkdtemp(tmpl)) return;
+    t_mkdtemp(tmpl, sizeof tmpl, "podchap");
     snprintf(path, sizeof path, "%s/ep.mp3", tmpl);
     unsigned char tag[512];
     size_t n = 10;
@@ -408,7 +529,7 @@ static void embedded_chapters(void)
     pod_chapter_t c[4];
     int k = pod_file_chapters(path, c, 4);
     printf("embedded chapters: %d%s\n", k, k ? "" : " (no FFmpeg in this build)");
-    CHECK(k == 0 || (k == 2 && c[0].start_ms == 0 && !strcmp(c[0].title, "Opening") && c[1].start_ms == 600 &&
+    CHECKF(k == 0 || (k == 2 && c[0].start_ms == 0 && !strcmp(c[0].title, "Opening") && c[1].start_ms == 600 &&
                      !strcmp(c[1].title, "Second part")), "embedded: %d", k);
     unlink(path);
     rmdir(tmpl);
@@ -419,10 +540,10 @@ int main(void)
     dates();
     feed();
     oldest_first();
+    long_addresses();
     opml_search_chapters();
     card();
+    unreadable();
     embedded_chapters();
-    if (fails) { printf("%d failed\n", fails); return 1; }
-    printf("podcast: ok\n");
-    return 0;
+    return t_result();
 }

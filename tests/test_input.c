@@ -4,14 +4,14 @@
  * device/input.c on the host: its events come from a pipe instead of
  * /dev/input (tests/fake holds the Linux headers it needs). A headphone jack
  * change is never lost, however full the queue is. Power wakes the screen as
- * it goes down, and turns it off as it comes back up.
+ * it goes down, and turns it off as it comes back up (unless the screen went
+ * off by itself meanwhile).
  */
 #include "../device/input.c"
 
 #include <fcntl.h>
 
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_util.h"
 
 static int wfd;
 
@@ -22,7 +22,7 @@ static void send_ev(int type, int code, int value)
     e.type = (uint16_t)type;
     e.code = (uint16_t)code;
     e.value = value;
-    if (write(wfd, &e, sizeof e) != (ssize_t)sizeof e) failures++;
+    if (write(wfd, &e, sizeof e) != (ssize_t)sizeof e) t_fails++;
 }
 
 /* Everything input_next() gives now: the headphones' states it told, in order. */
@@ -115,13 +115,28 @@ static void test_power(void)
     CHECK(sw == 0);
 
     /* pressed with the screen on, which then goes off by itself (its timeout)
-     * before the release: the release switches it, as it always did */
+     * before the release: the release says nothing, the screen is off as the
+     * press wanted it (it switched it, which turned the screen back on) */
     input_set_screen(1);
     power_key(1, 40000, &sw, &off);
     CHECK(sw == 0);
     input_set_screen(0);
     power_key(0, 40500, &sw, &off);
+    CHECK(sw == 0 && off == 0);
+    /* ...and the next press, the screen off, wakes it as ever */
+    power_key(1, 41000, &sw, &off);
     CHECK(sw == 1 && off == 0);
+    input_set_screen(1);
+    power_key(0, 41100, &sw, &off);
+    CHECK(sw == 0 && off == 0);
+    /* the same, Power held on for its 2 s: power-off all the same */
+    power_key(1, 45000, &sw, &off);
+    CHECK(sw == 0);
+    input_set_screen(0);
+    power_at(47000, &sw, &off);
+    CHECK(sw == 0 && off == 1);
+    power_key(0, 47200, &sw, &off);
+    CHECK(sw == 0 && off == 0);
     input_set_screen(1);
 
     /* a release with no press before it (the key was down as the player started): nothing */
@@ -164,7 +179,5 @@ int main(void)
 
     test_power();
 
-    if (failures) fprintf(stderr, "%d failure(s)\n", failures);
-    else printf("input: all checks passed\n");
-    return failures != 0;
+    return t_result();
 }

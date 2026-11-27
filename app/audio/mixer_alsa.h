@@ -30,9 +30,5 @@ int  mixer_find_playback_volume(const char *ctl_dev, char *name);
 int  mixer_enum_get(const char *ctl_dev, const char *control, char *name, int cap);
 int  mixer_enum_count(const char *ctl_dev, const char *control);
 int  mixer_enum_set(const char *ctl_dev, const char *control, int item);
-/* Any boolean, integer or enumerated control, every channel to `value`. -1 on error. */
-int  mixer_ctl_set(const char *ctl_dev, const char *control, int value);
-/* Every control of the card, its type, range and value, one per line (diagnostics). */
-void mixer_dump(const char *ctl_dev, FILE *out);
 
 #endif

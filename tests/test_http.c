@@ -7,11 +7,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "core/clock.h"
 #include "net/http.h"
+#include "test_util.h"
 
 /* ---- tries (http_get_retry, http_download_retry): fake single tries ---- */
 
-static int t_fails, t_calls, t_abort_after;
+static int t_failing, t_calls, t_abort_after;
 static long t_last;                                  /* what a try returns once it stops failing */
 static volatile int t_abort;
 
@@ -20,7 +22,7 @@ static long fake_get(const char *url, char *buf, size_t cap, const volatile int 
     (void)url; (void)buf; (void)cap; (void)abort;
     t_calls++;
     if (t_abort_after && t_calls >= t_abort_after) t_abort = 1;
-    return t_calls <= t_fails ? -1 : t_last;
+    return t_calls <= t_failing ? -1 : t_last;
 }
 
 static int64_t fake_download(const char *url, const char *path, http_progress_fn progress, void *ctx,
@@ -29,81 +31,114 @@ static int64_t fake_download(const char *url, const char *path, http_progress_fn
     (void)url; (void)path; (void)progress; (void)ctx; (void)abort;
     t_calls++;
     if (t_abort_after && t_calls >= t_abort_after) t_abort = 1;
-    return t_calls <= t_fails ? -1 : t_last;
+    return t_calls <= t_failing ? -1 : t_last;
 }
 
-static int tries_failed;
-#define TCHECK(c, ...) do { if (!(c)) { tries_failed++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
-
-static void t_set(int fails, long last, int abort_after)
+static void t_set(int failing, long last, int abort_after)
 {
-    t_fails = fails;
+    t_failing = failing;
     t_last = last;
     t_calls = 0;
     t_abort = 0;
     t_abort_after = abort_after;
 }
 
-static int test_tries(void)
+static void test_tries(void)
 {
     char buf[16];
     http_test_tries(fake_get, fake_download, 1, 1);
     t_set(0, 5, 0);
-    TCHECK(http_get_retry("u", buf, sizeof buf, &t_abort) == 5 && t_calls == 1, "first try: %d calls", t_calls);
+    CHECKF(http_get_retry("u", buf, sizeof buf, &t_abort) == 5 && t_calls == 1, "first try: %d calls", t_calls);
     t_set(1, 5, 0);                                  /* a lookup that failed once */
-    TCHECK(http_get_retry("u", buf, sizeof buf, &t_abort) == 5 && t_calls == 2, "second try: %d calls", t_calls);
+    CHECKF(http_get_retry("u", buf, sizeof buf, &t_abort) == 5 && t_calls == 2, "second try: %d calls", t_calls);
     t_set(2, 5, 0);
-    TCHECK(http_get_retry("u", buf, sizeof buf, NULL) == 5 && t_calls == 3, "third try: %d calls", t_calls);
+    CHECKF(http_get_retry("u", buf, sizeof buf, NULL) == 5 && t_calls == 3, "third try: %d calls", t_calls);
     t_set(9, 5, 0);                                  /* no network: three tries, then -1 */
-    TCHECK(http_get_retry("u", buf, sizeof buf, &t_abort) == -1 && t_calls == 3, "gave up after %d", t_calls);
+    CHECKF(http_get_retry("u", buf, sizeof buf, &t_abort) == -1 && t_calls == 3, "gave up after %d", t_calls);
     t_set(9, 5, 1);                                  /* cancelled during the first: no more */
-    TCHECK(http_get_retry("u", buf, sizeof buf, &t_abort) == -1 && t_calls == 1, "after abort: %d calls", t_calls);
+    CHECKF(http_get_retry("u", buf, sizeof buf, &t_abort) == -1 && t_calls == 1, "after abort: %d calls", t_calls);
     t_set(0, -3, 0);                                 /* not there: the server answered */
-    TCHECK(http_get_retry("u", buf, sizeof buf, &t_abort) == -3 && t_calls == 1, "-3 tried %d times", t_calls);
+    CHECKF(http_get_retry("u", buf, sizeof buf, &t_abort) == -3 && t_calls == 1, "-3 tried %d times", t_calls);
     t_set(0, -2, 0);                                 /* too long: the same next time */
-    TCHECK(http_get_retry("u", buf, sizeof buf, &t_abort) == -2 && t_calls == 1, "-2 tried %d times", t_calls);
+    CHECKF(http_get_retry("u", buf, sizeof buf, &t_abort) == -2 && t_calls == 1, "-2 tried %d times", t_calls);
     t_set(2, 14831595, 0);                           /* the update's download */
-    TCHECK(http_download_retry("u", "p", NULL, NULL, &t_abort) == 14831595 && t_calls == 3,
+    CHECKF(http_download_retry("u", "p", NULL, NULL, &t_abort) == 14831595 && t_calls == 3,
            "download: %d calls", t_calls);
     t_set(9, 7, 2);
-    TCHECK(http_download_retry("u", "p", NULL, NULL, &t_abort) == -1 && t_calls == 2,
+    CHECKF(http_download_retry("u", "p", NULL, NULL, &t_abort) == -1 && t_calls == 2,
            "download cancelled: %d calls", t_calls);
     t_set(0, -3, 0);
-    TCHECK(http_download_retry("u", "p", NULL, NULL, &t_abort) == -3 && t_calls == 1,
+    CHECKF(http_download_retry("u", "p", NULL, NULL, &t_abort) == -3 && t_calls == 1,
            "download -3 tried %d times", t_calls);
     t_set(0, HTTP_ERR_FULL, 0);                      /* the card nearly full: the same next time */
-    TCHECK(http_download_retry("u", "p", NULL, NULL, &t_abort) == HTTP_ERR_FULL && t_calls == 1,
+    CHECKF(http_download_retry("u", "p", NULL, NULL, &t_abort) == HTTP_ERR_FULL && t_calls == 1,
            "card full tried %d times", t_calls);
     t_set(0, HTTP_ERR_WRITE, 0);
-    TCHECK(http_download_retry("u", "p", NULL, NULL, &t_abort) == HTTP_ERR_WRITE && t_calls == 1,
+    CHECKF(http_download_retry("u", "p", NULL, NULL, &t_abort) == HTTP_ERR_WRITE && t_calls == 1,
            "card not written tried %d times", t_calls);
     t_set(1, HTTP_ERR_FULL, 0);                      /* (after a try the network failed) */
-    TCHECK(http_download_retry("u", "p", NULL, NULL, &t_abort) == HTTP_ERR_FULL && t_calls == 2,
+    CHECKF(http_download_retry("u", "p", NULL, NULL, &t_abort) == HTTP_ERR_FULL && t_calls == 2,
            "card full after a failed try: %d calls", t_calls);
-    TCHECK(HTTP_ERR_FULL < 0 && HTTP_ERR_WRITE < 0 && HTTP_ERR_FULL != -1 && HTTP_ERR_WRITE != -1 &&
+    CHECKF(HTTP_ERR_FULL < 0 && HTTP_ERR_WRITE < 0 && HTTP_ERR_FULL != -1 && HTTP_ERR_WRITE != -1 &&
            HTTP_ERR_FULL != -3 && HTTP_ERR_WRITE != -3 && HTTP_ERR_FULL != HTTP_ERR_WRITE, "their own codes");
     http_test_tries(NULL, NULL, 2000, 5000);
 
     /* what a body read comes to (http_get): an answer cut short isn't a whole one */
-    TCHECK(http_get_result(5000, 5000, 0, 0, 0) == 5000, "whole");
-    TCHECK(http_get_result(5000, 0, 0, 0, 0) == 5000 && http_get_result(5000, -38, 0, 0, 0) == 5000, "no length given");
-    TCHECK(http_get_result(1460, 5000, 0, 1, 0) == -1, "cut short after its first bytes");
-    TCHECK(http_get_result(1460, 5000, 0, 0, 0) == -1, "cut short, the server just hanging up");
-    TCHECK(http_get_result(5000, 5000, 0, 1, 0) == 5000, "all of it, then an error (an untidy hang-up)");
-    TCHECK(http_get_result(0, 5000, 0, 1, 0) == -1 && http_get_result(0, 0, 0, 1, 0) == -1, "nothing");
-    TCHECK(http_get_result(0, 0, 0, 0, 0) == 0, "an empty answer");
-    TCHECK(http_get_result(4095, 9000, 1, 0, 0) == -2 && http_get_result(4095, 0, 1, 0, 0) == -2, "longer than the buffer");
-    TCHECK(http_get_result(5000, 5000, 0, 0, 1) == -1, "cancelled");
-    TCHECK(http_get_result(1460, 0, 0, 1, 0) == 1460, "no length and an error after some: as before");
-    return tries_failed;
+    CHECKF(http_get_result(5000, 5000, 0, 0, 0) == 5000, "whole");
+    CHECKF(http_get_result(5000, 0, 0, 0, 0) == 5000 && http_get_result(5000, -38, 0, 0, 0) == 5000, "no length given");
+    CHECKF(http_get_result(1460, 5000, 0, 1, 0) == -1, "cut short after its first bytes");
+    CHECKF(http_get_result(1460, 5000, 0, 0, 0) == -1, "cut short, the server just hanging up");
+    CHECKF(http_get_result(5000, 5000, 0, 1, 0) == 5000, "all of it, then an error (an untidy hang-up)");
+    CHECKF(http_get_result(0, 5000, 0, 1, 0) == -1 && http_get_result(0, 0, 0, 1, 0) == -1, "nothing");
+    CHECKF(http_get_result(0, 0, 0, 0, 0) == 0, "an empty answer");
+    CHECKF(http_get_result(4095, 9000, 1, 0, 0) == -2 && http_get_result(4095, 0, 1, 0, 0) == -2, "longer than the buffer");
+    CHECKF(http_get_result(5000, 5000, 0, 0, 1) == -1, "cancelled");
+    CHECKF(http_get_result(1460, 0, 0, 1, 0) == 1460, "no length and an error after some: as before");
+
+    /* A download's least speed (http_too_slow): given up once it has averaged
+     * under 2 KB/s over a minute. A download here reports its progress once a
+     * second, at a speed of its own. */
+    {
+        http_slow_t w = {0, 0};
+        uint64_t done = 0;
+        int64_t t = 0;
+        int gave = 0;
+        while (!gave && t < 1500 * 1000) {           /* 1 KB/s: a feed's server that held the worker 25 minutes */
+            t += 1000;
+            done += 1024;
+            gave = http_too_slow(&w, done, t);
+        }
+        CHECKF(gave && t == HTTP_SLOW_MS, "1 KB/s: given up after a minute (%d, %lld s)", gave, (long long)t / 1000);
+        w = (http_slow_t){0, 0};
+        for (t = 1000, done = 0, gave = 0; t <= 3600 * 1000; t += 1000) gave |= http_too_slow(&w, done += 3 * 1024, t);
+        CHECKF(!gave, "3 KB/s for an hour: carried on");
+        w = (http_slow_t){0, 0};
+        for (t = 1000, done = 0, gave = 0; t <= 3600 * 1000; t += 1000) gave |= http_too_slow(&w, done += HTTP_SLOW_BPS, t);
+        CHECKF(!gave, "2 KB/s exactly: carried on");
+        /* fast for a minute and a half, then nothing more: not given up while
+         * it comes, and within two minutes of its stopping */
+        w = (http_slow_t){0, 0};
+        int64_t gave_at = 0;
+        for (t = 1000, done = 0; t <= 600 * 1000 && !gave_at; t += 1000) {
+            if (t <= 90 * 1000) done += 1024 * 1024;
+            if (http_too_slow(&w, done, t)) gave_at = t;
+        }
+        CHECKF(gave_at > 90 * 1000 && gave_at <= (90 + 120) * 1000, "stalled after 90 s: given up at %lld s", (long long)gave_at / 1000);
+        /* it comes in pieces of 32 KB, one every 20 s (1.6 KB/s) */
+        w = (http_slow_t){5000, 0};
+        for (t = 25000, done = 0, gave_at = 0; t <= 600 * 1000 && !gave_at; t += 20000)
+            if (http_too_slow(&w, done += 32768, t)) gave_at = t;
+        CHECKF(gave_at == 65000, "32 KB every 20 s: given up a minute after its start (%lld s)", (long long)gave_at / 1000);
+        CHECKF(HTTP_GET_MS == 60000, "an answer's whole time: a minute");
+    }
 }
 
 #ifndef FATHOM_HAVE_FFMPEG
 int main(void)
 {
-    if (test_tries()) { printf("%d failed\n", tries_failed); return 1; }
-    printf("http: tries ok; downloads skipped (no FFmpeg in this build)\n");
-    return 0;
+    test_tries();
+    printf("http: downloads skipped (no FFmpeg in this build)\n");
+    return t_result();
 }
 #else
 #include <arpa/inet.h>
@@ -113,9 +148,6 @@ int main(void)
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
-static int fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 #define SIZE (3 * 1024 * 1024 + 123)
 
@@ -188,13 +220,6 @@ static void *run(void *arg)
 
 static volatile int rs_conns, rs_gone;
 
-static double mono_s(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
-}
-
 /* A WAV with no length (44.1 kHz, 16 bits, stereo, silent): the first
  * connection gets a second of it and is closed; the ones after go on until
  * rs_gone. */
@@ -260,32 +285,32 @@ static void test_stream(void)
     static int32_t pcm[4096 * 2];
     /* nothing listening: it fails at once (it took 11 s) */
     int port = 0, s = local_listener(&port);
-    CHECK(s >= 0, "a listener");
+    CHECKF(s >= 0, "a listener");
     close(s);
     snprintf(url, sizeof url, "http://127.0.0.1:%d/radio.wav", port);
-    double t0 = mono_s();
+    double t0 = clock_fsec();
     decoder_t *d = decoder_open_ex(url, &f, &stop);
-    double took = mono_s() - t0;
-    CHECK(!d && took < 3, "a refused stream: %s after %.1f s", d ? "opened" : "failed", took);
+    double took = clock_fsec() - t0;
+    CHECKF(!d && took < 3, "a refused stream: %s after %.1f s", d ? "opened" : "failed", took);
     if (d) decoder_close(d);
 
     /* a stream whose connection is closed after a second: gone on with, on a
      * new connection */
     s = local_listener(&port);
-    CHECK(s >= 0, "a listener");
+    CHECKF(s >= 0, "a listener");
     pthread_t st;
     pthread_create(&st, NULL, radio_server, (void *)(long)s);
     snprintf(url, sizeof url, "http://127.0.0.1:%d/radio.wav", port);
     d = decoder_open_ex(url, &f, &stop);
-    CHECK(d && f.rate == 44100 && f.channels == 2, "the stream opened (%u Hz, %u channels)", d ? f.rate : 0, d ? f.channels : 0);
+    CHECKF(d && f.rate == 44100 && f.channels == 2, "the stream opened (%u Hz, %u channels)", d ? f.rate : 0, d ? f.channels : 0);
     if (!d) return;
     long frames = 0, r = 1;
-    t0 = mono_s();
-    while (frames < 3 * 44100 && r > 0 && mono_s() - t0 < 60) {
+    t0 = clock_fsec();
+    while (frames < 3 * 44100 && r > 0 && clock_fsec() - t0 < 60) {
         r = decoder_read(d, pcm, 4096);
         if (r > 0) frames += r;
     }
-    CHECK(frames >= 3 * 44100 && rs_conns >= 2, "after its connection closed: %ld frames over %d connections", frames, rs_conns);
+    CHECKF(frames >= 3 * 44100 && rs_conns >= 2, "after its connection closed: %ld frames over %d connections", frames, rs_conns);
 
     /* its server gone for good: the stream ends once FFmpeg's own reconnects
      * are used up (11 s of waits; over a minute when each of them tried five
@@ -294,22 +319,19 @@ static void test_stream(void)
     shutdown(s, SHUT_RDWR);
     close(s);
     pthread_join(st, NULL);
-    t0 = mono_s();
-    while ((r = decoder_read(d, pcm, 4096)) > 0 && mono_s() - t0 < 180) ;
-    took = mono_s() - t0;
-    CHECK(r <= 0 && took < 30, "its server gone: the stream %s after %.1f s", r <= 0 ? "ended" : "still going", took);
+    t0 = clock_fsec();
+    while ((r = decoder_read(d, pcm, 4096)) > 0 && clock_fsec() - t0 < 180) ;
+    took = clock_fsec() - t0;
+    CHECKF(r <= 0 && took < 30, "its server gone: the stream %s after %.1f s", r <= 0 ? "ended" : "still going", took);
     printf("http: a refused stream fails at once; a dropped one reconnects; a dead one ends in %.1f s\n", took);
     decoder_close(d);
 }
-
-#include "tmpdir.h"
 
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
     char dir[512];
-    test_tmp(dir, sizeof dir, "http");
-    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    t_mkdtemp(dir, sizeof dir, "http");
     int ls = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a;
     memset(&a, 0, sizeof a);
@@ -334,7 +356,7 @@ int main(void)
         }
         for (int s = 0; s < 2; s++) pthread_join(t[s], NULL);
         for (int s = 0; s < 2; s++) {
-            CHECK(j[s].got == SIZE, "round %d: download %d: %lld bytes", round, s, (long long)j[s].got);
+            CHECKF(j[s].got == SIZE, "round %d: download %d: %lld bytes", round, s, (long long)j[s].got);
             FILE *f = fopen(j[s].out, "rb");
             long n = 0, bad = -1;
             size_t k;
@@ -343,16 +365,14 @@ int main(void)
                 n += (long)k;
             }
             if (f) fclose(f);
-            CHECK(n == SIZE && bad < 0, "round %d: download %d mixed up from byte %ld", round, s, bad);
+            CHECKF(n == SIZE && bad < 0, "round %d: download %d mixed up from byte %ld", round, s, bad);
             remove(j[s].out);
         }
     }
     close(ls);
     rmdir(dir);
     test_stream();
-    fails += test_tries();
-    if (fails) { printf("%d failed\n", fails); return 1; }
-    printf("http: ok\n");
-    return 0;
+    test_tries();
+    return t_result();
 }
 #endif

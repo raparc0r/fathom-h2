@@ -14,10 +14,7 @@
 #include <unistd.h>
 
 #include "audio/decoder.h"
-#include "tmpdir.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_util.h"
 
 #define FRAME_BYTES 417           /* 144 * 128000 / 44100 */
 #define SPF 1152                  /* samples a frame */
@@ -105,8 +102,7 @@ static long decode(const char *path, uint64_t from, audio_format_t *fmt, uint64_
 int main(void)
 {
     char dir[200], bare[300], tagged[300];
-    test_tmp(dir, sizeof dir, "fathom-test-mp3");
-    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    t_mkdtemp(dir, sizeof dir, "fathom-test-mp3");
     snprintf(bare, sizeof bare, "%s/bare.mp3", dir);
     snprintf(tagged, sizeof tagged, "%s/tagged.mp3", dir);
     const unsigned frames = 60, delay = 576, padding = 1105;
@@ -141,7 +137,5 @@ int main(void)
     unlink(bare);
     unlink(tagged);
     rmdir(dir);
-    if (failures) fprintf(stderr, "%d failure(s)\n", failures);
-    else printf("mp3: all checks passed\n");
-    return failures != 0;
+    return t_result();
 }

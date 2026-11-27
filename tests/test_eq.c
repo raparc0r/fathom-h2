@@ -4,6 +4,7 @@
  * integer filters against the double-precision design, low-frequency noise at
  * high rates, saturation. */
 #include "audio/eq.h"
+#include "core/clock.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -11,8 +12,7 @@
 #include <string.h>
 #include <time.h>
 
-static int fails;
-#define CHECK(c, ...) do { if (!(c)) { printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); fails++; } } while (0)
+#include "test_util.h"
 
 static const char *AUTOEQ =
     "Preamp: -6.4 dB\r\n"
@@ -53,15 +53,15 @@ int main(void)
 {
     eq_profile_t p;
     char err[128];
-    CHECK(eq_parse(AUTOEQ, &p, err, sizeof err) == 0, "parse: %s", err);
-    CHECK(p.n == 4 && fabs(p.preamp_db + 6.4) < 1e-9, "parse: %d bands, preamp %.2f", p.n, p.preamp_db);
-    CHECK(p.band[0].type == EQ_LOW_SHELF && p.band[0].fc == 105 && p.band[0].q == 0.70, "parse: band 1");
-    CHECK(p.band[3].type == EQ_HIGH_SHELF && p.band[3].gain_db == -2.0, "parse: band 5");
-    CHECK(eq_parse("Filter 1: ON LP Fc 100 Hz\n", &p, err, sizeof err) < 0, "an unsupported type is refused");
-    CHECK(eq_parse("hello\n", &p, err, sizeof err) < 0, "not a profile");
-    CHECK(eq_parse("Preamp: 0.0 dB\n", &p, err, sizeof err) == 0 && p.n == 0, "a flat profile (all bands removed)");
+    CHECKF(eq_parse(AUTOEQ, &p, err, sizeof err) == 0, "parse: %s", err);
+    CHECKF(p.n == 4 && fabs(p.preamp_db + 6.4) < 1e-9, "parse: %d bands, preamp %.2f", p.n, p.preamp_db);
+    CHECKF(p.band[0].type == EQ_LOW_SHELF && p.band[0].fc == 105 && p.band[0].q == 0.70, "parse: band 1");
+    CHECKF(p.band[3].type == EQ_HIGH_SHELF && p.band[3].gain_db == -2.0, "parse: band 5");
+    CHECKF(eq_parse("Filter 1: ON LP Fc 100 Hz\n", &p, err, sizeof err) < 0, "an unsupported type is refused");
+    CHECKF(eq_parse("hello\n", &p, err, sizeof err) < 0, "not a profile");
+    CHECKF(eq_parse("Preamp: 0.0 dB\n", &p, err, sizeof err) == 0 && p.n == 0, "a flat profile (all bands removed)");
     /* what the H2's editor writes reads back the same */
-    CHECK(eq_parse("Preamp: -3.5 dB\nFilter 1: ON LSC Fc 105 Hz Gain 2.5 dB Q 0.70\n"
+    CHECKF(eq_parse("Preamp: -3.5 dB\nFilter 1: ON LSC Fc 105 Hz Gain 2.5 dB Q 0.70\n"
                    "Filter 2: ON PK Fc 1000 Hz Gain -1.0 dB Q 1.41\nFilter 3: ON HSC Fc 10000 Hz Gain 1.5 dB Q 0.70\n",
                    &p, err, sizeof err) == 0 && p.n == 3 && p.band[1].q == 1.41 && p.band[2].type == EQ_HIGH_SHELF,
           "the editor's own format: %s", err);
@@ -73,7 +73,7 @@ int main(void)
     srand(1);
     for (int i = 0; i < 4096; i++) s[i] = c[i] = (int32_t)((unsigned)rand() << 1 ^ (unsigned)rand());
     eq_run(e, s, 2048);
-    CHECK(!memcmp(s, c, sizeof s), "a flat profile isn't bit for bit");
+    CHECKF(!memcmp(s, c, sizeof s), "a flat profile isn't bit for bit");
     eq_destroy(e);
 
     /* the UI's curve: the same as eq_response_db() without the preamp */
@@ -88,9 +88,9 @@ int main(void)
             double d = fabs(db[i] - (eq_response_db(&p, 48000, fq[i]) - p.preamp_db));
             if (d > worst) worst = d;
         }
-        CHECK(worst < 1e-3, "the curve differs from the response by %.4f dB", worst);
+        CHECKF(worst < 1e-3, "the curve differs from the response by %.4f dB", worst);
         eq_curve_db(&flat, 48000, fq, 64, db);
-        CHECK(db[0] == 0 && db[63] == 0, "a flat profile's curve is flat");
+        CHECKF(db[0] == 0 && db[63] == 0, "a flat profile's curve is flat");
         /* how long the editor's curve takes, the most bands at its 100 points (on
          * the H2 it's worked out again at each turn of the wheel) */
         eq_profile_t big = {.preamp_db = -6, .n = EQ_MAX_BANDS};
@@ -98,12 +98,9 @@ int main(void)
         double f100[100];
         float d100[100];
         for (int i = 0; i < 100; i++) f100[i] = 20 * pow(1000, i / 99.0);
-        struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        double t0 = clock_fsec();
         for (int r = 0; r < 10; r++) eq_curve_db(&big, 48000, f100, 100, d100);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        printf("the editor's curve, %d bands at 100 points: %.2f ms\n", EQ_MAX_BANDS,
-               ((t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6) / 10);
+        printf("the editor's curve, %d bands at 100 points: %.2f ms\n", EQ_MAX_BANDS, (clock_fsec() - t0) * 1e3 / 10);
     }
 
     /* the integer filters follow the design, at 44.1 and 192 kHz */
@@ -113,7 +110,7 @@ int main(void)
     for (int r = 0; r < 3; r++)
         for (int i = 0; i < 7; i++) {
             double want = eq_response_db(&p, rates[r], fs[i]), got = through(&p, rates[r], fs[i], 0.25);
-            CHECK(fabs(got - want) < 0.02, "%u Hz, %.0f Hz: %.3f dB, designed %.3f", rates[r], fs[i], got, want);
+            CHECKF(fabs(got - want) < 0.02, "%u Hz, %.0f Hz: %.3f dB, designed %.3f", rates[r], fs[i], got, want);
         }
     printf("response: within 0.02 dB of the design at 44.1, 96 and 192 kHz\n");
 
@@ -159,7 +156,7 @@ int main(void)
         res2 += (x[i] - fit) * (x[i] - fit);
     }
     double noise = 10 * log10(res2 / m) - 20 * log10(2147483648.0);
-    CHECK(noise < -130, "low filters at 192 kHz: noise and distortion at %.1f dBFS", noise);
+    CHECKF(noise < -130, "low filters at 192 kHz: noise and distortion at %.1f dBFS", noise);
     printf("20 Hz shelf + 40 Hz peak at 192 kHz: noise and distortion %.1f dBFS (rms)\n", noise);
     eq_destroy(el);
     free(x);
@@ -175,9 +172,8 @@ int main(void)
         double want = sin(2 * M_PI * 1000 * i / 44100.0);   /* clipped, the sign stays */
         if ((want > 0.5 && y[2 * i] < 0) || (want < -0.5 && y[2 * i] > 0)) wrapped++;
     }
-    CHECK(!wrapped, "%d samples wrapped round", wrapped);
+    CHECKF(!wrapped, "%d samples wrapped round", wrapped);
     eq_destroy(eh);
 
-    printf(fails ? "%d failures\n" : "eq ok\n", fails);
-    return fails != 0;
+    return t_result();
 }

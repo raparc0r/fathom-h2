@@ -36,7 +36,7 @@ UP=$S/upload
 CRT=/mnt/sd/fathom/keys/drive.crt
 KEY=/mnt/sd/fathom/keys/drive.key
 USER=fathom
-REALM="Fathom H2"
+REALM="Fathom"
 export LD_LIBRARY_PATH=$S/usr/lib:$S/lib:$W/usr/lib:$W/lib:$BT/usr/lib:$BT/lib
 
 say() { echo "share: $1" >&2; }

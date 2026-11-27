@@ -6,6 +6,8 @@
  * waits on it (the first start makes the host key, about a second). */
 #include "ssh.h"
 #include "shell.h"
+#include "core/clock.h"
+#include "core/thread.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -15,6 +17,7 @@
 #include <unistd.h>
 
 #define FATHOM_SSH "/usr/sbin/fathom-ssh"
+#define DROPBEAR_PID "/var/run/dropbear.pid"   /* (the script's own "alive") */
 
 static struct {
     pthread_mutex_t mu;
@@ -46,21 +49,47 @@ static int apply(int on, const char *password)
 static void *worker(void *arg)
 {
     (void)arg;
+    int on = 0;                                  /* dropbear was started: looked for once a minute */
+    sh_revive_t again = {0};                     /* (see shell.h) */
     sh_wait_home(3000);                          /* (Home first: shell.h) */
     for (;;) {
         pthread_mutex_lock(&S.mu);
-        while (!S.pending) pthread_cond_wait(&S.cv, &S.mu);
-        int want = S.want;
+        int look = 0;
+        while (!S.pending && !look) {
+            if (!on) pthread_cond_wait(&S.cv, &S.mu);
+            else look = mono_cond_wait_ms(&S.cv, &S.mu, SH_LOOK_MS) != 0;
+        }
+        int asked = S.pending, want = S.want;
         char pass[32];
         snprintf(pass, sizeof pass, "%s", S.password);
         S.pending = 0;
         pthread_mutex_unlock(&S.mu);
 
+        if (asked) {
+            again = (sh_revive_t){0};
+        } else {
+            /* The minute's look. dropbear gone (killed for memory): nothing
+             * looked, and the screen went on saying On with no SSH behind
+             * it. Started again as below, three times in a row at most,
+             * then left as one that couldn't be started. */
+            int what = sh_revive(&again, sh_pid_alive(DROPBEAR_PID), clock_ms32());
+            if (what == SH_REVIVE) fprintf(stderr, "ssh: dropbear is gone: starting it again (%d)\n", again.revived);
+            if (what == SH_GIVE_UP) {
+                fprintf(stderr, "ssh: dropbear is gone again: started again three times already, left off\n");
+                on = 0;
+                set_state(UI_SSH_FAILED);
+            }
+            if (what != SH_REVIVE) {
+                memset(pass, 0, sizeof pass);
+                continue;
+            }
+        }
         if (want) set_state(UI_SSH_STARTING);
         int ok = apply(want, pass) == 0;
         memset(pass, 0, sizeof pass);
         fprintf(stderr, "ssh: %s%s\n", want ? "on" : "off", ok ? "" : " (fathom-ssh failed)");
         set_state(!want ? UI_SSH_OFF : ok ? UI_SSH_ON : UI_SSH_FAILED);
+        on = want && ok;
     }
     return NULL;
 }
@@ -85,9 +114,8 @@ void ssh_init(int on, const char *password)
 {
     if (!ssh_available()) return;
     S.state = on ? UI_SSH_STARTING : UI_SSH_OFF;
-    pthread_t th;
-    if (pthread_create(&th, NULL, worker, NULL)) return;
-    pthread_detach(th);
+    mono_cond_init(&S.cv);              /* (the worker's minute: shell.h) */
+    if (thread_detached(worker, NULL, 0)) return;
     request(on, password);
 }
 

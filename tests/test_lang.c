@@ -8,16 +8,12 @@
 #include <unistd.h>
 
 #include "core/lang.h"
-#include "tmpdir.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_util.h"
 
 int main(void)
 {
     char dir[200];
-    test_tmp(dir, sizeof dir, "fathom-test-lang");
-    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    t_mkdtemp(dir, sizeof dir, "fathom-test-lang");
     char path[300], other[300];
     snprintf(path, sizeof path, "%s/Espa\xC3\xB1ol.txt", dir);
     snprintf(other, sizeof other, "%s/Deutsch.txt", dir);
@@ -75,7 +71,5 @@ int main(void)
     unlink(path);
     unlink(other);
     rmdir(dir);
-    if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
-    printf("lang: all good\n");
-    return 0;
+    return t_result();
 }

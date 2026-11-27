@@ -51,7 +51,6 @@ typedef struct {
 } audio_output_t;
 
 int  out_sdl_create(audio_output_t *out);
-void out_sdl_destroy(audio_output_t *out);
 
 /* ALSA PCM device (Linux; e.g. "/dev/snd/pcmC0D0p"), bit-perfect, kernel ioctls only. */
 int  out_alsa_create(audio_output_t *out, const char *device);

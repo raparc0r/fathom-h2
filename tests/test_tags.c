@@ -9,12 +9,7 @@
 #include <unistd.h>
 
 #include "library/tags.h"
-#include "tmpdir.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
-#define CHECK_STR(got, want) do { if (strcmp((got), (want))) { \
-    fprintf(stderr, "%s:%d: got \"%s\", want \"%s\"\n", __FILE__, __LINE__, (got), (want)); failures++; } } while (0)
+#include "test_util.h"
 
 typedef struct { unsigned char b[4096]; size_t n; } buf_t;
 
@@ -166,6 +161,33 @@ static void write_big_flac(const char *path, size_t big, const char *sheet)
     fclose(f);
 }
 
+/* A FLAC with `empty` metadata blocks of no bytes (padding) between its
+ * STREAMINFO and its comments (a title) and front cover (4 bytes) */
+static void write_padded_flac(const char *path, int empty)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); exit(1); }
+    unsigned char si[34] = {0};
+    si[0] = 0x10; si[2] = 0x10;
+    si[10] = 0x0A; si[11] = 0xC4; si[12] = 0x42; si[13] = 0xF0;
+    si[15] = 0x02; si[16] = 0xB1; si[17] = 0x10;
+    fwrite("fLaC", 1, 4, f);
+    fputc(0x00, f); fputc(0, f); fputc(0, f); fputc(34, f);
+    fwrite(si, 1, 34, f);
+    for (int i = 0; i < empty; i++) fwrite("\x01\0\0\0", 1, 4, f);
+    const char *title = "TITLE=Past The Padding";
+    uint32_t len = 4 + 4 + 4 + (uint32_t)strlen(title);
+    fputc(0x04, f); fputc(0, f); fputc(0, f); fputc((int)len, f);
+    put_le32(f, 0);                                              /* no vendor */
+    put_le32(f, 1);
+    put_entry(f, title);
+    static const unsigned char pic[] = {0x86, 0, 0, 36, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0,   /* the last block: type 3, no MIME, no words */
+                                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,       /* sizes */
+                                        0, 0, 0, 4, 0xFF, 0xD8, 0xFF, 0xD9};
+    fwrite(pic, 1, sizeof pic, f);
+    fclose(f);
+}
+
 /* `mp3` (a file that starts with an ID3 tag) as the ID3 chunk of a WAV or an
  * AIFF, after a little sound; `tag` 0: the same file without that chunk */
 static void wrap_id3(const char *mp3, const char *out, int aiff, int tag)
@@ -214,8 +236,7 @@ static int pic_right(const unsigned char *d, size_t n, size_t want)
 int main(void)
 {
     char dir[200], path[300];
-    test_tmp(dir, sizeof dir, "fathom-test-tags");
-    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    t_mkdtemp(dir, sizeof dir, "fathom-test-tags");
     tags_t t;
 
     /* ID3v2.2 (iTunes until 2005 or so): no tags at all before */
@@ -279,6 +300,43 @@ int main(void)
     CHECK_STR(t.title, "Ext F\xC3\xBCnf");
     CHECK_STR(t.album, "Album Four");
     CHECK_STR(t.genre, "Electronic");
+
+    /* A frame whose size, added to where it starts, comes round to 0 in 32 bits
+     * (the H2's size_t): the same frame was read again for good. On a 64-bit
+     * computer the sum never wrapped, so there this only shows the file is
+     * refused the same way; the alarm ends the test where it would hang. */
+    alarm(30);
+    fr.n = 0;
+    put(&fr, "TIT2", 4);
+    put_be(&fr, 0xFFFFFFF6u, 4);                       /* 10 (the frame's header) + this = 2^32 */
+    put_be(&fr, 0, 2);
+    snprintf(path, sizeof path, "%s/wrap.mp3", dir);
+    write_mp3(path, 3, 0, NULL, &fr, NULL);
+    CHECK(tags_read(path, &t) == 0);
+    CHECK_STR(t.title, "wrap");
+    data = NULL;
+    CHECK(tags_picture(path, &data, &len) != 0 && data == NULL);
+    unlink(path);
+    /* (the audit's 26 bytes: three frames that step backwards) */
+    static const unsigned char back[] = {'I', 'D', '3', 3, 0, 0, 0, 0, 0, 16, 'T', 'I', 'T', '2', 0xFF, 0xFF, 0xFF, 0xFA,
+                                         0xFF, 0xFF, 0xFF, 0xF2, 0, 0, 0, 0};
+    snprintf(path, sizeof path, "%s/back.mp3", dir);
+    FILE *bf = fopen(path, "wb");
+    if (bf) { fwrite(back, 1, sizeof back, bf); fclose(bf); }
+    tags_read(path, &t);
+    CHECK_STR(t.title, "back");
+    unlink(path);
+    /* and an extended header of nearly 4 GB (4 + its size wrapped to 2): no frames */
+    fr.n = 0;
+    text(&fr, 3, "TIT2", "Never Read");
+    ext.n = 0;
+    put_be(&ext, 0xFFFFFFFEu, 4);
+    snprintf(path, sizeof path, "%s/extwrap.mp3", dir);
+    write_mp3(path, 3, 0x40, &ext, &fr, NULL);
+    CHECK(tags_read(path, &t) == 0);
+    CHECK_STR(t.title, "extwrap");
+    unlink(path);
+    alarm(0);
 
     /* ID3v1.1 only: the file name was all there was */
     unsigned char v1[128] = "TAG";
@@ -411,13 +469,28 @@ int main(void)
         unlink(path);
     }
 
+    /* A FLAC's metadata blocks are walked 1,024 of them at most: a file of
+     * empty blocks (zeros after "fLaC") was read from end to end, four bytes
+     * at a time. What a file has in its first blocks is read as ever. */
+    {
+        long off = 0, plen = 0;
+        snprintf(path, sizeof path, "%s/padded.flac", dir);
+        write_padded_flac(path, 500);
+        CHECK(tags_read(path, &t) == 0 && t.sample_rate == 44100 && t.has_picture == 1);
+        CHECK_STR(t.title, "Past The Padding");
+        CHECK(tags_picture_at(path, &off, &plen) == 0 && plen == 4);
+        write_padded_flac(path, 5000);
+        CHECK(tags_read(path, &t) == 0 && t.sample_rate == 44100 && t.has_picture == 0);
+        CHECK_STR(t.title, "padded");
+        CHECK(tags_picture_at(path, &off, &plen) == -1);
+        unlink(path);
+    }
+
     const char *names[] = {"v22", "v23ext", "v24ext", "v1only", "both", "Bare Name"};
     for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
         snprintf(path, sizeof path, "%s/%s.mp3", dir, names[i]);
         unlink(path);
     }
     rmdir(dir);
-    if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
-    printf("tags: all good\n");
-    return 0;
+    return t_result();
 }

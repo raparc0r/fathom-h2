@@ -10,18 +10,10 @@
 # for mount, umount, sleep and the scripts it calls.
 #   sh tests/test_fathom_usbdisk.sh    (under dash too, when there is one)
 set -u
-here=$(cd "$(dirname "$0")/.." && pwd)
-SRC=${SRC:-$here/buildroot/external/board/h2/rootfs-overlay}
-T=$(mktemp -d)
-R=$T/root
+. "$(dirname "$0")/lib.sh"
 mkdir -p $T/bin $T/st $R/usr/lib/fathom
-rooted() {
-    sed -E -e "s#(^|[ =\"(<>])/(usr|mnt|sys|tmp|dev|proc|var)/#\\1$R/\\2/#g" -e "s#$R/dev/null#/dev/null#g" \
-        -e 's#\[ -b #[ -e #g' "$1" > "$2"
-}
-rooted $SRC/usr/sbin/fathom-usbdisk $T/fathom-usbdisk
-rooted $SRC/usr/lib/fathom/card.sh $R/usr/lib/fathom/card.sh
-SLEEP=$(command -v sleep)
+rooted $SRC/usr/sbin/fathom-usbdisk $T/fathom-usbdisk -e "$FILE_FOR_DEVICE"
+rooted $SRC/usr/lib/fathom/card.sh $R/usr/lib/fathom/card.sh -e "$FILE_FOR_DEVICE"
 LUN=$R/sys/kernel/config/usb_gadget/fathom/functions/mass_storage.0/lun.0
 STATE=$R/sys/class/udc/13500000.usb/state
 BUSY=$R/var/run/fathom-bootlog.busy
@@ -55,9 +47,6 @@ done
 chmod +x $T/bin/*
 export PATH=$T/bin:$PATH
 
-ok=0; bad=0
-check() { if eval "$2"; then echo "ok   $1"; ok=$((ok+1)); else echo "FAIL $1"; bad=$((bad+1)); fi; }
-count() { if [ -f "$1" ]; then echo $(($(wc -l < "$1") + 0)); else echo 0; fi; }
 mounted() { grep -q "^$R/dev/mmcblk0p1 $R/mnt/sd " $R/proc/mounts; }
 # The H2 with its card mounted and Fathom on it, on a computer
 fresh() {
@@ -126,5 +115,4 @@ check "the boot report being written: the unmount waits for it" '[ "$(sed -n 1p 
 
 done
 rm -rf $T
-echo "$ok passed, $bad failed"
-[ $bad -eq 0 ]
+finish

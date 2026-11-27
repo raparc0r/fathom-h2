@@ -8,9 +8,7 @@
 #include <time.h>
 
 #include "core/tz.h"
-
-static int fails;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
+#include "test_util.h"
 
 static int64_t utc(int y, int mo, int d, int h, int mi)
 {
@@ -41,7 +39,7 @@ int main(void)
             if (tm.tm_gmtoff != tz_offset(z, t)) {
                 fprintf(stderr, "%s at %lld: %d, the C library %ld\n", TZ_ZONES[z].name, (long long)t,
                         tz_offset(z, t), (long)tm.tm_gmtoff);
-                fails++;
+                t_fails++;
                 bad++;
             }
             /* read back: what the local time shows means this time (except in the hour that repeats) */
@@ -49,7 +47,7 @@ int main(void)
             int64_t back = tz_to_utc(z, l);
             if (back != t && tz_to_local(z, back) != l) {
                 fprintf(stderr, "%s: %lld back as %lld\n", TZ_ZONES[z].name, (long long)t, (long long)back);
-                fails++;
+                t_fails++;
                 bad++;
             }
         }
@@ -67,7 +65,7 @@ int main(void)
                 if (tu.tm_gmtoff != tz_offset(z, u)) {
                     fprintf(stderr, "%s near a change, %lld: %d, the C library %ld\n", TZ_ZONES[z].name, (long long)u,
                             tz_offset(z, u), (long)tu.tm_gmtoff);
-                    fails++;
+                    t_fails++;
                     break;
                 }
             }
@@ -96,10 +94,5 @@ int main(void)
     CHECK(!strcmp(s, "UTC-3:30"));
     CHECK(tz_rule_offset("nonsense", 0) == 0 && tz_rule_offset(NULL, 0) == 0);
 
-    if (fails) {
-        fprintf(stderr, "%d failed\n", fails);
-        return 1;
-    }
-    printf("tz: all passed\n");
-    return 0;
+    return t_result();
 }

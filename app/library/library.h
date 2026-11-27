@@ -12,6 +12,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+#include "library/scripts.h"
 #include <stdio.h>
 
 #include "shuffle/shuffle.h"
@@ -119,9 +121,9 @@ void library_trying(const char *what, int *fd, const char *text);
 void library_trying_done(const char *what, int *fd);
 int  library_trying_left(const char *what, char *out, size_t cap);
 /* The helper that reads files for a scan (library/reader.h: set with
- * reader_set_helper): its program's whole job when started with --reader, and
- * the one request it serves (for a helper that wraps it: a test's). */
-int library_reader_main(void);
+ * reader_set_helper): the one request it serves, for the program that is the
+ * helper when started with --reader (the player's, a test's) to give to
+ * reader_serve. */
 int library_reader_do(int op, const char *path, unsigned char **out, size_t *len);
 /* (the library's own requests are numbered below this: a program that wraps
  * library_reader_do to add its own starts here) */
@@ -235,20 +237,47 @@ int  library_art_legacy(library_t *lib);
 int  library_scan_unfinished(library_t *lib);
 /* After a stop that wasn't clean (a power cut): library_check() reads the
  * whole database through (SQLite's quick_check: seconds; a background
- * connection's job): 0 sound, -1 damaged. library_scan_distrust() makes the
+ * connection's job): 0 sound, -1 damaged. A check that couldn't be made (no
+ * memory at that moment, the card not answering) is 0 too: it says nothing
+ * about the file, and "damaged" sets the library aside and reads the whole
+ * card again. library_scan_distrust() makes the
  * next scan compare every file again, not trust the last one's word that
  * nothing changed. library_import_counts() brings plays, skips, favourites,
  * resume places and the play log over from another library file (one set
  * aside as damaged), by path, as far as it can still be read: how many songs
  * got some, -1 if it can't be read at all. */
+/* A library file that can't be used moved aside (PATH.bad, with its log), its
+ * plays owed to the new one (a mark beside it, kept across restarts; an old
+ * file still owed is not written over). library_import_owed(): after a scan
+ * that finished, brings them over once (library_import_counts) and clears
+ * the mark: how many songs got some, 0 if nothing is owed or not yet.
+ * library_file_damaged(): 1 if the file is not a database any more, 0 if it
+ * is or that can't be told just now. */
+void library_set_aside(const char *db_path);
+int  library_import_owed(library_t *lib);
+int  library_file_damaged(const char *db_path);
 int  library_check(library_t *lib);
+void library_test_check_fails(int sqlite_rc);   /* (tests: the next check's own query ends with this) */
+void library_test_against_fails(int at_row);        /* (tests: the fast walk's check against the library stops at this row; 0: not) */
+void library_test_scan_lookups_fail(int on);    /* (tests: a scan's lookups in the library all fail, as on a card not answering) */
+void library_test_groups_fail(int at_step);     /* (tests: the groups' passes over the songs fail from this step on, counted from now; -n: at step n only; 0: not) */
+void library_test_playlists_fail(int at_step);  /* (tests: this step of a scan's matching and writing of playlists fails, counted from now; 0: none) */
 void library_scan_distrust(library_t *lib);
 int  library_import_counts(library_t *lib, const char *old_db);
 /* No songs at all (a fresh install, or nothing copied yet). */
 int  library_empty(library_t *lib);
+/* Which writing the songs' names are in (library/scripts.h), counted over the
+ * whole library: for offering the character packs that draw them. One pass
+ * over the songs' titles, artists and albums (not for the thread that draws:
+ * a second or two for 50,000 songs on the H2). 0; -1: it couldn't be read
+ * through, and out says nothing. */
+int  library_scripts(library_t *lib, lib_scripts_t *out);
 /* How many songs a smart playlist has (what library_list(LIB_SMART, which)
  * would list), counted without listing them: Playlists' counts. */
 int  library_smart_count(library_t *lib, int which);
+/* As many as library_list(lib, view, parent) would give, without making the
+ * list (-1: no such view, or it couldn't be counted). */
+int  library_count(library_t *lib, lib_view_t view, int64_t parent);
 /* VACUUM: the database rewritten tight (a first scan leaves it fragmented,
  * which makes reading it about half as fast). Takes the write lock. It needs
  * about twice the database free on the card (SQLite's temporary copy, in

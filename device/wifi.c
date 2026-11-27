@@ -13,6 +13,8 @@
 #include "core/lang.h"
 #include "core/wifitxt.h"
 #include "core/lat.h"
+#include "core/clock.h"
+#include "core/thread.h"
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -136,13 +138,6 @@ static char noaddr_ssid[33], noaddr_said[33];
 static uint32_t noaddr_since;
 static int noaddr_ms;
 
-static uint32_t now_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000);
-}
-
 static void set_busy(const char *b)
 {
     pthread_mutex_lock(&W.mu);
@@ -182,7 +177,7 @@ static int split_right(char *line, char **f, int n)
 static int poll_status(void)
 {
     char out[256];
-    script_at = now_ms();
+    script_at = clock_ms32();
     if (!script_at) script_at = 1;
     if (sh_run(FATHOM_WIFI " status 2>/dev/null", out, sizeof out) != 0) return 0;
     ui_wifi_status_t st;
@@ -315,7 +310,7 @@ static int poll_quick(int *changed)
 static int look(void)
 {
     int changed = 0;
-    if (script_at && now_ms() - script_at < SCRIPT_EVERY_MS && poll_quick(&changed)) return changed;
+    if (script_at && clock_ms32() - script_at < SCRIPT_EVERY_MS && poll_quick(&changed)) return changed;
     return poll_status();
 }
 
@@ -336,7 +331,7 @@ static void pace_set(int s, int look)
  * something is (for the next time it's left) */
 static void pace_follow(int state)
 {
-    uint32_t t = now_ms();
+    uint32_t t = clock_ms32();
     if (join_until || state == UI_WIFI_CONNECTED || state == UI_WIFI_CONNECTING || state == UI_WIFI_OFF) {
         if (pace_s != PACE_MIN_S) pace_set(PACE_MIN_S, 0);
         pace_next = 0;
@@ -440,7 +435,7 @@ static void noaddr_follow(void)
     int state = W.st.state;
     snprintf(ssid, sizeof ssid, "%s", W.st.ssid);
     pthread_mutex_unlock(&W.mu);
-    uint32_t t = now_ms();
+    uint32_t t = clock_ms32();
     if (state == UI_WIFI_CONNECTED) noaddr_said[0] = '\0';   /* (it has one: worth saying again if it's lost) */
     if (state != UI_WIFI_CONNECTING || !ssid[0] || strcmp(ssid, noaddr_ssid)) {
         noaddr_reset();                          /* not that, or another network: from the start */
@@ -490,7 +485,7 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
         noaddr_reset();
         noaddr_said[0] = '\0';
         pthread_mutex_lock(&W.mu);
-        if (W.list_wanted && now_ms() - W.list_wanted_at > LIST_WISH_MS) W.list_wanted = 0;
+        if (W.list_wanted && clock_ms32() - W.list_wanted_at > LIST_WISH_MS) W.list_wanted = 0;
         pthread_mutex_unlock(&W.mu);
         int ok = sh_run(FATHOM_WIFI " on 2>&1 >/dev/null", err, sizeof err) == 0;
         /* A start that failed leaves the driver loaded and the chip powered
@@ -523,7 +518,7 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
         pace_s = PACE_MIN_S;                     /* (a new wpa_supplicant: its own 5 s) */
         pace_next = 0;
         poll_status();
-        join_since = now_ms();                    /* (see POLL_JOIN_MS) */
+        join_since = clock_ms32();                    /* (see POLL_JOIN_MS) */
         join_until = join_since + JOIN_WINDOW_MS;
         if (!join_until) join_until = 1;
         break;
@@ -542,7 +537,7 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
         memset(&W.st, 0, sizeof W.st);
         if (W.n_net) {                           /* its list was showing: wanted again if it's turned back on */
             W.list_wanted = 1;
-            W.list_wanted_at = now_ms();
+            W.list_wanted_at = clock_ms32();
         }
         W.n_net = 0;
         changed_locked();
@@ -561,7 +556,7 @@ static void do_cmd(int cmd, const char *ssid, const char *pass)
         pthread_mutex_lock(&W.mu);
         int state = W.st.state;
         pthread_mutex_unlock(&W.mu);
-        uint32_t t = now_ms();
+        uint32_t t = clock_ms32();
         if (join_until || state != UI_WIFI_ON || (last && t - last < WAKE_LOOK_MS)) break;
         last = t ? t : 1;
         pace_set(PACE_MIN_S, 1);
@@ -672,11 +667,11 @@ static void *worker(void *arg)
                    : W.st.state == UI_WIFI_CONNECTED ? POLL_CONNECTED_MS
                    : W.st.state == UI_WIFI_CONNECTING ? (noaddr_ms ? noaddr_ms : POLL_MS) : idle_ms;
             if (scan_due && scan_at) {           /* the first scan, when it's due */
-                int32_t left = (int32_t)(scan_at - now_ms());
+                int32_t left = (int32_t)(scan_at - clock_ms32());
                 if (left < ms) ms = left < 0 ? 0 : left;
             }
             if (pace_next && pace_s < PACE_MAX_S) {   /* searching less often, when due */
-                int32_t left = (int32_t)(pace_next - now_ms());
+                int32_t left = (int32_t)(pace_next - clock_ms32());
                 if (left < ms) ms = left < 0 ? 0 : left;
             }
             /* On, with no network joined: the status is asked less and less
@@ -722,9 +717,9 @@ static void *worker(void *arg)
             int dead = W.on && W.st.state == UI_WIFI_OFF;
             if (W.st.state == UI_WIFI_CONNECTED) revived = 0;
             pthread_mutex_unlock(&W.mu);
-            if (dead && revived < 3 && (!revived || now_ms() - revived_at >= 60000)) {
+            if (dead && revived < 3 && (!revived || clock_ms32() - revived_at >= 60000)) {
                 revived++;
-                revived_at = now_ms();
+                revived_at = clock_ms32();
                 fprintf(stderr, "wifi: its daemon is gone: starting it again (%d)\n", revived);
                 sh_run(FATHOM_WIFI " off >/dev/null 2>&1", NULL, 0);
                 do_cmd(CMD_START, "", "");
@@ -738,7 +733,7 @@ static void *worker(void *arg)
                 pthread_mutex_lock(&W.mu);
                 int state = W.st.state;
                 pthread_mutex_unlock(&W.mu);
-                uint32_t t = now_ms();
+                uint32_t t = clock_ms32();
                 if (state == UI_WIFI_CONNECTED) {
                     join_until = 0;
                     scan_at = t + SCAN_AFTER_JOIN_MS;
@@ -750,13 +745,13 @@ static void *worker(void *arg)
                 }
             }
             if (wish && !scan_due) {             /* Settings > Wi-Fi is waiting for its list */
-                uint32_t t = now_ms();
+                uint32_t t = clock_ms32();
                 scan_due = 1;
                 /* (no join to wait for, or one whose 5 s are long over: now) */
                 if (!join_until && (!scan_at || t - scan_at < 0x80000000u || scan_at - t > SCAN_AFTER_JOIN_MS))
                     scan_at = t ? t : 1;
             }
-            if (scan_due && scan_at && (int32_t)(scan_at - now_ms()) <= 0) {
+            if (scan_due && scan_at && (int32_t)(scan_at - clock_ms32()) <= 0) {
                 scan_due = 0;
                 scan_at = 0;
                 scan();
@@ -797,10 +792,8 @@ static void request(int cmd, const char *ssid, const char *pass)
 void wifi_init(int on)
 {
     if (!wifi_available()) return;
-    pthread_t th;
     mono_cond_init(&W.cv);
-    if (pthread_create(&th, NULL, worker, NULL)) return;
-    pthread_detach(th);
+    if (thread_detached(worker, NULL, 0)) return;
     if (on) {
         set_busy("Starting");                    /* (said from now: the worker lets Home be drawn first) */
         request(CMD_START, NULL, NULL);
@@ -837,7 +830,7 @@ void wifi_ui_do(int what, const char *ssid, const char *password)
     if (what == UI_WIFI_SCAN && (busy || !on)) {
         pthread_mutex_lock(&W.mu);
         W.list_wanted = 1;
-        W.list_wanted_at = now_ms();
+        W.list_wanted_at = clock_ms32();
         pthread_mutex_unlock(&W.mu);
         return;
     }

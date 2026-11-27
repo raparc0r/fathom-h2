@@ -11,17 +11,6 @@ int dt_days_in_month(int year, int mon)
     return days[mon - 1] + (mon == 2 && leap);
 }
 
-/* (Howard Hinnant's) */
-int64_t dt_days_from_civil(int64_t y, int m, int d)
-{
-    y -= m <= 2;
-    int64_t era = (y >= 0 ? y : y - 399) / 400;
-    int64_t yoe = y - era * 400;
-    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + doe - 719468;
-}
-
 void dt_from_time(int64_t t, dt_t *d)
 {
     if (t < dt_days_from_civil(DT_YEAR_MIN, 1, 1) * 86400 || t >= dt_days_from_civil(DT_YEAR_MAX + 1, 1, 1) * 86400)

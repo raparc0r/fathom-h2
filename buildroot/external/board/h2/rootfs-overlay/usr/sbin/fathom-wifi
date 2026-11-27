@@ -16,6 +16,7 @@
 #                                 password isn't valid, 4: it's wrong, 5: refused
 #   fathom-wifi forget SSID
 #   fathom-wifi ssid              the network joined now (for udhcpc's hook)
+#   fathom-wifi bssid             its access point's address (for the hook too)
 #   fathom-wifi nvram             the board's chip settings, made (as on does)
 #
 # The programs and modules are in fathom/wifi (post-build.sh), the chip's firmware
@@ -215,6 +216,8 @@ nvram() {
 # half written, and Wi-Fi then never started again). What's saved and sound is
 # also kept as networks.conf.bak, for `on` to go back to.
 conf_ok() { [ -s "$1" ] && grep -q '^ctrl_interface=' "$1" && grep -q '^update_config=1' "$1"; }
+# n: how many networks file $1 holds (0 without the file)
+networks() { n=$(grep -c 'network={' "$1" 2>/dev/null); case "$n" in ''|*[!0-9]*) n=0 ;; esac; }
 save() {
     cli save_config > /dev/null
     if grep -q '^[[:space:]]*disabled=1$' $CONF; then
@@ -232,7 +235,8 @@ dhcp_start() {
     (cd / && exec udhcpc -f -i wlan0 -S -A 3 -T 1 -x hostname:fathom-h2 -p $RUN/udhcpc.pid) < /dev/null > /dev/null 2>&1 &
 }
 dhcp_alive() { [ -f $RUN/udhcpc.pid ] && kill -0 "$(cat $RUN/udhcpc.pid)" 2>/dev/null; }
-# Joined to $ssid, with the address $ip ("" for none): DHCP made to follow.
+# Joined to $ssid, with the address $ip ("" for none), wpa_cli's status of that
+# moment in $st (the access point's address): DHCP made to follow.
 # By status at every look while joined, and by connect at the join itself (the
 # address then comes without waiting for the player's next look). It may empty
 # $ip (an address that was another network's).
@@ -243,15 +247,32 @@ dhcp_follow() {
     up
     lease=
     [ -f $RUN/lease-ssid ] && IFS= read -r lease < $RUN/lease-ssid
+    val bssid "$st"; ap=$v
+    at=
+    [ -f $RUN/lease-bssid ] && read -r at < $RUN/lease-bssid
     if [ -f $RUN/lease-ssid ] && [ "$lease" != "$ssid" ] && [ -f $RUN/udhcpc.pid ]; then
         read -r p < $RUN/udhcpc.pid
-        rm -f $RUN/lease-ssid
+        rm -f $RUN/lease-ssid $RUN/lease-bssid
         # release, then a fresh discover: apart, as two signals pending at once
         # arrive lowest first (USR1, renew, would come before the release)
         kill -USR2 "$p" 2>/dev/null; sleep 0.3; kill -USR1 "$p" 2>/dev/null
         echo $up > $RUN/asked              # (asked: not again just below)
         logger -t fathom-wifi "joined another network: a new address"
         ip=
+    elif [ -n "$ap" ] && [ -n "$at" ] && [ "$at" != "$ap" ] && [ -f $RUN/udhcpc.pid ]; then
+        # The same name at another access point than the one the address came
+        # from: the same network further on, or another place's network that
+        # shares the name and has addresses of its own (the old address was
+        # kept there: nothing worked). udhcpc is asked to renew: on the same
+        # network the address is confirmed and nothing drops; on another it is
+        # refused or unanswered, and udhcpc asks afresh by itself. Once per
+        # access point (noted here as asked about): a second renew before the
+        # first is answered makes udhcpc drop the address and start over.
+        read -r p < $RUN/udhcpc.pid
+        echo "$ap" > $RUN/lease-bssid
+        kill -USR1 "$p" 2>/dev/null
+        echo $up > $RUN/asked              # (asked: not again just below)
+        logger -t fathom-wifi "joined at another access point: the address asked for again"
     fi
     # Joined, no address yet: DHCP woken (udhcpc rests while no network is
     # joined: its lease hook), and again every 10 s until there's one. (A
@@ -358,16 +379,34 @@ on)
     if grep -q '^[[:space:]]*disabled=1$' $CONF; then
         sed '/^[[:space:]]*disabled=1$/d' $CONF > $CONF.new && sync && mv $CONF.new $CONF
     fi
-    rm -f $RUN/lease-ssid $RUN/seen
+    rm -f $RUN/lease-ssid $RUN/lease-bssid $RUN/seen
     ifconfig wlan0 up
-    if ! wpa_start; then
-        # it won't read the file (damaged past its first lines): the copy, else afresh
+    # A start that fails isn't yet a damaged file (no memory at that moment,
+    # the program not read from the card yet, wlan0 not ready): once more on
+    # the file as it is, a second later, before anything is made of it
+    wpa_start || { logger -t fathom-wifi "wpa_supplicant didn't start: once more"; sleep 1; wpa_start; }
+    if ! running; then
+        # it won't read the file (damaged past its first lines): the copy, else afresh.
+        # The file as it is goes to networks.conf.bad first; a .bad already
+        # there with more networks than this one is kept (the fuller list is
+        # the one to have), and this one goes to networks.conf.bad2. Without
+        # that copy made, and the same, the file isn't touched.
+        aside=$CONF.bad
+        networks $CONF; now=$n; networks $CONF.bad
+        [ $n -gt $now ] && aside=$CONF.bad2
+        cp $CONF $aside 2>/dev/null && sync && cmp -s $CONF $aside || { say "wpa_supplicant didn't start"; exit 1; }
         logger -t fathom-wifi "wpa_supplicant didn't start: networks.conf set aside"
-        cp $CONF $CONF.bad 2>/dev/null
         if conf_ok $CONF.bak && ! cmp -s $CONF.bak $CONF; then cp $CONF.bak $CONF
         else printf 'ctrl_interface=%s\nupdate_config=1\n' $CTRL > $CONF; fi
         sync
-        wpa_start || { say "wpa_supplicant didn't start"; exit 1; }
+        if ! wpa_start; then
+            # Not the file, then: it goes back exactly as it was (it was
+            # emptied for a start that failed for some other reason)
+            logger -t fathom-wifi "wpa_supplicant didn't start on that either: networks.conf put back as it was"
+            cp $aside $CONF.new && sync && mv $CONF.new $CONF
+            sync
+            say "wpa_supplicant didn't start"; exit 1
+        fi
     fi
     lat "wpa_supplicant started"
     for i in $(seq 1 20); do [ -S $CTRL/wlan0 ] && break; sleep 0.2; done
@@ -565,11 +604,16 @@ ssid)
     val ssid "$(cli status)"; unesc "$v"
     [ -n "$u" ] && printf '%s\n' "$u"
     ;;
+bssid)
+    running || exit 0
+    val bssid "$(cli status)"
+    [ -n "$v" ] && printf '%s\n' "$v"
+    ;;
 nvram)
     nvram
     ;;
 *)
-    echo "usage: fathom-wifi on|off|status|scan|saved|connect SSID [PASSWORD]|forget SSID|ssid|nvram" >&2
+    echo "usage: fathom-wifi on|off|status|scan|saved|connect SSID [PASSWORD]|forget SSID|ssid|bssid|nvram" >&2
     exit 2
     ;;
 esac

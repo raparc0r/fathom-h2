@@ -19,8 +19,10 @@
  * write() holds. A write never waits while paused, so the engine's thread stays
  * free for the next command (a skip while paused). A flush makes a write in
  * progress drop the rest of its (old) audio. */
+#define _GNU_SOURCE   /* pipe2 */
 #include "audio/out_bt.h"
 #include "audio/btconv.h"
+#include "core/clock.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -46,6 +48,7 @@
 #define START_MS 6000         /* the same when a stream starts (connect, resume):
                                * headphones can take seconds to start one (AirPods: >2 s) */
 #define OPEN_MS 8000          /* fathom-avrcp pcm-open */
+#define CLI_MS 4000           /* bluealsa-cli info (it answers in a fraction of a second) */
 
 typedef struct {
     char cli[256];            /* bluealsa-cli (info) */
@@ -77,17 +80,24 @@ typedef struct {
     long cap;
 } out_bt_t;
 
-/* Runs bluealsa-cli ARGS...; its stdout to out (if any). Returns its exit status. */
+/* Runs bluealsa-cli ARGS...; its stdout to out (if any). Returns its exit
+ * status; -1 if it couldn't run or had not finished its answer in CLI_MS (it
+ * is stopped then: this is the playback thread, which mustn't wait for ever).
+ * The pipe is close-on-exec: a daemon that another thread starts in the same
+ * instant would keep the write end, and the read would wait for that daemon. */
 static int cli(out_bt_t *o, char *out, size_t cap, const char *const *args)
 {
     int p[2] = {-1, -1};
-    if (out && pipe(p)) return -1;
+    if (out && pipe2(p, O_CLOEXEC)) return -1;
     pid_t pid = fork();
-    if (pid < 0) return -1;
+    if (pid < 0) {
+        if (out) { close(p[0]); close(p[1]); }
+        return -1;
+    }
     if (pid == 0) {
         int null = open("/dev/null", O_RDWR);
         dup2(null, 0);
-        dup2(out ? p[1] : null, 1);
+        dup2(out ? p[1] : null, 1);            /* (the copy isn't close-on-exec) */
         dup2(null, 2);
         setenv("LD_LIBRARY_PATH", o->libs, 1);
         const char *argv[12] = {o->cli};
@@ -97,17 +107,32 @@ static int cli(out_bt_t *o, char *out, size_t cap, const char *const *args)
         execv(o->cli, (char *const *)argv);
         _exit(127);
     }
+    int late = 0;
     if (out) {
         close(p[1]);
         size_t got = 0;
-        ssize_t r;
-        while (got + 1 < cap && (r = read(p[0], out + got, cap - 1 - got)) > 0) got += (size_t)r;
+        uint32_t end = clock_ms32() + CLI_MS;
+        while (got + 1 < cap) {
+            int left = (int)(int32_t)(end - clock_ms32());
+            if (left <= 0) { late = 1; break; }
+            struct pollfd pf = {.fd = p[0], .events = POLLIN};
+            int r = poll(&pf, 1, left);
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) { late = 1; break; }
+            ssize_t n = read(p[0], out + got, cap - 1 - got);
+            if (n <= 0) break;                 /* (its end) */
+            got += (size_t)n;
+        }
         out[got] = '\0';
         close(p[0]);
     }
+    if (late) {
+        fprintf(stderr, "bt: bluealsa-cli gave no answer in %d s, stopped\n", CLI_MS / 1000);
+        kill(pid, SIGKILL);
+    }
     int st = 0;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    return late ? -1 : WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
 /* The link's codec and rate, from `bluealsa-cli info PCM`. */
@@ -121,13 +146,6 @@ static void link_info(out_bt_t *o)
     else if ((c = strstr(info, "Codec: "))) sscanf(c + 7, "%23[^ :\n]", o->codec);
     const char *r = strstr(info, "Sampling: ");
     if (r) o->link_rate = (unsigned)strtoul(r + 10, NULL, 10);
-}
-
-static uint32_t now_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 
 /* Closing both ends the stream: bluez-alsa releases the PCM. */
@@ -209,7 +227,7 @@ static int pcm_open(out_bt_t *o)
     o->ctrl = fds[1];
     o->broken = 0;
     pthread_mutex_unlock(&o->mu);
-    o->start_until = now_ms() + START_MS;      /* a new stream */
+    o->start_until = clock_ms32() + START_MS;      /* a new stream */
     o->lost = 0;
     return 0;
 }
@@ -298,7 +316,7 @@ static int send_kept(out_bt_t *o, unsigned gen)
          * stream, another device took them over, ...). Don't wait for ever:
          * the engine would hang with it, and play/pause and skips with it.
          * A stream starting (or starting again after a pause): more patience. */
-        uint32_t t = now_ms();
+        uint32_t t = clock_ms32();
         if (!deadline) {
             since = t;
             deadline = t + STALL_MS;
@@ -366,7 +384,7 @@ static void bt_flush(void *ctx)
 {
     out_bt_t *o = ctx;
     o->gen++;
-    o->start_until = now_ms() + START_MS;
+    o->start_until = clock_ms32() + START_MS;
     o->lost = 0;
     pcm_must(o, "Drop", 500);                  /* what's queued goes; the stream stays */
     if (o->conv) btconv_reset(o->conv);
@@ -381,7 +399,7 @@ static void bt_pause(void *ctx, int on)
 {
     out_bt_t *o = ctx;
     if (!on) {
-        o->start_until = now_ms() + START_MS;
+        o->start_until = clock_ms32() + START_MS;
         o->paused = 0;
         return;
     }

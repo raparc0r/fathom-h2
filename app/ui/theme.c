@@ -92,7 +92,9 @@ int theme_parse(const char *text, theme_t *t, char *err, size_t errcap)
     char *copy = strdup(text ? text : "");
     if (!copy) { errf(err, errcap, "out of memory\n"); return -1; }
     int lineno = 0, bad = 0;
-    for (char *save = NULL, *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+    /* (a byte-order mark, as Notepad's "UTF-8" saves one: not part of the first line) */
+    char *start = !strncmp(copy, "\xEF\xBB\xBF", 3) ? copy + 3 : copy;
+    for (char *save = NULL, *line = strtok_r(start, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
         lineno++;
         char *semi = strchr(line, ';');
         if (semi) *semi = '\0';
@@ -241,6 +243,14 @@ int theme_load_file(const char *path, theme_t *t, char *err, size_t errcap)
     if (!buf) { fclose(f); return -1; }
     size_t got = fread(buf, 1, (size_t)len, f);
     fclose(f);
+    if (got != (size_t)len) {
+        /* (read short: not the theme. Parsed as far as it came, past its
+         * required colours it passed with defaults for the rest, and the
+         * editor could then save it back short) */
+        free(buf);
+        if (err && errcap) snprintf(err, errcap, "%s: can't be read\n", path);
+        return -1;
+    }
     buf[got] = '\0';
     int r = theme_parse(buf, t, err, errcap);
     free(buf);
@@ -317,7 +327,7 @@ int theme_format(const theme_t *t, char *out, size_t cap)
     if (!out || !cap) return -1;
     out_t o = {out, cap, 0, 0};
     out[0] = '\0';
-    put(&o, "; Made on the H2 with Fathom's theme editor (THEMES.md explains every key)\n\n[theme]\n");
+    put(&o, "; Made on the player with Fathom's theme editor (THEMES.md explains every key)\n\n[theme]\n");
     put_text(&o, "name", t->name);
     if (t->author[0]) put_text(&o, "author", t->author);
     if (t->licence[0]) put_text(&o, "licence", t->licence);

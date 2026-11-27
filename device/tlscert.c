@@ -79,16 +79,7 @@ static int usable(const char *key_path, const char *crt_path, const char *host, 
 /* Written whole or not at all (a new file, then renamed over the old). */
 static int put(const char *path, const unsigned char *buf, size_t n)
 {
-    char tmp[600];
-    snprintf(tmp, sizeof tmp, "%s.new", path);
-    FILE *f = fopen(tmp, "wbe");
-    if (!f) return -1;
-    int ok = fwrite(buf, 1, n, f) == n;
-    ok = fflush(f) == 0 && ok;
-    fsync(fileno(f));
-    ok = fclose(f) == 0 && ok;
-    if (!ok || file_replace(tmp, path)) { unlink(tmp); return -1; }
-    return 0;
+    return file_write_whole(path, buf, n, NULL, 0);
 }
 
 static void stamp(time_t t, char out[16])

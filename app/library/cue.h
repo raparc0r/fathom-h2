@@ -59,6 +59,10 @@ void cue_part_path(char *out, size_t cap, const char *file, int track, uint32_t 
 /* Where a track's path has its "::NN@..." (the file is what's before), or
  * NULL if it's an ordinary file's path. */
 const char *cue_part_suffix(const char *path);
+/* The file a track is in: a track's path gives its file's (copied into buf),
+ * an ordinary file's path is given back as it is. NULL: a track's path whose
+ * file's doesn't fit buf. */
+const char *cue_part_file(const char *path, char *buf, size_t cap);
 /* A track's path taken apart: the track number (> 0), or 0 if it's an
  * ordinary file's path (then nothing is written). */
 int cue_part_parse(const char *path, char *file, size_t cap, uint32_t *start, uint32_t *end);

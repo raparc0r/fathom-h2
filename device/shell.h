@@ -6,6 +6,7 @@
 #define FATHOM_SHELL_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* Runs a shell command; its first `cap` bytes of output to out (NULL: none
  * kept, all read). Returns the exit status, -1 if it couldn't run. */
@@ -36,6 +37,21 @@ void mono_cond_init(pthread_cond_t *cv);
 void sh_home_shown(void);
 void sh_wait_home(int max_ms);
 int  mono_cond_wait_ms(pthread_cond_t *cv, pthread_mutex_t *mu, int ms);
+/* A server a worker started and expects to find running (the network drive's
+ * lighttpd, SSH's dropbear), looked for once a minute while it's on. One
+ * killed for memory was never noticed: the screen went on saying On.
+ * sh_pid_alive: the pid file names a process that is there (what the scripts'
+ * own "status" looks at; no program is run for it).
+ * sh_revive: what to do about what the look found. SH_WELL: nothing.
+ * SH_REVIVE: gone, start it again; three times in a row at most, as Bluetooth
+ * does (in a row: until it has then stayed up for five minutes).
+ * SH_GIVE_UP: gone after that: leave it, and show it as not started.
+ * *r zeroed when it's started because it was asked for. */
+#define SH_LOOK_MS 60000
+typedef struct { int revived; uint32_t revived_at; } sh_revive_t;
+enum { SH_WELL, SH_REVIVE, SH_GIVE_UP };
+int  sh_pid_alive(const char *pidfile);
+int  sh_revive(sh_revive_t *r, int alive, uint32_t now_ms);
 /* s as one single-quoted shell word ('it'\''s), cut to fit cap. */
 void sh_quote(const char *s, char *out, size_t cap);
 /* An interface's IPv4 address, "" without one. */

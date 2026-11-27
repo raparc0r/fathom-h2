@@ -2,6 +2,8 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Reading a zip file, an entry at a time (unzip.h). */
 #include "net/unzip.h"
+#include "core/bytes.h"
+#include "core/fsafe.h"
 
 #include <fcntl.h>
 #include <stdlib.h>
@@ -11,8 +13,6 @@
 
 #define CHUNK 16384
 
-static uint16_t le16(const unsigned char *p) { return (uint16_t)(p[0] | p[1] << 8); }
-static uint32_t le32(const unsigned char *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 
 static int read_at(FILE *f, uint64_t off, void *buf, size_t n)
 {
@@ -34,7 +34,7 @@ int zip_open(zip_t *z, const char *path)
     long at = -1;
     for (long i = (long)tail - 22; i >= 0; i--)
         if (b[i] == 'P' && b[i + 1] == 'K' && b[i + 2] == 5 && b[i + 3] == 6 &&
-            i + 22 + le16(b + i + 20) == (long)tail) { at = i; break; }
+            i + 22 + (long)le16(b + i + 20) == (long)tail) { at = i; break; }
     if (at < 0) { free(b); goto fail; }
     const unsigned char *e = b + at;
     unsigned disk = le16(e + 4), cd_disk = le16(e + 6), here = le16(e + 8);
@@ -151,11 +151,9 @@ int zip_extract(zip_t *z, const zip_entry_t *e, zip_sink_fn sink, void *ctx, con
         ok = r == Z_STREAM_END;
     }
 done:
-#ifdef POSIX_FADV_DONTNEED
     /* What was read leaves the page cache: 16 MB of zip would otherwise push
      * out the player's own code (run from the card) on the H2. */
-    posix_fadvise(fileno(z->f), (off_t)data, (off_t)e->csize, POSIX_FADV_DONTNEED);
-#endif
+    file_drop_cache(fileno(z->f), (off_t)data, (off_t)e->csize);
     free(in);
     free(out);
     return ok && produced == e->usize && crc == e->crc ? 0 : -1;

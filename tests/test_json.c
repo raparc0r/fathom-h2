@@ -5,9 +5,7 @@
 #include <string.h>
 
 #include "net/json.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_util.h"
 
 int main(void)
 {
@@ -73,7 +71,5 @@ int main(void)
     deep[sizeof deep - 1] = '\0';
     CHECK(json_type(json_root(deep, strlen(deep))) == JSON_NONE);   /* too deep, unterminated */
 
-    if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
-    printf("json: all good\n");
-    return 0;
+    return t_result();
 }

@@ -48,6 +48,27 @@ is_proc() {
     case "$c" in *"$2"*) return 0 ;; esac
     return 1
 }
+# pid $1 hasn't ended yet (one that has, and only waits for its parent to
+# collect it, has no command line and holds nothing open)
+alive() {
+    kill -0 "$1" 2>/dev/null || return 1
+    [ -r /proc/$1/cmdline ] || return 0
+    c=; IFS= read -r c 2>/dev/null < /proc/$1/cmdline
+    [ -n "$c" ]
+}
+# $pids cut down to those still running: looked at every 0.1 s until none is,
+# $1 times at most
+wait_gone() {
+    n=$1
+    while :; do
+        left=
+        for p in $pids; do alive $p && left="$left $p"; done
+        pids=$left
+        [ -n "$pids" ] && [ $n -gt 0 ] || break
+        sleep 0.1
+        n=$((n - 1))
+    done
+}
 # the player as the headphones see it (AVRCP: state, track; their buttons)
 avrcp_start() {
     [ -x /mnt/sd/fathom/bin/fathom-avrcp ] || return 0
@@ -59,16 +80,32 @@ avrcp_start() {
 # The pairings, kept on the card: written whole and on the card before they take
 # the old archive's place, and the one before kept (a power cut in that moment
 # left an archive that didn't open: every pairing gone)
+#
+# An archive that is there and couldn't be unpacked at start, nor the one
+# before, isn't "no pairings": it may be a passing thing (no memory just then,
+# a read that failed). $UNREAD marks it, in RAM: while it stands nothing is
+# saved over either file (the empty list went over the archive at the next
+# save, and over the one before at the save after: every pairing lost). The
+# next start tries them again. A pairing made meanwhile takes the mark away:
+# the user has started over.
+UNREAD=$RUN/pairings-unread
 save() {
+    [ -f $UNREAD ] && return
     [ -d /var/lib/bluetooth ] && tar -cf $STATE.new -C /var/lib bluetooth 2>/dev/null && sync || return
     [ -s $STATE ] && tar -tf $STATE >/dev/null 2>&1 && cp $STATE $STATE.bak && sync
     mv $STATE.new $STATE && sync
 }
 restore() {
+    rm -f $UNREAD
     [ -f $STATE ] && tar -xf $STATE -C /var/lib 2>/dev/null && return
     [ -f $STATE ] && logger -t fathom-bt "the pairings' archive doesn't open: the one before used"
     rm -rf /var/lib/bluetooth; mkdir -p /var/lib/bluetooth
-    [ -f $STATE.bak ] && tar -xf $STATE.bak -C /var/lib 2>/dev/null
+    [ -f $STATE.bak ] && tar -xf $STATE.bak -C /var/lib 2>/dev/null && return 0
+    # (no archive at all, or only an empty file: a new card, saved as ever)
+    if [ -s $STATE ] || [ -s $STATE.bak ]; then
+        : > $UNREAD
+        logger -t fathom-bt "no archive of the pairings could be unpacked: nothing saved over them until a pairing is made"
+    fi
     return 0
 }
 # AAC: a bluez-alsa with Fraunhofer's FDK AAC, built by the user for their own H2
@@ -201,21 +238,33 @@ start)
     can io-rt-priority && rt="--io-rt-priority=10"
     $ba -p a2dp-source $codecs $rt $range --a2dp-force-audio-cd --a2dp-volume >> /tmp/bluealsa.log 2>&1 &
     echo $! > $RUN/bluealsa.pid
-    # On, and bonding (pairings keep their keys): bluetoothd does both by
-    # itself as it takes the controller (AutoEnable and AlwaysPairable in
-    # /etc/fathom/bluetooth.conf), so each is only asked for here if "show"
-    # didn't already say so: a bluetoothctl from the card spared, or two.
+    # On: bluetoothd does it by itself as it takes the controller (AutoEnable
+    # in /etc/fathom/bluetooth.conf), so it's only asked for here if "show"
+    # didn't already say so: a bluetoothctl from the card spared.
+    # And not pairable: left on, anything in range could pair with the H2,
+    # nobody agreeing (no agent is there to ask, and BlueZ then takes a "just
+    # works" pairing as it comes). "pair" turns it on for as long as it takes.
+    # BlueZ starts that way; a controller that shows anything else (it can
+    # remember) is told, here too only then.
     case "$show" in *"Powered: yes"*) ;; *) ctl power on > /dev/null ;; esac
-    case "$show" in *"Pairable: yes"*) ;; *) ctl pairable on > /dev/null ;; esac
+    case "$show" in *"Pairable: no"*) ;; *) ctl pairable off > /dev/null ;; esac
     avrcp_start
     echo on
     ;;
 stop)
     running && save
+    # The daemons run from the card, and what comes next may unmount it (USB
+    # drive mode: "The card is in use"): they're waited for, up to 2 s, and
+    # one that still hasn't ended is killed outright.
+    pids=
     for d in avrcp bluealsa bluetoothd dbus; do
-        [ -f $RUN/$d.pid ] && kill "$(cat $RUN/$d.pid)" 2>/dev/null
+        p=; read -r p 2>/dev/null < $RUN/$d.pid
+        [ -n "$p" ] && kill "$p" 2>/dev/null && pids="$pids $p"
         rm -f $RUN/$d.pid
     done
+    wait_gone 20
+    for p in $pids; do kill -9 $p 2>/dev/null; done
+    wait_gone 10
     rm -f /var/run/dbus/system_bus_socket
     fathom-bluetooth off > /dev/null
     echo off
@@ -260,9 +309,18 @@ paired)
     ;;
 pair)
     running && [ -n "$2" ] || exit 1
+    # Pairable (bonding: without it BlueZ keeps no key for the pairing) only
+    # while the H2 pairs with the device the user chose: on just before, off
+    # again whatever comes of it, also when this is ended part-way.
+    trap 'ctl pairable off > /dev/null' EXIT
+    trap 'exit 1' HUP INT TERM
+    ctl pairable on > /dev/null
     # headphones pair without a code ("just works"); the agent says so
     ctl --agent NoInputNoOutput pair "$2" | grep -q -E "Pairing successful|AlreadyExists" || { say "pairing failed"; exit 1; }
+    ctl pairable off > /dev/null
+    trap - EXIT HUP INT TERM
     ctl trust "$2" > /dev/null
+    rm -f $UNREAD                                      # (a pairing made: saved from here on)
     save
     ctl connect "$2" | grep -q "Connection successful" || { say "paired, not connected"; exit 2; }
     ;;

@@ -9,7 +9,6 @@
 
 int  bt_available(void);                      /* the stack is on the card */
 void bt_init(int on, const char *last);       /* on: start now; last: headphones to reconnect */
-void bt_request(int cmd, const char *addr);
 
 /* For ui_hooks_t */
 int  bt_ui_state(char *busy, size_t cap);

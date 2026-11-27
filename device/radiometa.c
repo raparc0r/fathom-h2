@@ -2,6 +2,7 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 #include "radiometa.h"
 #include "shell.h"
+#include "core/thread.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -66,6 +67,8 @@ static unsigned char *fetch(const char *url, job_t *job, size_t max, size_t *len
     AVDictionary *opt = NULL;
     av_dict_set(&opt, "rw_timeout", "10000000", 0);
     av_dict_set(&opt, "user_agent", "Fathom (HiFi Walker H2)", 0);
+    /* (only the network, as net/http.c: a cover's address is what a server said) */
+    av_dict_set(&opt, "protocol_whitelist", "http,https,tls,tcp,httpproxy", 0);
     ff_tls_options(&opt);
     int r = avio_open2(&pb, url, AVIO_FLAG_READ, &icb, &opt);
     av_dict_free(&opt);
@@ -121,13 +124,14 @@ static void do_info(void)
     pthread_mutex_unlock(&mu);
 
     char artist[256] = "", title[256] = "", visual[512] = "";
-    int ok = -1, n = rf_station(info);
+    int ok = -1, reached = 0, n = rf_station(info);
     int64_t step_start = 0, step_end = 0;
     if (n >= 0) {
         char url[128];
         rf_url(n, url, sizeof url);
         char *json = (char *)fetch(url, &job, MAX_ANSWER, NULL);
         if (json) {
+            reached = 1;
             ok = rf_parse(json, artist, sizeof artist, title, sizeof title, visual, sizeof visual);
             if (ok == 0) rf_step_times(json, &step_start, &step_end);
             free(json);
@@ -136,7 +140,16 @@ static void do_info(void)
     /* Asked again when the song on now ends, not every 15 s (a new TLS
      * connection each time, for as long as the station plays); every 15 s
      * still when its end can't be told by this clock (rf_next_fetch_s). */
-    int again = ok == 0 ? rf_next_fetch_s((int64_t)time(NULL), step_start, step_end) : 5;
+    /* Not read: after 5 s, then less often while it goes on failing
+     * (rf_retry_s), from the start again for another station. An answer
+     * that came and names no song (talk between two songs) is not that: asked
+     * at the usual pace, or the next song's name could be three minutes late. */
+    static unsigned fails_gen;        /* (this thread's own) the station the count is of */
+    static int fails;
+    if (fails_gen != job.mine) { fails_gen = job.mine; fails = 0; }
+    fails = ok == 0 ? 0 : fails < 100 ? fails + 1 : fails;
+    int again = ok == 0 ? rf_next_fetch_s((int64_t)time(NULL), step_start, step_end)
+              : reached ? (fails <= 1 ? 5 : RF_POLL_S) : rf_retry_s(fails);
     LAT("radiometa: info %s, asked again in %d s", ok == 0 ? "read" : "not read", again);
 
     pthread_mutex_lock(&mu);
@@ -157,7 +170,7 @@ static void *run(void *arg)
      * decoding give way to the stream's own connection, the UI and the music
      * on the one core (nice 10, this thread only: behind them, but not
      * starved into a timeout the way nice 19 can be). */
-    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
+    thread_nice(10);
     pthread_mutex_lock(&mu);
     for (;;) {
         if (art_done != art_gen) { do_art(); continue; }        /* a new cover first: it's quick */
@@ -174,16 +187,8 @@ static void *run(void *arg)
 static void start(void)   /* under mu */
 {
     if (started) return;
-    pthread_t t;
-    pthread_attr_t a;
-    pthread_attr_init(&a);
-    pthread_attr_setstacksize(&a, 128 * 1024);
     mono_cond_init(&cv);
-    if (pthread_create(&t, &a, run, NULL) == 0) {
-        pthread_detach(t);
-        started = 1;
-    }
-    pthread_attr_destroy(&a);
+    if (thread_detached(run, NULL, 128 * 1024) == 0) started = 1;
 }
 
 void radiometa_want(const char *info)

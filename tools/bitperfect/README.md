@@ -53,7 +53,7 @@ serial console while it's on), so fetch the recording after leaving it:
 
     cc -O2 -o usbdac-play tools/usbdac/usbdac_play.c -framework CoreAudio -framework CoreFoundation
     ssh root@10.42.0.1 touch /tmp/fathom-usbdac-tap     # then Sound -> USB DAC mode
-    ./usbdac-play "Fathom H2" 96000 2 ref96.raw
+    ./usbdac-play "Fathom Audio" 96000 2 ref96.raw
     # Back on the H2 ends USB DAC mode; the network comes back
     ssh root@10.42.0.1 cat /tmp/fathom-usbdac.raw > tap96.raw
     python3 tools/usbdac/check.py tap96.raw ref96.raw S24_LE

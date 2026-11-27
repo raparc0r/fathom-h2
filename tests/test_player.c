@@ -5,8 +5,6 @@
  * generated library: six 0.3 s FLAC files played through the real engine and a
  * silent real-time output.
  */
-#include <FLAC/metadata.h>
-#include <FLAC/stream_encoder.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,48 +16,26 @@
 
 #include "audio/engine.h"
 #include "audio/output.h"
+#include "core/clock.h"
 #include <sqlite3.h>
 
 #include "library/library.h"
 #include "library/playlist.h"
 #include "player/player.h"
-#include "tmpdir.h"
+#include "test_flac.h"
+#include "test_util.h"
 
 #define N 6
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
 
+/* 0.3 s of silence. Guests (Artists): on track 6 in the artist tag, on track 5 in the title */
 static int write_flac_rate(const char *path, int track, unsigned rate)
 {
-    FLAC__StreamEncoder *e = FLAC__stream_encoder_new();
-    FLAC__stream_encoder_set_channels(e, 2);
-    FLAC__stream_encoder_set_bits_per_sample(e, 16);
-    FLAC__stream_encoder_set_sample_rate(e, rate);
-    FLAC__StreamMetadata *vc = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
-    FLAC__StreamMetadata_VorbisComment_Entry en;
-    char buf[64];
-    /* guests (Artists): on track 6 in the artist tag, on track 5 in the title */
-    snprintf(buf, sizeof buf, track == 5 ? "T%d (feat. Guest Two)" : "T%d", track);
-    FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, "TITLE", buf);
-    FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-    FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, "ARTIST",
-                                                                   track == 6 ? "Test Artist feat. Guest One" : "Test Artist");
-    FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-    FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, "ALBUMARTIST", "Test Artist");
-    FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-    FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, "ALBUM", "Test Album");
-    FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-    snprintf(buf, sizeof buf, "%d", track);
-    FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, "TRACKNUMBER", buf);
-    FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-    FLAC__stream_encoder_set_metadata(e, &vc, 1);
-    if (FLAC__stream_encoder_init_file(e, path, NULL, NULL) != FLAC__STREAM_ENCODER_INIT_STATUS_OK) return -1;
-    static FLAC__int32 pcm[2 * 13230];   /* 0.3 s of silence */
-    FLAC__stream_encoder_process_interleaved(e, pcm, 13230);
-    FLAC__stream_encoder_finish(e);
-    FLAC__stream_encoder_delete(e);
-    FLAC__metadata_object_delete(vc);
-    return 0;
+    char title[64], tr[16];
+    snprintf(title, sizeof title, track == 5 ? "T%d (feat. Guest Two)" : "T%d", track);
+    snprintf(tr, sizeof tr, "%d", track);
+    return t_write_flac(path, &(t_flac_t){.frames = 13230, .rate = rate, .tags = {
+        {"TITLE", title}, {"ARTIST", track == 6 ? "Test Artist feat. Guest One" : "Test Artist"},
+        {"ALBUMARTIST", "Test Artist"}, {"ALBUM", "Test Album"}, {"TRACKNUMBER", tr}}});
 }
 
 static int write_flac(const char *path, int track) { return write_flac_rate(path, track, 44100); }
@@ -67,16 +43,7 @@ static int write_flac(const char *path, int track) { return write_flac_rate(path
 /* A long silent FLAC with no tags (a podcast episode stand-in). */
 static int write_flac_long(const char *path, int seconds)
 {
-    FLAC__StreamEncoder *e = FLAC__stream_encoder_new();
-    FLAC__stream_encoder_set_channels(e, 2);
-    FLAC__stream_encoder_set_bits_per_sample(e, 16);
-    FLAC__stream_encoder_set_sample_rate(e, 44100);
-    if (FLAC__stream_encoder_init_file(e, path, NULL, NULL) != FLAC__STREAM_ENCODER_INIT_STATUS_OK) return -1;
-    static FLAC__int32 pcm[2 * 44100];
-    for (int s = 0; s < seconds; s++) FLAC__stream_encoder_process_interleaved(e, pcm, 44100);
-    FLAC__stream_encoder_finish(e);
-    FLAC__stream_encoder_delete(e);
-    return 0;
+    return t_write_flac(path, &(t_flac_t){.frames = (unsigned)seconds * 44100});
 }
 
 static uint32_t now_pos(player_t *p)
@@ -86,30 +53,19 @@ static uint32_t now_pos(player_t *p)
     return n.pos_ms;
 }
 
-static void sleep_ms(int ms)
-{
-    struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000};
-    nanosleep(&t, NULL);
-}
-
 /* Tick the player until `cond` holds or `ms` pass. The checks here run in
  * real time, on a computer that may be busy (or run the test at a low
  * priority): waits end as soon as their condition holds, so they're long
  * (SLOW), and a check never depends on seeing a 0.3 s track as it plays. */
 #define SLOW 15000
 #define WAIT_FOR(p, cond, ms) do { \
-    for (int w_ = 0; w_ < (ms) / 10 && !(cond); w_++) { player_tick(p); sleep_ms(10); } \
+    for (int w_ = 0; w_ < (ms) / 10 && !(cond); w_++) { player_tick(p); t_sleep_ms(10); } \
     player_tick(p); \
 } while (0)
 /* The same without a player: until `cond` holds or SLOW passes */
-#define WAIT_UNTIL(cond) do { for (int w_ = 0; w_ < SLOW / 10 && !(cond); w_++) sleep_ms(10); } while (0)
+#define WAIT_UNTIL(cond) do { for (int w_ = 0; w_ < SLOW / 10 && !(cond); w_++) t_sleep_ms(10); } while (0)
 
-static uint64_t mono_ms_now(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
-}
+static uint64_t mono_ms_now(void) { return (uint64_t)clock_ms(); }
 
 static int64_t cur_id(player_t *p)
 {
@@ -144,16 +100,7 @@ static int idx_of(player_t *p, const int64_t *t, int n)
 /* A short silent FLAC at a given depth and rate (engine format tests). */
 static int write_flac_fmt(const char *path, int bits, unsigned rate)
 {
-    FLAC__StreamEncoder *e = FLAC__stream_encoder_new();
-    FLAC__stream_encoder_set_channels(e, 2);
-    FLAC__stream_encoder_set_bits_per_sample(e, (unsigned)bits);
-    FLAC__stream_encoder_set_sample_rate(e, rate);
-    if (FLAC__stream_encoder_init_file(e, path, NULL, NULL) != FLAC__STREAM_ENCODER_INIT_STATUS_OK) return -1;
-    static FLAC__int32 pcm[2 * 4410];
-    FLAC__stream_encoder_process_interleaved(e, pcm, 4410);
-    FLAC__stream_encoder_finish(e);
-    FLAC__stream_encoder_delete(e);
-    return 0;
+    return t_write_flac(path, &(t_flac_t){.frames = 4410, .bits = (unsigned)bits, .rate = rate});
 }
 
 /* The output is reopened when a deeper track follows at the same rate (a 24-bit
@@ -175,7 +122,7 @@ static void test_engine_depth(const char *dir)
         eng_status_t s;
         engine_status(e, &s);
         if (s.track_id == 2 && !s.next_queued) break;
-        sleep_ms(10);
+        t_sleep_ms(10);
     }
     CHECK(st.opens == 2 && st.fmt.bits == 24);   /* 16 -> 24: reopened for 24 bits */
     engine_queue_next(e, c, 3);
@@ -183,7 +130,7 @@ static void test_engine_depth(const char *dir)
         eng_status_t s;
         engine_status(e, &s);
         if (s.ended || (s.track_id == 3 && s.state == ENG_STOPPED)) break;
-        sleep_ms(10);
+        t_sleep_ms(10);
     }
     CHECK(st.opens == 2);                         /* 24 -> 16: exact on the open output, kept */
     engine_free(e);
@@ -267,10 +214,7 @@ static unsigned long long written(void) { return __atomic_load_n(&g_written, __A
 static int g_gate;
 static long gated_write(void *ctx, const int32_t *x, long n)
 {
-    while (__atomic_load_n(&g_gate, __ATOMIC_SEQ_CST)) {
-        struct timespec ts = {0, 1000000};
-        nanosleep(&ts, NULL);
-    }
+    while (__atomic_load_n(&g_gate, __ATOMIC_SEQ_CST)) t_sleep_ms(1);
     return counting_write(ctx, x, n);
 }
 
@@ -533,9 +477,7 @@ static void slurp(const char *path, char *buf, size_t cap)
 
 static void spit(const char *path, const char *text)
 {
-    FILE *f = fopen(path, "w");
-    CHECK(f && fputs(text, f) >= 0);
-    if (f) fclose(f);
+    CHECK(t_write_text(path, text) == 0);
 }
 
 /* What PATH.pos says: the track and the position (-1: no record). */
@@ -586,7 +528,7 @@ static void test_save_starting(const char *dir)
     CHECK(player_save(p, queue) == 0);
     CHECK(pos_record(queue, &ms) == t[0] && ms >= 400);          /* playing: where it is */
     __atomic_store_n(&g_gate, 1, __ATOMIC_SEQ_CST);              /* the thread held in its write */
-    sleep_ms(100);
+    t_sleep_ms(100);
     player_next(p);
     engine_status(eng, &es);
     CHECK(es.starting && es.track_id == t[0] && es.pos_ms >= 400);   /* (still the old track's figures) */
@@ -652,7 +594,7 @@ static void test_keys_while_starting(const char *dir)
     player_play(p, t, 3, 1);
     WAIT_FOR(p, now_pos(p) >= 3400, SLOW);
     __atomic_store_n(&g_gate, 1, __ATOMIC_SEQ_CST);              /* the thread held in its write */
-    sleep_ms(100);
+    t_sleep_ms(100);
     player_next(p);
     engine_status(eng, &es);
     CHECK(es.starting && cur_id(p) == t[2]);
@@ -663,7 +605,7 @@ static void test_keys_while_starting(const char *dir)
     player_seek_by(p, 2000);
     __atomic_store_n(&g_gate, 0, __ATOMIC_SEQ_CST);
     WAIT_FOR(p, (engine_status(eng, &es), !es.starting && es.track_id == t[1] && es.state == ENG_PLAYING), SLOW);
-    sleep_ms(150);
+    t_sleep_ms(150);
     engine_status(eng, &es);
     CHECK(es.track_id == t[1] && es.pos_ms < 2000);              /* from its top: no jump from the old position */
     if (es.pos_ms >= 2000) fprintf(stderr, "a jump while starting: at %u ms\n", es.pos_ms);
@@ -920,7 +862,7 @@ static void test_radio_net(player_t *p, const char *music)
     CHECK(SEQ(a) == 4 + 1);
     /* ...and so it stays when the network goes and comes back some time later */
     player_radio_test_pace(2000);                 /* ("some time": over 60 ms) */
-    sleep_ms(150);
+    t_sleep_ms(150);
     player_radio_net(p, 0);
     WAIT_FOR(p, 0, 50);
     player_radio_net(p, 1);
@@ -959,7 +901,7 @@ static void test_radio_net(player_t *p, const char *music)
     /* waiting isn't for ever: given up after a while (0.3 s here, ten minutes
      * really), so the player can count as idle; back with the network still */
     player_radio_test_pace(2000);
-    sleep_ms(150);                                /* (not "just after" this time) */
+    t_sleep_ms(150);                                /* (not "just after" this time) */
     a = player_seq(p);
     player_toggle_pause(p);
     player_radio_net(p, 0);
@@ -1096,7 +1038,7 @@ static void test_radio_net(player_t *p, const char *music)
      * that long: here "that long" is no time at all, so the first failure
      * is the last */
     player_radio_test_new_ms(1);
-    sleep_ms(5);
+    t_sleep_ms(5);
     a = player_seq(p);
     player_toggle_pause(p);
     WAIT_FOR(p, (player_now(p, &n), n.radio_failed), SLOW);
@@ -1129,8 +1071,7 @@ static void test_radio_net(player_t *p, const char *music)
 int main(void)
 {
     char dir[200];
-    test_tmp(dir, sizeof dir, "fathom-test-player");
-    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    t_mkdtemp(dir, sizeof dir, "fathom-test-player");
     char path[256], music[300];
     snprintf(music, sizeof music, "%s/music", dir);
     mkdir(music, 0755);
@@ -1465,7 +1406,7 @@ int main(void)
     player_set_repeat(p, REPEAT_OFF);
     player_play(p, t, N, 5);
     WAIT_FOR(p, !playing(p), SLOW);
-    sleep_ms(100);
+    t_sleep_ms(100);
     player_tick(p);
     CHECK(!playing(p) && cur_id(p) == t[5]);
 
@@ -1540,7 +1481,7 @@ int main(void)
             player_tick(p);
             uint32_t p0 = now_pos(p);
             uint64_t w0 = mono_ms_now();
-            sleep_ms(1000);
+            t_sleep_ms(1000);
             player_tick(p);
             double r = (double)(now_pos(p) - p0) / (double)(mono_ms_now() - w0);
             fast = r >= 1.3 && r <= 1.7;
@@ -1556,7 +1497,7 @@ int main(void)
             int64_t id0 = cur_id(p);
             uint32_t p0 = now_pos(p);
             uint64_t w0 = mono_ms_now();
-            sleep_ms(120);
+            t_sleep_ms(120);
             player_tick(p);
             if (cur_id(p) != id0 || !playing(p)) continue;   /* (the 0.3 s track ended meanwhile) */
             double r = (double)(now_pos(p) - p0) / (double)(mono_ms_now() - w0);
@@ -1585,7 +1526,7 @@ int main(void)
         eng_status_t before, after;
         engine_status(eng, &before);
         WAIT_UNTIL((engine_status(eng, &after), after.stop_seq != before.stop_seq));   /* six 0.3 s tracks */
-        sleep_ms(300);                                    /* (and nothing after) */
+        t_sleep_ms(300);                                    /* (and nothing after) */
         engine_status(eng, &after);
         CHECK(after.track_id == t[5] && after.stop_seq == before.stop_seq + 1 && after.ended && !after.error);
         player_tick(p);
@@ -1917,6 +1858,22 @@ int main(void)
         CHECK(library_playlist_remove(lib, pl, 2) == 0);      /* T1 T3 */
         CHECK(library_list(lib, LIB_PLAYLIST_TRACKS, pl, &items) == 2 && items.ids[0] == t[0] && items.ids[1] == t[2]);
         library_list_free(&items);
+        {   /* the query for its songs failing (no memory, a read error: here a column it
+             * names is away for a moment) is not the list's end: the file was rewritten
+             * with what had come, the header alone, and the next scan dropped the songs */
+            sqlite3 *x = NULL;
+            int64_t one[] = {t[1]};
+            CHECK(sqlite3_open(db, &x) == SQLITE_OK &&
+                  sqlite3_exec(x, "ALTER TABLE tracks RENAME COLUMN duration_ms TO d_ms", NULL, NULL, NULL) == SQLITE_OK);
+            CHECK(library_playlist_add(lib, pl, one, 1) != 0);
+            CHECK(sqlite3_exec(x, "ALTER TABLE tracks RENAME COLUMN d_ms TO duration_ms", NULL, NULL, NULL) == SQLITE_OK);
+            sqlite3_close(x);
+            CHECK(m3u_read(plfile, &m) == 0 && m.n == 2);       /* as it was */
+            m3u_free(&m);
+            CHECK(library_playlist_remove(lib, pl, 2) == 0);    /* (the one that did go into the library: out again, and the file written) */
+            CHECK(m3u_read(plfile, &m) == 0 && m.n == 2);
+            m3u_free(&m);
+        }
         char renamed[400];
         snprintf(renamed, sizeof renamed, "%s/Late Night.m3u8", pldir);
         CHECK(library_playlist_rename(lib, pl, "Late Night") == 0 && access(renamed, F_OK) == 0 &&
@@ -2071,11 +2028,7 @@ int main(void)
     library_list_free(&tr);
     library_list_free(&albums);
     library_close(lib);
-    char cmd[400];
-    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
-    if (system(cmd) != 0) fprintf(stderr, "could not remove %s\n", dir);
+    if (t_rm_rf(dir) != 0) fprintf(stderr, "could not remove %s\n", dir);
 
-    if (failures) fprintf(stderr, "%d failure(s)\n", failures);
-    else printf("player: all checks passed\n");
-    return failures != 0;
+    return t_result();
 }

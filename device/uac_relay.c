@@ -20,6 +20,7 @@
  * runs dry however long the music plays.
  */
 #include "uac_relay.h"
+#include "core/clock.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -37,6 +38,7 @@
 #include <sound/asound.h>
 
 #include "audio/engine.h"   /* audio_thread_priority */
+#include "audio/alsa_hw.h"
 #include "audio/output.h"
 
 #define PITCH_NOMINAL 1000000
@@ -48,15 +50,8 @@ struct uac_relay {
     char dac_dev[64];
     pthread_mutex_t mu;
     uac_relay_status_t st;
-    uint32_t last_audio;            /* ms_now() when audio last arrived */
+    uint32_t last_audio;            /* clock_ms32() when audio last arrived */
 };
-
-static uint32_t ms_now(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (uint32_t)(t.tv_sec * 1000 + t.tv_nsec / 1000000);
-}
 
 static void sleep_ms(int ms)
 {
@@ -123,43 +118,6 @@ static int find_card(void)
 
 /* ---- the capture side: kernel PCM ioctls, as out_alsa.c does ---- */
 
-static struct snd_mask *hp_mask(struct snd_pcm_hw_params *p, int n)
-{
-    return &p->masks[n - SNDRV_PCM_HW_PARAM_FIRST_MASK];
-}
-
-static struct snd_interval *hp_int(struct snd_pcm_hw_params *p, int n)
-{
-    return &p->intervals[n - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
-}
-
-static void hp_any(struct snd_pcm_hw_params *p)
-{
-    memset(p, 0, sizeof *p);
-    for (int n = SNDRV_PCM_HW_PARAM_FIRST_MASK; n <= SNDRV_PCM_HW_PARAM_LAST_MASK; n++)
-        memset(hp_mask(p, n)->bits, 0xff, sizeof hp_mask(p, n)->bits);
-    for (int n = SNDRV_PCM_HW_PARAM_FIRST_INTERVAL; n <= SNDRV_PCM_HW_PARAM_LAST_INTERVAL; n++) {
-        hp_int(p, n)->min = 0;
-        hp_int(p, n)->max = UINT_MAX;
-    }
-    p->rmask = ~0u;
-    p->info = ~0u;
-}
-
-static void hp_mask_set(struct snd_pcm_hw_params *p, int n, unsigned v)
-{
-    struct snd_mask *m = hp_mask(p, n);
-    memset(m->bits, 0, sizeof m->bits);
-    m->bits[v >> 5] |= 1u << (v & 31);
-}
-
-static void hp_int_set(struct snd_pcm_hw_params *p, int n, unsigned v)
-{
-    struct snd_interval *i = hp_int(p, n);
-    i->min = i->max = v;
-    i->integer = 1;
-}
-
 /* Opens and starts the capture at `rate`: S32_LE stereo, 40 ms of buffer. */
 static int cap_open(int card, unsigned rate, unsigned *period)
 {
@@ -201,9 +159,7 @@ static int cap_open(int card, unsigned rate, unsigned *period)
     sp.start_threshold = 1;
     sp.stop_threshold = buffer;             /* full = overrun: stop, start again */
     sp.xfer_align = 1;
-    unsigned long boundary = buffer;
-    while (boundary * 2 <= LONG_MAX - buffer) boundary *= 2;
-    sp.boundary = boundary;
+    sp.boundary = alsa_boundary(buffer);
     if (ioctl(fd, SNDRV_PCM_IOCTL_SW_PARAMS, &sp) || ioctl(fd, SNDRV_PCM_IOCTL_PREPARE) ||
         ioctl(fd, SNDRV_PCM_IOCTL_START)) {
         fprintf(stderr, "usb dac: capture start: %s\n", strerror(errno));
@@ -235,6 +191,8 @@ typedef struct {
     double integ;                   /* ppm */
     int pitch;
     uint32_t next_steer, next_rate;
+    uint32_t retry_at;              /* an open that failed is tried again then */
+    int retry_ms;                   /* the wait before that try; 0: none failed at this rate */
 } relay_state_t;
 
 static void set_pitch(relay_state_t *s, int ppm)
@@ -317,11 +275,15 @@ static void *relay_main(void *arg)
     uac_relay_t *r = arg;
     audio_thread_priority(1);           /* the computer's audio, ahead of the UI like playback */
     relay_state_t s = {.card = -1, .ctl = -1, .cap = -1};
+    /* (due at once, whatever the clock reads: left at 0, a time 24.8 days or
+     * more behind reads as one still to come, and USB DAC mode started on an
+     * H2 that had been on that long never read the computer's rate: no sound) */
+    s.next_rate = s.next_steer = s.next_bits = clock_ms32();
     s.out_ok = out_alsa_create(&s.out, r->dac_dev) == 0;
     if (!s.out_ok) fprintf(stderr, "usb dac: no DAC at %s\n", r->dac_dev);
 
     while (!r->stop) {
-        uint32_t now = ms_now();
+        uint32_t now = clock_ms32();
         if (s.card < 0) {
             s.card = find_card();
             if (s.card < 0) { sleep_ms(200); continue; }
@@ -350,11 +312,26 @@ static void *relay_main(void *arg)
                 stream_close(&s);
                 fprintf(stderr, "usb dac: computer sends %ld Hz\n", rate);
                 stream_open(&s, (unsigned)rate);
+                s.retry_ms = 0;
                 pthread_mutex_lock(&r->mu);
                 r->st.rate = (unsigned)rate;
                 r->st.bits = 0;
                 pthread_mutex_unlock(&r->mu);
                 s.used = 0;
+            }
+        }
+        /* An open that failed (the capture or the DAC not ready) is tried
+         * again: a second later, then after twice the wait each time, up to
+         * 32 s. Before, never while the computer kept its rate: silence until
+         * the cable was pulled. (No DAC at all: nothing to try.) */
+        if (s.cap < 0 && s.rate && s.rate != UINT_MAX && s.out_ok) {
+            if (!s.retry_ms) {
+                s.retry_ms = 1000;
+                s.retry_at = now + 1000;
+            } else if ((int32_t)(now - s.retry_at) >= 0) {
+                stream_open(&s, s.rate);
+                if (s.retry_ms < 32000) s.retry_ms *= 2;
+                s.retry_at = now + (uint32_t)s.retry_ms;
             }
         }
         if (s.cap < 0) { sleep_ms(100); continue; }
@@ -385,7 +362,7 @@ static void *relay_main(void *arg)
         for (long i = 0; i < 2 * (long)x.result; i++) s.used |= (uint32_t)s.buf[i];
         s.fill_sum += s.out.delay(s.out.ctx);
         s.fill_n++;
-        now = ms_now();
+        now = clock_ms32();
         if ((int32_t)(now - s.next_steer) >= 0) {
             s.next_steer = now + 500;
             steer(&s);
@@ -403,8 +380,6 @@ static void *relay_main(void *arg)
         if (bits > 0) r->st.bits = bits;
         r->st.frames += (unsigned long long)x.result;
         r->last_audio = now;
-        r->st.pitch = s.pitch;
-        s.out.describe(s.out.ctx, r->st.dac, sizeof r->st.dac);
         pthread_mutex_unlock(&r->mu);
     }
     stream_close(&s);
@@ -421,7 +396,6 @@ uac_relay_t *uac_relay_start(const char *dac)
     if (!r) return NULL;
     snprintf(r->dac_dev, sizeof r->dac_dev, "%s", dac);
     pthread_mutex_init(&r->mu, NULL);
-    r->st.pitch = PITCH_NOMINAL;
     if (pthread_create(&r->th, NULL, relay_main, r)) {
         free(r);
         return NULL;
@@ -433,7 +407,7 @@ void uac_relay_status(uac_relay_t *r, uac_relay_status_t *st)
 {
     pthread_mutex_lock(&r->mu);
     *st = r->st;
-    st->playing = r->st.rate && r->last_audio && ms_now() - r->last_audio < 500;
+    st->playing = r->st.rate && r->last_audio && clock_ms32() - r->last_audio < 500;
     pthread_mutex_unlock(&r->mu);
 }
 

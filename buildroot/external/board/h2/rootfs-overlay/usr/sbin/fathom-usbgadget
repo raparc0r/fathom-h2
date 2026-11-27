@@ -42,6 +42,7 @@ normal() {
     unbind
     rm -f $C/uac2.0 $C/hid.keys
     link_normal
+    echo "Fathom" > $G/strings/0x409/product
     echo "Serial, network and USB drive" > $C/strings/0x409/configuration
     bind 2>/dev/null || { sleep 1; bind; }
 }
@@ -64,7 +65,7 @@ dac)
         echo 0 > $A/c_volume_present 2>/dev/null
         echo 0 > $A/p_mute_present 2>/dev/null
         echo 0 > $A/p_volume_present 2>/dev/null
-        echo "Fathom H2" > $A/function_name 2>/dev/null
+        echo "Fathom Audio" > $A/function_name 2>/dev/null
     fi
     ln -s $A $C/
     # Media keys: the H2's Play, Prev and Next for the computer's player. A
@@ -81,6 +82,10 @@ dac)
         fi
         ln -s $K $C/
     fi
+    # The name a computer lists the sound output under: some take the audio
+    # function's name, others the device's, so both say it while this is
+    # a DAC (normal puts the device's own back)
+    echo "Fathom Audio" > $G/strings/0x409/product
     echo "USB DAC" > $C/strings/0x409/configuration
     # Refused (the controller can't take the audio function as it is): the
     # computer gets its serial, network and drive back rather than nothing

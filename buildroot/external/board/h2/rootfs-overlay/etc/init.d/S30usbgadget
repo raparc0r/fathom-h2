@@ -28,7 +28,7 @@ start)
     echo 0x02 > bDeviceSubClass
     echo 0x01 > bDeviceProtocol
     echo "Fathom" > strings/0x409/manufacturer
-    echo "Fathom H2" > strings/0x409/product
+    echo "Fathom" > strings/0x409/product
     echo "fathom-h2" > strings/0x409/serialnumber
 
     echo "Serial, network and USB drive" > configs/c.1/strings/0x409/configuration
@@ -39,7 +39,7 @@ start)
     L=functions/mass_storage.0/lun.0
     echo 1 > $L/removable
     echo 0 > $L/ro
-    echo "Fathom  H2 microSD" > $L/inquiry_string
+    echo "Fathom  microSD" > $L/inquiry_string
 
     ln -s $G/functions/acm.GS0 $G/functions/ecm.usb0 $G/functions/mass_storage.0 configs/c.1/
     # (the controller is set up beside the kernel's other drivers,

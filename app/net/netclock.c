@@ -2,6 +2,7 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 /* The clock and HTTPS (netclock.h). */
 #include "net/netclock.h"
+#include "core/clock.h"
 
 #include <ctype.h>
 #include <pthread.h>
@@ -33,17 +34,10 @@ static int64_t g_failed_at;              /* (monotonic s: settimeofday doesn't m
 
 void netclock_set_fetcher(int (*fetch)(void)) { g_fetch = fetch; }
 
-static int64_t mono_s(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec;
-}
-
 static int fetch_locked(void)
 {
     int r = g_fetch ? g_fetch() : -1;
-    g_failed_at = r ? (mono_s() | 1) : 0;
+    g_failed_at = r ? (clock_s() | 1) : 0;
     return r;
 }
 
@@ -61,7 +55,7 @@ int netclock_ensure(void)
     if (!g_fetch) return -1;
     pthread_mutex_lock(&g_fetching);
     /* (set meanwhile by the fetch another request waited for: nothing to do) */
-    if (netclock_unset() && !(g_failed_at && mono_s() - g_failed_at < 30)) fetch_locked();
+    if (netclock_unset() && !(g_failed_at && clock_s() - g_failed_at < 30)) fetch_locked();
     pthread_mutex_unlock(&g_fetching);
     return netclock_unset() ? -1 : 0;
 }

@@ -2,6 +2,9 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 #define _FILE_OFFSET_BITS 64   /* DSD files pass 2 GB */
 #include "tags.h"
+#include "core/bytes.h"
+#include "core/path.h"
+#include "core/utf8.h"
 
 #include <ctype.h>
 #include <fcntl.h>
@@ -22,13 +25,6 @@
 #include "audio/vorbis.h"
 
 /* ---------- helpers ---------- */
-
-static const char *ext_of(const char *path)
-{
-    const char *dot = strrchr(path, '.');
-    const char *slash = strrchr(path, '/');
-    return (dot && (!slash || dot > slash)) ? dot + 1 : "";
-}
 
 /* Formats through FFmpeg (with the decoders the H2's build has: integer ones,
  * as Fathom is built soft-float). Ogg Vorbis is read here and decoded by Tremor (an .ogg
@@ -53,7 +49,7 @@ static int opus_ext(const char *e) { return !strcasecmp(e, "opus") || ogg_ext(e)
 
 int tags_supported(const char *path)
 {
-    const char *e = ext_of(path);
+    const char *e = path_ext(path);
 #ifdef FATHOM_HAVE_FFMPEG
     if (ff_ext(e)) return 1;
 #endif
@@ -161,11 +157,38 @@ static int read_flac_libflac(const char *path, tags_t *t)
     return 0;
 }
 
-static uint32_t be24(const unsigned char *p) { return (uint32_t)p[0] << 16 | (uint32_t)p[1] << 8 | p[2]; }
-static uint32_t be32(const unsigned char *p) { return (uint32_t)p[0] << 24 | be24(p + 1); }
-static uint32_t le32(const unsigned char *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 
 #define FLAC_COMMENT_MAX (64u * 1024)   /* a comment longer than this isn't a tag we show */
+/* A file has a handful of metadata blocks. Empty ones by the million (a file
+ * of zeros after "fLaC") had the whole of it read, four bytes at a time. */
+#define FLAC_MAX_BLOCKS 1024
+
+/* f, at a FLAC file's first byte, left at its first metadata block (an ID3v2
+ * tag in front passed over, as libFLAC does): 0, or -1 if it isn't one. */
+static int flac_start(FILE *f)
+{
+    unsigned char h[10];
+    if (fread(h, 1, 4, f) != 4) return -1;
+    if (!memcmp(h, "ID3", 3)) {
+        if (fread(h + 4, 1, 6, f) != 6) return -1;
+        long skip = 10 + ((long)(h[6] & 0x7f) << 21 | (long)(h[7] & 0x7f) << 14 | (long)(h[8] & 0x7f) << 7 | (h[9] & 0x7f));
+        if (h[5] & 0x10) skip += 10;                /* footer */
+        if (fseek(f, skip, SEEK_SET) || fread(h, 1, 4, f) != 4) return -1;
+    }
+    return memcmp(h, "fLaC", 4) ? -1 : 0;
+}
+
+/* The metadata block f is at: its type and length, *last set on the last one
+ * (f left at its first byte). 0, or -1: no header to read. */
+static int flac_block(FILE *f, int *last, int *type, uint32_t *len)
+{
+    unsigned char bh[4];
+    if (fread(bh, 1, 4, f) != 4) return -1;
+    *last = bh[0] & 0x80;
+    *type = bh[0] & 0x7f;
+    *len = be24(bh + 1);
+    return 0;
+}
 
 /* A FLAC's tags in one pass over its metadata blocks: STREAMINFO, the first
  * VORBIS_COMMENT, and of each PICTURE only its type (whether there's a front
@@ -180,22 +203,12 @@ static int read_flac_cue(const char *path, tags_t *t, char **cue, size_t *cue_le
 {
     FILE *f = fopen(path, "rbe");
     if (!f) return -1;
-    unsigned char h[10];
     int ok = 0, vc_done = 0;
-    if (fread(h, 1, 4, f) != 4) goto out;
-    if (!memcmp(h, "ID3", 3)) {                   /* an ID3v2 tag in front (libFLAC skips it too) */
-        if (fread(h + 4, 1, 6, f) != 6) goto out;
-        long skip = 10 + ((long)(h[6] & 0x7f) << 21 | (long)(h[7] & 0x7f) << 14 | (long)(h[8] & 0x7f) << 7 | (h[9] & 0x7f));
-        if (h[5] & 0x10) skip += 10;                /* footer */
-        if (fseek(f, skip, SEEK_SET) || fread(h, 1, 4, f) != 4) goto out;
-    }
-    if (memcmp(h, "fLaC", 4)) goto out;
-    for (int last = 0; !last;) {
-        unsigned char bh[4];
-        if (fread(bh, 1, 4, f) != 4) break;
-        last = bh[0] & 0x80;
-        int type = bh[0] & 0x7f;
-        uint32_t len = be24(bh + 1);
+    if (flac_start(f)) goto out;
+    for (int last = 0, blocks = 0; !last && blocks < FLAC_MAX_BLOCKS; blocks++) {
+        int type;
+        uint32_t len;
+        if (flac_block(f, &last, &type, &len)) break;
         if (type == 0 && !ok && len >= 34) {          /* STREAMINFO */
             unsigned char b[34];
             if (fread(b, 1, 34, f) != 34) break;
@@ -305,6 +318,13 @@ static uint32_t syncsafe(const unsigned char *p)
     return ((uint32_t)p[0] << 21) | ((uint32_t)p[1] << 14) | ((uint32_t)p[2] << 7) | p[3];
 }
 
+/* A frame's size from its header h: v2.2's three bytes after a three-letter
+ * name; four after a four-letter one, plain in v2.3 and syncsafe in v2.4. */
+static uint32_t id3_frame_size(int version, const unsigned char *h)
+{
+    return version == 2 ? be24(h + 3) : version == 4 ? syncsafe(h + 4) : be32(h + 4);
+}
+
 /* A tag too big to hold whole, f at its first byte after the header (see
  * ID3_WHOLE_MAX): its small frames copied one after another, as id3_next
  * reads them. */
@@ -318,15 +338,12 @@ static int id3_load_big(FILE *f, id3_t *id, int ext)
     if (ext && id->version > 2) {                    /* the extended header (as id3_load) */
         unsigned char e[4];
         if (fread(e, 1, 4, f) != 4) return -1;
-        at += id->version == 3 ? 4 + (off_t)((uint32_t)e[0] << 24 | (uint32_t)e[1] << 16 | (uint32_t)e[2] << 8 | e[3])
-                               : (off_t)syncsafe(e);
+        at += id->version == 3 ? 4 + (off_t)be32(e) : (off_t)syncsafe(e);
     }
     while (at + (off_t)hl <= end) {
         unsigned char h[10];
         if (fseeko(f, at, SEEK_SET) || fread(h, 1, hl, f) != hl || h[0] == 0) break;
-        uint32_t sz = id->version == 2 ? ((uint32_t)h[3] << 16 | (uint32_t)h[4] << 8 | h[5])
-                    : id->version == 4 ? syncsafe(h + 4)
-                    : ((uint32_t)h[4] << 24 | (uint32_t)h[5] << 16 | (uint32_t)h[6] << 8 | h[7]);
+        uint32_t sz = id3_frame_size(id->version, h);
         if ((off_t)sz > end - at - (off_t)hl) break;
         int keep = sz <= ID3_FRAME_KEEP;
         size_t need = hl + (keep ? sz : 0);
@@ -381,9 +398,8 @@ static int id3_load(FILE *f, id3_t *id)
         /* an extended header (a CRC, restrictions) before the frames: its
          * size excludes its own 4 bytes in v2.3, includes them (syncsafe) in
          * v2.4. Read as frames, it ended the tag: no tags at all. */
-        size_t skip = id->version == 3 ? 4 + ((size_t)id->buf[0] << 24 | (size_t)id->buf[1] << 16 |
-                                              (size_t)id->buf[2] << 8 | id->buf[3])
-                                       : syncsafe(id->buf);
+        size_t skip = id->version == 3 ? be32(id->buf) : syncsafe(id->buf);
+        if (id->version == 3) skip = skip > id->len - 4 ? id->len : skip + 4;   /* (4 + a size near 4 GB: see id3_next) */
         if (skip > id->len) skip = id->len;
         memmove(id->buf, id->buf + skip, id->len - skip);
         id->len -= skip;
@@ -406,27 +422,40 @@ static const unsigned char *id3_next(const id3_t *id, size_t *pos, char fid[5], 
     while (*pos + hl <= id->len) {
         const unsigned char *h = id->buf + *pos;
         if (h[0] == 0) return NULL;  /* padding */
-        uint32_t sz;
+        uint32_t sz = id3_frame_size(id->version, h);
         if (id->version == 2) {
             memcpy(fid, h, 3);
             fid[3] = '\0';
             for (size_t i = 0; i < sizeof ID3_V22 / sizeof ID3_V22[0]; i++)
                 if (!strcmp(fid, ID3_V22[i][0])) { memcpy(fid, ID3_V22[i][1], 5); break; }
-            sz = (uint32_t)h[3] << 16 | (uint32_t)h[4] << 8 | h[5];
         } else {
             memcpy(fid, h, 4);
             fid[4] = '\0';
-            sz = id->version == 4 ? syncsafe(h + 4)
-                                  : ((uint32_t)h[4] << 24 | (uint32_t)h[5] << 16 | (uint32_t)h[6] << 8 | h[7]);
         }
         *pos += hl;
-        if (*pos + sz > id->len) return NULL;
+        /* (not *pos + sz: with the H2's 32-bit size_t a size near 4 GB comes round
+         * to before *pos, and the same frame is read again for good) */
+        if (sz > id->len - *pos) return NULL;
         const unsigned char *body = id->buf + *pos;
         *pos += sz;
         *size = sz;
         return body;
     }
     return NULL;
+}
+
+/* Up to n bytes of b, or to its first NUL, into out (cap bytes; not ended):
+ * Latin-1 written as UTF-8, or (latin1 0) the bytes as they are. How many
+ * bytes were written. */
+static size_t latin1_put(const unsigned char *b, size_t n, int latin1, char *out, size_t cap)
+{
+    size_t w = 0;
+    for (size_t i = 0; i < n && b[i] && w + 3 < cap; i++) {
+        unsigned c = b[i];
+        if (latin1 && c >= 0x80) { out[w++] = (char)(0xC0 | (c >> 6)); out[w++] = (char)(0x80 | (c & 0x3F)); }
+        else out[w++] = (char)c;
+    }
+    return w;
 }
 
 /* Decode an ID3 text frame body into UTF-8. */
@@ -437,11 +466,7 @@ static void id3_text(const unsigned char *b, size_t n, char *out, size_t cap)
     int enc = b[0];
     b++; n--;
     if (enc == 0 || enc == 3) {  /* Latin-1 or UTF-8 */
-        for (size_t i = 0; i < n && b[i] && w + 3 < cap; i++) {
-            unsigned c = b[i];
-            if (enc == 0 && c >= 0x80) { out[w++] = (char)(0xC0 | (c >> 6)); out[w++] = (char)(0x80 | (c & 0x3F)); }
-            else out[w++] = (char)c;
-        }
+        w = latin1_put(b, n, enc == 0, out, cap);
     } else {  /* UTF-16 with BOM (1) or big-endian (2) */
         int le = 0;
         size_t i = 0;
@@ -457,10 +482,7 @@ static void id3_text(const unsigned char *b, size_t n, char *out, size_t cap)
                 u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
                 i += 2;
             }
-            if (u < 0x80) out[w++] = (char)u;
-            else if (u < 0x800) { out[w++] = (char)(0xC0 | u >> 6); out[w++] = (char)(0x80 | (u & 0x3F)); }
-            else if (u < 0x10000) { out[w++] = (char)(0xE0 | u >> 12); out[w++] = (char)(0x80 | ((u >> 6) & 0x3F)); out[w++] = (char)(0x80 | (u & 0x3F)); }
-            else { out[w++] = (char)(0xF0 | u >> 18); out[w++] = (char)(0x80 | ((u >> 12) & 0x3F)); out[w++] = (char)(0x80 | ((u >> 6) & 0x3F)); out[w++] = (char)(0x80 | (u & 0x3F)); }
+            w += utf8_encode(u, out + w);
         }
     }
     out[w] = '\0';
@@ -552,11 +574,7 @@ static void read_id3(const char *path, tags_t *t)
 /* An ID3v1 field: Latin-1, padded with NULs or spaces. */
 static void id3v1_field(const unsigned char *b, size_t n, char *out, size_t cap)
 {
-    size_t w = 0;
-    for (size_t i = 0; i < n && b[i] && w + 3 < cap; i++) {
-        if (b[i] >= 0x80) { out[w++] = (char)(0xC0 | (b[i] >> 6)); out[w++] = (char)(0x80 | (b[i] & 0x3F)); }
-        else out[w++] = (char)b[i];
-    }
+    size_t w = latin1_put(b, n, 1, out, cap);
     while (w > 0 && out[w - 1] == ' ') w--;
     out[w] = '\0';
 }
@@ -752,7 +770,6 @@ static long ogg_vorbis_start(FILE *f, ogg_rd_t *r, uint32_t *rate, uint8_t *chan
     return count > 0x7fffffff ? 0x7fffffff : (long)count;
 }
 
-static uint64_t le64(const unsigned char *p) { return (uint64_t)le32(p + 4) << 32 | le32(p); }
 
 /* The granule position of the stream's last whole page: its length in
  * samples (for a file starting at 0, as encoders write them), or 0. Pages
@@ -1021,7 +1038,7 @@ static int read_ff(const char *path, tags_t *t)
         if (fc->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC) t->has_picture = 1;
     avformat_close_input(&fc);
 #ifdef FATHOM_HAVE_VORBIS
-    if (!t->has_picture && opus_ext(ext_of(path))) t->has_picture = ogg_opus_has_picture(path);   /* (FFmpeg has let a big one go) */
+    if (!t->has_picture && opus_ext(path_ext(path))) t->has_picture = ogg_opus_has_picture(path);   /* (FFmpeg has let a big one go) */
 #endif
     return 0;
 }
@@ -1096,7 +1113,7 @@ static int picture_ff(const char *path, unsigned char **data, size_t *len, size_
 int tags_read(const char *path, tags_t *t)
 {
     memset(t, 0, sizeof *t);
-    const char *e = ext_of(path);
+    const char *e = path_ext(path);
     int r = -1;
     if (!strcasecmp(e, "flac")) r = read_flac(path, t);
     else if (!strcasecmp(e, "mp3")) r = read_mp3(path, t);
@@ -1125,7 +1142,7 @@ int tags_cuesheet(const char *path, char **text, size_t *len)
 {
     *text = NULL;
     *len = 0;
-    const char *e = ext_of(path);
+    const char *e = path_ext(path);
     tags_t t;
     memset(&t, 0, sizeof t);
     if (!strcasecmp(e, "flac")) read_flac_cue(path, &t, text, len);
@@ -1153,33 +1170,19 @@ static size_t g_max_picture = (size_t)-1;
  * cover), else the first of any other kind; never a file icon (1, 2). */
 int tags_picture_at(const char *path, long *off, long *len)
 {
-    const char *sfx = cue_part_suffix(path);
-    if (sfx) {
-        char file[1024];
-        if ((size_t)(sfx - path) >= sizeof file) return -1;
-        memcpy(file, path, (size_t)(sfx - path));
-        file[sfx - path] = '\0';
-        return tags_picture_at(file, off, len);
-    }
-    if (strcasecmp(ext_of(path), "flac")) return -1;
+    char file[1024];
+    const char *of = cue_part_file(path, file, sizeof file);
+    if (!of) return -1;
+    if (of != path) return tags_picture_at(of, off, len);   /* a CUE track: its file's */
+    if (strcasecmp(path_ext(path), "flac")) return -1;
     FILE *f = fopen(path, "rbe");
     if (!f) return -1;
-    unsigned char h[10];
     int best = 99;
-    if (fread(h, 1, 4, f) != 4) goto out;
-    if (!memcmp(h, "ID3", 3)) {
-        if (fread(h + 4, 1, 6, f) != 6) goto out;
-        long skip = 10 + ((long)(h[6] & 0x7f) << 21 | (long)(h[7] & 0x7f) << 14 | (long)(h[8] & 0x7f) << 7 | (h[9] & 0x7f));
-        if (h[5] & 0x10) skip += 10;
-        if (fseek(f, skip, SEEK_SET) || fread(h, 1, 4, f) != 4) goto out;
-    }
-    if (memcmp(h, "fLaC", 4)) goto out;
-    for (int last = 0; !last;) {
-        unsigned char bh[4];
-        if (fread(bh, 1, 4, f) != 4) break;
-        last = bh[0] & 0x80;
-        int type = bh[0] & 0x7f;
-        uint32_t blen = be24(bh + 1);
+    if (flac_start(f)) goto out;
+    for (int last = 0, blocks = 0; !last && blocks < FLAC_MAX_BLOCKS; blocks++) {
+        int type;
+        uint32_t blen;
+        if (flac_block(f, &last, &type, &blen)) break;
         long next = ftell(f) + (long)blen;
         if (type == 6 && blen >= 32) {
             unsigned char b[8];
@@ -1226,7 +1229,7 @@ static int riff_id3_seek(FILE *f)
     for (int n = 0; n < 4096; n++) {
         unsigned char c[8];
         if (fseeko(f, at, SEEK_SET) || fread(c, 1, 8, f) != 8) return -1;
-        uint32_t size = wav ? ((uint32_t)c[7] << 24 | (uint32_t)c[6] << 16 | (uint32_t)c[5] << 8 | c[4]) : be32(c + 4);
+        uint32_t size = wav ? le32(c + 4) : be32(c + 4);
         if (!strncasecmp((const char *)c, "id3 ", 4)) return 0;      /* (f is at the chunk's first byte) */
         at += 8 + (off_t)size + (size & 1);
     }
@@ -1254,15 +1257,11 @@ int tags_picture(const char *path, unsigned char **data, size_t *len)
 {
     *data = NULL;
     *len = 0;
-    const char *sfx = cue_part_suffix(path);
-    if (sfx) {                                   /* a CUE track: its file's cover */
-        char file[1024];
-        if ((size_t)(sfx - path) >= sizeof file) return -1;
-        memcpy(file, path, (size_t)(sfx - path));
-        file[sfx - path] = '\0';
-        return tags_picture(file, data, len);
-    }
-    const char *e = ext_of(path);
+    char file[1024];
+    const char *of = cue_part_file(path, file, sizeof file);
+    if (!of) return -1;
+    if (of != path) return tags_picture(of, data, len);   /* a CUE track: its file's cover */
+    const char *e = path_ext(path);
     if (!strcasecmp(e, "flac")) {
         long off, n;
         if (tags_picture_at(path, &off, &n) || (size_t)n > g_max_picture) return -1;

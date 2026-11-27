@@ -6,9 +6,7 @@
 #include <string.h>
 
 #include "ui/coverflow.h"
-
-static int fails;
-#define CHECK(c) do { if (!(c)) { fails++; printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
+#include "test_util.h"
 
 enum { GUARD = 4096, MID_X = (FLOW_W - FLOW_COVER) / 2, MID_Y = 6 };
 static uint16_t store[GUARD + FLOW_W * FLOW_H + GUARD];
@@ -145,7 +143,5 @@ int main(void)
         flow_draw(out, none, 0, BG, BLANK, 1);
         CHECK(count(BG) == FLOW_W * FLOW_H);
     }
-    if (fails) { printf("%d failure(s)\n", fails); return 1; }
-    printf("coverflow: ok\n");
-    return 0;
+    return t_result();
 }

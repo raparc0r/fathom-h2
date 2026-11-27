@@ -2,6 +2,8 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Uninstall Fathom, on the card (uninstall.h). */
 #include "sys/uninstall.h"
+#include "core/datetime.h"
+#include "core/fsafe.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -23,12 +25,6 @@
 static void at(char *out, size_t cap, const char *card, const char *name)
 {
     snprintf(out, cap, "%s/%s", card, name);
-}
-
-static int exists(const char *path)
-{
-    struct stat st;
-    return !stat(path, &st);
 }
 
 static int is_upt(const char *name)
@@ -102,9 +98,11 @@ int uninstall_pending(const char *card)
 {
     char p[600];
     at(p, sizeof p, card, DIR_ "/undo");
-    if (exists(p)) return 1;
+    if (file_exists(p)) return 1;
     at(p, sizeof p, card, DIR_ "/renames");
-    return exists(p);
+    if (file_exists(p)) return 1;
+    at(p, sizeof p, card, DIR_ "/target");       /* (an Apply cut before it had changed anything: its note alone) */
+    return file_exists(p);
 }
 
 static void forget(const char *card)
@@ -114,8 +112,38 @@ static void forget(const char *card)
     unlink(p);
     at(p, sizeof p, card, DIR_ "/renames");
     unlink(p);
+    at(p, sizeof p, card, DIR_ "/target");
+    unlink(p);
     at(p, sizeof p, card, DIR_);
     rmdir(p);
+}
+
+/* The HiBy file an Apply set out to change, by the name it had then (noted
+ * before anything is written: target_note). "" if no note (an Apply by an
+ * older Fathom). Until the last rename it still has that name, and nothing
+ * else says which file the undo is for. */
+static void target_read(const char *card, char *name, size_t cap)
+{
+    char p[600];
+    name[0] = '\0';
+    at(p, sizeof p, card, DIR_ "/target");
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    if (fgets(name, (int)cap, f)) name[strcspn(name, "\r\n")] = '\0';
+    else name[0] = '\0';
+    fclose(f);
+}
+
+static int target_note(const char *card, const char *name)
+{
+    char p[600];
+    at(p, sizeof p, card, DIR_ "/target");
+    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return -1;
+    size_t n = strlen(name);
+    int bad = write(fd, name, n) != (ssize_t)n || write(fd, "\n", 1) != 1 || fsync(fd);
+    if (close(fd)) bad = 1;
+    return bad ? -1 : 0;
 }
 
 int uninstall_forget_stale(const char *card)
@@ -128,6 +156,27 @@ int uninstall_forget_stale(const char *card)
     upt_kind_t kind = u.kind;
     upt_close(&u);
     if (!e && kind == UPT_HIBY_PATCHED) return 0;
+    /* Not the file made ready. Either that was long ago (HiBy's recovery
+     * installed it, the files were moved by hand: forgotten, below, the
+     * files left as they are), or the Apply itself was cut short (the player
+     * stopped in the second it takes): then HiBy's file is half changed, or
+     * changed and not yet named update.upt, and the undo is the only way
+     * back. Forgotten like the first, it was lost: the file couldn't be
+     * put back, and Fathom's installer stayed set aside under another name.
+     * The second is told by HiBy's file still being there under the name it
+     * had, and either update.upt not there yet or that file not whole. */
+    char name[256], hp[600];
+    target_read(card, name, sizeof name);
+    at(hp, sizeof hp, card, name[0] ? name : UPDATE);
+    if (file_exists(hp)) {
+        upt_err_t he = upt_open(&u, hp, 0);
+        upt_close(&u);
+        int renamed = strcmp(name[0] ? name : UPDATE, UPDATE) != 0;
+        if (he || (renamed && !file_exists(p))) {
+            uninstall_cancel(card);
+            return 1;
+        }
+    }
     forget(card);
     return 1;
 }
@@ -168,18 +217,19 @@ uni_err_t uninstall_apply(const char *card, const char *name, upt_t *u, upt_err_
     char p[600], undo[600];
     if (why) *why = UPT_OK;
     at(p, sizeof p, card, DIR_);
-    if (mkdir(p, 0755) && !exists(p)) return UNI_WRITE;
+    if (mkdir(p, 0755) && !file_exists(p)) return UNI_WRITE;
     at(undo, sizeof undo, card, DIR_ "/undo");
     int other = strcmp(name, UPDATE) != 0;
     if (other) {
         at(p, sizeof p, card, UPDATE);
-        if (exists(p)) {
+        if (file_exists(p)) {
             char aside[600];
             at(aside, sizeof aside, card, ASIDE);
-            if (exists(aside)) return UNI_IN_THE_WAY;
+            if (file_exists(aside)) return UNI_IN_THE_WAY;
             if (journal_rename(card, UPDATE, ASIDE)) { uninstall_cancel(card); return UNI_WRITE; }
         }
     }
+    if (target_note(card, name)) { uninstall_cancel(card); return UNI_WRITE; }   /* (which file the undo will be for) */
     upt_err_t e = upt_patch(u, undo);
     if (e) {
         if (why) *why = e;
@@ -211,17 +261,22 @@ int uninstall_cancel(const char *card)
         }
         fclose(f);
     }
-    /* the names back, the last first */
-    const char *hiby = UPDATE;
+    /* the names back, the last first. HiBy's file: the one that was renamed
+     * to update.upt, or, if the Apply never got that far, the one it noted
+     * (it was taken for update.upt then: the undo was tried on Fathom's own
+     * installer, refused, and thrown away with the rest). */
+    char noted[256];
+    target_read(card, noted, sizeof noted);
+    const char *hiby = noted[0] ? noted : UPDATE;
     for (int i = n - 1; i >= 0; i--) {
         char a[600], b[600];
         at(a, sizeof a, card, to[i]);
         at(b, sizeof b, card, from[i]);
-        if (exists(a) && !exists(b) && rename(a, b)) r = -1;
+        if (file_exists(a) && !file_exists(b) && rename(a, b)) r = -1;
         if (!strcmp(to[i], UPDATE)) hiby = from[i];
     }
     /* then the file's contents */
-    if (exists(undo)) {
+    if (file_exists(undo)) {
         char p[600];
         at(p, sizeof p, card, hiby);
         if (upt_undo(p, undo)) r = -1;
@@ -244,22 +299,12 @@ int64_t uninstall_stock_time(const char *card)
 }
 
 /* Days from 1970-01-01 to y-m-d (proleptic Gregorian). */
-static int64_t days_from_civil(int64_t y, int m, int d)
-{
-    y -= m <= 2;
-    int64_t era = (y >= 0 ? y : y - 399) / 400;
-    int64_t yoe = y - era * 400;
-    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + doe - 719468;
-}
-
 int64_t uninstall_ver_time(const char *ver)
 {
     int y, mo, d, h, mi, se, n = 0;
     if (sscanf(ver, "%4d-%2d-%2dT%2d:%2d:%2d%n", &y, &mo, &d, &h, &mi, &se, &n) != 6) return -1;
     if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || se > 60) return -1;
-    int64_t t = days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se;
+    int64_t t = dt_days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se;
     const char *z = ver + n;
     int oh, om;
     if ((z[0] == '+' || z[0] == '-') && sscanf(z + 1, "%2d:%2d", &oh, &om) == 2)
@@ -284,7 +329,7 @@ const char *uninstall_error_text(uni_err_t e)
     case UNI_IN_THE_WAY: return N_("Move update.upt and fathom-install.upt off the card first");
     case UNI_NO_SPACE: return N_("Not enough space on the card");
     case UNI_WRITE: return N_("Couldn't write to the card");
-    case UNI_OLDER: return N_("Older than the H2's firmware");
+    case UNI_OLDER: return N_("Older than the player's firmware");
     default: return N_("Couldn't use the update file");
     }
 }

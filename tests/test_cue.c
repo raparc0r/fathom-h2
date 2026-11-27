@@ -9,8 +9,6 @@
  * Each sample says where it is: left = frame & 0xFFFF, right = frame >> 16,
  * so any frame out of place shows.
  */
-#include <FLAC/metadata.h>
-#include <FLAC/stream_encoder.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,19 +23,12 @@
 #include "audio/output.h"
 #include "library/cue.h"
 #include "library/library.h"
-#include "tmpdir.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_db.h"
+#include "test_flac.h"
+#include "test_util.h"
 
 #define RATE   44100
 #define FRAMES (10 * RATE)   /* 10 s */
-
-static void sleep_ms(int ms)
-{
-    struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000};
-    nanosleep(&t, NULL);
-}
 
 /* ---------- the parser ---------- */
 
@@ -120,6 +111,30 @@ static void test_parser(void)
                 "TRACK 08 AUDIO\nINDEX 01 00:40:00\n") == 3);
     CHECK(S.tracks[0].number == 2 && S.tracks[1].number == 6 && S.tracks[1].start == 20 * 75 && S.tracks[2].number == 8);
 
+    /* a number a track's path can't hold (none, 0, over 99, not a number): its
+     * place in the sheet instead, and every path one that plays */
+    CHECK(parse("FILE \"a.flac\" WAVE\n"
+                "TRACK 00 AUDIO\nINDEX 01 00:00:00\n"
+                "TRACK AUDIO\nINDEX 01 00:10:00\n"
+                "TRACK 100 AUDIO\nINDEX 01 00:20:00\n"
+                "TRACK -4 AUDIO\nINDEX 01 00:30:00\n"
+                "TRACK 05 AUDIO\nINDEX 01 00:40:00\n") == 5);
+    for (int i = 0; i < 5; i++) {
+        char tp[64], tf[64];
+        uint32_t ts, te;
+        CHECK(S.tracks[i].number == i + 1);
+        cue_part_path(tp, sizeof tp, "/m/a.flac", S.tracks[i].number, S.tracks[i].start, 0);
+        CHECK(cue_part_parse(tp, tf, sizeof tf, &ts, &te) == i + 1 && ts == (uint32_t)i * 10 * 75);
+    }
+    /* that place taken by another track: left out (the rest stay) */
+    CHECK(parse("FILE \"a.flac\" WAVE\n"
+                "TRACK 02 AUDIO\nINDEX 01 00:00:00\n"
+                "TRACK 0 AUDIO\nINDEX 01 00:10:00\n"
+                "TRACK 03 AUDIO\nINDEX 01 00:20:00\n") == 2);
+    CHECK(S.tracks[0].number == 2 && S.tracks[1].number == 3);
+    /* a number is looked for on the TRACK's own line only */
+    CHECK(parse("FILE \"a.flac\" WAVE\nTRACK\n7\nINDEX 01 00:00:00\n") == 1 && S.tracks[0].number == 1);
+
     /* several files; EAC's "gaps appended" layout puts the next FILE between a
      * track's INDEX 00 and 01: the track is in the file its INDEX 01 is in */
     CHECK(parse("FILE \"1.flac\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 00 04:00:00\n"
@@ -144,46 +159,22 @@ static void test_parser(void)
 
 /* ---------- the generated library ---------- */
 
-static int write_flac(const char *path, int frames, const char *title, const char *cuesheet)
+/* Each frame says which it is: its number's low 16 bits on the left, the rest on the right */
+static void frame_numbers(FLAC__int32 *pcm, unsigned at, unsigned n)
 {
-    FLAC__StreamEncoder *e = FLAC__stream_encoder_new();
-    FLAC__stream_encoder_set_channels(e, 2);
-    FLAC__stream_encoder_set_bits_per_sample(e, 16);
-    FLAC__stream_encoder_set_sample_rate(e, RATE);
-    FLAC__StreamMetadata *vc = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
-    FLAC__StreamMetadata_VorbisComment_Entry en;
-    FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, "TITLE", title);
-    FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-    FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, "ARTIST", "File Artist");
-    FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-    FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, "ALBUM", "File Album");
-    FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-    FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, "REPLAYGAIN_TRACK_GAIN", "-4.00 dB");
-    FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-    if (cuesheet) {
-        FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, "CUESHEET", cuesheet);
-        FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
+    for (unsigned k = 0; k < n; k++) {
+        int i = (int)(at + k);
+        pcm[2 * k] = (int16_t)(i & 0xFFFF);
+        pcm[2 * k + 1] = (int16_t)(i >> 16);
     }
-    FLAC__stream_encoder_set_metadata(e, &vc, 1);
-    if (FLAC__stream_encoder_init_file(e, path, NULL, NULL) != FLAC__STREAM_ENCODER_INIT_STATUS_OK) return -1;
-    FLAC__int32 *pcm = malloc((size_t)frames * 2 * sizeof *pcm);
-    if (!pcm) return -1;
-    for (int i = 0; i < frames; i++) {
-        pcm[2 * i] = (int16_t)(i & 0xFFFF);
-        pcm[2 * i + 1] = (int16_t)(i >> 16);
-    }
-    FLAC__stream_encoder_process_interleaved(e, pcm, (unsigned)frames);
-    FLAC__stream_encoder_finish(e);
-    FLAC__stream_encoder_delete(e);
-    FLAC__metadata_object_delete(vc);
-    free(pcm);
-    return 0;
 }
 
-static void write_text(const char *path, const char *text)
+/* (cuesheet NULL: the file has none) */
+static int write_flac(const char *path, int frames, const char *title, const char *cuesheet)
 {
-    FILE *f = fopen(path, "wb");
-    if (f) { fputs(text, f); fclose(f); }
+    return t_write_flac(path, &(t_flac_t){.frames = (unsigned)frames, .rate = RATE, .fill = frame_numbers, .tags = {
+        {"TITLE", title}, {"ARTIST", "File Artist"}, {"ALBUM", "File Album"}, {"REPLAYGAIN_TRACK_GAIN", "-4.00 dB"},
+        {"CUESHEET", cuesheet}}});
 }
 
 /* Which frame of the file a decoded frame is. */
@@ -217,7 +208,7 @@ static int c_open(void *ctx, const audio_format_t *f) { (void)f; ((cap_t *)ctx)-
 static long c_write(void *ctx, const int32_t *fr, long n)
 {
     cap_t *c = ctx;
-    while (!c->gate) sleep_ms(1);
+    while (!c->gate) t_sleep_ms(1);
     for (long i = 0; i < n; i++) c->bad += frame_of(fr + 2 * i) != c->next++;
     c->frames += (unsigned long long)n;
     return n;
@@ -247,30 +238,6 @@ static int64_t album_named(library_t *lib, const char *name)
     return id;
 }
 
-static int64_t db_int(const char *db, const char *sql)
-{
-    sqlite3 *h;
-    sqlite3_stmt *s;
-    int64_t v = -1;
-    if (sqlite3_open(db, &h) != SQLITE_OK) return -1;
-    if (sqlite3_prepare_v2(h, sql, -1, &s, NULL) == SQLITE_OK) {
-        if (sqlite3_step(s) == SQLITE_ROW) v = sqlite3_column_int64(s, 0);
-        sqlite3_finalize(s);
-    }
-    sqlite3_close(h);
-    return v;
-}
-
-static void db_exec(const char *db, const char *sql)
-{
-    sqlite3 *h;
-    if (sqlite3_open(db, &h) != SQLITE_OK) return;
-    char *err = NULL;
-    if (sqlite3_exec(h, sql, NULL, NULL, &err) != SQLITE_OK) { fprintf(stderr, "sql: %s\n", err); failures++; }
-    sqlite3_free(err);
-    sqlite3_close(h);
-}
-
 /* The sheet for Album.flac (written for the WAV: FILE names Album.wav), in
  * Latin-1 like many old ones. `t2` is track 2's title. */
 static void write_sheet(const char *path, const char *t2)
@@ -284,7 +251,7 @@ static void write_sheet(const char *path, const char *t2)
              "    INDEX 00 00:02:50\r\n    INDEX 01 00:03:00\r\n"
              "  TRACK 03 AUDIO\r\n    TITLE \"Closing\"\r\n    INDEX 01 00:07:00\r\n",
              t2);
-    write_text(path, text);
+    t_write_text(path, text);
 }
 
 int main(void)
@@ -292,8 +259,7 @@ int main(void)
     test_parser();
 
     char dir[200];
-    test_tmp(dir, sizeof dir, "fathom-test-cue");
-    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    t_mkdtemp(dir, sizeof dir, "fathom-test-cue");
     char music[300], path[700], sheet[700], emb[700], single[700], db[300], art[300];
     snprintf(music, sizeof music, "%s/music", dir);
     mkdir(music, 0755);
@@ -310,10 +276,10 @@ int main(void)
     snprintf(broken, sizeof broken, "%s/Broken/b.flac", music);
     write_flac(broken, RATE, "Broken Whole", NULL);
     snprintf(path, sizeof path, "%s/Broken/b.cue", music);
-    write_text(path, "FILE \"b.flac\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:05:00\nTRACK 02 AUDIO\nINDEX 01 00:06:00\n");
+    t_write_text(path, "FILE \"b.flac\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:05:00\nTRACK 02 AUDIO\nINDEX 01 00:06:00\n");
     /* a playlist naming the whole file (made before the sheet, or elsewhere), and a track */
     snprintf(path, sizeof path, "%s/list.m3u8", music);
-    write_text(path, "#EXTM3U\nCue Album/Album.flac\nSingle/one.flac\n");
+    t_write_text(path, "#EXTM3U\nCue Album/Album.flac\nSingle/one.flac\n");
     snprintf(path, sizeof path, "%s/Cue Album/Album.flac", music);
     snprintf(sheet, sizeof sheet, "%s/Cue Album/Album.cue", music);
     snprintf(emb, sizeof emb, "%s/Embedded/Embedded.flac", music);
@@ -333,7 +299,7 @@ int main(void)
 
     library_t *lib = library_open(db, art);
     CHECK(lib && library_scan(lib, music, NULL, NULL) == 3 + 2 + 1 + 1);   /* the big files aren't tracks */
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE title IN ('Whole File', 'Embedded Whole')") == 0);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE title IN ('Whole File', 'Embedded Whole')") == 0);
 
     /* the sheet's album: its tracks, in order, with the sheet's fields */
     int64_t alb = album_named(lib, "Caf\xC3\xA9 Sessions");
@@ -350,11 +316,11 @@ int main(void)
     CHECK(library_album_artist(lib, alb) > 0);
     char name[256];
     CHECK(library_artist_name(lib, library_album_artist(lib, alb), name, sizeof name) == 0 && !strcmp(name, "Cue Band"));
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE genre='Rock' AND cue>0") == 3);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE genre='Rock' AND cue>0") == 3);
     /* the file's own gain is the album's; each track's is measured later */
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE cue>0 AND rg_state=0 AND rg_album=-4.0 AND path LIKE '%Album.flac::%'") == 3);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE cue>0 AND rg_state=0 AND rg_album=-4.0 AND path LIKE '%Album.flac::%'") == 3);
     library_list_free(&l);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE title='Broken Whole' AND cue=0") == 1);   /* stays one */
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE title='Broken Whole' AND cue=0") == 1);   /* stays one */
 
     /* the playlist: the file's tracks, then the other */
     CHECK(library_list(lib, LIB_PLAYLISTS, 0, &l) == 1);
@@ -410,7 +376,7 @@ int main(void)
     for (int w = 0; w < 500; w++) {
         engine_status(eng, &st);
         if (st.ended) break;
-        sleep_ms(10);
+        t_sleep_ms(10);
     }
     CHECK(st.ended && st.track_id == t2.id && st.len_ms == 4000 && st.pos_ms == 4000);
     CHECK(cap.frames == (unsigned long long)7 * RATE && cap.bad == 0 && cap.opens == 1);
@@ -427,7 +393,7 @@ int main(void)
     lib_rg_t rg = {2, -3.0f, 0.5f, 0, 0, 0};
     library_rg_store(lib, ids[1], &rg);
     lib_list_t sl;
-    int64_t one = db_int(db, "SELECT id FROM tracks WHERE title='One Alone'");
+    int64_t one = t_db_int(db, "SELECT id FROM tracks WHERE title='One Alone'");
     library_played(lib, one, 0, 1000);
     library_played(lib, ids[0], 0, 1000);
     library_set_favourite(lib, ids[2], 1);
@@ -435,12 +401,12 @@ int main(void)
     CHECK(library_scan(lib, music, NULL, NULL) == 7 && library_scan_changes(lib) == 3);
     for (int i = 0; i < 3; i++) CHECK(library_track(lib, ids[i], &t1) == 0);
     CHECK(library_track(lib, ids[1], &t2) == 0 && !strcmp(t2.title, "Middle Eight"));
-    CHECK(db_int(db, "SELECT rg_state FROM tracks WHERE title='Middle Eight'") == 2);
+    CHECK(t_db_int(db, "SELECT rg_state FROM tracks WHERE title='Middle Eight'") == 2);
     CHECK(library_rg_gain(lib, ids[1], 0) > 0.70f && library_rg_gain(lib, ids[1], 0) < 0.71f);   /* -3 dB */
-    CHECK(db_int(db, "SELECT play_count FROM tracks WHERE title='One Alone'") == 1);
-    CHECK(db_int(db, "SELECT play_count FROM tracks WHERE title='Opening'") == 1);
+    CHECK(t_db_int(db, "SELECT play_count FROM tracks WHERE title='One Alone'") == 1);
+    CHECK(t_db_int(db, "SELECT play_count FROM tracks WHERE title='Opening'") == 1);
     CHECK(library_favourite(lib, ids[2]) == 1);
-    CHECK(db_int(db, "SELECT id FROM tracks WHERE title='One Alone'") == one);
+    CHECK(t_db_int(db, "SELECT id FROM tracks WHERE title='One Alone'") == one);
 
     /* levelling measures the parts: their paths are what it gets */
     int64_t rid;
@@ -458,28 +424,24 @@ int main(void)
              "INSERT INTO tracks(path, mtime, size, title, tags_v) VALUES('%s', %lld, %lld, 'Embedded Whole', 1);",
              emb, emb, (long long)es.st_mtime, (long long)es.st_size);
     library_close(lib);
-    db_exec(db, sql);
+    CHECKF(t_db_exec(db, sql) == SQLITE_OK, "sql: %s", sql);
     lib = library_open(db, art);
     CHECK(lib && library_needs_tags(lib));
     CHECK(library_scan(lib, music, NULL, NULL) == 7 && !library_needs_tags(lib));
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE title IN ('In One', 'In Two')") == 2);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM tracks WHERE title='Embedded Whole'") == 0);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE title IN ('In One', 'In Two')") == 2);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM tracks WHERE title='Embedded Whole'") == 0);
     CHECK(library_scan(lib, music, NULL, NULL) == 7 && library_scan_changes(lib) == 0);
 
     /* the sheet gone: the file is one track again */
     unlink(sheet);
     CHECK(library_scan(lib, music, NULL, NULL) == 1 + 2 + 1 + 1);
-    CHECK(db_int(db, "SELECT duration_ms FROM tracks WHERE title='Whole File' AND cue=0") == 10000);
-    CHECK(db_int(db, "SELECT COUNT(*) FROM cues") == 2);   /* Embedded.flac and the broken sheet */
+    CHECK(t_db_int(db, "SELECT duration_ms FROM tracks WHERE title='Whole File' AND cue=0") == 10000);
+    CHECK(t_db_int(db, "SELECT COUNT(*) FROM cues") == 2);   /* Embedded.flac and the broken sheet */
     CHECK(library_list(lib, LIB_PLAYLISTS, 0, &l) == 1 && library_list(lib, LIB_PLAYLIST_TRACKS, l.ids[0], &sl) == 2);
     library_list_free(&sl);
     library_list_free(&l);
     library_close(lib);
 
-    char cmd[400];
-    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
-    if (system(cmd)) {}
-    if (failures) fprintf(stderr, "%d failure(s)\n", failures);
-    else printf("cue: all passed\n");
-    return failures ? 1 : 0;
+    t_rm_rf(dir);
+    return t_result();
 }

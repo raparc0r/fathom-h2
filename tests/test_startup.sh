@@ -7,23 +7,18 @@
 # udhcpd, pidof and sleep:
 #   S40usbnet   a USB network that isn't there doesn't hold the start-up up
 #   S90fathom   the player started first and SSH set up beside it; SSH all
-#               the same with no player, or with autostart off; at stop, the
+#               the same with no player (and the card-out screen), or with
+#               autostart off; at stop, the
 #               player's exit looked for 10 times a second, and how long it
 #               took said (on the card when it was long, or it was killed)
 #   sh tests/test_startup.sh           (under dash too, when there is one)
 set -u
-here=$(cd "$(dirname "$0")/.." && pwd)
-SRC=${SRC:-$here/buildroot/external/board/h2/rootfs-overlay}
-T=$(mktemp -d)
-R=$T/root
+. "$(dirname "$0")/lib.sh"
 mkdir -p $T/bin $T/st $R/usr/lib/fathom $R/usr/sbin
-rooted() {
-    sed -E -e "s#(^|[ =\"(<>])/(usr|mnt|sys|tmp|dev|proc|var|etc)/#\\1$R/\\2/#g" -e "s#$R/dev/null#/dev/null#g" "$1" > "$2"
-}
+ROOTED="$ROOTED|etc"
 rooted $SRC/etc/init.d/S40usbnet $T/S40usbnet
 rooted $SRC/etc/init.d/S90fathom $T/S90fathom
 rooted $SRC/usr/lib/fathom/card.sh $R/usr/lib/fathom/card.sh
-SLEEP=$(command -v sleep)
 
 # sleep: counted by how long was asked for; short ones pass at once (really
 # 0.05 s each while st/hold is there), long ones (the 10 minutes between two
@@ -86,11 +81,6 @@ X
     chmod +x $PLAYER
 }
 
-ok=0; bad=0
-check() { if eval "$2"; then echo "ok   $1"; ok=$((ok+1)); else echo "FAIL $1"; bad=$((bad+1)); fi; }
-until_() { i=0; while ! eval "$1" && [ $i -lt 300 ]; do $SLEEP 0.02; i=$((i+1)); done; }
-count() { if [ -f "$1" ]; then echo $(($(wc -l < "$1") + 0)); else echo 0; fi; }
-lines() { [ -f "$1" ] && tr '\n' ' ' < "$1" | sed 's/ $//'; }
 PIDF=$R/var/run/fathom.pid
 LOG=$R/tmp/fathom-player.log
 STOPLOG=$R/mnt/sd/fathom/player-stop.log
@@ -153,12 +143,15 @@ fresh
 $SH $T/S90fathom start > $T/st/out 2>&1
 check "no player: fathom-ssh run all the same" '[ "$(lines $T/st/ssh)" = "boot done" ] && grep -q "not found" $T/st/out'
 check "...and no loop" '[ ! -f $PIDF ] && [ ! -f $T/st/player.runs ]'
+check "...and the card-out screen asked for (not the logo for ever), the card marked unusable" \
+    'grep -q "fathom-cardout" $T/st/daemons 2>/dev/null && [ -e $R/var/run/fathom-card-out ]'
 
 # 7. Autostart off (development): SSH, no player
 fresh; player; touch $R/mnt/sd/fathom/no-autostart
 $SH $T/S90fathom start > $T/st/out 2>&1
 $SLEEP 0.1
 check "autostart off: fathom-ssh run, the player not" '[ "$(lines $T/st/ssh)" = "boot done" ] && grep -q "autostart disabled" $T/st/out && [ ! -f $T/st/player.runs ] && [ ! -f $PIDF ]'
+check "...and no card-out screen: the console is what was asked for" '[ ! -f $T/st/daemons ] && [ ! -e $R/var/run/fathom-card-out ]'
 
 # --- S90fathom stop ---
 # 8. A player slow to stop (over a second): waited for, and said on the card too
@@ -232,5 +225,4 @@ check "five quick exits: the log kept on the card, and a longer wait" 'grep -q "
 fresh
 done
 rm -rf $T
-echo "$ok passed, $bad failed"
-[ $bad -eq 0 ]
+finish

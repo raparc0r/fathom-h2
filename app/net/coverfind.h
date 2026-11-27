@@ -68,17 +68,19 @@ int  cf_pick(const cf_album_t *a, const cf_match_t *m, int n);
 
 /* Fetching and downloading: http_get and http_download unless replaced (the
  * simulator and the tests read saved files). */
-typedef long (*cf_fetch_fn)(const char *url, char *buf, size_t cap, const volatile int *abort);
-typedef int64_t (*cf_download_fn)(const char *url, const char *path, http_progress_fn progress, void *ctx,
-                                  const volatile int *abort);
-void cf_set_fetch(cf_fetch_fn fn);
-void cf_set_download(cf_download_fn fn);
+void cf_set_fetch(http_get_fn fn);
+void cf_set_download(http_download_fn fn);
 void cf_set_mb_gap_ms(int ms);   /* (the tests: no wait between MusicBrainz's answers) */
 void cf_set_retry_ms(int ms);    /* (the tests: between tries; otherwise 2 s, 3 s, 5 s) */
 
 /* Start the worker; found covers go in dir (fathom/covers). 0, -1. */
 int  cf_start(const char *dir);
 void cf_stop(void);
+/* The same in two steps (as podsync_stop_ask and podsync_stop_wait): _ask
+ * only tells the worker, _wait waits for it, ms at most (under 0: as long as
+ * it takes). 1: it's back; 0: it isn't, and is left to end with the player. */
+void cf_stop_ask(void);
+int  cf_stop_wait(int ms);
 
 /* One album: a new find (the last one's dropped). 0, -1 (not started). */
 int  cf_find(const cf_album_t *a);

@@ -6,11 +6,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
-#include "tmpdir.h"
 
-static int fails;
-#define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
+#include "test_util.h"
 
 int main(void)
 {
@@ -140,8 +139,7 @@ int main(void)
 
     /* changing the list from the H2 */
     char dir[200], path[128], path2[128];
-    test_tmp(dir, sizeof dir, "fathom-radio");
-    CHECK(mkdtemp(dir) != NULL);
+    CHECK(t_mkdtemp(dir, sizeof dir, "fathom-radio") != NULL);
     snprintf(path, sizeof path, "%s/radio.txt", dir);
     snprintf(path2, sizeof path2, "%s/other.txt", dir);
     radio_station_t big[RADIO_MAX + 4], add = {.name = "#Jazz\nFM ", .url = "https://jazz.example/live"};
@@ -186,6 +184,23 @@ int main(void)
     if (f) { text[fread(text, 1, sizeof text - 1, f)] = '\0'; fclose(f); }
     CHECK(!strcmp(text, "# mine\r\nOne = http://one.example/\r\n# two later\r\n"
                         "Three = http://three.example/ | info: radiofrance:1\n"));
+    {   /* a list that is there and can't be read (the card not answering: here, no
+         * leave to read it) is not "no list yet": nothing is made from the example and
+         * written over it, and the owner's stations are there when it reads again */
+        radio_station_t fresh = {.name = "New", .url = "http://new.example/"};
+        char before[2048] = "", after[2048] = "";
+        f = fopen(path2, "rb");
+        if (f) { before[fread(before, 1, sizeof before - 1, f)] = '\0'; fclose(f); }
+        CHECK(chmod(path2, 0) == 0);
+        if (geteuid() != 0) {              /* (root reads it whatever its mode) */
+            CHECK(radio_add(path2, "assets/radio.txt", &fresh) == -1);
+            CHECK(radio_remove(path2, "assets/radio.txt", "http://one.example/") == -1);
+        }
+        CHECK(chmod(path2, 0644) == 0);
+        f = fopen(path2, "rb");
+        if (f) { after[fread(after, 1, sizeof after - 1, f)] = '\0'; fclose(f); }
+        CHECK(before[0] && !strcmp(before, after));
+    }
     /* full: RADIO_MAX stations shown, no more added */
     for (int i = 2; i < RADIO_MAX; i++) {
         radio_station_t s = {.name = "S"};
@@ -234,6 +249,45 @@ int main(void)
     CHECK(n == 3 && !strcmp(big[2].name, "Only here") && !strcmp(big[2].icon, "https://only.example/o.png"));
     CHECK(radio_load_list(path3, NULL, big, RADIO_MAX) == -1);
     remove(ex);
+    /* a long list (70 KB of notes, then the stations): all of it is read, where
+     * only its first 64 KB were and the stations after that weren't shown; a
+     * station is added to it and removed from it, its notes as they were. One
+     * past any list's length (1 MB) is shown as far as it is read and is not
+     * changed: whole afterwards (such a list was written back cut off, once) */
+    {
+        char pathl[128];
+        snprintf(pathl, sizeof pathl, "%s/long.txt", dir);
+        f = fopen(pathl, "wb");
+        if (f) {
+            for (int i = 0; i < 1000; i++) fprintf(f, "# a note, %04d: sixty-nine bytes a line with its end, as notes are\n", i);
+            fputs("Far = http://far.example/\nFarther = http://farther.example/\n", f);
+            fclose(f);
+        }
+        struct stat st0, st1;
+        CHECK(stat(pathl, &st0) == 0 && st0.st_size > 66000);
+        n = radio_load(pathl, big, RADIO_MAX);
+        CHECK(n == 2 && !strcmp(big[0].name, "Far") && !strcmp(big[1].url, "http://farther.example/"));
+        radio_station_t far = {.name = "Farthest", .url = "http://farthest.example/"};
+        CHECK(radio_add(pathl, NULL, &far) == 1);
+        CHECK(radio_load(pathl, big, RADIO_MAX) == 3 && !strcmp(big[2].name, "Farthest"));
+        CHECK(radio_remove(pathl, NULL, "http://far.example/") == 0);
+        CHECK(radio_load(pathl, big, RADIO_MAX) == 2 && !strcmp(big[0].name, "Farther"));
+        CHECK(stat(pathl, &st1) == 0 && st1.st_size == st0.st_size + (off_t)strlen("Farthest = http://farthest.example/\n")
+                                                                   - (off_t)strlen("Far = http://far.example/\n"));
+        f = fopen(pathl, "wb");
+        if (f) {
+            fputs("Near = http://near.example/\n", f);
+            for (int i = 0; i < 16000; i++) fprintf(f, "# a note, %05d: sixty-nine bytes a line with its end, as notes are\n", i);
+            fputs("Lost = http://lost.example/\n", f);
+            fclose(f);
+        }
+        CHECK(stat(pathl, &st0) == 0 && st0.st_size > 1024 * 1024);
+        CHECK(radio_load(pathl, big, RADIO_MAX) == 1 && !strcmp(big[0].name, "Near"));
+        CHECK(radio_add(pathl, NULL, &far) == -1);
+        CHECK(radio_remove(pathl, NULL, "http://near.example/") == -1);
+        CHECK(stat(pathl, &st1) == 0 && st1.st_size == st0.st_size);
+        remove(pathl);
+    }
     /* an address with a '|' in it (a directory's station is anyone's): the
      * line ends its address there, and what followed isn't read back as the
      * station's logo and site */
@@ -245,32 +299,11 @@ int main(void)
         radio_station_t rb;
         CHECK(radio_parse(bline, &rb, 1) == 1 && !rb.icon[0] && !rb.site[0] && !strcmp(rb.url, "http://radio.example/live"));
     }
-    /* a list longer than is read here: not changed (it was written back cut
-     * off at 64 KB), and whole afterwards */
-    {
-        f = fopen(path3, "wb");
-        size_t wrote = 0;
-        if (f) {
-            wrote += (size_t)fprintf(f, "First = http://first.example/s\n");
-            for (int i = 0; i < 1400; i++) wrote += (size_t)fprintf(f, "# a note of mine, line %04d, some fifty bytes long ..\n", i);
-            wrote += (size_t)fprintf(f, "Last = http://last.example/s\n");
-            fclose(f);
-        }
-        CHECK(wrote > 70000);
-        CHECK(radio_remove(path3, NULL, "http://first.example/s") == -1);
-        CHECK(radio_add(path3, NULL, &more) == -1);
-        f = fopen(path3, "rb");
-        long size = -1;
-        if (f) { fseek(f, 0, SEEK_END); size = ftell(f); fclose(f); }
-        CHECK(size == (long)wrote);
-        remove(path3);
-    }
     /* nowhere to write */
     CHECK(radio_add("/nonexistent-dir/radio.txt", "assets/radio.txt", &more) == -1);
     remove(path);
     remove(path2);
     rmdir(dir);
 
-    if (!fails) printf("radio: ok\n");
-    return fails != 0;
+    return t_result();
 }

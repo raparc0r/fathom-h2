@@ -13,21 +13,13 @@
 # waiting, nothing mounted.
 #   sh tests/test_bootlog.sh           (under dash too, when there is one)
 set -u
-here=$(cd "$(dirname "$0")/.." && pwd)
-SRC=${SRC:-$here/buildroot/external/board/h2/rootfs-overlay}
-T=$(mktemp -d)
-R=$T/root
+. "$(dirname "$0")/lib.sh"
 mkdir -p $T/bin $T/st
 # The scripts with their paths inside the root; a plain file stands for a
 # block device (-b: nobody here may make one)
-rooted() {
-    sed -E -e "s#(^|[ =\"(<>])/(usr|mnt|sys|tmp|dev|proc|var)/#\\1$R/\\2/#g" -e "s#$R/dev/null#/dev/null#g" \
-        -e 's#\[ -b #[ -e #g' "$1" > "$2"
-}
-rooted $SRC/etc/init.d/S01bootlog $T/S01bootlog
+rooted $SRC/etc/init.d/S01bootlog $T/S01bootlog -e "$FILE_FOR_DEVICE"
 mkdir -p $R/usr/lib/fathom
-rooted $SRC/usr/lib/fathom/card.sh $R/usr/lib/fathom/card.sh
-SLEEP=$(command -v sleep)
+rooted $SRC/usr/lib/fathom/card.sh $R/usr/lib/fathom/card.sh -e "$FILE_FOR_DEVICE"
 
 # sleep: counted, by how long was asked for (0.05: the wait for the card; 8:
 # the report's; 5: the LED's; 0.1: whoever waits for the report), and st/at.N
@@ -59,10 +51,7 @@ chmod +x $T/bin/*
 PATH0=$PATH
 export PATH=$T/bin:$PATH
 
-ok=0; bad=0
-check() { if eval "$2"; then echo "ok   $1"; ok=$((ok+1)); else echo "FAIL $1"; bad=$((bad+1)); fi; }
-until_() { i=0; while ! eval "$1" && [ $i -lt 300 ]; do $SLEEP 0.02; i=$((i+1)); done; }
-sleeps() { if [ -f $T/st/sleeps.${1:-0.05} ]; then echo $(($(wc -l < $T/st/sleeps.${1:-0.05}) + 0)); else echo 0; fi; }
+sleeps() { count $T/st/sleeps.${1:-0.05}; }
 mounted() { grep -q "^$R/dev/$1 $R/mnt/sd " $R/proc/mounts; }
 BUSY=$R/var/run/fathom-bootlog.busy
 LOG=$R/mnt/sd/fathom/boot-1.log
@@ -196,5 +185,4 @@ check "a report that died while writing: 5 s, then no longer in the way" '[ $rc 
 
 done
 rm -rf $T
-echo "$ok passed, $bad failed"
-[ $bad -eq 0 ]
+finish

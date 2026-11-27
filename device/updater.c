@@ -19,6 +19,7 @@
  * card is checked before the download (an estimate) and after it (exactly).
  */
 #include "updater.h"
+#include "core/thread.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -34,7 +35,7 @@
 #include "net/netclock.h"
 #include "net/update.h"
 
-#define INSTALL_AGAIN N_("Couldn't install it: restart the H2 to try again")
+#define INSTALL_AGAIN N_("Couldn't install it: restart the player to try again")
 #define ANSWER_MAX (64 << 10)        /* GitHub's answer for 0.7.0: 8 KB, most of it the notes */
 
 static struct {
@@ -93,17 +94,12 @@ static void dl_progress(uint64_t done, uint64_t total, void *ctx)
     progress(done, (uint64_t)U.rel.size, ctx);
 }
 
-static void low_priority(void)
-{
-    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);
-}
-
 /* ---- the steps (each its own thread) ---- */
 
 static void *check_thread(void *arg)
 {
     (void)arg;
-    low_priority();
+    thread_nice(19);
     char *buf = malloc(ANSWER_MAX);
     long n = buf ? http_get_retry(U.api, buf, ANSWER_MAX, &U.abort) : -1;
     update_release_t r;
@@ -157,7 +153,7 @@ static void no_space_locked(int64_t need)
 static void *download_thread(void *arg)
 {
     (void)arg;
-    low_priority();
+    thread_nice(19);
     const update_release_t *r = &U.rel;
     const char *why = NULL;             /* (said in place of err's own words) */
     int err = UPDATE_OK, nospace = 0;
@@ -261,7 +257,7 @@ static void *install_thread(void *arg)
 static void *discard_thread(void *arg)
 {
     (void)arg;
-    low_priority();
+    thread_nice(19);
     update_remove_tree(U.stage);
     pthread_mutex_lock(&U.mu);
     U.running = 0;
@@ -274,11 +270,9 @@ static void *discard_thread(void *arg)
 static int run_locked(void *(*fn)(void *))
 {
     if (U.running) return 0;
-    pthread_t th;
     U.running = 1;
     U.abort = 0;
-    if (pthread_create(&th, NULL, fn, NULL)) { U.running = 0; return 0; }
-    pthread_detach(th);
+    if (thread_detached(fn, NULL, 0)) { U.running = 0; return 0; }
     return 1;
 }
 
@@ -299,6 +293,8 @@ void updater_ui_state(ui_update_t *st)
 {
     pthread_mutex_lock(&U.mu);
     *st = U.st;
+    /* (what updater_do's check does without the network: see there) */
+    st->no_net = U.st.state == UI_UPD_FAILED && !U.running && (U.ready_kept || update_install_begun(U.stage));
     pthread_mutex_unlock(&U.mu);
 }
 

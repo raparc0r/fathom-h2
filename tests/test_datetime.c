@@ -5,9 +5,7 @@
 #include <time.h>
 
 #include "core/datetime.h"
-
-static int fails;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
+#include "test_util.h"
 
 static int is(const dt_t *d, int y, int mo, int day, int h, int mi)
 {
@@ -31,7 +29,7 @@ int main(void)
         dt_from_time(t, &d);
         if (!is(&d, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min)) {
             fprintf(stderr, "dt_from_time(%lld)\n", (long long)t);
-            fails++;
+            t_fails++;
             break;
         }
         CHECK(dt_to_time(&d) == t - tm.tm_sec);
@@ -99,10 +97,5 @@ int main(void)
     dt_from_time(dt_to_time(&d), &back);
     CHECK(is(&back, 2026, 4, 30, 10, 5));
 
-    if (fails) {
-        fprintf(stderr, "%d failed\n", fails);
-        return 1;
-    }
-    printf("datetime: all passed\n");
-    return 0;
+    return t_result();
 }

@@ -2,6 +2,7 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Reading JSON in place (json.h). */
 #include "net/json.h"
+#include "core/utf8.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -138,16 +139,6 @@ static int hex4(const char *p, unsigned *u)
     return 0;
 }
 
-static size_t utf8(unsigned c, char *o)
-{
-    if (c < 0x80) { o[0] = (char)c; return 1; }
-    if (c < 0x800) { o[0] = (char)(0xC0 | c >> 6); o[1] = (char)(0x80 | (c & 0x3F)); return 2; }
-    if (c < 0x10000) { o[0] = (char)(0xE0 | c >> 12); o[1] = (char)(0x80 | (c >> 6 & 0x3F)); o[2] = (char)(0x80 | (c & 0x3F)); return 3; }
-    o[0] = (char)(0xF0 | c >> 18); o[1] = (char)(0x80 | (c >> 12 & 0x3F));
-    o[2] = (char)(0x80 | (c >> 6 & 0x3F)); o[3] = (char)(0x80 | (c & 0x3F));
-    return 4;
-}
-
 long json_string(json_t v, char *out, size_t cap)
 {
     if (json_type(v) != JSON_STRING || !out || !cap) { if (out && cap) out[0] = '\0'; return -1; }
@@ -177,7 +168,7 @@ long json_string(json_t v, char *out, size_t cap)
                     p += 6;
                 }
                 if (u >= 0xD800 && u < 0xE000) u = 0xFFFD;
-                k = utf8(u, ch);
+                k = utf8_encode(u, ch);
                 break;
             }
             default: ch[0] = e;                      /* \" \\ \/ */

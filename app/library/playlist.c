@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 #include "library/playlist.h"
+#include "core/path.h"
+#include "core/utf8.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -10,11 +12,15 @@
 #include <sys/stat.h>
 
 #define M3U_MAX_BYTES (1 << 20)   /* a playlist bigger than this is not a playlist */
+/* Nor is one of more entries than this: 1 MB of two-byte lines is half a
+ * million of them, 30 MB as paths during a scan. (Refused, not cut short: a
+ * playlist cut short would be written back that way at its next edit.) */
+#define M3U_MAX_ENTRIES 20000
 
 int m3u_supported(const char *path)
 {
-    const char *dot = strrchr(path, '.');
-    return dot && (!strcasecmp(dot, ".m3u") || !strcasecmp(dot, ".m3u8"));
+    const char *e = path_ext(path);
+    return !strcasecmp(e, "m3u") || !strcasecmp(e, "m3u8");
 }
 
 void path_normalize(char *p)
@@ -101,6 +107,7 @@ void text_loose_key(const char *s, char *out, size_t cap)
 
 static int push(m3u_t *m, int *cap, const char *p, const char *info, int secs)
 {
+    if (m->n >= M3U_MAX_ENTRIES) return -1;
     if (m->n == *cap) {
         int nc = *cap ? *cap * 2 : 64;
         char **np = realloc(m->paths, (size_t)nc * sizeof *np);
@@ -183,14 +190,6 @@ static const uint16_t CP1252[32] = {
 
 static uint32_t cp1252(unsigned char c) { return c >= 0x80 && c < 0xA0 ? CP1252[c - 0x80] : c; }
 
-static size_t put_utf8(char *o, uint32_t u)
-{
-    if (u < 0x80) { o[0] = (char)u; return 1; }
-    if (u < 0x800) { o[0] = (char)(0xC0 | u >> 6); o[1] = (char)(0x80 | (u & 0x3F)); return 2; }
-    o[0] = (char)(0xE0 | u >> 12); o[1] = (char)(0x80 | ((u >> 6) & 0x3F)); o[2] = (char)(0x80 | (u & 0x3F));
-    return 3;
-}
-
 /* An .m3u's lines that aren't UTF-8 (in Windows' code page, as Windows
  * players and older software write them) as UTF-8, taken as Windows-1252
  * (Latin-1's letters, and ’ “ ” – …): "Café" spelt so never matched the
@@ -215,7 +214,7 @@ static char *latin1_lines(const char *in, size_t *len)
             } else {
                 bad = 1;
                 char tmp[3];   /* (counting) */
-                for (size_t j = i; j < e; j++) w += put_utf8(out ? out + w : tmp, cp1252((unsigned char)in[j]));
+                for (size_t j = i; j < e; j++) w += utf8_encode(cp1252((unsigned char)in[j]), out ? out + w : tmp);
             }
             if (e < n) {
                 if (out) out[w] = '\n';
@@ -238,17 +237,21 @@ int m3u_read(const char *path, m3u_t *out)
     memset(out, 0, sizeof *out);
     FILE *f = fopen(path, "rbe");
     if (!f) return -1;
-    /* as much as the file holds (a 1 MB buffer for any playlist, before) */
+    /* as much as the file holds (a 1 MB buffer for any playlist, before); a
+     * bigger file is not read at all (its first 1 MB was, as the playlist) */
     struct stat st;
-    size_t cap = fstat(fileno(f), &st) == 0 && st.st_size >= 0 && st.st_size < M3U_MAX_BYTES ? (size_t)st.st_size
-                                                                                            : M3U_MAX_BYTES;
+    if (fstat(fileno(f), &st) || st.st_size < 0 || st.st_size > M3U_MAX_BYTES) { fclose(f); return -1; }
+    size_t cap = (size_t)st.st_size;
     char *buf = malloc(cap + 1);
     size_t n = buf ? fread(buf, 1, cap, f) : 0;
+    /* Fewer bytes than the file has (a read that failed): not the playlist.
+     * (Parsed as far as it went, it was stored short or empty, and the next
+     * edit wrote that over the file.) */
+    int bad = !buf || n != cap || ferror(f);
     fclose(f);
-    if (!buf) return -1;
+    if (bad) { free(buf); return -1; }
     /* .m3u8 is UTF-8 by name; an .m3u may be either, line by line */
-    const char *ext = strrchr(path, '.');
-    if (ext && !strcasecmp(ext, ".m3u")) {
+    if (!strcasecmp(path_ext(path), "m3u")) {
         char *u = latin1_lines(buf, &n);
         if (u) {
             free(buf);

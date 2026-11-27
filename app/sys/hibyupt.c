@@ -2,6 +2,8 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 /* HiBy's update files (hibyupt.h). */
 #include "sys/hibyupt.h"
+#include "core/bytes.h"
+#include "core/fsafe.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -21,8 +23,6 @@
 
 /* ---------- small helpers ---------- */
 
-static uint32_t le32(const uint8_t *p) { return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
-static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
 
 static void put_both32(uint8_t *p, uint32_t v)      /* ISO 9660's both-byte-order field */
 {
@@ -64,17 +64,6 @@ static int write_at(int fd, const void *buf, size_t len, uint64_t off)
         off += (uint64_t)n;
     }
     return 0;
-}
-
-/* What was read leaves the page cache: a 60 MB image would otherwise push out
- * the music's cached pages and other programs' code, in 24 MB of RAM. */
-static void drop_cache(int fd, uint64_t off, uint64_t len)
-{
-#ifdef POSIX_FADV_DONTNEED
-    posix_fadvise(fd, (off_t)off, (off_t)len, POSIX_FADV_DONTNEED);
-#else
-    (void)fd; (void)off; (void)len;
-#endif
 }
 
 const upt_file_t *upt_file(const upt_t *u, const char *name)
@@ -369,7 +358,7 @@ static upt_err_t hash_file(upt_t *u, const upt_file_t *f, char md5[33], char *ba
         off += n;
         pg->done += n;
         if (off - last_drop >= 1024 * 1024 || off == f->size) {
-            drop_cache(u->fd, base + last_drop, off - last_drop);
+            file_drop_cache(u->fd, (off_t)(base + last_drop), (off_t)(off - last_drop));   /* (a 60 MB image) */
             last_drop = off;
         }
         if (pg->progress) pg->progress(pg->ctx, pg->done, pg->total);
@@ -439,9 +428,6 @@ typedef struct {
 
 #define UNDO_SIZE (8 + 4 * 4 + 8 * UPT_MAX_TREES + SECTOR)
 
-static void put32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
-static void put64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
-static uint64_t le64(const uint8_t *p) { return le32(p) | (uint64_t)le32(p + 4) << 32; }
 
 static int sync_dir_of(const char *path)
 {
@@ -461,11 +447,11 @@ static upt_err_t undo_save(const char *undo_path, const undo_t *d)
 {
     uint8_t b[UNDO_SIZE] = {0};
     memcpy(b, UNDO_MAGIC, 8);
-    put32(b + 8, d->lba);
-    put32(b + 12, d->old_size);
-    put32(b + 16, d->new_size);
-    put32(b + 20, d->nrec);
-    for (int i = 0; i < UPT_MAX_TREES; i++) put64(b + 24 + 8 * i, d->rec[i]);
+    put_le32(b + 8, d->lba);
+    put_le32(b + 12, d->old_size);
+    put_le32(b + 16, d->new_size);
+    put_le32(b + 20, d->nrec);
+    for (int i = 0; i < UPT_MAX_TREES; i++) put_le64(b + 24 + 8 * i, d->rec[i]);
     memcpy(b + 24 + 8 * UPT_MAX_TREES, d->sector, SECTOR);
 
     char tmp[1100];

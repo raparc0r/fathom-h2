@@ -104,6 +104,8 @@ typedef struct {
     uint64_t done, total;
     char message[96];       /* UI_UPD_FAILED: why (English: the UI translates it) */
     int need_mb;            /* and for want of space: how many MB it needs (0: not that) */
+    int no_net;             /* UI_UPD_FAILED: the update is on the card (ready again once there's room, or to
+                             * be finished at a restart): Try again asks nothing of the network */
 } ui_update_t;
 enum { UI_UPD_CHECK, UI_UPD_START, UI_UPD_CANCEL, UI_UPD_INSTALL };
 /* Uninstall Fathom (Settings > About > Uninstall Fathom): HiBy's update file
@@ -121,6 +123,25 @@ typedef struct {
     int no_file;            /* and for want of a file: none on the card (where to get one is shown) */
 } ui_uninstall_t;
 enum { UI_UNI_CHECK, UI_UNI_APPLY, UI_UNI_CANCEL, UI_UNI_RESTART };
+
+/* Settings > Interface > Language packs: the character packs there are
+ * (Japanese...), each downloaded once when the user asks, or removed. */
+#define UI_MAX_PACKS 8
+enum { UI_PACK_ABSENT, UI_PACK_GETTING, UI_PACK_THERE, UI_PACK_FAILED };
+typedef struct {
+    char id[12];            /* "ja", "zh-hans": which it is, whatever its name reads */
+    char name[32];          /* "Japanese" (English: the UI translates it) */
+    int state;
+    int percent;            /* UI_PACK_GETTING */
+    int64_t bytes;          /* the download's size */
+    char message[64];       /* UI_PACK_FAILED: why (English: the UI translates it) */
+    int han;                /* it has the characters Chinese and Japanese share */
+    char brief[24];         /* ...and its name beside the others that do: "Simplified" */
+    int first;              /* ...and of those that are there, it is the one whose are used */
+    int songs;              /* songs in the library with names it would draw (0: none, or not known):
+                             * while it isn't there, Home offers it */
+} ui_pack_t;
+enum { UI_PACK_GET, UI_PACK_CANCEL, UI_PACK_REMOVE, UI_PACK_FIRST };
 
 typedef struct {
     void (*brightness)(int level);        /* 1..UI_BRIGHTNESS_LEVELS: apply now */
@@ -254,6 +275,13 @@ typedef struct {
      * says when the state changes with ui_uninstall_changed(). */
     void (*uninstall_state)(ui_uninstall_t *st);
     void (*uninstall_do)(int what);
+    /* Settings > Interface > Language packs (NULL hides it). packs_state: the
+     * packs into out (cap at most), how many. packs_do: UI_PACK_GET (download
+     * it), UI_PACK_CANCEL, UI_PACK_REMOVE, UI_PACK_FIRST (its shapes for the
+     * characters several packs have), for the pack at that place. The
+     * device says when anything of it changes with ui_packs_changed(). */
+    int  (*packs_state)(ui_pack_t *out, int cap);
+    void (*packs_do)(int index, int what);
     /* Settings > Power > Battery: the history for a graph of `days` (1 or 7),
      * from core/batlog.c. 0, or -1 (none: Battery shows only the charge). */
     int  (*battery_report)(batrep_t *rep, int days);
@@ -264,10 +292,30 @@ typedef struct {
 void ui_init(lv_obj_t *screen, const theme_t *themes, int n_themes,
              const ui_fonts_t *fonts, int n_fonts, library_t *lib, player_t *player);
 void ui_key(ui_key_t k);
+/* A key from the headphones' buttons (Play, Prev, Next): playback, whatever
+ * screen is open (on a typing screen the H2's own Prev and Next move the cursor). */
+void ui_media_key(ui_key_t k);
 int ui_tick(void);              /* ~10x per second: follows the player; 0 when it needn't until a key */
 /* Measuring (a cover flow's slides timed to the log: `touch /tmp/fathom-flow`
  * before one is opened): 1 while it is on, and then what the platform did on
  * the UI's thread and how long it took, for a late frame to name. */
+/* A progress screen's parts, the same for the interface's own (a rescan) and
+ * the platform's screens before the interface is up (a first scan): a column
+ * on `parent`, its rows (wrap: the title; else one line, kept when empty),
+ * the note at the foot, and, once the note has its text, the column cut to
+ * whole rows above it. They need no ui_init. */
+lv_obj_t *ui_scan_column(lv_obj_t *parent);
+lv_obj_t *ui_scan_label(lv_obj_t *col, const lv_font_t *f, uint32_t colour, int wrap);
+lv_obj_t *ui_scan_note(lv_obj_t *parent, const lv_font_t *f, uint32_t colour);
+void ui_scan_fit(lv_obj_t *col, lv_obj_t *note);
+/* About > Clock's value for a time (seconds since 1970, UTC): the date and
+ * time in the zone chosen there, "27 Nov 2026, 06:10", with " UTC" when none
+ * is. For the platform's About rows (the H2's and the simulator's). */
+void ui_clock_text(int64_t now, char *out, size_t cap);
+/* How long is left, in words ("About 3 minutes left"), for a scan's screen:
+ * the interface's own and the device's first-scan and tidying screens. It
+ * needs no ui_init. */
+void ui_left_words(uint32_t left_s, char *t, size_t n);
 int ui_timing(void);
 void ui_took(const char *what, long us);
 void ui_tick_1s(void);
@@ -296,6 +344,15 @@ void ui_share_changed(void);    /* the network drive's state changed: refresh it
 void ui_ssh_changed(void);      /* SSH's state changed: refresh its screen */
 void ui_update_changed(void);   /* the update's state or progress changed: refresh its screens */
 void ui_uninstall_changed(void);   /* Uninstall Fathom's state or progress changed */
+/* A character pack's state or progress changed: its screen is refreshed. drawn:
+ * one came or went (the device has named the packs' folder again, ui_packs_dir):
+ * everything on the screen is drawn again. */
+void ui_packs_changed(int drawn);
+/* Whether the library's names have been counted yet (ui_pack_t.songs says
+ * something). Until they have, the toast for names drawn as boxes waits: Home
+ * may be about to say it, and better. Not for ever: a minute after being told
+ * "not yet" the toast is free again (a start with no scan). Counted, unless told. */
+void ui_packs_counted(int counted);
 /* The library changed (a rescan): the open lists are read again, in place. */
 void ui_library_changed(void);
 /* Covers were made (a scan in the background): shown where they were missing. */
@@ -358,5 +415,18 @@ int ui_test_typing(void);
 /* The row of the open list that the highlight is drawn on (tests: it is the
  * selected row, whatever happened to the list). */
 int ui_test_pill_row(void);
+/* The row of an action in the menu that is open, by its label in English
+ * ("Go to artist"); -1: no menu open, or no such action in it (tests). */
+int ui_test_ctx_row(const char *label);
+/* The open list's row that reads `text` (a setting's name, a network's);
+ * -1: none does (tests). */
+int ui_test_row(const char *text);
+/* The message over the screen now (a toast, a setting's help); NULL: none (tests). */
+const char *ui_test_toast(void);
+/* The cover flow's cache: 1 if it holds this album's cover, 0 if it holds the
+ * album as having none, -1 if it doesn't hold it (or there is no cache) (tests). */
+int ui_test_flow_cover(int64_t album);
+/* Whether one of the list's rows is scrolling its text (tests). */
+int ui_test_row_scrolls(void);
 
 #endif

@@ -45,11 +45,6 @@ double rng_unit(rng_t *r)
     return (double)((hi << 26) | lo) * (1.0 / 9007199254740992.0);
 }
 
-double rng_range(rng_t *r, double lo, double hi)
-{
-    return lo + (hi - lo) * rng_unit(r);
-}
-
 uint64_t rng_os_seed(void)
 {
     uint64_t seed = 0;

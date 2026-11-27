@@ -17,8 +17,6 @@ uint32_t rng_u32(rng_t *r);
 uint32_t rng_below(rng_t *r, uint32_t bound);
 /* Uniform double in [0, 1). */
 double   rng_unit(rng_t *r);
-/* Uniform double in [lo, hi). */
-double   rng_range(rng_t *r, double lo, double hi);
 /* Seed from the operating system's entropy source; falls back to time if unavailable. */
 uint64_t rng_os_seed(void);
 

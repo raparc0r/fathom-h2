@@ -13,6 +13,7 @@
  *                                              the language FILE (tools/lang/check.py)
  *   fathom-sim --wifi-wait                     headless: a station chosen while Wi-Fi is still joining
  *   fathom-sim --type-test                     headless: typing with the wheel, the cursor moved with Prev and Next
+ *   fathom-sim --ui-checks                     headless: the UI's defects found by reading, one check each
  *                                              plays once it has joined (a test)
  *
  * Keys: Up/Down = wheel, Enter = centre (Play), Esc/Backspace = Back,
@@ -23,7 +24,9 @@
  */
 #include <FLAC/metadata.h>
 #include <FLAC/stream_encoder.h>
+#ifndef FATHOM_SIM_HEADLESS
 #include <SDL.h>
+#endif
 #include <ftw.h>
 #include <limits.h>
 #include <math.h>
@@ -40,6 +43,8 @@
 #include "core/settings.h"
 #include "audio/engine.h"
 #include "audio/eq.h"
+#include "audio/gain.h"
+#include "ui/sound_text.h"
 #include "audio/output.h"
 #include "library/library.h"
 #include "net/radiodir.h"
@@ -55,12 +60,13 @@
 #include "ui/assets.h"
 #include "ui/fonts.h"
 #include "ui/ui.h"
+#include "core/clock.h"
 
 #define DB_PATH  "build/sim-data/library.db"
 #define ART_DIR  "build/sim-data/art"
 
 static library_t *g_lib;
-static int g_bench;         /* --bench: the clock output, for real-time playing */
+static int g_bench;         /* --bench, --ui-checks: the clock output, for real-time playing */
 static engine_t *g_eng;
 static player_t *g_player;
 
@@ -366,24 +372,13 @@ static int sim_ssh_state(ui_ssh_t *st)
 static void sim_ssh_do(int what) { (void)what; }
 /* Sound > Balance and Volume limit, as on the headphone jack (balance on the engine) */
 static int g_sim_bal, g_sim_limit, g_sim_xf, g_sim_width = 3;
-static const int SIM_WIDTHS[] = {WIDTH_MONO, 50, 75, WIDTH_NORMAL, 110, 120, 130, 140, 150, 160, 170, 180, 190, WIDTH_MAX};
-#define SIM_N_WIDTHS ((int)(sizeof SIM_WIDTHS / sizeof SIM_WIDTHS[0]))
 static void sim_sound_value(int what, char *out, size_t cap)
 {
-    char n[16];   /* (translated, as the H2's) */
-    if (what == UI_SOUND_CROSSFEED) { snprintf(out, cap, "%s", tr(crossfeed_name(g_sim_xf))); return; }
-    if (what == UI_SOUND_WIDTH) {
-        int w = SIM_WIDTHS[g_sim_width];
-        if (w == WIDTH_MONO) snprintf(out, cap, "%s", tr("Mono"));
-        else if (w == WIDTH_NORMAL) snprintf(out, cap, "%s", tr("Off"));
-        else snprintf(out, cap, "%d %%", w);
-        return;
-    }
-    snprintf(n, sizeof n, "%d", abs(g_sim_bal));
-    if (what == UI_SOUND_BALANCE && !g_sim_bal) snprintf(out, cap, "%s", tr("Centre"));
-    else if (what == UI_SOUND_BALANCE) tr_fill(out, cap, g_sim_bal < 0 ? "%s dB left" : "%s dB right", n, NULL);
-    else if (!g_sim_limit) snprintf(out, cap, "%s", tr("Off"));
-    else snprintf(out, cap, "%d dB", g_sim_limit);
+    /* (the H2's own words: ui/sound_text.h) */
+    if (what == UI_SOUND_CROSSFEED) snprintf(out, cap, "%s", tr(crossfeed_name(g_sim_xf)));
+    else if (what == UI_SOUND_WIDTH) sound_text_width(WIDTH_STEPS[g_sim_width], out, cap);
+    else if (what == UI_SOUND_BALANCE) sound_text_balance(g_sim_bal, out, cap);
+    else sound_text_limit_db(g_sim_limit, out, cap);
 }
 static int sim_sound_adjust(int what, int dir)
 {
@@ -393,14 +388,15 @@ static int sim_sound_adjust(int what, int dir)
         return 0;
     }
     if (what == UI_SOUND_WIDTH) {
-        g_sim_width = g_sim_width + dir < 0 ? 0 : g_sim_width + dir >= SIM_N_WIDTHS ? SIM_N_WIDTHS - 1 : g_sim_width + dir;
-        if (g_eng) engine_set_width(g_eng, SIM_WIDTHS[g_sim_width]);
+        g_sim_width = g_sim_width + dir < 0 ? 0 : g_sim_width + dir >= WIDTH_N_STEPS ? WIDTH_N_STEPS - 1 : g_sim_width + dir;
+        if (g_eng) engine_set_width(g_eng, WIDTH_STEPS[g_sim_width]);
         return 0;
     }
     if (what == UI_SOUND_BALANCE) {
         g_sim_bal = g_sim_bal + dir < -12 ? -12 : g_sim_bal + dir > 12 ? 12 : g_sim_bal + dir;
-        float g = (float)pow(10.0, -abs(g_sim_bal) / 20.0);
-        if (g_eng) engine_set_balance(g_eng, g_sim_bal > 0 ? g : 1.0f, g_sim_bal < 0 ? g : 1.0f);
+        float l, r;
+        balance_gains(g_sim_bal, &l, &r);
+        if (g_eng) engine_set_balance(g_eng, l, r);
     } else {
         g_sim_limit = g_sim_limit + dir * 3 < -30 ? -30 : g_sim_limit + dir * 3 > 0 ? 0 : g_sim_limit + dir * 3;
     }
@@ -440,6 +436,49 @@ static void sim_language_set(const char *name)
  * go by at a press (the simulator has no network) */
 static ui_update_t g_sim_upd = {.state = UI_UPD_IDLE, .current = "v0.7.0", .latest = "v0.8.0", .size = 16234567};
 static void sim_update_state(ui_update_t *st) { *st = g_sim_upd; }
+
+/* Settings > Interface > Language packs, with a stand-in for the download:
+ * asked for, it is "downloading" (42 %) until the screenshots or a check say
+ * it has come; removed, it is absent */
+#define SIM_PACKS 4
+static ui_pack_t g_sim_packs[SIM_PACKS] = {
+    {.id = "ja", .name = "Japanese", .state = UI_PACK_ABSENT, .bytes = 3304868, .han = 1},
+    {.id = "ko", .name = "Korean", .state = UI_PACK_ABSENT, .bytes = 2553390},
+    {.id = "zh-hans", .name = "Chinese (Simplified)", .state = UI_PACK_ABSENT, .bytes = 3282028, .han = 1, .brief = "Simplified"},
+    {.id = "zh-hant", .name = "Chinese (Traditional)", .state = UI_PACK_ABSENT, .bytes = 6637170, .han = 1, .brief = "Traditional"}};
+static const char *const SIM_PACK_ID[SIM_PACKS] = {"ja", "ko", "zh-hans", "zh-hant"};
+static int g_sim_pack_did = -1, g_sim_pack_at = -1;   /* the last packs_do, and for which pack (tests) */
+static int sim_packs_state(ui_pack_t *out, int cap)
+{
+    int n = cap < SIM_PACKS ? cap : SIM_PACKS;
+    for (int i = 0; i < n; i++) out[i] = g_sim_packs[i];
+    return n;
+}
+static void advance(uint32_t ms);              /* (time stepped by hand: below) */
+static void sim_packs_all(int state)
+{
+    for (int k = 0; k < SIM_PACKS; k++) {
+        g_sim_packs[k].state = state;
+        g_sim_packs[k].first = 0;
+        g_sim_packs[k].songs = 0;
+    }
+}
+static void sim_packs_do(int i, int what)
+{
+    if (i < 0 || i >= SIM_PACKS) return;
+    g_sim_pack_did = what;
+    g_sim_pack_at = i;
+    if (what == UI_PACK_FIRST) {                /* its shapes for the shared characters */
+        for (int k = 0; k < SIM_PACKS; k++) g_sim_packs[k].first = k == i;
+        ui_packs_first(SIM_PACK_ID[i]);
+        ui_packs_changed(1);
+        return;
+    }
+    g_sim_packs[i].message[0] = 0;
+    g_sim_packs[i].state = what == UI_PACK_GET ? UI_PACK_GETTING : UI_PACK_ABSENT;
+    g_sim_packs[i].percent = 42;
+    ui_packs_changed(what == UI_PACK_REMOVE);
+}
 static void sim_update_do(int what)
 {
     int next[] = {[UI_UPD_CHECK] = UI_UPD_AVAILABLE, [UI_UPD_START] = UI_UPD_READY,
@@ -547,11 +586,7 @@ static int sim_about(int i, char *label, size_t lc, char *value, size_t vc)
     if (i > 2) return -1;
     if (i == 2) {
         snprintf(label, lc, "Clock");
-        int z = tz_find(settings_get("clock.tz", "UTC"));   /* (as the device shows it) */
-        dt_t t;
-        static const char *const MON[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-        dt_split(tz_to_local(z, g_sim_clock), &t);
-        if (g_sim_clock) snprintf(value, vc, "%d %s %d, %02d:%02d%s", t.day, MON[(t.mon + 11) % 12], t.year, t.hour, t.min, z ? "" : " UTC");
+        if (g_sim_clock) ui_clock_text(g_sim_clock, value, vc);   /* (the device's own words) */
         else snprintf(value, vc, "Not set: <Play> sets it");
         return 0;
     }
@@ -580,6 +615,7 @@ static const ui_hooks_t g_hooks = {.about = sim_about, .rescan = sim_rescan, .sc
                                    .transport_toggle = sim_transport_toggle, .battery_info = sim_battery_info,
                                    .languages = sim_languages, .language_set = sim_language_set,
                                    .update_state = sim_update_state, .update_do = sim_update_do,
+                                   .packs_state = sim_packs_state, .packs_do = sim_packs_do,
                                    .uninstall_state = sim_uninstall_state, .uninstall_do = sim_uninstall_do,
                                    .eq_list = sim_eq_list, .eq_get = sim_eq_get, .eq_put = sim_eq_put,
                                    .eq_preview = sim_eq_preview,
@@ -636,10 +672,66 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
     ui_set_battery(86, 1);   /* the desktop has no H2 battery: a fixed sample value, charging (two icons) */
     ui_set_bt_link(UI_BT_LINK_CONNECTED);   /* and headphones, so the header shows every kind of icon */
 
+    /* FATHOM_SIM_FLOW_FRAMES=1: not the screenshots but the cover flow in
+     * motion, a picture every 40 ms into dir (frame-0000.bmp on), for a GIF
+     * of it. FATHOM_SIM_THEME: which theme, 0 on.
+     * FATHOM_SIM_FLOW_SCRIPT: what the wheel does, read left to right:
+     *   >N   to Albums' Nth album (0: the first) before anything is recorded
+     *   +    a turn on, and a picture      -   a turn back, and a picture
+     *   .N   N pictures with nothing turned
+     * so "+.10" is a turn every 440 ms, "+++" three turns 40 ms apart (six
+     * that close and the rest go a letter at a time), ".1+" one 80 ms after
+     * the last (slow enough to count as one album again). Without it, the
+     * sample library's Debut (69) on by four, a quick spin to M, the wheel
+     * slowing to Maxinquaye (156), and back by two. */
+    if (getenv("FATHOM_SIM_FLOW_FRAMES")) {
+        int th = getenv("FATHOM_SIM_THEME") ? atoi(getenv("FATHOM_SIM_THEME")) : 0;
+        const char *sc = getenv("FATHOM_SIM_FLOW_SCRIPT");
+        if (!sc) sc = ">69 .25 +.10 +.10 +.10 +.10 .6 +++++++++++++++ .1+ .1+ .2+ .2+ .3+ .4+ .30 -.12 -.12 .35";
+        ui_set_theme(th >= 0 && th < g_n_themes ? th : 0);
+        settings_set_int("display.album_flow", 1);
+        ui_set_battery(86, 0);                          /* (not charging: its mark pulses, and every frame would differ) */
+        ui_show("albums");
+        ui_key(UI_KEY_UP);                              /* (the sample's second album: from the first) */
+        int n = 0;
+        for (; *sc; sc++) {
+            int key = *sc == '+' || *sc == '-', idle = 0;
+            if (*sc == '>' && !n) {
+                /* (100 ms apart: each turn one album, however many there are) */
+                for (int to = (int)strtol(sc + 1, (char **)&sc, 10); to > 0; to--) {
+                    lv_tick_inc(100);
+                    lv_timer_handler();
+                    ui_key(UI_KEY_DOWN);
+                }
+                sc--;
+                continue;
+            }
+            if (*sc == '.') { idle = (int)strtol(sc + 1, (char **)&sc, 10); sc--; }
+            if (!key && !idle) continue;
+            if (!n) for (int i = 0; i < 80; i++) { lv_tick_inc(20); lv_timer_handler(); }   /* (at rest first, its covers read) */
+            for (int f = 0; f < (key ? 1 : idle); f++, n++) {
+                if (key) ui_key(*sc == '+' ? UI_KEY_DOWN : UI_KEY_UP);
+                /* (LVGL's clock is stepped here, 40 ms a frame in two halves: the
+                 * slides move by it, whatever the computer's own time) */
+                lv_tick_inc(20);
+                lv_timer_handler();
+                lv_tick_inc(20);
+                lv_timer_handler();
+                lv_obj_update_layout(lv_screen_active());
+                lv_draw_buf_t *img = lv_snapshot_take(lv_screen_active(), LV_COLOR_FORMAT_RGB888);
+                char path[1024];
+                snprintf(path, sizeof path, "%s/frame-%04d.bmp", dir, n);
+                if (img) { write_bmp(path, img); lv_draw_buf_destroy(img); }
+            }
+        }
+        printf("%d frames in %s\n", n, dir);
+        return 0;
+    }
+
     static const char *const screens[] = {"home", "albums", "tracks", "playlists", "playlist", "nowplaying", "themes",
                                           "quick", "context", "info", "queue", "glyphs", "search",
                                           "artists", "artist", "artistsongs", "albumartists", "homeedit",
-                                          "usbask", "wifiask", "interface", "usbdrive", "scrub", "sound", "radio", "radionp", "share", "ssh", "toast", "abouthelp", "genres", "folders", "folder", "years", "homeend", "homeall", "signal", "purenp",
+                                          "usbask", "wifiask", "interface", "packs", "packsgetting", "packsthere", "packsfailed", "packshelp", "packsshared", "homepacks", "packsneeded", "usbdrive", "scrub", "sound", "radio", "radionp", "share", "ssh", "toast", "abouthelp", "genres", "folders", "folder", "years", "homeend", "homeall", "signal", "purenp",
                                           "rdir", "rdirgenres", "rdirresults", "rdirbusy", "rdircountries", "rdirsearch",
                                           "rdirctx", "rdirerror", "rdirnp", "rdirnpmenu", "rdirrandom",
                                           "about", "clockset", "clockdone", "update", "updatelatest", "updatefailed", "updateprogress",
@@ -723,7 +815,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
             } else if (!strcmp(screens[s], "usbdrive")) {
                 ui_show("nowplaying");
                 sample = ui_message_screen("USB drive",
-                                           "Eject the H2 on your computer, or unplug the cable, to go back to your music.");
+                                           "Eject the player on your computer, or unplug the cable, to go back to your music.");
             } else if (!strncmp(screens[s], "update", 6)) {   /* the update's screens, in each state */
                 static const struct { const char *name; ui_update_t u; } st[] = {
                     {"update", {.state = UI_UPD_AVAILABLE}},
@@ -742,6 +834,33 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
                         g_sim_upd = u;
                     }
                 ui_show("update");
+            } else if (!strcmp(screens[s], "homepacks") || !strcmp(screens[s], "packsneeded")) {
+                /* the library has names in Japanese and Korean and neither pack is there:
+                 * Home's "Get language packs", and the page it opens */
+                sim_packs_all(UI_PACK_ABSENT);
+                g_sim_packs[0].songs = 342;
+                g_sim_packs[1].songs = 27;
+                settings_set("packs.ignored", "");
+                ui_packs_changed(0);
+                ui_show("home");
+                for (int k = 0; k < 12; k++) ui_key(UI_KEY_UP);   /* the top: the entry */
+                if (!strcmp(screens[s], "packsneeded")) ui_key(UI_KEY_OK);
+                ui_set_theme(t);                            /* (the slide finished) */
+            } else if (!strncmp(screens[s], "packs", 5)) {       /* Language packs, in each state */
+                const char *is = screens[s] + 5;
+                g_sim_packs[0].state = !strcmp(is, "getting") ? UI_PACK_GETTING : !strcmp(is, "there") ? UI_PACK_THERE
+                                       : !strcmp(is, "failed") ? UI_PACK_FAILED : UI_PACK_ABSENT;
+                g_sim_packs[0].percent = 42;
+                g_sim_packs[0].message[0] = 0;
+                for (int k = 1; k < SIM_PACKS; k++) g_sim_packs[k].state = UI_PACK_ABSENT;
+                if (!strcmp(is, "shared")) {                 /* Japanese and both Chinese there: the choice's row */
+                    g_sim_packs[0].state = g_sim_packs[2].state = g_sim_packs[3].state = UI_PACK_THERE;
+                    g_sim_packs[2].first = 1;
+                }
+                ui_show("packs");
+                if (!strcmp(is, "help")) ui_key(UI_KEY_MENU);    /* what the row is for */
+                if (!strcmp(is, "shared")) for (int k = 0; k < SIM_PACKS; k++) { ui_key(UI_KEY_DOWN); advance(150); }   /* onto that row */
+                sim_packs_all(UI_PACK_ABSENT);
             } else if (!strncmp(screens[s], "uninstall", 9)) {   /* Uninstall Fathom, in each state */
                 static const struct { const char *name; ui_uninstall_t u; } st[] = {
                     {"uninstall", {.state = UI_UNI_READY, .ver = "2025-11-11"}},
@@ -888,7 +1007,7 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
             } else {
                 ui_show(screens[s]);
             }
-            int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast") || !strcmp(screens[s], "unreadwhere") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp") ||
+            int on_top = !strcmp(screens[s], "usbdrive") || !strcmp(screens[s], "toast") || !strcmp(screens[s], "unreadwhere") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "packshelp") || !strcmp(screens[s], "xfhelp") ||
                          !strncmp(screens[s], "whatsnew", 8) || !strncmp(screens[s], "welcome", 7) || !strcmp(screens[s], "abouthelp") ||
                          !strcmp(screens[s], "clockset") || !strncmp(screens[s], "rescan", 6) ||
                          (g_sim_upd.state >= UI_UPD_DOWNLOADING && g_sim_upd.state <= UI_UPD_RESTARTING) ||
@@ -921,10 +1040,14 @@ static int screenshots(const char *dir, theme_t *themes, const ui_fonts_t *fonts
             }
             if (!strncmp(screens[s], "whatsnew", 8) || !strcmp(screens[s], "aboutwn") || !strcmp(screens[s], "askinstallwn"))
                 ui_set_whats_new("", "", 0);
-            if (!strcmp(screens[s], "toast") || !strcmp(screens[s], "unreadwhere") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "xfhelp") || !strcmp(screens[s], "abouthelp") ||
+            if (!strcmp(screens[s], "toast") || !strcmp(screens[s], "unreadwhere") || !strcmp(screens[s], "libhelp") || !strcmp(screens[s], "packshelp") || !strcmp(screens[s], "xfhelp") || !strcmp(screens[s], "abouthelp") ||
                 !strcmp(screens[s], "clockset"))   /* (gone before the next screens) */
                 for (uint32_t c = 0; c < lv_obj_get_child_count(lv_layer_top()); c++)
                     lv_obj_add_flag(lv_obj_get_child(lv_layer_top(), (int32_t)c), LV_OBJ_FLAG_HIDDEN);
+            if (!strcmp(screens[s], "homepacks") || !strcmp(screens[s], "packsneeded")) {   /* (the offer gone before the next screens) */
+                sim_packs_all(UI_PACK_ABSENT);
+                ui_packs_changed(0);
+            }
             printf("%s\n", path);
         }
         /* Albums as cover flow (Settings > Interface > Cover flow): at rest some
@@ -1499,6 +1622,1600 @@ static int wifi_wait_check(theme_t *themes, const ui_fonts_t *fonts)
     return g_ww_bad ? 1 : 0;
 }
 
+/* ---- the UI's checks (the ui_checks test): one for each defect found by
+ * reading ui.c (the audit of 2026-11-26), on a scratch
+ * library of four albums of three songs, half a minute of silence each,
+ * through the clock output: nothing ends by itself while a check runs. ---- */
+static int g_uc_bad;
+#define UC(cond) do { if (!(cond)) { fprintf(stderr, "ui-checks: line %d: %s\n", __LINE__, #cond); g_uc_bad++; } } while (0)
+
+#define UC_LONG "Beta Is The Second Letter Of The Greek Alphabet And Too Long For A Row"
+static int uc_song(const char *file, const char *title, const char *artist, const char *album, int no)
+{
+    char path[96], num[8];
+    snprintf(path, sizeof path, "uc-music/%s.flac", file);
+    snprintf(num, sizeof num, "%d", no);
+    FLAC__StreamEncoder *e = FLAC__stream_encoder_new();
+    FLAC__stream_encoder_set_channels(e, 2);
+    FLAC__stream_encoder_set_bits_per_sample(e, 16);
+    FLAC__stream_encoder_set_sample_rate(e, 44100);
+    FLAC__StreamMetadata *vc = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
+    const char *kv[][2] = {{"TITLE", title}, {"ARTIST", artist}, {"ALBUM", album}, {"TRACKNUMBER", num}};
+    for (int k = 0; k < 4; k++) {
+        FLAC__StreamMetadata_VorbisComment_Entry en;
+        FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, kv[k][0], kv[k][1]);
+        FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
+    }
+    FLAC__stream_encoder_set_metadata(e, &vc, 1);
+    int ok = FLAC__stream_encoder_init_file(e, path, NULL, NULL) == FLAC__STREAM_ENCODER_INIT_STATUS_OK;
+    if (ok) {
+        static FLAC__int32 pcm[2 * 4410];
+        for (int i = 0; i < 300; i++) FLAC__stream_encoder_process_interleaved(e, pcm, 4410);
+        FLAC__stream_encoder_finish(e);
+    }
+    FLAC__stream_encoder_delete(e);
+    FLAC__metadata_object_delete(vc);
+    return ok ? 0 : -1;
+}
+
+static int uc_songs(void)
+{
+    static const char *const ALBUM[] = {"Alpha", UC_LONG, "Gamma", "Delta"};
+    static const char *const ARTIST[] = {"Ann", "Bob And A Band Whose Name Is Much Too Long For One Row Of A List", "Cat", "Dan"};
+    static const char *const SONG[] = {"Amber", "Aster", "Azure", "Birch", "Bloom", "Brook",
+                                       "Cedar", "Clove", "Coral", "Dune", "Dusk", "Dawn"};
+    if (mkdir("uc-music", 0755)) return -1;
+    for (int i = 0; i < 12; i++)
+        if (uc_song(SONG[i], SONG[i], ARTIST[i / 3], ALBUM[i / 3], i % 3 + 1)) return -1;
+    return library_scan(g_lib, "uc-music", NULL, NULL) == 12 ? 0 : -1;
+}
+
+/* The open list's row `row` selected, with the wheel */
+static void uc_row(int row)
+{
+    int sel = 0;
+    for (int g = 0; g < 40 && ui_list_state(&sel, NULL, NULL) && sel != row; g++) {
+        ui_key(sel < row ? UI_KEY_DOWN : UI_KEY_UP);
+        advance(100);                             /* (slowly: the wheel turned fast goes by more than a row) */
+    }
+    advance(300);
+}
+
+/* An album without a cover: a plain square of the theme's surface colour in
+ * Albums. (It was filled with the low 16 bits of the colour's 24, read as a
+ * pixel: a blue square on a dark theme, a salmon one on a light one. The
+ * songs here have no covers.) */
+static void uc_plain_square(void)
+{
+    for (int t = 0; t < g_n_themes; t++) {
+        ui_set_theme(t);
+        ui_show("albums");
+        advance(600);
+        uint32_t c = g_themes[t].surface, low = theme_rgb565(c) & 0xffff;
+        uint16_t right = (uint16_t)(((c >> 19) & 31) << 11 | ((c >> 10) & 63) << 5 | ((c >> 3) & 31));
+        lv_obj_update_layout(lv_screen_active());
+        lv_draw_buf_t *img = lv_snapshot_take(lv_screen_active(), LV_COLOR_FORMAT_RGB565);
+        UC(img != NULL);
+        if (!img) continue;
+        long n_right = 0, n_low = 0;
+        for (int y = 0; y < UI_H; y++) {
+            const uint16_t *row = (const uint16_t *)(const void *)(img->data + (size_t)y * img->header.stride);
+            for (int x = 0; x < UI_W; x++) {
+                n_right += row[x] == right;
+                n_low += low != right && row[x] == low;
+            }
+        }
+        lv_draw_buf_destroy(img);
+        UC(n_right >= LIB_ART_SMALL * LIB_ART_SMALL * 3 / 4);
+        UC(n_low == 0);
+        if (n_low || n_right < LIB_ART_SMALL * LIB_ART_SMALL * 3 / 4)
+            printf("theme %d: %ld pixels of the surface's colour, %ld of its low 16 bits\n", t, n_right, n_low);
+    }
+    ui_set_theme(0);
+    ui_show("home");
+    advance(400);
+}
+
+/* U1: a media key with the screen off starts no scrolling text (a long name
+ * selected scrolled on unseen, 60 times a second, until the screen came on) */
+static void uc_asleep_marquee(void)
+{
+    ui_show("albums");
+    uc_row(1);                                    /* the long name */
+    advance(1500);
+    UC(lv_anim_count_running() > 0);              /* lit: it scrolls after a second */
+    ui_set_awake(0);
+    advance(100);
+    UC(lv_anim_count_running() == 0);
+    ui_key(UI_KEY_NEXT);
+    advance(1500);
+    UC(lv_anim_count_running() == 0);
+    ui_set_awake(1);
+    advance(1500);
+    UC(lv_anim_count_running() > 0);              /* and again once it's lit */
+    ui_show("home");
+    advance(400);
+}
+
+/* The whole library cued, paused on song `start` (by name: Amber, Aster ... Dusk) */
+static void uc_cue(int start)
+{
+    lib_list_t songs;
+    if (library_list(g_lib, LIB_SONGS, 0, &songs) <= 0) { UC(!"songs"); return; }
+    player_cue(g_player, songs.ids, songs.n, start);
+    library_list_free(&songs);
+    ui_tick();
+}
+static int uc_index(void)
+{
+    player_now_t now;
+    player_now(g_player, &now);
+    return now.index;
+}
+
+/* U2: <Prev> and <Next> on a typing screen move the cursor only from the H2's
+ * own keys with the screen lit: with it off, and from the headphones' buttons,
+ * they are the song's (both were swallowed by the typing) */
+static void uc_typing_media(void)
+{
+    uc_cue(0);
+    setenv("FATHOM_SIM_SEARCH", "abd", 1);
+    ui_show("search");
+    advance(400);
+    ui_key(UI_KEY_PREV);                          /* lit: the cursor, not the song */
+    UC(ty_is("abd", 2) && uc_index() == 0);
+    ui_set_awake(0);
+    ui_key(UI_KEY_NEXT);                          /* off: the song */
+    UC(ty_is("abd", 2) && uc_index() == 1);
+    ui_set_awake(1);
+    ui_media_key(UI_KEY_NEXT);                    /* the headphones': the song */
+    UC(ty_is("abd", 2) && uc_index() == 2);
+    ui_key(UI_KEY_NEXT);
+    UC(ty_is("abd", 3) && uc_index() == 2);
+    player_pause(g_player, 1);
+    setenv("FATHOM_SIM_SEARCH", "", 1);
+    ui_show("home");
+    advance(400);
+}
+
+/* U4: a list that gets shorter by itself takes its selection with it. The
+ * queue's last row when the song ends (the selection stayed past the end:
+ * <Play> and <Menu> did nothing); Search under quick settings when a rescan
+ * drops a song it had found (its results were only read again with Search on
+ * top: the song's row stayed, empty). */
+static void uc_shrink(void)
+{
+    int sel = -1, n = 0, n0 = 0;
+    uc_cue(9);                                    /* Dawn: Dune and Dusk queued after it */
+    ui_show("nowplaying");
+    ui_show("queue");
+    advance(400);
+    ui_list_state(NULL, &n, NULL);
+    UC(n == 2);
+    uc_row(1);
+    player_next(g_player);                        /* (as when the song ends) */
+    ui_tick();
+    ui_tick_1s();
+    advance(400);
+    ui_list_state(&sel, &n, NULL);
+    UC(n == 1 && sel == 0 && ui_test_pill_row() == 0);
+    player_pause(g_player, 1);
+
+    setenv("FATHOM_SIM_SEARCH", "dusk", 1);
+    setenv("FATHOM_SIM_SEARCH_ROW", "1", 1);
+    ui_show("search");
+    advance(400);
+    int depth = ui_list_state(NULL, &n0, NULL);
+    UC(n0 >= 2);                                  /* the typing row, and Dusk */
+    ui_key(UI_KEY_MENU_LONG);                     /* quick settings over Search */
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == depth + 1);
+    UC(remove("uc-music/Dusk.flac") == 0);
+    library_scan(g_lib, "uc-music", NULL, NULL);
+    ui_library_changed();
+    ui_key(UI_KEY_MENU);                          /* and away */
+    advance(400);
+    UC(ui_list_state(&sel, &n, NULL) == depth && n == n0 - 1 && sel < n);
+    UC(uc_song("Dusk", "Dusk", "Dan", "Delta", 2) == 0);
+    library_scan(g_lib, "uc-music", NULL, NULL);
+    ui_library_changed();
+    setenv("FATHOM_SIM_SEARCH", "", 1);
+    unsetenv("FATHOM_SIM_SEARCH_ROW");
+    ui_show("home");
+    advance(400);
+}
+
+/* A song's id, by its title (-1: none) */
+static int64_t uc_id(const char *title)
+{
+    lib_list_t songs;
+    int64_t id = -1;
+    if (library_list(g_lib, LIB_SONGS, 0, &songs) <= 0) return -1;
+    for (int i = 0; i < songs.n; i++) {
+        lib_track_t t;
+        if (library_track(g_lib, songs.ids[i], &t) == 0 && !strcmp(t.title, title)) id = songs.ids[i];
+    }
+    library_list_free(&songs);
+    return id;
+}
+static int uc_queued(int64_t id)
+{
+    for (int i = 0; i < player_queue_len(g_player); i++)
+        if (player_queue_at(g_player, i) == id) return i;
+    return -1;
+}
+
+/* U5: the queue's menu and Move are for a song, not a row: the song changing
+ * meanwhile moves the rows up, and "Remove from queue" removed the next song,
+ * the wheel moved another. */
+static void uc_queue_menu(void)
+{
+    int64_t dawn = uc_id("Dawn"), dune = uc_id("Dune");
+    int sel = -1;
+    uc_cue(6);                                    /* Cedar: Clove, Coral, Dawn, Dune, Dusk after it */
+    ui_show("nowplaying");
+    ui_show("queue");
+    advance(400);
+    uc_row(2);
+    UC(dawn > 0 && player_queue_at(g_player, 2) == dawn);
+    ui_key(UI_KEY_MENU);                          /* Play now, Move, Remove from queue, Clear queue */
+    advance(400);
+    player_next(g_player);                        /* the song ends: Dawn is the second row now */
+    ui_tick();
+    uc_row(2);
+    ui_key(UI_KEY_OK);                            /* Remove from queue */
+    advance(400);
+    UC(player_queue_len(g_player) == 3 && uc_queued(dawn) < 0 && uc_queued(dune) == 1);
+    player_pause(g_player, 1);
+
+    uc_cue(6);
+    ui_show("nowplaying");
+    ui_show("queue");
+    advance(400);
+    uc_row(2);
+    ui_key(UI_KEY_MENU);
+    advance(400);
+    uc_row(1);
+    ui_key(UI_KEY_OK);                            /* Move: the wheel moves Dawn */
+    advance(400);
+    player_next(g_player);
+    ui_tick();
+    ui_tick_1s();
+    advance(400);
+    ui_list_state(&sel, NULL, NULL);
+    UC(sel == 1 && ui_test_pill_row() == 1);      /* the highlight went up with it */
+    ui_key(UI_KEY_UP);
+    advance(400);
+    ui_list_state(&sel, NULL, NULL);
+    UC(uc_queued(dawn) == 0 && uc_queued(dune) == 2 && sel == 0);
+    ui_key(UI_KEY_OK);
+    player_pause(g_player, 1);
+    ui_show("home");
+    advance(400);
+}
+
+/* <Menu> on what is shown, then <Play> on its action `label`; 0 if it was there */
+static int uc_menu(const char *label)
+{
+    ui_key(UI_KEY_MENU);
+    advance(400);
+    int row = ui_test_ctx_row(label);
+    if (row < 0) return -1;
+    uc_row(row);
+    ui_key(UI_KEY_OK);
+    advance(400);
+    return 0;
+}
+
+/* U6: what is opened from Now Playing doesn't pile up under it. Show queue
+ * and back to Now Playing with a long <Back>, ten times, left a Queue each
+ * time: with the eight levels in use <Menu> did nothing, and from Now Playing
+ * it showed the list under it and marked that level as opened from there. */
+static void uc_piles(void)
+{
+    int n = 0;
+    uc_cue(0);
+    ui_show("nowplaying");
+    advance(400);
+    for (int i = 0; i < 10; i++) {
+        UC(uc_menu("Show queue") == 0);
+        UC(ui_list_state(NULL, &n, NULL) == 2 && n == 11);       /* Home and the Queue */
+        ui_key(UI_KEY_BACK_LONG);
+        advance(400);
+        UC(ui_list_state(NULL, NULL, NULL) == 0);
+    }
+    for (int i = 0; i < 4; i++) {                 /* Go to artist: its page, once */
+        UC(uc_menu("Go to artist") == 0);
+        UC(ui_list_state(NULL, NULL, NULL) == 2);
+        ui_key(UI_KEY_BACK_LONG);
+        advance(400);
+    }
+    /* quick settings, Bluetooth from them, and back to Now Playing: the same */
+    for (int i = 0; i < 4; i++) {
+        ui_key(UI_KEY_MENU_LONG);
+        advance(400);
+        UC(ui_list_state(NULL, NULL, NULL) == 2);
+        ui_key(UI_KEY_BACK_LONG);
+        advance(400);
+    }
+
+    /* Two "Add to playlist" opened from Now Playing, for two songs: the first
+     * one's list of playlists is gone when the second opens (left under it,
+     * it added the second's song) */
+    UC(uc_menu("Add to playlist") == 0);
+    ui_key(UI_KEY_BACK_LONG);
+    advance(400);
+    player_next(g_player);
+    ui_tick();
+    UC(uc_menu("Add to playlist") == 0);
+    UC(ui_list_state(NULL, NULL, NULL) == 2);
+    ui_key(UI_KEY_BACK);                          /* (nothing chosen) */
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == 0);
+    ui_key(UI_KEY_BACK_LONG);
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == 1);     /* Home, not the first one's list */
+    player_pause(g_player, 1);
+
+    /* ...and one opened from a list, left under pages opened since, is no
+     * longer for its song once another has been opened: <Play> in it adds
+     * nothing (it made a playlist of the other's song) */
+    ui_show("songs");
+    advance(400);
+    UC(uc_menu("Add to playlist") == 0);
+    ui_key(UI_KEY_BACK_LONG);
+    advance(400);
+    UC(uc_menu("Go to artist") == 0);
+    ui_key(UI_KEY_OK);
+    advance(400);
+    UC(uc_menu("Add to playlist") == 0);
+    UC(ui_list_state(NULL, NULL, NULL) == 6);     /* Home, Songs, the first list, the artist, the album, the second */
+    for (int i = 0; i < 3; i++) { ui_key(UI_KEY_BACK); advance(400); }
+    UC(ui_list_state(NULL, NULL, NULL) == 3);     /* the first one again */
+    ui_key(UI_KEY_OK);                            /* New playlist */
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == 2 && library_playlist_count_writable(g_lib) == 0);
+
+    /* The ten levels in use, by going from page to page in the lists (a
+     * song's artist, an album of theirs, a song's artist...): <Menu> on Now
+     * Playing opens nothing, and stays there; the lists are as they were. */
+    ui_show("songs");
+    advance(400);
+    UC(uc_menu("Go to album") == 0);
+    for (int i = 0; i < 3; i++) {
+        UC(uc_menu("Go to artist") == 0);
+        ui_key(UI_KEY_OK);                        /* their album */
+        advance(400);
+    }
+    UC(uc_menu("Go to artist") == 0);
+    UC(ui_list_state(NULL, NULL, NULL) == 10);
+    ui_key(UI_KEY_BACK_LONG);
+    advance(400);
+    ui_key(UI_KEY_MENU);
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == 0);     /* still Now Playing */
+    ui_key(UI_KEY_BACK_LONG);
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == 10);
+    ui_key(UI_KEY_BACK);
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == 9);     /* <Back> closes a page: not to Now Playing */
+    ui_show("home");
+    advance(400);
+}
+
+/* Wi-Fi for the checks: on (ww_state), with these networks in range */
+static ui_wifi_net_t g_uc_net[4];
+static int g_uc_nets;
+static int uc_networks(ui_wifi_net_t *out, int max)
+{
+    int n = g_uc_nets < max ? g_uc_nets : max;
+    memcpy(out, g_uc_net, (size_t)n * sizeof *out);
+    return n;
+}
+static char g_uc_joined[33], g_uc_pressed[18];
+static void uc_wifi_do(int what, const char *ssid, const char *password)
+{
+    (void)password;
+    if (what == UI_WIFI_CONNECT) snprintf(g_uc_joined, sizeof g_uc_joined, "%s", ssid);
+}
+/* ...and Bluetooth: on, with these devices */
+static ui_bt_dev_t g_uc_dev[3];
+static int uc_bt_state(char *busy, size_t cap) { snprintf(busy, cap, "%s", ""); return 1; }
+static int uc_bt_devices(ui_bt_dev_t *out, int max)
+{
+    int n = max < 3 ? max : 3;
+    memcpy(out, g_uc_dev, (size_t)n * sizeof *out);
+    return n;
+}
+static void uc_bt_do(int what, const char *addr)
+{
+    if (what == UI_BT_PRESS) snprintf(g_uc_pressed, sizeof g_uc_pressed, "%s", addr);
+}
+static void uc_wifi_hooks(void)
+{
+    ui_hooks_t hooks = g_hooks;
+    hooks.wifi_state = ww_state;
+    hooks.wifi_networks = uc_networks;
+    hooks.wifi_do = uc_wifi_do;
+    hooks.bt_state = uc_bt_state;
+    hooks.bt_devices = uc_bt_devices;
+    hooks.bt_do = uc_bt_do;
+    ui_set_hooks(&hooks);
+    ww_set(1, UI_WIFI_ON, "");
+}
+/* The open list's row that reads `text` selected and <Play> pressed; 0 if it was there */
+static int uc_open(const char *text)
+{
+    int row = ui_test_row(text);
+    if (row < 0) return -1;
+    uc_row(row);
+    ui_key(UI_KEY_OK);
+    advance(400);
+    return 0;
+}
+
+/* U3: a Wi-Fi password typed from quick settings, opened over Search, leaves
+ * what was typed in Search as it was (one text for every typing screen: the
+ * password took its place, and the wheel was left on a letter Search hasn't) */
+static void uc_typing_kept(void)
+{
+    g_uc_net[0] = (ui_wifi_net_t){.ssid = "Net", .dbm = -50, .secured = 1};
+    g_uc_nets = 1;
+    uc_wifi_hooks();
+    setenv("FATHOM_SIM_SEARCH", "dusk", 1);
+    ui_show("search");
+    advance(400);
+    int depth = ui_list_state(NULL, NULL, NULL);
+    UC(ty_is("dusk", 4));
+    ui_key(UI_KEY_MENU_LONG);                     /* quick settings > Wi-Fi > Net: its password */
+    advance(400);
+    UC(uc_open("Wi-Fi") == 0);
+    UC(uc_open("Net") == 0);
+    UC(ui_list_state(NULL, NULL, NULL) == depth + 3 && ty_is("", 0));
+    for (int i = 0; i < 3; i++) ui_key(UI_KEY_MENU);   /* the wheel to the signs: further than Search's letters go */
+    ui_key(UI_KEY_OK);
+    advance(600);
+    UC(strlen(ui_test_entry(NULL)) == 1);
+    ui_key(UI_KEY_BACK);                          /* the sign deleted, */
+    for (int i = 0; i < 3; i++) { ui_key(UI_KEY_BACK); advance(400); }   /* and back out to Search */
+    UC(ui_list_state(NULL, NULL, NULL) == depth && ty_is("dusk", 4));
+    ui_key(UI_KEY_OK);                            /* the wheel where it was, on E */
+    UC(ty_is("duske", 5));
+    advance(600);
+    setenv("FATHOM_SIM_SEARCH", "", 1);
+    ui_set_hooks(&g_hooks);
+    ui_show("home");
+    advance(400);
+}
+
+/* U11: in Settings > Wi-Fi and Bluetooth the selection is a network or a
+ * device, not a row: a search that puts the strongest first leaves it on the
+ * one it was on (<Play> joined the one that had taken its row); and <Play>
+ * acts on the list as drawn, not on one the platform has since made. */
+static void uc_net_follow(void)
+{
+    static const ui_wifi_net_t A = {.ssid = "Alpha net", .dbm = -40}, B = {.ssid = "Beta net", .dbm = -60},
+                               C = {.ssid = "Gamma net", .dbm = -70}, D = {.ssid = "Delta net", .dbm = -30};
+    int sel = -1;
+    g_uc_net[0] = A; g_uc_net[1] = B; g_uc_net[2] = C;
+    g_uc_nets = 3;
+    uc_wifi_hooks();
+    ui_show("wifi");
+    advance(400);
+    UC(ui_test_row("Beta net") == 4);
+    uc_row(4);
+    g_uc_net[0] = B; g_uc_net[1] = C; g_uc_net[2] = A;      /* a search: another order */
+    ui_wifi_changed();
+    advance(400);
+    ui_list_state(&sel, NULL, NULL);
+    UC(sel == 3 && ui_test_pill_row() == 3 && ui_test_row("Beta net") == 3);
+    ui_key(UI_KEY_OK);
+    UC(!strcmp(g_uc_joined, "Beta net"));
+    advance(400);
+    g_uc_net[0] = D;                                        /* another in its row, not yet said nor drawn: */
+    g_uc_joined[0] = 0;
+    ui_key(UI_KEY_OK);                                      /* <Play> is for the row as it shows */
+    UC(!strcmp(g_uc_joined, "Beta net"));
+    advance(400);
+    g_uc_net[0] = A; g_uc_net[1] = B; g_uc_net[2] = C;
+    ui_wifi_changed();
+    advance(400);
+    ui_list_state(&sel, NULL, NULL);
+    UC(sel == 3 && ui_test_pill_row() == 3);                /* (Beta gone, then back in another row: the row it was on) */
+
+    static const ui_bt_dev_t X = {.addr = "00:00:00:00:00:01", .name = "Xray"}, Y = {.addr = "00:00:00:00:00:02", .name = "Yoke"},
+                             Z = {.addr = "00:00:00:00:00:03", .name = "Zulu"};
+    g_uc_dev[0] = X; g_uc_dev[1] = Y; g_uc_dev[2] = Z;
+    ui_show("bluetooth");
+    advance(400);
+    UC(ui_test_row("Yoke") == 4);
+    uc_row(4);
+    g_uc_dev[0] = Y; g_uc_dev[1] = Z; g_uc_dev[2] = X;
+    ui_bt_changed();
+    advance(400);
+    ui_list_state(&sel, NULL, NULL);
+    UC(sel == 3 && ui_test_pill_row() == 3);
+    g_uc_dev[0] = Z; g_uc_dev[1] = X; g_uc_dev[2] = X;      /* (not yet said nor drawn) */
+    ui_key(UI_KEY_OK);
+    UC(!strcmp(g_uc_pressed, Y.addr));
+    advance(400);
+    ui_set_hooks(&g_hooks);
+    ui_show("home");
+    advance(400);
+}
+
+/* The open menu's action `label`, with the wheel and <Play>, no time passing */
+static void uc_act(const char *label)
+{
+    int row = ui_test_ctx_row(label);
+    UC(row >= 0);
+    for (int i = 0; i < row; i++) ui_key(UI_KEY_DOWN);
+    ui_key(UI_KEY_OK);
+}
+
+/* U7: "Delete playlist" asks for a second press, of the same menu: armed on
+ * one playlist, a single press within 3 s deleted another */
+static void uc_delete_armed(void)
+{
+    int64_t dawn = uc_id("Dawn");
+    int64_t one = library_playlist_create(g_lib, "One"), two = library_playlist_create(g_lib, "Two");
+    UC(one > 0 && two > 0 && library_playlist_add(g_lib, one, &dawn, 1) == 0 && library_playlist_add(g_lib, two, &dawn, 1) == 0);
+    ui_show("playlists");
+    advance(400);
+    int r1 = ui_test_row("One"), r2 = ui_test_row("Two");
+    UC(r1 >= 0 && r2 >= 0);
+    uc_row(r1);
+    ui_key(UI_KEY_MENU);
+    uc_act("Delete playlist");                    /* "Press again": not pressed again */
+    ui_key(UI_KEY_BACK);
+    advance(50);
+    ui_key(r2 > r1 ? UI_KEY_DOWN : UI_KEY_UP);    /* (they are next to each other) */
+    ui_key(UI_KEY_MENU);
+    uc_act("Delete playlist");                    /* the other one's: its first press */
+    UC(library_playlist_count_writable(g_lib) == 2);
+    advance(50);
+    ui_key(UI_KEY_OK);                            /* and its second */
+    UC(library_playlist_count_writable(g_lib) == 1);
+    advance(400);
+    library_playlist_delete(g_lib, one);
+    library_playlist_delete(g_lib, two);
+    ui_library_changed();
+    ui_show("home");
+    advance(400);
+}
+
+/* U8: <Menu> on a setting shows its help each time: after a help had gone by
+ * itself, the next <Menu> did nothing (it was taken for the press that puts
+ * a help away) */
+static void uc_help_again(void)
+{
+    ui_show("settings");
+    advance(400);
+    ui_key(UI_KEY_MENU);
+    advance(200);
+    UC(ui_test_toast() != NULL);
+    advance(8000);                                /* gone by itself */
+    UC(ui_test_toast() == NULL);
+    ui_key(UI_KEY_MENU);
+    advance(200);
+    UC(ui_test_toast() != NULL);
+    ui_key(UI_KEY_MENU);                          /* (and <Menu> on a help still puts it away) */
+    advance(200);
+    UC(ui_test_toast() == NULL);
+    ui_show("home");
+    advance(400);
+}
+
+/* U9: the Welcome (and What's new) over everything: <Menu> held does nothing
+ * (quick settings opened under it, there when it was put away) */
+static void uc_welcome_menu(void)
+{
+    ui_show("home");
+    advance(400);
+    ui_show_welcome();
+    advance(400);
+    ui_key(UI_KEY_MENU_LONG);
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == 1);
+    ui_key(UI_KEY_BACK);                          /* the Welcome away: Home */
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == 1);
+    ui_key(UI_KEY_MENU_LONG);                     /* (and now it opens) */
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == 2);
+    ui_show("home");
+    advance(400);
+}
+
+/* U10: the question asked when a computer is connected goes when the cable
+ * comes out, also from under quick settings opened over it (it stayed there,
+ * and the next cable put a second one on top) */
+static void uc_usb_question(void)
+{
+    ui_show("home");
+    advance(400);
+    ui_usb_prompt();
+    advance(400);
+    ui_key(UI_KEY_MENU_LONG);                     /* quick settings over the question */
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == 3);
+    ui_usb_prompt();                              /* (said again: still one question) */
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == 3);
+    ui_usb_prompt_close();                        /* the cable out */
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == 2 && ui_test_row("Wi-Fi") < 0 && ui_test_row("Brightness") >= 0);   /* quick settings still */
+    ui_key(UI_KEY_BACK);
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == 1);     /* and Home under them, no question */
+}
+
+/* U12: Now Playing > Menu > Find cover that can't start (no network) leaves
+ * Now Playing showing, not the list under it; and with Wi-Fi off, the
+ * question it asks goes back to Now Playing */
+static void uc_find_cover_np(void)
+{
+    ui_hooks_t hooks = g_hooks;
+    hooks.wifi_state = ww_state;
+    hooks.wifi_networks = uc_networks;
+    hooks.wifi_do = ww_do;
+    hooks.radio_ready = ww_ready;
+    ui_set_hooks(&hooks);
+    ww_set(1, UI_WIFI_ON, "");                    /* on, nothing joined */
+    uc_cue(0);
+    ui_show("nowplaying");
+    advance(400);
+    UC(uc_menu("Find cover") == 0);
+    UC(ui_list_state(NULL, NULL, NULL) == 0);     /* said why; still Now Playing */
+    ww_set(0, UI_WIFI_OFF, "");
+    UC(uc_menu("Find cover") == 0);
+    UC(ui_list_state(NULL, NULL, NULL) == 2);     /* "Turn on Wi-Fi?" */
+    ui_key(UI_KEY_BACK);
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == 0);
+    ui_set_hooks(&g_hooks);
+    ui_show("home");
+    advance(400);
+}
+
+/* R5: an update that is on the card already (no room to install it, or an
+ * install to finish at a restart): Try again fetches nothing, so it is not
+ * answered with "Turn on Wi-Fi?" (with Wi-Fi off the update could only be
+ * given up). A failure that does need the network still asks. */
+/* A character pack whose pages aren't in memory: the text is laid out at its
+ * full width and drawn empty, without waiting for the card, and drawn again
+ * by itself when the pack's thread has brought the pages in. A pack of two
+ * characters is made here (all ink, 12 pixels), and read as from a slow card. */
+static int g_uc_draws;
+static void uc_count_draw(lv_event_t *e) { (void)e; g_uc_draws++; }
+
+static long uc_ink(lv_obj_t *obj)
+{
+    lv_obj_update_layout(obj);
+    lv_draw_buf_t *img = lv_snapshot_take(obj, LV_COLOR_FORMAT_ARGB8888);
+    if (!img) return -1;
+    long n = 0;
+    for (uint32_t y = 0; y < img->header.h; y++)
+        for (uint32_t x = 0; x < img->header.w; x++)
+            n += img->data[(size_t)y * img->header.stride + (size_t)x * 4 + 3] > 128;
+    lv_draw_buf_destroy(img);
+    return n;
+}
+
+/* A pack of two characters, 12 pixels, every pixel of them `ink` (0..15), written as `path` */
+enum { UCP_CELLS = 2, UCP_PX = 12 };
+static int uc_make_pack(const char *dir, const char *path, int ink)
+{
+    enum { PG = 4096, CELLS = UCP_CELLS, PX = UCP_PX, ROW = 6, CELL = ROW * PX };
+    static unsigned char img[3 * PG];
+    static const unsigned CP[CELLS] = {0x3042, 0x6771};
+    memset(img, 0, sizeof img);
+    memcpy(img, "FATHGLY1", 8);
+    img[8] = CELLS;
+    img[12] = 1;
+    img[17] = PG >> 8;                            /* the index at page 1 */
+    img[21] = (3 * PG) >> 8;                      /* the file's length */
+    unsigned char *h = img + 24;
+    h[0] = PX; h[2] = ROW; h[4] = CELL; h[9] = (2 * PG) >> 8; h[12] = (unsigned char)(signed char)-1; h[13] = 4;
+    for (int i = 0; i < CELLS; i++) {
+        img[PG + i * 4] = (unsigned char)CP[i];
+        img[PG + i * 4 + 1] = (unsigned char)(CP[i] >> 8);
+        img[PG + i * 4 + 2] = (unsigned char)i;
+    }
+    memset(img + 2 * PG, ink * 0x11, CELLS * CELL);
+    mkdir(dir, 0755);
+    FILE *f = fopen(path, "wb");
+    int ok = f && fwrite(img, 1, sizeof img, f) == sizeof img;
+    if (f) ok = fclose(f) == 0 && ok;
+    return ok;
+}
+
+static void uc_pack_arrives(void)
+{
+    enum { CELLS = UCP_CELLS, PX = UCP_PX };
+    int ok = uc_make_pack("uc-packs", "uc-packs/glyphs-uc.bin", 15);
+    UC(ok);
+    if (!ok) return;
+
+    ui_packs_dir("uc-packs");
+    ui_packs_test(1, 150);                        /* nothing in memory; 150 ms a page */
+    /* (on a screen of its own: on the player's, anything drawn near the label
+     * draws it too, and the count below would be the status bar's) */
+    lv_obj_t *was = lv_screen_active(), *scr = lv_obj_create(NULL);
+    lv_screen_load(scr);
+    lv_obj_t *lab = lv_label_create(scr);
+    lv_obj_set_style_text_font(lab, ui_font_pack(PX), 0);
+    lv_obj_set_style_text_color(lab, lv_color_white(), 0);
+    lv_obj_center(lab);
+    lv_obj_add_event_cb(lab, uc_count_draw, LV_EVENT_DRAW_MAIN, NULL);
+    unsigned empty0, drawn0, redraws0, empty, drawn, redraws;
+    ui_packs_counts(&empty0, &drawn0, &redraws0);
+    lv_label_set_text(lab, "\xE3\x81\x82\xE6\x9D\xB1");     /* the two characters */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    g_uc_draws = 0;
+    advance(40);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    ui_packs_counts(&empty, &drawn, &redraws);
+    UC(g_uc_draws > 0);                           /* drawn... */
+    UC((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 120);   /* ...without the page's 150 ms */
+    UC(lv_obj_get_width(lab) == CELLS * PX);      /* its place kept */
+    UC(empty - empty0 == CELLS && drawn == drawn0 && redraws == redraws0);            /* both empty, nothing asked yet */
+    /* Nothing touches the label from here on. When the pages are there (in
+     * real time: 3 s at most) the pack's timer asks once for the screen to be
+     * drawn again, and the label is, from its cells. */
+    for (int i = 0; i < 150 && redraws == redraws0; i++) {
+        usleep(20000);
+        g_uc_draws = 0;
+        advance(40);
+        ui_packs_counts(NULL, NULL, &redraws);
+    }
+    advance(80);
+    ui_packs_counts(&empty, &drawn, &redraws);
+    UC(redraws == redraws0 + 1);
+    UC(g_uc_draws > 0 && drawn - drawn0 == CELLS && empty - empty0 == CELLS);
+    advance(1000);
+    ui_packs_counts(&empty, &drawn, &redraws);
+    UC(redraws == redraws0 + 1 && empty - empty0 == CELLS);   /* once: the timer has gone */
+    UC(uc_ink(lab) == CELLS * PX * PX);           /* (looked at last: taking the picture draws it again) */
+    lv_screen_load(was);
+    lv_obj_delete(scr);
+    ui_packs_test(0, 0);
+    ui_packs_dir("build/packs");
+    advance(100);
+}
+
+/* Settings > Interface > Language packs: <Play> on a pack downloads it,
+ * cancels the download, or (twice within 3 s) removes it; a failure is said
+ * once, with its reason. The download itself is the simulator's stand-in. */
+static void uc_packs_page(void)
+{
+    int n = 0;
+    ui_show("interface");
+    advance(300);
+    UC(ui_test_row("Language packs") >= 0);
+    g_sim_packs[0].state = UI_PACK_ABSENT;
+    ui_show("packs");
+    advance(300);
+    ui_list_state(NULL, &n, NULL);
+    UC(n == SIM_PACKS && ui_test_row("Japanese") == 0 && ui_test_row("Korean") == 1);
+
+    g_sim_pack_did = -1;
+    ui_key(UI_KEY_OK);                            /* not there: download */
+    advance(200);
+    UC(g_sim_pack_did == UI_PACK_GET && g_sim_packs[0].state == UI_PACK_GETTING);
+    ui_key(UI_KEY_OK);                            /* downloading: cancel */
+    advance(200);
+    UC(g_sim_pack_did == UI_PACK_CANCEL && g_sim_packs[0].state == UI_PACK_ABSENT);
+
+    g_sim_packs[0].state = UI_PACK_THERE;         /* it has come */
+    ui_packs_changed(1);
+    advance(200);
+    g_sim_pack_did = -1;
+    ui_key(UI_KEY_OK);                            /* there: once asks... */
+    advance(200);
+    UC(g_sim_pack_did == -1 && ui_test_toast() && strstr(ui_test_toast(), "again"));
+    advance(3200);                                /* ...and is forgotten after 3 s */
+    ui_key(UI_KEY_OK);
+    advance(200);
+    UC(g_sim_pack_did == -1 && g_sim_packs[0].state == UI_PACK_THERE);
+    ui_key(UI_KEY_OK);                            /* twice: removed */
+    advance(200);
+    UC(g_sim_pack_did == UI_PACK_REMOVE && g_sim_packs[0].state == UI_PACK_ABSENT);
+    UC(ui_test_toast() && !strcmp(ui_test_toast(), "Removed"));   /* (not "Press again" left on the screen) */
+    advance(3500);
+
+    g_sim_packs[0].state = UI_PACK_FAILED;        /* a download that failed: why, once */
+    snprintf(g_sim_packs[0].message, sizeof g_sim_packs[0].message, "Couldn't reach the server");
+    ui_packs_changed(0);
+    advance(200);
+    UC(ui_test_toast() && !strcmp(ui_test_toast(), "Couldn't reach the server"));
+    advance(4000);
+    UC(ui_test_toast() == NULL);
+    ui_packs_changed(0);                          /* (nothing new: not said again) */
+    advance(200);
+    UC(ui_test_toast() == NULL);
+    g_sim_pack_did = -1;
+    ui_key(UI_KEY_OK);                            /* failed: <Play> tries again */
+    advance(200);
+    UC(g_sim_pack_did == UI_PACK_GET);
+    g_sim_packs[0].state = UI_PACK_ABSENT;
+    g_sim_packs[0].message[0] = 0;
+
+    /* the second pack is its own: <Play> on its row asks for it, not for the first */
+    ui_key(UI_KEY_DOWN);
+    advance(300);
+    g_sim_pack_did = g_sim_pack_at = -1;
+    ui_key(UI_KEY_OK);
+    advance(200);
+    UC(g_sim_pack_did == UI_PACK_GET && g_sim_pack_at == 1);
+    UC(g_sim_packs[1].state == UI_PACK_GETTING && g_sim_packs[0].state == UI_PACK_ABSENT);
+    /* Remove armed on one pack doesn't remove the other */
+    g_sim_packs[0].state = g_sim_packs[1].state = UI_PACK_THERE;
+    ui_packs_changed(0);
+    advance(200);
+    g_sim_pack_did = -1;
+    ui_key(UI_KEY_OK);                            /* the second: once */
+    advance(200);
+    ui_key(UI_KEY_UP);
+    advance(300);
+    ui_key(UI_KEY_OK);                            /* the first: once (not "twice") */
+    advance(200);
+    UC(g_sim_pack_did == -1 && g_sim_packs[0].state == UI_PACK_THERE && g_sim_packs[1].state == UI_PACK_THERE);
+    advance(3500);
+    g_sim_packs[0].state = g_sim_packs[1].state = UI_PACK_ABSENT;
+    ui_show("home");
+    advance(400);
+}
+
+/* Language packs with two packs there that share characters: a last row,
+ * "Shared characters", and <Play> on it goes round the packs that have them
+ * (not Korean, not one that isn't there). With fewer than two: no such row. */
+static void uc_packs_shared(void)
+{
+    int n = 0;
+    sim_packs_all(UI_PACK_ABSENT);
+    g_sim_packs[0].state = g_sim_packs[1].state = UI_PACK_THERE;     /* Japanese and Korean: nothing shared */
+    ui_show("packs");
+    advance(300);
+    ui_list_state(NULL, &n, NULL);
+    UC(n == SIM_PACKS && ui_test_row("Shared characters") < 0);
+    g_sim_packs[2].state = UI_PACK_THERE;                            /* and Simplified Chinese */
+    ui_packs_changed(1);
+    advance(300);
+    ui_list_state(NULL, &n, NULL);
+    UC(n == SIM_PACKS + 1 && ui_test_row("Shared characters") == SIM_PACKS);
+    uc_row(SIM_PACKS);
+    g_sim_pack_did = g_sim_pack_at = -1;
+    ui_key(UI_KEY_OK);                            /* from Japanese (the first there) to Simplified */
+    advance(300);
+    UC(g_sim_pack_did == UI_PACK_FIRST && g_sim_pack_at == 2 && g_sim_packs[2].first);
+    ui_key(UI_KEY_OK);                            /* and round to Japanese: Korean and the absent Traditional passed over */
+    advance(300);
+    UC(g_sim_pack_did == UI_PACK_FIRST && g_sim_pack_at == 0 && g_sim_packs[0].first && !g_sim_packs[2].first);
+    g_sim_packs[3].state = UI_PACK_THERE;                            /* Traditional too: three to go round */
+    ui_packs_changed(1);
+    advance(300);
+    ui_key(UI_KEY_OK);
+    advance(300);
+    ui_key(UI_KEY_OK);
+    advance(300);
+    UC(g_sim_pack_at == 3 && g_sim_packs[3].first);
+    /* the one whose shapes are used is removed: the row follows what is left */
+    g_sim_packs[3].state = g_sim_packs[2].state = UI_PACK_ABSENT;
+    ui_packs_changed(1);
+    advance(300);
+    ui_list_state(NULL, &n, NULL);
+    UC(n == SIM_PACKS && ui_test_row("Shared characters") < 0);
+    sim_packs_all(UI_PACK_ABSENT);
+    ui_packs_first("");
+    ui_show("home");
+    advance(400);
+}
+
+/* The library has names a pack would draw, and the pack isn't there: Home has
+ * "Get language packs", whatever the language and however many. It opens
+ * Language packs, where the first row, "Needed by your library", fetches every
+ * pack the library needs, one after another; the packs it needs are listed
+ * first; "Hide from Home" puts the offer off. */
+static void uc_packs_offer(void)
+{
+    int n = 0, n0 = 0;
+    sim_packs_all(UI_PACK_ABSENT);
+    settings_set("packs.ignored", "");
+    ui_packs_changed(0);
+    ui_show("home");
+    advance(300);
+    ui_list_state(NULL, &n0, NULL);
+    UC(ui_test_row("Get language packs") < 0);    /* nothing needed: Home as ever */
+    ui_show("packs");
+    advance(300);
+    ui_list_state(NULL, &n, NULL);
+    UC(n == SIM_PACKS && ui_test_row("Needed by your library") < 0 && ui_test_row("Hide from Home") < 0);
+
+    g_sim_packs[1].songs = 27;                    /* a scan found Korean names: one row on Home... */
+    ui_packs_changed(0);
+    ui_show("home");
+    advance(300);
+    ui_list_state(NULL, &n, NULL);
+    UC(n == n0 + 1 && ui_test_row("Get language packs") == 0);
+    g_sim_packs[0].songs = 342;                   /* ...and Japanese: still the one row, the same words */
+    ui_packs_changed(0);
+    advance(300);
+    ui_list_state(NULL, &n, NULL);
+    UC(n == n0 + 1 && ui_test_row("Get language packs") == 0);
+
+    uc_row(0);
+    ui_key(UI_KEY_OK);                            /* the page: what is needed, its packs first, the others, Hide */
+    advance(400);
+    ui_list_state(NULL, &n, NULL);
+    UC(n == SIM_PACKS + 2 && ui_test_row("Needed by your library") == 0 && ui_test_row("Japanese") == 1 && ui_test_row("Korean") == 2);
+    UC(ui_test_row("Chinese (Simplified)") == 3 && ui_test_row("Hide from Home") == SIM_PACKS + 1);
+
+    g_sim_pack_did = g_sim_pack_at = -1;
+    ui_key(UI_KEY_OK);                            /* Needed: the first of them is fetched */
+    advance(300);
+    UC(g_sim_pack_did == UI_PACK_GET && g_sim_pack_at == 0 && g_sim_packs[0].state == UI_PACK_GETTING);
+    ui_key(UI_KEY_OK);                            /* again while it downloads: cancelled, and the rest not fetched */
+    advance(300);
+    UC(g_sim_pack_did == UI_PACK_CANCEL && g_sim_pack_at == 0 && g_sim_packs[1].state == UI_PACK_ABSENT);
+    g_sim_pack_did = g_sim_pack_at = -1;
+    ui_packs_changed(0);
+    advance(300);
+    UC(g_sim_pack_did == -1);                     /* (nothing starts by itself after a cancel) */
+
+    ui_key(UI_KEY_OK);                            /* Needed again: the first... */
+    advance(300);
+    UC(g_sim_pack_did == UI_PACK_GET && g_sim_pack_at == 0);
+    g_sim_packs[0].state = UI_PACK_THERE;         /* ...it has come: the next is fetched by itself */
+    g_sim_pack_did = g_sim_pack_at = -1;
+    ui_packs_changed(1);
+    advance(300);
+    UC(g_sim_pack_did == UI_PACK_GET && g_sim_pack_at == 1 && g_sim_packs[1].state == UI_PACK_GETTING);
+    ui_list_state(NULL, &n, NULL);
+    UC(n == SIM_PACKS + 2 && ui_test_row("Needed by your library") == 0);          /* (Korean still to come) */
+    g_sim_packs[1].state = UI_PACK_THERE;         /* the last: nothing more is asked for, the two rows go */
+    g_sim_pack_did = -1;
+    ui_packs_changed(1);
+    advance(300);
+    ui_list_state(NULL, &n, NULL);
+    UC(g_sim_pack_did == -1 && n == SIM_PACKS && ui_test_row("Needed by your library") < 0 && ui_test_row("Hide from Home") < 0);
+    UC(ui_test_row("Japanese") == 0 && ui_test_row("Korean") == 1);
+    ui_show("home");
+    advance(300);
+    ui_list_state(NULL, &n, NULL);
+    UC(n == n0 && ui_test_row("Get language packs") < 0);                           /* and Home's row with them */
+
+    /* one that fails stops it: the next isn't fetched, and the reason is said */
+    g_sim_packs[0].state = g_sim_packs[1].state = UI_PACK_ABSENT;
+    ui_packs_changed(1);
+    ui_show("packs");
+    advance(300);
+    ui_key(UI_KEY_OK);
+    advance(300);
+    g_sim_packs[0].state = UI_PACK_FAILED;
+    snprintf(g_sim_packs[0].message, sizeof g_sim_packs[0].message, "Couldn't reach the server");
+    g_sim_pack_did = g_sim_pack_at = -1;
+    ui_packs_changed(0);
+    advance(300);
+    UC(g_sim_pack_did == -1 && g_sim_packs[1].state == UI_PACK_ABSENT);
+    UC(ui_test_toast() && !strcmp(ui_test_toast(), "Couldn't reach the server"));
+    advance(4000);
+    ui_key(UI_KEY_OK);                            /* Needed once more: the one that failed is tried again */
+    advance(300);
+    UC(g_sim_pack_did == UI_PACK_GET && g_sim_pack_at == 0);
+    ui_key(UI_KEY_OK);                            /* (cancelled: the stand-in leaves it absent) */
+    advance(300);
+
+    /* a row that comes or goes above the selection doesn't move it to another pack: Korean removed
+     * (the row for what is needed comes back, first), the highlight is still on Korean. Seen on the H2. */
+    {
+        int sel = -1;
+        g_sim_packs[0].state = g_sim_packs[1].state = UI_PACK_THERE;
+        ui_packs_changed(1);
+        advance(300);
+        uc_row(1);                                /* Korean, with nothing needed: the second row */
+        UC(ui_test_row("Korean") == 1);
+        g_sim_packs[1].state = UI_PACK_ABSENT;    /* removed */
+        ui_packs_changed(1);
+        advance(300);
+        ui_list_state(&sel, NULL, NULL);
+        UC(ui_test_row("Needed by your library") == 0 && ui_test_row("Korean") == 2 && sel == 2);
+        g_sim_packs[1].state = UI_PACK_THERE;     /* and back: the row above goes, the highlight stays with it */
+        ui_packs_changed(1);
+        advance(300);
+        ui_list_state(&sel, NULL, NULL);
+        UC(ui_test_row("Korean") == 1 && sel == 1);
+        g_sim_packs[0].state = g_sim_packs[1].state = UI_PACK_ABSENT;
+        ui_packs_changed(1);
+        advance(300);
+        uc_row(0);
+    }
+
+    /* only Korean needed: its pack comes before Japanese's */
+    g_sim_packs[0].songs = 0;
+    ui_packs_changed(0);
+    advance(300);
+    UC(ui_test_row("Needed by your library") == 0 && ui_test_row("Korean") == 1 && ui_test_row("Japanese") == 2);
+    g_sim_packs[0].songs = 342;
+    ui_packs_changed(0);
+    advance(300);
+
+    /* Hide from Home: these packs aren't offered again; the page keeps what is needed */
+    uc_row(SIM_PACKS + 1);
+    ui_key(UI_KEY_OK);
+    advance(400);
+    UC(!strcmp(settings_get("packs.ignored", ""), "ja,ko"));
+    UC(ui_test_toast() && strstr(ui_test_toast(), "Language packs"));
+    ui_list_state(NULL, &n, NULL);
+    UC(n == SIM_PACKS + 1 && ui_test_row("Hide from Home") < 0 && ui_test_row("Needed by your library") == 0);
+    advance(3500);
+    ui_show("home");
+    advance(300);
+    ui_list_state(NULL, &n, NULL);
+    UC(n == n0 && ui_test_row("Get language packs") < 0);
+
+    g_sim_packs[2].songs = 12;                    /* later the library gets Chinese names: offered, the others still put off */
+    ui_packs_changed(0);
+    advance(300);
+    ui_list_state(NULL, &n, NULL);
+    UC(n == n0 + 1 && ui_test_row("Get language packs") == 0);
+    g_sim_packs[2].state = UI_PACK_THERE;         /* fetched: nothing left to offer */
+    ui_packs_changed(1);
+    advance(300);
+    ui_list_state(NULL, &n, NULL);
+    UC(n == n0);
+
+    sim_packs_all(UI_PACK_ABSENT);
+    settings_set("packs.ignored", "");
+    ui_packs_changed(0);
+    ui_show("home");
+    advance(400);
+}
+
+/* Two packs with the same character: the one put first draws it; with none
+ * put first, the first by name does. (aa: every pixel full; bb: every pixel
+ * faint, under what uc_ink counts.) */
+static void uc_packs_order(void)
+{
+    int ok = uc_make_pack("uc-order", "uc-order/glyphs-aa.bin", 15) && uc_make_pack("uc-order", "uc-order/glyphs-bb.bin", 1);
+    UC(ok);
+    if (!ok) return;
+    const long full = UCP_CELLS * UCP_PX * UCP_PX;
+    ui_packs_first("");
+    ui_packs_dir("uc-order");
+    lv_obj_t *was = lv_screen_active(), *scr = lv_obj_create(NULL);
+    lv_screen_load(scr);
+    lv_obj_t *lab = lv_label_create(scr);
+    lv_obj_set_style_text_font(lab, ui_font_pack(UCP_PX), 0);
+    lv_obj_set_style_text_color(lab, lv_color_white(), 0);
+    lv_obj_center(lab);
+    lv_label_set_text(lab, "\xE3\x81\x82\xE6\x9D\xB1");
+    for (int i = 0; i < 50 && uc_ink(lab) != full; i++) { usleep(20000); advance(40); }   /* (its pages may be fetched) */
+    UC(uc_ink(lab) == full);                      /* by name: aa */
+    ui_packs_first("bb");
+    for (int i = 0; i < 50 && uc_ink(lab) != 0; i++) { usleep(20000); advance(40); }
+    UC(uc_ink(lab) == 0);                         /* bb put first */
+    ui_packs_first("no-such-pack");
+    for (int i = 0; i < 50 && uc_ink(lab) != full; i++) { usleep(20000); advance(40); }
+    UC(uc_ink(lab) == full);                      /* one that isn't there: by name again */
+    ui_packs_first("bb");
+    ui_packs_first("");
+    for (int i = 0; i < 50 && uc_ink(lab) != full; i++) { usleep(20000); advance(40); }
+    UC(uc_ink(lab) == full);                      /* and none */
+    lv_screen_load(was);
+    lv_obj_delete(scr);
+    ui_packs_dir("build/packs");
+    advance(100);
+}
+
+/* A name with Japanese and no pack for it: the boxes, and once for a card
+ * where the packs are */
+static void uc_packs_told(void)
+{
+    const ui_fonts_t *ff = g_n_themes > 0 ? ui_theme_fonts(&g_themes[0]) : NULL;
+    UC(ff != NULL);
+    if (!ff) return;
+    ui_packs_dir("uc-no-packs");                  /* (no such folder) */
+    settings_set_int("packs.told", 0);
+    g_sim_packs[0].state = UI_PACK_ABSENT;
+    ui_packs_wanted(1);
+    advance(4000);
+    ui_tick_1s();
+    advance(100);
+    UC(ui_test_toast() == NULL);                  /* nothing Japanese seen: nothing said */
+    lv_obj_t *lab = lv_label_create(lv_screen_active());
+    lv_obj_set_style_text_font(lab, ff->body, 0);
+    lv_label_set_text(lab, "\xE3\x81\x82\xE6\x9D\xB1");
+    advance(100);
+    ui_tick_1s();
+    advance(100);
+    UC(ui_test_toast() && strstr(ui_test_toast(), "Language packs"));
+    UC(settings_get_int("packs.told", 0) == 1);
+    advance(7000);
+    UC(ui_test_toast() == NULL);
+    lv_label_set_text(lab, "\xE3\x81\x84");      /* another, later: not said again */
+    advance(100);
+    ui_tick_1s();
+    advance(100);
+    UC(ui_test_toast() == NULL);
+    /* Before the library's names have been counted (a first start after the
+     * update): the toast waits, for Home may be about to offer; counted, and
+     * nothing offered, it is said. Seen on the H2: both at that first start. */
+    settings_set_int("packs.told", 0);
+    ui_packs_counted(0);
+    lv_label_set_text(lab, "\xE3\x81\x88");
+    advance(100);
+    ui_tick_1s();
+    advance(100);
+    UC(ui_test_toast() == NULL && settings_get_int("packs.told", 0) == 0);     /* not yet */
+    ui_packs_counted(1);                          /* counted: no names of the library's need a pack (songs 0) */
+    ui_tick_1s();
+    advance(100);
+    UC(ui_test_toast() && strstr(ui_test_toast(), "Language packs") && settings_get_int("packs.told", 0) == 1);
+    advance(7000);
+    /* ...and counted with names that do: Home offers, the toast keeps quiet */
+    settings_set_int("packs.told", 0);
+    ui_packs_counted(0);
+    lv_label_set_text(lab, "\xE3\x81\x8A");
+    advance(100);
+    ui_tick_1s();
+    advance(100);
+    g_sim_packs[0].songs = 342;
+    ui_packs_counted(1);
+    ui_packs_changed(0);
+    ui_tick_1s();
+    advance(100);
+    UC(ui_test_toast() == NULL && settings_get_int("packs.told", 0) == 0);
+    g_sim_packs[0].songs = 0;
+    ui_packs_changed(0);
+    /* a start where nothing ever counts: the toast is free again after a minute */
+    ui_packs_counted(0);
+    lv_label_set_text(lab, "\xE3\x81\x8B");
+    advance(100);
+    ui_tick_1s();
+    advance(100);
+    UC(ui_test_toast() == NULL);
+    advance(61000);
+    ui_tick_1s();
+    advance(100);
+    UC(ui_test_toast() && strstr(ui_test_toast(), "Language packs"));
+    advance(7000);
+    ui_packs_counted(1);
+
+    /* A pack has just come. The last picture before it was read had boxes in
+     * it: that isn't a name still in want of a pack, and nothing is said. (On
+     * the H2 the toast came right after everything needed had been fetched.) */
+    settings_set_int("packs.told", 0);
+    ui_packs_dir("uc-no-packs");
+    lv_label_set_text(lab, "\xE3\x81\x82");      /* drawn as a box: no pack */
+    advance(100);
+    ui_packs_dir("uc-packs");                     /* its pack arrives: the folder named again, the screen told */
+    g_sim_packs[0].state = UI_PACK_THERE;
+    ui_packs_changed(1);
+    advance(200);
+    ui_tick_1s();
+    advance(100);
+    UC(ui_test_toast() == NULL && settings_get_int("packs.told", 0) == 0);
+    g_sim_packs[0].state = UI_PACK_ABSENT;
+    ui_packs_dir("uc-no-packs");
+    ui_packs_changed(1);
+    advance(200);
+    ui_packs_wanted(1);
+
+    settings_set_int("packs.told", 0);            /* Korean is told the same way (a card not told yet) */
+    lv_label_set_text(lab, "\xED\x95\x9C");      /* a Hangul syllable */
+    advance(100);
+    ui_tick_1s();
+    advance(100);
+    UC(ui_test_toast() && strstr(ui_test_toast(), "Language packs") && settings_get_int("packs.told", 0) == 1);
+    advance(7000);
+    settings_set_int("packs.told", 0);            /* with every pack there: nothing to offer */
+    sim_packs_all(UI_PACK_THERE);
+    lv_label_set_text(lab, "\xE3\x81\x86");
+    advance(100);
+    ui_tick_1s();
+    advance(100);
+    UC(ui_test_toast() == NULL && settings_get_int("packs.told", 0) == 0);
+    sim_packs_all(UI_PACK_ABSENT);
+    lv_obj_delete(lab);
+    ui_packs_dir("build/packs");
+    advance(100);
+}
+
+static void uc_update_no_net(void)
+{
+    ui_hooks_t hooks = g_hooks;
+    hooks.wifi_state = ww_state;
+    hooks.wifi_networks = uc_networks;
+    hooks.wifi_do = ww_do;
+    hooks.radio_ready = ww_ready;
+    ui_set_hooks(&hooks);
+    ww_set(0, UI_WIFI_OFF, "");
+    ui_update_t was = g_sim_upd, failed = {.state = UI_UPD_FAILED, .message = "Not enough space on the card", .need_mb = 63, .no_net = 1};
+    snprintf(failed.current, sizeof failed.current, "%s", was.current);
+    snprintf(failed.latest, sizeof failed.latest, "%s", was.latest);
+    for (int kept = 1; kept >= 0; kept--) {
+        failed.no_net = kept;
+        g_sim_upd = failed;
+        ui_show("update");
+        advance(400);
+        int before = ui_list_state(NULL, NULL, NULL);
+        ui_key(UI_KEY_DOWN);                      /* the second row: Try again */
+        advance(200);
+        ui_key(UI_KEY_OK);
+        advance(400);
+        if (kept) UC(g_sim_upd.state == UI_UPD_AVAILABLE && ui_list_state(NULL, NULL, NULL) == before);
+        else UC(g_sim_upd.state == UI_UPD_FAILED && ui_list_state(NULL, NULL, NULL) != before);   /* asked for Wi-Fi */
+        ui_show("home");
+        advance(400);
+    }
+    g_sim_upd = was;
+    ui_set_hooks(&g_hooks);
+    ui_show("home");
+    advance(400);
+}
+
+/* U13: Playlists with nothing in it (no music yet): <Play> opens nothing (it
+ * opened "Never played": "no row" and that playlist were the same number).
+ * Before the scratch library is made. */
+static void uc_empty_playlists(void)
+{
+    int n = -1;
+    ui_show("playlists");
+    advance(400);
+    UC(ui_list_state(NULL, &n, NULL) == 2 && n == 0);
+    ui_key(UI_KEY_OK);
+    advance(400);
+    UC(ui_list_state(NULL, NULL, NULL) == 2);
+    ui_show("home");
+    advance(400);
+}
+
+/* The scratch library's album `i` (by name: Alpha, Beta..., Delta, Gamma) */
+static int64_t uc_album(int i)
+{
+    lib_list_t al;
+    int64_t id = -1;
+    if (library_list(g_lib, LIB_ALBUMS, 0, &al) > i) id = al.ids[i];
+    library_list_free(&al);
+    return id;
+}
+
+/* R2: the cover flow shows a cover made while it is open (a scan's cover
+ * pass in the background): the album stayed "has none" there until the flow
+ * was left and opened again */
+static void uc_flow_new_cover(void)
+{
+    static uint16_t large[LIB_ART_LARGE * LIB_ART_LARGE], small[LIB_ART_SMALL * LIB_ART_SMALL];
+    int64_t beta = uc_album(1);
+    settings_set_int("display.album_flow", 1);
+    ui_show("albums");                            /* (its second album in the middle) */
+    advance(400);
+    UC(beta > 0 && ui_test_flow_cover(beta) == 0);
+    for (size_t i = 0; i < sizeof large / sizeof large[0]; i++) large[i] = 0xF800;
+    for (size_t i = 0; i < sizeof small / sizeof small[0]; i++) small[i] = 0xF800;
+    UC(library_store_found_cover(g_lib, beta, large, small) == 0);
+    ui_covers_changed();
+    advance(400);
+    UC(ui_test_flow_cover(beta) == 1);
+    settings_set_int("display.album_flow", 0);
+    ui_show("home");
+    advance(400);
+}
+
+/* R4: a row under the cover flow doesn't scroll its text there, unseen (the
+ * artist's long name, selected in the list the flow was opened from, started
+ * scrolling after a second and kept the screen being drawn) */
+static void uc_flow_hidden_row(void)
+{
+    settings_set_int("display.album_flow", 2);    /* an artist's albums as a cover flow */
+    ui_show("albumartists");
+    uc_row(1);                                    /* the long name */
+    advance(1500);
+    UC(ui_test_row_scrolls());                    /* in the list: it scrolls */
+    ui_key(UI_KEY_OK);
+    advance(400);
+    UC(ui_test_flow_cover(uc_album(1)) >= 0);     /* the flow, with their album */
+    advance(1500);
+    UC(!ui_test_row_scrolls());
+    ui_key(UI_KEY_BACK);                          /* the list again: it does */
+    advance(1900);
+    UC(ui_test_row_scrolls());
+    settings_set_int("display.album_flow", 0);
+    ui_show("home");
+    advance(400);
+}
+
+/* The station directory for the checks: three made-up stations, whatever is
+ * asked (nothing here reaches a network, and this build's player has nothing
+ * that could open them) */
+static long uc_dir_fetch(const char *url, char *buf, size_t cap, const volatile int *abort)
+{
+    (void)abort;
+    if (!strstr(url, "/stations/")) return strstr(url, "/json/url/") ? 0 : -1;
+    return snprintf(buf, cap, "[{\"name\":\"Radio A\",\"url\":\"http://127.0.0.1:9/a\",\"codec\":\"MP3\"},"
+                              "{\"name\":\"Radio B\",\"url\":\"http://127.0.0.1:9/b\",\"codec\":\"MP3\"},"
+                              "{\"name\":\"Radio C\",\"url\":\"http://127.0.0.1:9/c\",\"codec\":\"MP3\"}]");
+}
+static int uc_stations(void)
+{
+    player_now_t now;
+    player_now(g_player, &now);
+    return now.radio ? now.count : 0;
+}
+/* the directory's answer, once it is in (the open list has `rows` rows) */
+static void uc_dir_wait(int rows)
+{
+    int n = 0;
+    for (int i = 0; i < 300 && (ui_list_state(NULL, &n, NULL), n) != rows; i++) {
+        ui_tick();
+        usleep(10 * 1000);
+    }
+    advance(400);
+}
+
+/* R6: a station playing by itself (the list it was started from has been
+ * left) is given a list again by <Play> on it in a new list: Next and
+ * Previous go through that one (it was shown in Now Playing, and stayed alone) */
+static void uc_radio_relist(void)
+{
+    rdir_set_fetch(uc_dir_fetch);
+    ui_show("rdirgenres");                        /* Radio > Find stations > Genres, on Jazz */
+    advance(400);
+    ui_key(UI_KEY_OK);
+    uc_dir_wait(4);                               /* Random station, and the three */
+    UC(uc_open("Radio B") == 0);
+    UC(uc_stations() == 3 && ui_list_state(NULL, NULL, NULL) == 0);
+    ui_key(UI_KEY_BACK_LONG);                     /* its list, */
+    advance(400);
+    ui_key(UI_KEY_BACK);                          /* left: it plays on alone */
+    advance(400);
+    UC(uc_stations() == 1);
+    ui_key(UI_KEY_OK);                            /* the genre opened again: a new list */
+    uc_dir_wait(4);
+    UC(uc_open("Radio B") == 0);
+    UC(ui_list_state(NULL, NULL, NULL) == 0);     /* Now Playing, the station still on */
+    UC(uc_stations() == 3);
+    ui_key(UI_KEY_NEXT);
+    ui_tick();
+    {
+        const radio_station_t *st = player_radio_station(g_player);
+        UC(st && !strcmp(st->name, "Radio C"));
+    }
+    uc_cue(0);                                    /* (off the radio) */
+    UC(uc_stations() == 0);
+    ui_show("home");
+    advance(400);
+}
+
+/* R3 (its second half): the cover flow's pictures (645 KB) are given back
+ * while Now Playing is over it, and are there again, on the same album, when
+ * the flow shows again */
+static void uc_flow_under_np(void)
+{
+    int sel = -1;
+    int64_t beta = uc_album(1);
+    settings_set_int("display.album_flow", 1);
+    ui_show("albums");
+    advance(400);
+    UC(ui_test_flow_cover(beta) == 1);            /* (the cover it was given above) */
+    ui_key(UI_KEY_BACK_LONG);                     /* Now Playing over it */
+    advance(600);
+    UC(ui_list_state(NULL, NULL, NULL) == 0 && ui_test_flow_cover(beta) == -1);
+    ui_tick_1s();
+    UC(ui_test_flow_cover(beta) == -1);
+    ui_key(UI_KEY_BACK_LONG);                     /* and the flow again */
+    advance(600);
+    ui_list_state(&sel, NULL, NULL);
+    UC(sel == 1 && ui_test_flow_cover(beta) == 1 && ui_test_flow_cover(uc_album(0)) == 0 && ui_test_flow_cover(uc_album(2)) == 0);
+    ui_key(UI_KEY_DOWN);                          /* it turns as before */
+    advance(600);
+    ui_list_state(&sel, NULL, NULL);
+    UC(sel == 2 && ui_test_flow_cover(uc_album(3)) == 0);
+    settings_set_int("display.album_flow", 0);
+    ui_show("home");
+    advance(400);
+    UC(ui_test_flow_cover(beta) == -1);
+}
+
+/* U14 (the first of four small ones): Rename playlist on a name longer than
+ * the typing screen holds shows whole letters (the last was cut in two), and
+ * Done with nothing changed leaves the name as it is (it saved the cut one) */
+static void uc_rename_long(void)
+{
+    char name[128] = "", now[128] = "";
+    for (int i = 0; i < 40; i++) strcat(name, "\xc3\xa9");      /* forty letters of two bytes */
+    int64_t pl = library_playlist_create(g_lib, name), dawn = uc_id("Dawn");
+    UC(pl > 0 && library_playlist_add(g_lib, pl, &dawn, 1) == 0);
+    ui_show("playlists");
+    advance(400);
+    int row = ui_test_row(name);
+    UC(row >= 0);
+    uc_row(row);
+    UC(uc_menu("Rename playlist") == 0);
+    UC(strlen(ui_test_entry(NULL)) == 62);        /* 31 whole letters */
+    library_playlist_delete(g_lib, pl);
+    memset(name, 'n', 70);                        /* and one of seventy plain letters */
+    name[70] = 0;
+    pl = library_playlist_create(g_lib, name);
+    UC(pl > 0 && library_playlist_add(g_lib, pl, &dawn, 1) == 0);
+    ui_show("playlists");
+    advance(400);
+    row = ui_test_row(name);
+    UC(row >= 0);
+    uc_row(row);
+    UC(uc_menu("Rename playlist") == 0);
+    UC(strlen(ui_test_entry(NULL)) == 63);
+    ui_key(UI_KEY_UP);                            /* the wheel on Done */
+    ui_key(UI_KEY_OK);
+    advance(400);
+    library_playlist_name(g_lib, pl, now, sizeof now);
+    UC(!strcmp(now, name) && ui_list_state(NULL, NULL, NULL) == 2);
+    library_playlist_delete(g_lib, pl);
+    ui_library_changed();
+    ui_show("home");
+    advance(400);
+}
+
+/* U14 (the second): the marker on Now Playing's bar, then <Play>: the song
+ * goes to the marker, however long since the screen was last drawn (the jump
+ * was worked out from where the song was then: up to a second further on) */
+static void uc_scrub(void)
+{
+    player_now_t now;
+    uc_cue(0);
+    player_pause(g_player, 0);                    /* playing, in real time */
+    ui_show("nowplaying");
+    advance(400);
+    usleep(300 * 1000);
+    ui_tick();
+    ui_key(UI_KEY_DOWN);                          /* the marker: 5 s on from 0:00 */
+    usleep(800 * 1000);                           /* (nothing drawn meanwhile) */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    ui_key(UI_KEY_OK);
+    usleep(150 * 1000);
+    player_now(g_player, &now);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long since = (long)(t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    long off = (long)now.pos_ms - (5000 + since);         /* (0.8 s late, as it was) */
+    if (getenv("UC_DEBUG")) fprintf(stderr, "ui-checks: scrubbed to %u ms, %ld ms after: %ld ms from the marker\n", now.pos_ms, since, off);
+    UC(off > -400 && off < 400);
+    player_pause(g_player, 1);
+    ui_show("home");
+    advance(400);
+}
+
+/* U14 (the third): Volume levelling with a value in settings.ini that isn't
+ * one of its three (edited by hand: -5) shows Off, and <Play> goes on to
+ * Track (it went to -1, and the player was given that) */
+static void uc_levelling(void)
+{
+    settings_set_int("sound.levelling", -5);
+    ui_show("sound");
+    advance(400);
+    UC(uc_open("Volume levelling") == 0);
+    UC(settings_get_int("sound.levelling", 0) == LEVEL_TRACK && player_levelling(g_player) == LEVEL_TRACK);
+    settings_set_int("sound.levelling", LEVEL_OFF);
+    player_set_levelling(g_player, LEVEL_OFF);
+    ui_show("home");
+    advance(400);
+}
+
+/* U14 (the fourth): a list of the station directory that says "Waiting for
+ * Wi-Fi" is asked for once Wi-Fi has joined, also when Now Playing (or Wi-Fi's
+ * own page) is over it by then (it went on saying so until <Play>) */
+static void uc_radio_waiting(void)
+{
+    int n = -1;
+    ui_hooks_t hooks = g_hooks;
+    hooks.wifi_state = ww_state;
+    hooks.wifi_networks = uc_networks;
+    hooks.wifi_do = ww_do;
+    hooks.wifi_wake = ww_wake;
+    hooks.radio_ready = ww_ready;
+    ui_set_hooks(&hooks);
+    rdir_set_fetch(uc_dir_fetch);
+    ww_set(1, UI_WIFI_ON, "");                    /* on, nothing joined yet */
+    ui_show("rdirgenres");
+    advance(400);
+    ui_key(UI_KEY_OK);                            /* Jazz: "Waiting for Wi-Fi" */
+    advance(400);
+    int depth = ui_list_state(NULL, &n, NULL);
+    UC(n == 0);
+    ui_key(UI_KEY_BACK_LONG);                     /* Now Playing meanwhile */
+    advance(400);
+    ww_set(1, UI_WIFI_CONNECTED, "");             /* joined */
+    uc_dir_wait(4);
+    ui_key(UI_KEY_BACK_LONG);
+    advance(400);
+    UC(ui_list_state(NULL, &n, NULL) == depth && n == 4);
+    ui_set_hooks(&g_hooks);
+    ui_show("home");
+    advance(400);
+}
+
+/* "The library's names aren't counted yet", said before ui_init as the device
+ * says it, still holds after: the toast for boxes waits. (Kept where ui_init
+ * clears, it was lost: on the H2 the toast came at a first start all the same.) */
+static void uc_packs_before_init(const ui_fonts_t *ff)
+{
+    UC(ff != NULL);
+    if (!ff) return;
+    ui_packs_dir("uc-no-packs");
+    settings_set_int("packs.told", 0);
+    sim_packs_all(UI_PACK_ABSENT);
+    lv_obj_t *lab = lv_label_create(lv_screen_active());
+    lv_obj_set_style_text_font(lab, ff->body, 0);
+    lv_label_set_text(lab, "\xE3\x81\x82\xE6\x9D\xB1");     /* boxes: no pack */
+    advance(200);
+    ui_tick_1s();
+    advance(100);
+    UC(ui_test_toast() == NULL && settings_get_int("packs.told", 0) == 0);
+    ui_packs_counted(1);
+    ui_tick_1s();
+    advance(100);
+    UC(ui_test_toast() && strstr(ui_test_toast(), "Language packs"));
+    advance(7000);
+    lv_obj_delete(lab);
+    settings_set_int("packs.told", 0);
+    ui_packs_wanted(1);
+    ui_packs_dir("build/packs");
+    advance(100);
+}
+
+static int ui_check(theme_t *themes, const ui_fonts_t *fonts)
+{
+    lv_tick_set_cb(fake_tick);
+    lv_display_t *d = lv_display_create(UI_W, UI_H);
+    lv_display_set_buffers(d, g_fb, NULL, sizeof g_fb, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(d, null_flush);
+    if (!g_player) { fprintf(stderr, "ui-checks: no player\n"); return 1; }
+    ui_packs_counted(0);                          /* (as the device: said while starting, before ui_init: uc_packs_before_init) */
+    ui_init(lv_screen_active(), themes, g_n_themes, fonts, 1, g_lib, g_player);
+    ui_set_hooks(&g_hooks);
+    ui_set_battery(86, 0);
+    ui_set_theme(0);
+    library_set_found_covers("uc-covers");        /* (in the scratch folder, as everything here) */
+    uc_packs_before_init(fonts);
+    uc_empty_playlists();
+    if (uc_songs()) { fprintf(stderr, "ui-checks: no scratch library\n"); return 1; }
+    ui_library_changed();
+    uc_asleep_marquee();
+    uc_typing_media();
+    uc_shrink();
+    uc_queue_menu();
+    uc_piles();
+    uc_typing_kept();
+    uc_net_follow();
+    uc_delete_armed();
+    uc_help_again();
+    uc_welcome_menu();
+    uc_usb_question();
+    uc_find_cover_np();
+    uc_flow_new_cover();
+    uc_flow_hidden_row();
+    uc_radio_relist();
+    uc_flow_under_np();
+    uc_rename_long();
+    uc_scrub();
+    uc_levelling();
+    uc_radio_waiting();
+    uc_update_no_net();
+    uc_pack_arrives();
+    uc_packs_page();
+    uc_packs_told();
+    uc_packs_shared();
+    uc_packs_order();
+    uc_packs_offer();
+    uc_plain_square();
+    player_pause(g_player, 1);
+    printf("ui-checks: %s\n", g_uc_bad ? "FAILED" : "ok");
+    return g_uc_bad ? 1 : 0;
+}
+
 static int frame(const char *dir, const char *name)
 {
     lv_obj_update_layout(lv_screen_active());
@@ -1598,22 +3315,15 @@ static double cpu_s(void)
     return (double)t.tv_sec + t.tv_nsec / 1e9;
 }
 
-static uint32_t mono_ms_sim(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (uint32_t)(t.tv_sec * 1000 + t.tv_nsec / 1000000);
-}
-
 static unsigned long bench_case(const char *name, int seconds, int max_wait)
 {
     unsigned long wakeups = 0;
-    uint32_t w0 = mono_ms_sim();                  /* the change of screen first, not counted */
-    while (mono_ms_sim() - w0 < 1500) { uint32_t w = lv_timer_handler(); usleep((w > 50 ? 50 : w) * 1000); }
+    uint32_t w0 = clock_ms32();                  /* the change of screen first, not counted */
+    while (clock_ms32() - w0 < 1500) { uint32_t w = lv_timer_handler(); usleep((w > 50 ? 50 : w) * 1000); }
     g_flushes = g_flush_px = g_still_px = 0;
     double c0 = cpu_s();
-    uint32_t t0 = mono_ms_sim();
-    while (mono_ms_sim() - t0 < (uint32_t)seconds * 1000) {
+    uint32_t t0 = clock_ms32();
+    while (clock_ms32() - t0 < (uint32_t)seconds * 1000) {
         uint32_t wait = lv_timer_handler();
         int timeout = wait > (uint32_t)max_wait ? max_wait : (int)wait;
         wakeups++;
@@ -1647,23 +3357,23 @@ static void bench_scroll(const char *name, int seconds, int max_wait)
     unsigned long wakeups = 0, steps = 0;
     g_flushes = g_flush_px = g_still_px = 0;
     double c0 = cpu_s();
-    uint32_t t0 = mono_ms_sim(), next = t0;
-    while (mono_ms_sim() - t0 < (uint32_t)seconds * 1000) {
-        uint32_t now = mono_ms_sim();
+    uint32_t t0 = clock_ms32(), next = t0;
+    while (clock_ms32() - t0 < (uint32_t)seconds * 1000) {
+        uint32_t now = clock_ms32();
         if ((int32_t)(now - next) >= 0) {          /* down for 2 s, up for 2 s */
             ui_key((now - t0) / 2000 % 2 ? UI_KEY_UP : UI_KEY_DOWN);
             next += 60;
             steps++;
         }
         uint32_t wait = lv_timer_handler();
-        int32_t until = (int32_t)(next - mono_ms_sim());
+        int32_t until = (int32_t)(next - clock_ms32());
         int timeout = wait > (uint32_t)max_wait ? max_wait : (int)wait;
         if (until < timeout) timeout = until < 0 ? 0 : until;
         wakeups++;
         if (timeout > 0) usleep((useconds_t)timeout * 1000);
     }
-    uint32_t w0 = mono_ms_sim();                   /* the last animation ends */
-    while (mono_ms_sim() - w0 < 600) { uint32_t w = lv_timer_handler(); usleep((w > 20 ? 20 : w) * 1000); }
+    uint32_t w0 = clock_ms32();                   /* the last animation ends */
+    while (clock_ms32() - w0 < 600) { uint32_t w = lv_timer_handler(); usleep((w > 20 ? 20 : w) * 1000); }
     double c = cpu_s() - c0;
     printf("%-28s %6.1f wakeups/s %6.1f flushes/s %8.0f px/s  cpu %5.2f %%  (%lu steps)\n", name,
            wakeups / (double)seconds, g_flushes / (double)seconds, g_flush_px / (double)seconds,
@@ -1673,7 +3383,7 @@ static void bench_scroll(const char *name, int seconds, int max_wait)
 static int bench(theme_t *themes, const ui_fonts_t *fonts, int seconds)
 {
     uint16_t *fb = g_bench_fb;
-    lv_tick_set_cb(mono_ms_sim);
+    lv_tick_set_cb(clock_ms32);
     lv_display_t *d = lv_display_create(UI_W, UI_H);
     lv_display_set_color_format(d, LV_COLOR_FORMAT_RGB565);
     lv_display_set_buffers(d, fb, NULL, sizeof g_bench_fb, LV_DISPLAY_RENDER_MODE_DIRECT);
@@ -1720,7 +3430,12 @@ static int bench(theme_t *themes, const ui_fonts_t *fonts, int seconds)
 
 /* ---- interactive ---- */
 
+#ifdef FATHOM_SIM_HEADLESS
+/* (built without SDL: no window and no sound; the headless modes are all there is) */
+int out_sdl_create(audio_output_t *out) { (void)out; return -1; }
+#else
 static uint32_t sdl_ticks(void) { return SDL_GetTicks(); }
+#endif
 
 static int g_theme;  /* theme shown now; T cycles from here */
 
@@ -1787,7 +3502,13 @@ static void setup_player(const char *music, int silent)
     mkdir("build/sim-data", 0755);
     settings_load(silent ? "" : "build/sim-data/settings.ini");   /* screenshots: defaults, never saved */
     sim_language_set(settings_get("display.language", ""));
-    g_lib = library_open(DB_PATH, ART_DIR);
+    /* FATHOM_SIM_DB: another library file (a copy with other names, to look at
+     * other scripts); FATHOM_SIM_PACKS: where character packs are (build/packs) */
+    /* FATHOM_SIM_PACK_FIRST: the pack whose shapes draw the characters several have ("zh-hans") */
+    const char *db = getenv("FATHOM_SIM_DB"), *packs = getenv("FATHOM_SIM_PACKS");
+    ui_packs_dir(packs ? packs : "build/packs");
+    ui_packs_first(getenv("FATHOM_SIM_PACK_FIRST"));
+    g_lib = library_open(db && *db ? db : DB_PATH, ART_DIR);
     if (!g_lib) return;
     library_set_playlist_dir(g_lib, "build/sim-data/playlists");
     if (music) {
@@ -1806,7 +3527,7 @@ static void setup_player(const char *music, int silent)
 int main(int argc, char **argv)
 {
     const char *shots = NULL, *motion_dir = NULL, *music = NULL, *lang_file = NULL;
-    int theme = 0, zoom = 3, bench_s = 0, wifi_wait = 0, type_test = 0;
+    int theme = 0, zoom = 3, bench_s = 0, wifi_wait = 0, type_test = 0, ui_checks = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--screenshots") && i + 1 < argc) shots = argv[++i];
         else if (!strcmp(argv[i], "--motion") && i + 1 < argc) motion_dir = argv[++i];
@@ -1816,6 +3537,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--lang-check") && i + 1 < argc) lang_file = argv[++i];
         else if (!strcmp(argv[i], "--wifi-wait")) wifi_wait = 1;
         else if (!strcmp(argv[i], "--type-test")) type_test = wifi_wait = 1;   /* (set up as that test is) */
+        else if (!strcmp(argv[i], "--ui-checks")) ui_checks = wifi_wait = g_bench = 1;   /* (and its songs last, as they do on the H2) */
         else if (!strcmp(argv[i], "--bench")) { bench_s = i + 1 < argc && atoi(argv[i + 1]) > 0 ? atoi(argv[++i]) : 5; g_bench = 1; }
         else { fprintf(stderr, "usage: %s [--theme N] [--zoom Z] [--music DIR] | --screenshots DIR | --motion DIR | --bench [S] | --wifi-wait\n", argv[0]); return 2; }
     }
@@ -1831,7 +3553,7 @@ int main(int argc, char **argv)
     setup_player(music, shots || motion_dir || bench_s || lang_file || wifi_wait);
     if (bench_s) return bench(themes, fonts, bench_s);
     if (wifi_wait) {
-        int bad = type_test ? type_check(themes, fonts) : wifi_wait_check(themes, fonts);
+        int bad = ui_checks ? ui_check(themes, fonts) : type_test ? type_check(themes, fonts) : wifi_wait_check(themes, fonts);
         nftw(scratch, ww_rm, 8, FTW_DEPTH | FTW_PHYS);
         return bad;
     }
@@ -1854,6 +3576,13 @@ int main(int argc, char **argv)
     if (shots) return screenshots(shots, themes, fonts);
     if (motion_dir) return motion(motion_dir, themes, fonts, theme);
 
+#ifdef FATHOM_SIM_HEADLESS
+    (void)zoom;
+    (void)theme;
+    (void)on_key;
+    fprintf(stderr, "fathom-sim: built without SDL (FATHOM_SIM_HEADLESS): the headless modes only\n");
+    return 2;
+#else
     lv_tick_set_cb(sdl_ticks);
     lv_display_t *disp = lv_sdl_window_create(UI_W, UI_H);
     lv_sdl_window_set_zoom(disp, (uint8_t)(zoom < 1 ? 1 : zoom));
@@ -1881,4 +3610,5 @@ int main(int argc, char **argv)
         uint32_t wait = lv_timer_handler();
         SDL_Delay(wait < 5 ? 5 : wait > 16 ? 16 : wait);
     }
+#endif
 }

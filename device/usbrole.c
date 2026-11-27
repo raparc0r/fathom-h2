@@ -44,6 +44,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "core/clock.h"
+#include "gpio_line.h"
+#include "sysfile.h"
+
 #define TICK_MS       250       /* while placing a device as the host */
 #define IDLE_MS       1000      /* otherwise: nothing here needs to be quicker */
 #define NO_VBUS_MS    2000      /* sink -> DRP */
@@ -58,63 +62,13 @@ static int g_cfg1 = -1, g_cfg0 = -1;
 static char g_vbus_state[300];   /* /sys/class/regulator/regulator.N/state of "usb-vbus" */
 static volatile sig_atomic_t g_quit;
 
-static long now_ms(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
-}
-
 /* (with the time since boot: the clock may not be set yet) */
 static void say(const char *fmt, const char *a)
 {
     char msg[300];
     snprintf(msg, sizeof msg, fmt, a);
-    long t = now_ms();
+    long t = (long)clock_ms();
     syslog(LOG_INFO, "[%ld.%02ld] %s", t / 1000, t % 1000 / 10, msg);
-}
-
-static int line_request(const char *chip_label, unsigned line, int value, const char *consumer)
-{
-    int out = -1;
-    for (int i = 0; i < 8 && out < 0; i++) {
-        char path[32];
-        snprintf(path, sizeof path, "/dev/gpiochip%d", i);
-        int fd = open(path, O_RDWR | O_CLOEXEC);
-        if (fd < 0) continue;
-        struct gpiochip_info info;
-        memset(&info, 0, sizeof info);
-        if (ioctl(fd, GPIO_GET_CHIPINFO_IOCTL, &info) == 0 && !strcmp(info.label, chip_label)) {
-            struct gpio_v2_line_request req;
-            memset(&req, 0, sizeof req);
-            req.offsets[0] = line;
-            req.num_lines = 1;
-            req.config.flags = GPIO_V2_LINE_FLAG_OUTPUT;
-            req.config.num_attrs = 1;
-            req.config.attrs[0].attr.id = GPIO_V2_LINE_ATTR_ID_OUTPUT_VALUES;
-            req.config.attrs[0].attr.values = (unsigned)value;
-            req.config.attrs[0].mask = 1;
-            snprintf(req.consumer, sizeof req.consumer, "%s", consumer);
-            if (ioctl(fd, GPIO_V2_GET_LINE_IOCTL, &req) == 0) out = req.fd;
-        }
-        close(fd);
-    }
-    return out;
-}
-
-static void line_set(int fd, int value)
-{
-    struct gpio_v2_line_values v = {.bits = (unsigned)value, .mask = 1};
-    ioctl(fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &v);
-}
-
-static int read_str(const char *path, char *buf, size_t cap)
-{
-    FILE *f = fopen(path, "re");
-    if (!f) return -1;
-    int ok = fgets(buf, (int)cap, f) != NULL;
-    fclose(f);
-    return ok ? 0 : -1;
 }
 
 static void find_vbus_regulator(void)
@@ -124,7 +78,7 @@ static void find_vbus_regulator(void)
     while (d && (e = readdir(d))) {
         char path[300], name[32];
         snprintf(path, sizeof path, "/sys/class/regulator/%s/name", e->d_name);
-        if (read_str(path, name, sizeof name) == 0 && !strncmp(name, "usb-vbus", 8))
+        if (sysfile_line(path, name, sizeof name) == 0 && !strncmp(name, "usb-vbus", 8))
             snprintf(g_vbus_state, sizeof g_vbus_state, "/sys/class/regulator/%s/state", e->d_name);
     }
     if (d) closedir(d);
@@ -134,14 +88,14 @@ static void find_vbus_regulator(void)
 static int we_source(void)
 {
     char s[16];
-    return g_vbus_state[0] && read_str(g_vbus_state, s, sizeof s) == 0 && !strncmp(s, "enabled", 7);
+    return g_vbus_state[0] && sysfile_line(g_vbus_state, s, sizeof s) == 0 && !strncmp(s, "enabled", 7);
 }
 
 /* Someone else supplies VBUS (the PMIC sees it while ours is off). */
 static int other_source(void)
 {
     char s[8];
-    return !we_source() && read_str("/sys/class/power_supply/battery/online", s, sizeof s) == 0 && s[0] == '1';
+    return !we_source() && sysfile_line("/sys/class/power_supply/battery/online", s, sizeof s) == 0 && s[0] == '1';
 }
 
 /* What is on the bus: 0 nothing (yet), 1 a device we can't place yet, 2 an
@@ -157,23 +111,23 @@ static int bus_contents(void)
     while (d && (e = readdir(d))) {
         if (!strncmp(e->d_name, "usb", 3) || e->d_name[0] == '.') continue;   /* root hubs */
         if (strstr(e->d_name, "-0:")) continue;                                /* and their interfaces */
-        char path[300], v[8];
+        char path[300], v[8] = "";       /* (empty unless read: a device not configured yet has no count) */
         if (!strchr(e->d_name, ':')) {                                          /* a device */
             devices++;
             snprintf(path, sizeof path, "/sys/bus/usb/devices/%s/bNumInterfaces", e->d_name);
-            if (read_str(path, v, sizeof v) == 0) want += atoi(v);   /* blank until configured */
+            if (sysfile_line(path, v, sizeof v) == 0) want += atoi(v);   /* blank until configured */
             char vid[8] = "?", pid[8] = "?";
             snprintf(path, sizeof path, "/sys/bus/usb/devices/%s/idVendor", e->d_name);
-            read_str(path, vid, sizeof vid);
+            sysfile_line(path, vid, sizeof vid);
             snprintf(path, sizeof path, "/sys/bus/usb/devices/%s/idProduct", e->d_name);
-            read_str(path, pid, sizeof pid);
+            sysfile_line(path, pid, sizeof pid);
             vid[strcspn(vid, "\n")] = pid[strcspn(pid, "\n")] = '\0';
             if (sl < sizeof seen) sl += (size_t)snprintf(seen + sl, sizeof seen - sl, " %s:%s(%d)", vid, pid, atoi(v));
             continue;
         }
         have++;
         snprintf(path, sizeof path, "/sys/bus/usb/devices/%s/bInterfaceClass", e->d_name);
-        if (read_str(path, v, sizeof v) == 0) {
+        if (sysfile_line(path, v, sizeof v) == 0) {
             if (!strncmp(v, "01", 2)) audio = 1;
             if (!strncmp(v, "09", 2)) hub = 1;
             if (sl < sizeof seen) sl += (size_t)snprintf(seen + sl, sizeof seen - sl, " if%.2s", v);
@@ -192,8 +146,8 @@ static int bus_contents(void)
 
 static void set_drp(int on)
 {
-    line_set(g_cfg1, on);
-    line_set(g_cfg0, on);
+    gpio_line_set(g_cfg1, on);
+    gpio_line_set(g_cfg0, on);
     say("%s", on ? "dual role (looking for a USB DAC)" : "sink only");
 }
 
@@ -203,8 +157,8 @@ int main(void)
 {
     openlog("usbrole", isatty(2) ? LOG_PERROR : 0, LOG_DAEMON);
     /* Start as the bootloader leaves the chip: sink. */
-    g_cfg1 = line_request("GPIOB", 30, 0, "tcs1421-cfg1");
-    g_cfg0 = line_request("GPIOD", 5, 0, "tcs1421-cfg0");
+    g_cfg1 = gpio_line_request("GPIOB", 30, 0, "tcs1421-cfg1");
+    g_cfg0 = gpio_line_request("GPIOD", 5, 0, "tcs1421-cfg0");
     if (g_cfg1 < 0 || g_cfg0 < 0) { syslog(LOG_ERR, "CFG pins: %m"); return 1; }
     find_vbus_regulator();
     if (!g_vbus_state[0]) say("%s", "no usb-vbus regulator: host detection off");
@@ -216,12 +170,12 @@ int main(void)
     int pc_seen = 0;                 /* in DRP, someone else supplied VBUS */
     int retry_ms = RETRY_MS;         /* DRP again after a device that never showed up */
     say("%s", "sink only");
-    long last = now_ms();
+    long last = (long)clock_ms();
     int tick = IDLE_MS;
     while (!g_quit) {
         struct timespec ts = {tick / 1000, (tick % 1000) * 1000000L};
         nanosleep(&ts, NULL);
-        long t = now_ms();
+        long t = (long)clock_ms();
         int dt = (int)(t - last);      /* (timers count what really went by) */
         last = t;
         tick = IDLE_MS;

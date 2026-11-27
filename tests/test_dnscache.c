@@ -18,10 +18,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "core/clock.h"
 #include "net/dnscache.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: CHECK(%s)\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_util.h"
 
 static uint32_t t_now = 1000;
 static uint32_t fake_clock(void) { return t_now; }
@@ -30,13 +29,6 @@ static int lookups, frees, fail_with;
 static char last_node[256];
 static int last_family = -1;       /* the hints' family at the last lookup (-1: no hints) */
 static volatile int hold;          /* lookups don't come back while it's set (a slow router) */
-
-static uint32_t real_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000);
-}
 
 /* Until the background has nothing left to look up */
 static void settle(void)
@@ -114,13 +106,13 @@ static void test_kept(void)
      * answering, holds nothing up), and asked again in the background */
     t_now += DNSCACHE_FRESH_MS;
     hold = 1;
-    uint32_t w0 = real_ms();
+    uint32_t w0 = clock_ms32();
     for (int i = 0; i < 3; i++) {                    /* (a burst of connections) */
         r = NULL;
         CHECK(ask("stream.example.org", "443", &r) == 0 && r && port_of(r) == 443);
         dnscache_freeaddrinfo(r, fake_free);
     }
-    CHECK(real_ms() - w0 < 1000 && frees == 1);      /* not waited for; ours, not the real free's */
+    CHECK(clock_ms32() - w0 < 1000 && frees == 1);      /* not waited for; ours, not the real free's */
     hold = 0;
     settle();
     CHECK(lookups == 2 && frees == 2);               /* asked again once, its result freed */
@@ -309,7 +301,5 @@ int main(void)
     test_many_out();
     test_prefetch();
     test_ipv4_only();
-    if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
-    printf("dnscache: ok\n");
-    return 0;
+    return t_result();
 }

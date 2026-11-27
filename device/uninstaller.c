@@ -17,6 +17,7 @@
  * The battery is the player's to check (main.c), before apply.
  */
 #include "uninstaller.h"
+#include "core/thread.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -116,7 +117,7 @@ static int find_and_check(upt_t *u, char *name, size_t cap, int writable)
 static void *check_thread(void *arg)
 {
     (void)arg;
-    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);
+    thread_nice(19);
     upt_t u;
     char name[256];
     u.fd = -1;
@@ -132,7 +133,7 @@ static void *check_thread(void *arg)
 static void *apply_thread(void *arg)
 {
     (void)arg;
-    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);
+    thread_nice(19);
     upt_t u;
     char name[256], p[600];
     u.fd = -1;
@@ -181,18 +182,12 @@ static void start(void *(*fn)(void *))
     if (N.running) { pthread_mutex_unlock(&N.mu); return; }
     N.running = 1;
     pthread_mutex_unlock(&N.mu);
-    pthread_t t;
-    pthread_attr_t a;
-    pthread_attr_init(&a);
-    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&a, 64 * 1024);
-    if (pthread_create(&t, &a, fn, NULL)) {
+    if (thread_detached(fn, NULL, 64 * 1024)) {
         pthread_mutex_lock(&N.mu);
         N.running = 0;
         pthread_mutex_unlock(&N.mu);
         fail("Couldn't use the update file", 0);
     }
-    pthread_attr_destroy(&a);
 }
 
 void uninstaller_do(int what)

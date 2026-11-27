@@ -35,6 +35,7 @@ static int back_long_fired;
 static int power_down, power_off_fired;
 static int screen_on = 1;        /* as the caller last said (input_set_screen) */
 static int power_woke;           /* Power went down with the screen off: said on the press, not the release */
+static int power_screen;         /* the screen as Power went down */
 static int menu_down, menu_long_fired, menu_chord;   /* Menu held; quick settings sent; wheel turned */
 static uint32_t menu_since;
 static int track_key;             /* Prev/Next held: UI_KEY_PREV or UI_KEY_NEXT, -1 if none */
@@ -200,14 +201,17 @@ static void on_key(int code, int value, uint32_t now)
          * the release, so that holding it for power-off doesn't blank the
          * screen first. On is said on the press: nothing to wait for with
          * the screen dark, and the release came 80 to 200 ms later, all of it
-         * added to every wake. That press's release then says nothing. */
+         * added to every wake. That press's release then says nothing. Nor
+         * does a release that finds the screen gone off by itself since the
+         * press (its timeout): "switch the screen" then turned it back on. */
         if (press) {
             power_down = 1; power_since = now; power_off_fired = 0;
             power_woke = !screen_on;
+            power_screen = screen_on;
             if (power_woke) push(IN_POWER, 0);
         } else if (power_down) {
             power_down = 0;
-            if (!power_off_fired && !power_woke) push(IN_POWER, 0);
+            if (!power_off_fired && !power_woke && screen_on == power_screen) push(IN_POWER, 0);
             power_woke = 0;
         }
         break;

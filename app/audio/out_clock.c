@@ -11,6 +11,7 @@
 #include <time.h>
 
 #include "audio/output.h"
+#include "core/clock.h"
 
 typedef struct {
     pthread_mutex_t lock;
@@ -23,13 +24,6 @@ typedef struct {
 
 static clock_out_t g_clock = {.lock = PTHREAD_MUTEX_INITIALIZER};
 
-static double now(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (double)t.tv_sec + t.tv_nsec / 1e9;
-}
-
 /* Frames the "listener" has heard so far. */
 static unsigned long long heard(clock_out_t *c, double t)
 {
@@ -41,7 +35,7 @@ static unsigned long long heard(clock_out_t *c, double t)
 
 static void restart(clock_out_t *c)
 {
-    c->start = now();
+    c->start = clock_fsec();
     c->written = 0;
 }
 
@@ -61,7 +55,7 @@ static long c_write(void *ctx, const int32_t *f, long n)
     clock_out_t *c = ctx;
     for (;;) {
         pthread_mutex_lock(&c->lock);
-        double t = now();
+        double t = clock_fsec();
         if (!c->paused && heard(c, t) >= c->written)
             restart(c);                                  /* ran dry: rebase the clock on now */
         long ahead = (long)(c->written - heard(c, t));
@@ -81,7 +75,7 @@ static long c_delay(void *ctx)
 {
     clock_out_t *c = ctx;
     pthread_mutex_lock(&c->lock);
-    long d = (long)(c->written - heard(c, now()));
+    long d = (long)(c->written - heard(c, clock_fsec()));
     pthread_mutex_unlock(&c->lock);
     return d;
 }
@@ -107,7 +101,7 @@ static void c_pause(void *ctx, int on)
 {
     clock_out_t *c = ctx;
     pthread_mutex_lock(&c->lock);
-    double t = now();
+    double t = clock_fsec();
     if (on && !c->paused) { c->paused = 1; c->paused_at = t; }
     else if (!on && c->paused) { c->paused = 0; c->start += t - c->paused_at; }
     pthread_mutex_unlock(&c->lock);

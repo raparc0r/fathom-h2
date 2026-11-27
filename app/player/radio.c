@@ -4,6 +4,7 @@
 #include "core/fsafe.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,21 +84,16 @@ int radio_parse(const char *text, radio_station_t *out, int max)
     return n;
 }
 
+static char *read_text(const char *path, int *over);
+
 int radio_load(const char *path, radio_station_t *out, int max)
 {
-    FILE *f = fopen(path, "rbe");
-    if (!f) return -1;
-    char *buf = malloc(65536);
-    if (!buf) { fclose(f); return -1; }
-    size_t n = fread(buf, 1, 65535, f);
-    fclose(f);
-    buf[n] = '\0';
-    char *t = buf;
-    if (n >= 3 && (unsigned char)t[0] == 0xef && (unsigned char)t[1] == 0xbb && (unsigned char)t[2] == 0xbf) t += 3;
+    char *t = read_text(path, NULL);                /* (all of it, a BOM dropped) */
+    if (!t) return -1;
     for (char *c = t; *c; c++)
         if (*c == '\r') *c = '\n';                   /* Windows and old Mac line ends */
     int r = radio_parse(t, out, max);
-    free(buf);
+    free(t);
     return r;
 }
 
@@ -121,21 +117,43 @@ int radio_load_list(const char *path, const char *example, radio_station_t *out,
 
 /* ---------- changing the list ---------- */
 
-#define LIST_MAX 65536
+#define LIST_MAX (1024 * 1024)   /* no list is longer: 64 stations' lines are under 80 KB, the rest is notes */
+#define LINE_ROOM 1538           /* (room kept after a list's text for one more line: radio_add) */
 
-/* A file's text (NUL-terminated, a BOM dropped), or NULL: there's none, or
- * (*over set) it is longer than is held here. Such a list is shown as far as
- * it's read and never written back: what was past the end would be lost. */
+/* A file's text (NUL-terminated, a BOM dropped, LINE_ROOM spare after it), or
+ * NULL: there's none, or (*over set) it is there and not all of it is held
+ * here: longer than LIST_MAX, or it couldn't be read (the card not answering,
+ * no memory). Such a list is never written back: what wasn't read would be
+ * lost. (A list that couldn't be read counted as none, and the next station
+ * added or removed wrote a new one, made from the example, over the owner's.)
+ * Without `over`, what could be read of it. All of a list is read, whatever
+ * its length: the first 64 KB were, and the stations after that weren't shown,
+ * without a word. */
 static char *read_text(const char *path, int *over)
 {
     if (over) *over = 0;
     FILE *f = path ? fopen(path, "rbe") : NULL;
-    if (!f) return NULL;
-    char *buf = malloc(LIST_MAX);
-    size_t n = buf ? fread(buf, 1, LIST_MAX - 1, f) : 0;
-    int more = buf && n == LIST_MAX - 1 && fgetc(f) != EOF;
+    if (!f) {
+        if (over && path && errno != ENOENT) *over = 1;
+        return NULL;
+    }
+    size_t cap = 8192, n = 0;
+    char *buf = malloc(cap + LINE_ROOM);
+    int more = !buf;
+    while (buf) {
+        n += fread(buf + n, 1, cap - 1 - n, f);
+        if (n < cap - 1) { more = ferror(f); break; }          /* its end (or the card stopped answering) */
+        if (cap >= LIST_MAX) { more = fgetc(f) != EOF; break; }
+        char *b = realloc(buf, cap * 2 + LINE_ROOM);
+        if (!b) { more = 1; break; }
+        buf = b;
+        cap *= 2;
+    }
     fclose(f);
-    if (!buf) return NULL;
+    if (!buf) {
+        if (over) *over = 1;
+        return NULL;
+    }
     if (more && over) {
         *over = 1;
         free(buf);
@@ -163,7 +181,7 @@ static int line_station(const char *a, const char *b, radio_station_t *st)
 static const char NEW_LIST[] =
     "# Your internet radio stations (Home > Radio), in this order. One per line:\n"
     "#   Name = stream URL\n"
-    "# Lines starting with # are notes. Find stations on the H2 adds stations here;\n"
+    "# Lines starting with # are notes. Find stations on the player adds stations here;\n"
     "# Menu on one in Home > Radio removes it.\n\n";
 
 /* The list's text: the file, or until there's one, a new list with the example's stations. */
@@ -172,14 +190,15 @@ static char *list_text(const char *path, const char *example)
     int over;
     char *t = read_text(path, &over);
     if (t || over) return t;
-    t = malloc(LIST_MAX);
-    if (!t) return NULL;
-    size_t n = (size_t)snprintf(t, LIST_MAX, "%s", NEW_LIST);
     char *ex = read_text(example, NULL);
+    size_t cap = sizeof NEW_LIST + (ex ? strlen(ex) : 0) + 2 + LINE_ROOM;   /* (the example's lines, each with a line end) */
+    t = malloc(cap);
+    if (!t) { free(ex); return NULL; }
+    size_t n = (size_t)snprintf(t, cap, "%s", NEW_LIST);
     for (const char *line = ex; line && *line;) {
         const char *end = strchr(line, '\n'), *stop = end ? end : line + strlen(line);
         radio_station_t st;
-        if (line_station(line, stop, &st) && n + (size_t)(stop - line) + 2 < LIST_MAX) {
+        if (line_station(line, stop, &st)) {
             memcpy(t + n, line, (size_t)(stop - line));
             n += (size_t)(stop - line);
             while (n && t[n - 1] == '\r') n--;
@@ -194,17 +213,7 @@ static char *list_text(const char *path, const char *example)
 
 static int write_text(const char *path, const char *text)
 {
-    char tmp[600];
-    snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    FILE *f = fopen(tmp, "wbe");
-    if (!f) return -1;
-    size_t n = strlen(text);
-    int ok = fwrite(text, 1, n, f) == n;
-    ok = fflush(f) == 0 && ok;
-    ok = fsync(fileno(f)) == 0 && ok;
-    ok = fclose(f) == 0 && ok;
-    if (!ok || file_replace(tmp, path)) { unlink(tmp); return -1; }
-    return 0;
+    return file_write_whole(path, text, strlen(text), NULL, 0);
 }
 
 void radio_line(const radio_station_t *st, char *out, size_t cap)

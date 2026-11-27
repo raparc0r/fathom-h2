@@ -8,8 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int fails;
-#define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
+#include "test_util.h"
 
 int main(void)
 {
@@ -32,6 +31,21 @@ int main(void)
         "  \"steps\" : { \"c_7\" : { \"title\" : \"Next\", \"highlightedArtists\" : [ \"Later\", \"X\" ] } } }";
     CHECK(rf_parse(k, a, sizeof a, t, sizeof t, v, sizeof v) == 0);
     CHECK(!strcmp(t, "Next") && !strcmp(a, "Later") && v[0] == '\0');
+
+    /* the cover's address goes to a fetch: only one on the network is one
+     * (a file's path, file:, another scheme: the song's info without a cover) */
+    static const char *const not_web[] = {"/mnt/sdcard/Music/cover.jpg", "file:///etc/passwd", "crypto:file:///x.jpg",
+                                          "ftp://example.org/c.jpg", "//example.org/c.jpg", " https://example.org/c.jpg", ""};
+    for (int i = 0; i < 7; i++) {
+        char js[320];
+        snprintf(js, sizeof js, "{\"levels\":[{\"position\":0,\"items\":[\"c_7\"]}],"
+                 "\"steps\":{\"c_7\":{\"title\":\"Next\",\"visual\":\"%s\"}}}", not_web[i]);
+        snprintf(v, sizeof v, "x");
+        CHECK(rf_parse(js, a, sizeof a, t, sizeof t, v, sizeof v) == 0 && !strcmp(t, "Next") && v[0] == '\0');
+    }
+    CHECK(rf_parse("{\"levels\":[{\"position\":0,\"items\":[\"c_7\"]}],"
+                   "\"steps\":{\"c_7\":{\"title\":\"Next\",\"visual\":\"http://example.org/c?id=1\"}}}",
+                   a, sizeof a, t, sizeof t, v, sizeof v) == 0 && !strcmp(v, "http://example.org/c?id=1"));
 
     CHECK(rf_parse("{\"levels\":[{\"items\":[\"z\"],\"position\":0}],\"steps\":{}}", a, sizeof a, t, sizeof t, NULL, 0) != 0);
     CHECK(rf_parse("{\"levels\":[{\"items\":[],\"position\":0}]}", a, sizeof a, t, sizeof t, NULL, 0) != 0);
@@ -80,6 +94,12 @@ int main(void)
     CHECK(rf_next_fetch_s(1763900200, 1763900420, 1763900180) == RF_POLL_S);       /* nonsense */
     CHECK(rf_next_fetch_s(1763900200, 1763900180, 1763900180 + 5 * 3600) == RF_POLL_S);
 
+    /* a request that gave nothing: asked again after 5 s, then less and less
+     * often while they go on failing (every 5 s for ever, it was) */
+    CHECK(rf_retry_s(1) == 5 && rf_retry_s(2) == 15 && rf_retry_s(3) == 60);
+    CHECK(rf_retry_s(4) == RF_POLL_MAX_S && rf_retry_s(5) == RF_POLL_MAX_S && rf_retry_s(1000000) == RF_POLL_MAX_S);
+    CHECK(rf_retry_s(0) == 5 && rf_retry_s(-1) == 5);                              /* (none counted: as the first) */
+
     CHECK(rf_station("radiofrance:7") == 7);
     CHECK(rf_station("radiofrance:") == -1);
     CHECK(rf_station("other:7") == -1);
@@ -87,6 +107,5 @@ int main(void)
     rf_url(7, u, sizeof u);
     CHECK(!strcmp(u, "https://api.radiofrance.fr/livemeta/pull/7"));
 
-    if (!fails) printf("rfmeta: ok\n");
-    return fails != 0;
+    return t_result();
 }

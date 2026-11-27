@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -18,16 +19,7 @@
 #include "library/library.h"
 #include "net/radiodir.h"
 #include "net/radioicon.h"
-#include "tmpdir.h"
-
-static int fails;
-#define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
-
-static void nap(int ms)
-{
-    struct timespec t = {ms / 1000, (ms % 1000) * 1000000L};
-    nanosleep(&t, NULL);
-}
+#include "test_util.h"
 
 /* ---- a small PNG (RGB, 8 bits, rows unfiltered), one colour ---- */
 
@@ -119,6 +111,7 @@ static long make_ico_chunk(unsigned char *out, uint32_t len, size_t has)
 
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static int calls, offline, slow_ms, reach;   /* reach: the "unreachable" servers answer now */
+static int signed_in;                        /* a "portal" address gives its picture, not the network's sign-in page */
 static char asked[32][96];
 
 static long fake_fetch(const char *url, char *buf, size_t cap, const volatile int *abort)
@@ -127,7 +120,7 @@ static long fake_fetch(const char *url, char *buf, size_t cap, const volatile in
     if (calls < 32) snprintf(asked[calls], sizeof asked[calls], "%s", url);
     calls++;
     pthread_mutex_unlock(&mu);
-    for (int t = 0; t < slow_ms && !(abort && *abort); t += 10) nap(10);
+    for (int t = 0; t < slow_ms && !(abort && *abort); t += 10) t_sleep_ms(10);
     if (abort && *abort) return -1;
     if (offline || (strstr(url, "unreachable") && !reach)) return -1;
     /* stations' own sites: their pages, and what the pages name */
@@ -165,6 +158,7 @@ static long fake_fetch(const char *url, char *buf, size_t cap, const volatile in
         strstr(url, "touch.example/") || strstr(url, "rel.example/") || strstr(url, "long.example/"))
         return -3;                                                    /* anything else there: not found */
     if (strstr(url, "gone")) return -3;
+    if (strstr(url, "portal") && !signed_in) return snprintf(buf, cap, "<html><body>Sign in to the Wi-Fi</body></html>");
     if (strstr(url, "huge")) { memset(buf, 'x', cap - 1); buf[cap - 1] = '\0'; return -2; }
     if (strstr(url, "empty")) { buf[0] = '\0'; return 0; }
     if (strstr(url, "svg")) return snprintf(buf, cap, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1 1\"/>");
@@ -207,8 +201,6 @@ static long fake_dir(const char *url, char *buf, size_t cap, const volatile int 
     return snprintf(buf, cap, "[]");                 /* a stream the directory doesn't have */
 }
 
-static long size_of(const char *path);
-
 static int dir_asked_for(const char *stream_tail)
 {
     int k = 0;
@@ -223,7 +215,7 @@ static long tpic(const char *dir, const char *stream)
     char id[13], p[700];
     ricon_stream_id(stream, id);
     snprintf(p, sizeof p, "%s/%s.565", dir, id);
-    return id[0] ? size_of(p) : -1;
+    return id[0] ? t_file_size(p) : -1;
 }
 
 static int tmarked(const char *dir, const char *stream)
@@ -231,7 +223,7 @@ static int tmarked(const char *dir, const char *stream)
     char id[13], p[700];
     ricon_stream_id(stream, id);
     snprintf(p, sizeof p, "%s/%s.none", dir, id);
-    return id[0] && size_of(p) == 0;
+    return id[0] && t_file_size(p) == 0;
 }
 
 static int asked_for(const char *url)
@@ -245,21 +237,15 @@ static int asked_for(const char *url)
 
 static void settle(void)
 {
-    for (int i = 0; i < 1000 && ricon_busy(); i++) nap(10);
+    for (int i = 0; i < 1000 && ricon_busy(); i++) t_sleep_ms(10);
     CHECK(!ricon_busy());
-}
-
-static long size_of(const char *path)
-{
-    struct stat sb;
-    return stat(path, &sb) == 0 ? (long)sb.st_size : -1;
 }
 
 /* the size of an icon's picture file (-1: none), and whether it's marked as no use */
 static long pic(const char *url)
 {
     char p[700];
-    return ricon_path(url, p, sizeof p) == 0 ? size_of(p) : -1;
+    return ricon_path(url, p, sizeof p) == 0 ? t_file_size(p) : -1;
 }
 
 static int marked(const char *url)
@@ -267,7 +253,17 @@ static int marked(const char *url)
     char p[700];
     if (ricon_path(url, p, sizeof p)) return 0;
     memcpy(p + strlen(p) - 3, "none", 5);
-    return size_of(p) == 0;
+    return t_file_size(p) == 0;
+}
+
+/* an address's mark, made `days` days ago: 0, or -1 (it has none) */
+static int age_mark(const char *url, int days)
+{
+    char p[700];
+    if (ricon_path(url, p, sizeof p)) return -1;
+    memcpy(p + strlen(p) - 3, "none", 5);
+    struct timeval tv[2] = {{time(NULL) - (time_t)days * 86400, 0}, {time(NULL) - (time_t)days * 86400, 0}};
+    return utimes(p, tv);
 }
 
 static int files_in(const char *dir)
@@ -286,7 +282,7 @@ static long spic(const char *dir, const char *site)
     char id[13], p[700];
     ricon_site_id(site, id);
     snprintf(p, sizeof p, "%s/%s.565", dir, id);
-    return id[0] ? size_of(p) : -1;
+    return id[0] ? t_file_size(p) : -1;
 }
 
 static int smarked(const char *dir, const char *site)
@@ -294,7 +290,7 @@ static int smarked(const char *dir, const char *site)
     char id[13], p[700];
     ricon_site_id(site, id);
     snprintf(p, sizeof p, "%s/%s.none", dir, id);
-    return id[0] && size_of(p) == 0;
+    return id[0] && t_file_size(p) == 0;
 }
 
 static radio_station_t station(const char *name, const char *icon)
@@ -310,8 +306,7 @@ static radio_station_t station(const char *name, const char *icon)
 int main(void)
 {
     char tmpl[512], dir[600], p[700], q[720];
-    test_tmp(tmpl, sizeof tmpl, "fathom-radioicon");
-    if (!mkdtemp(tmpl)) return 1;
+    t_mkdtemp(tmpl, sizeof tmpl, "fathom-radioicon");
     snprintf(dir, sizeof dir, "%s/radio-icons", tmpl);
     enum { SMALL = LIB_ART_SMALL * LIB_ART_SMALL * 2, BOTH = SMALL + LIB_ART_LARGE * LIB_ART_LARGE * 2 };
     CHECK(SMALL == 2312 && BOTH == 39304);
@@ -433,14 +428,14 @@ int main(void)
     settle();
     CHECK(pic(st[1].icon) == BOTH && marked(st[2].icon));               /* still in the list */
     CHECK(pic(st[0].icon) == -1 && !marked(st[3].icon) && pic(st[n - 1].icon) == -1);
-    CHECK(size_of(p) == -1 && size_of(q) == 1 && calls == before);
+    CHECK(t_file_size(p) == -1 && t_file_size(q) == 1 && calls == before);
     CHECK(files_in(dir) == 3);
     ricon_sync(NULL, -1, 1);                                             /* no list (it couldn't be read): nothing touched */
     settle();
     CHECK(files_in(dir) == 3);
     ricon_sync(NULL, 0, 1);                                              /* an empty list: none are anyone's */
     settle();
-    CHECK(files_in(dir) == 1 && size_of(q) == 1);
+    CHECK(files_in(dir) == 1 && t_file_size(q) == 1);
 
     /* a list given while a run is under way gets its own run after it */
     slow_ms = 300;
@@ -457,7 +452,7 @@ int main(void)
     /* stopped mid-fetch: the run ends, nothing half-written; started again, it's fetched */
     slow_ms = 3000;
     ricon_sync(st, 2, 1);
-    nap(30);
+    t_sleep_ms(30);
     time_t t0 = time(NULL);
     ricon_stop();
     CHECK(!ricon_busy() && time(NULL) - t0 <= 2 && pic(st[1].icon) == -1);
@@ -716,7 +711,7 @@ int main(void)
         ricon_stream_id(ds[5].url, own);
         snprintf(memo, sizeof memo, "%s/%s.dir", ddir, own);
         int asked1 = dir_asked_for("%2Fmemo");
-        CHECK(asked1 >= 1 && asked1 <= 3 && size_of(memo) > 0 && tpic(ddir, ds[5].url) == -1 && !tmarked(ddir, ds[5].url));
+        CHECK(asked1 >= 1 && asked1 <= 3 && t_file_size(memo) > 0 && tpic(ddir, ds[5].url) == -1 && !tmarked(ddir, ds[5].url));
         CHECK(asked_for("https://unreachable.example/memo.png") == 1);
         calls = 0;
         ricon_sync(ds, d, 1);
@@ -726,7 +721,7 @@ int main(void)
         reach = 1;                                                    /* the servers are back: the logos, and the memo's */
         ricon_sync(ds, d, 1);
         settle();
-        CHECK(dir_asked_for("%2Fmemo") == asked1 && tpic(ddir, ds[5].url) == BOTH && size_of(memo) == -1);
+        CHECK(dir_asked_for("%2Fmemo") == asked1 && tpic(ddir, ds[5].url) == BOTH && t_file_size(memo) == -1);
         CHECK(pic(ds[0].icon) == BOTH && pic(ds[4].icon) == BOTH);
         ricon_station_id(&ds[0], own);                                /* its own logo again, now that it's there */
         ricon_id(ds[0].icon, want);
@@ -797,6 +792,40 @@ int main(void)
         ricon_stop();
     }
 
+    /* ---- a mark of "no use" is good for a week: a logo marked so for a
+     * network's sign-in page answered in its place (or a "too many requests")
+     * is asked for again then, and one that's still no use marked afresh ---- */
+    {
+        char adir[600];
+        snprintf(adir, sizeof adir, "%s/aged", tmpl);
+        CHECK(ricon_start(adir) == 0);
+        ricon_test_forget_unreached();
+        radio_station_t ag[2];
+        ag[0] = station("portal", "https://img.example/portal-logo.png");
+        ag[1] = station("gone", "https://img.example/gone-for-good.png");
+        for (int i = 0; i < 2; i++) snprintf(ag[i].url, sizeof ag[i].url, "http://192.168.1.5/s%d", i);   /* (not for the directory) */
+        calls = 0;
+        signed_in = 0;
+        ricon_sync(ag, 2, 1);
+        settle();
+        CHECK(calls == 2 && marked(ag[0].icon) && marked(ag[1].icon) && pic(ag[0].icon) == -1);
+        signed_in = 1;
+        CHECK(age_mark(ag[0].icon, 6) == 0 && age_mark(ag[1].icon, 6) == 0);
+        ricon_sync(ag, 2, 1);
+        settle();
+        CHECK(calls == 2 && marked(ag[0].icon));                         /* six days: not asked again */
+        CHECK(age_mark(ag[0].icon, 8) == 0 && age_mark(ag[1].icon, 8) == 0);
+        ricon_sync(ag, 2, 1);
+        settle();
+        CHECK(calls == 4);                                               /* eight: both asked again */
+        CHECK(pic(ag[0].icon) == BOTH && !marked(ag[0].icon));           /* the picture, and its mark gone */
+        CHECK(pic(ag[1].icon) == -1 && marked(ag[1].icon));
+        ricon_sync(ag, 2, 1);
+        settle();
+        CHECK(calls == 4);                                               /* marked afresh: not again for a week */
+        ricon_stop();
+    }
+
     /* ---- a page's tags as pages write them: an attribute with no value, no
      * space after a quoted one, spaces round the "=" (each lost the href) ---- */
     {
@@ -829,9 +858,6 @@ int main(void)
         alarm(0);
     }
 
-    char cmd[700];
-    snprintf(cmd, sizeof cmd, "rm -rf '%s'", tmpl);
-    if (system(cmd)) {}
-    if (!fails) printf("radioicon: ok\n");
-    return fails != 0;
+    t_rm_rf(tmpl);
+    return t_result();
 }

@@ -53,7 +53,9 @@ int uninstall_pending(const char *card);
 /* At start: a record whose update.upt is no longer the HiBy file it made
  * ready (HiBy's recovery installed it and Fathom was installed again, or the
  * files were moved by hand) is forgotten, the files left as they are, so a
- * later cancel can't rename what's there now. 1 if it was. */
+ * later cancel can't rename what's there now. One left by an Apply that was
+ * cut short (HiBy's file half changed, or not yet named update.upt) is
+ * cancelled instead: the file and the names put back. 1 if either. */
 int uninstall_forget_stale(const char *card);
 
 /* The space it needs on the card, in MB (the file's size and the spare), and

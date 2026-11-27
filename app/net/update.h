@@ -27,6 +27,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "net/http.h"
+
 #define UPDATE_API "https://api.github.com/repos/raparc0r/fathom-h2/releases/latest"
 
 /* "v0.7.0", "0.7.0", "v0.7.0-12-gabc1234", "v0.7.0-dirty": 0 and v[3].
@@ -67,8 +69,7 @@ enum {
 const char *update_error_text(int err);
 
 /* SHA-256 of a file, as hex: 0, -1. progress may be NULL. */
-typedef void (*update_progress_fn)(uint64_t done, uint64_t total, void *ctx);
-int update_file_sha256(const char *path, char hex[65], update_progress_fn progress, void *ctx,
+int update_file_sha256(const char *path, char hex[65], http_progress_fn progress, void *ctx,
                        const volatile int *abort);
 
 /* Bytes free where path is (statvfs), and the card's cluster size. */
@@ -80,7 +81,7 @@ int64_t update_stage_needs(const char *zip_path, long cluster, int64_t kernel_si
 /* Unpack the release's sd/ from zip_path into STAGE/sd (STAGE created),
  * checking every file against about/SHA256SUMS; STAGE/READY is written last.
  * progress: bytes written of the sd/ files' total. UPDATE_OK or an error. */
-int update_stage(const char *zip_path, const char *stage, update_progress_fn progress, void *ctx,
+int update_stage(const char *zip_path, const char *stage, http_progress_fn progress, void *ctx,
                  const volatile int *abort);
 
 /* Install STAGE/sd onto the card (card: its top folder), as above; STAGE is

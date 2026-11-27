@@ -4,6 +4,8 @@
 #define _GNU_SOURCE   /* memmem */
 #include "net/podcast.h"
 #include "core/fsafe.h"
+#include "core/datetime.h"
+#include "core/utf8.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -84,16 +86,9 @@ static int xr_tag(xr_t *x, char *name, size_t cap, const char **attrs, const cha
 static void put_utf8(char *out, size_t cap, size_t *n, unsigned long c)
 {
     char b[4];
-    int k;
-    if (c < 0x80) { b[0] = (char)c; k = 1; }
-    else if (c < 0x800) { b[0] = (char)(0xC0 | c >> 6); b[1] = (char)(0x80 | (c & 0x3F)); k = 2; }
-    else if (c < 0x10000) {
-        b[0] = (char)(0xE0 | c >> 12); b[1] = (char)(0x80 | ((c >> 6) & 0x3F)); b[2] = (char)(0x80 | (c & 0x3F)); k = 3;
-    } else if (c < 0x110000) {
-        b[0] = (char)(0xF0 | c >> 18); b[1] = (char)(0x80 | ((c >> 12) & 0x3F));
-        b[2] = (char)(0x80 | ((c >> 6) & 0x3F)); b[3] = (char)(0x80 | (c & 0x3F)); k = 4;
-    } else return;
-    if (*n + (size_t)k < cap) { memcpy(out + *n, b, (size_t)k); *n += (size_t)k; }
+    if (c >= 0x110000) return;
+    size_t k = utf8_encode((uint32_t)c, b);
+    if (*n + k < cap) { memcpy(out + *n, b, k); *n += k; }
 }
 
 /* Text with its entities decoded, markup dropped and white space collapsed
@@ -210,17 +205,18 @@ static int xr_attr(const char *a, const char *end, const char *name, char *out, 
     return 0;
 }
 
-/* ---------- dates, lengths, names ---------- */
-
-static int64_t days_from_civil(int y, int m, int d)
+/* An address kept whole or not at all ("": cut at cap - 1 bytes it would be
+ * another address, fetched and failing for good; a cut image's marked the
+ * cover as dealt with). v: as read, with room for 8 bytes more than cap. */
+static void whole_address(const char *v, char *out, size_t cap)
 {
-    y -= m <= 2;
-    int64_t era = (y >= 0 ? y : y - 399) / 400;
-    int64_t yoe = y - era * 400;
-    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + doe - 719468;
+    size_t n = strlen(v);
+    if (n >= cap) n = 0;
+    memcpy(out, v, n);
+    out[n] = '\0';
 }
+
+/* ---------- dates, lengths, names ---------- */
 
 int64_t pod_parse_date(const char *s)
 {
@@ -236,7 +232,7 @@ int64_t pod_parse_date(const char *s)
         /* ISO 8601 (some feeds): 2026-11-19T05:00:00Z */
         int y, mo, dd, hh = 0, mi = 0, ss = 0;
         if (sscanf(s, "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &dd, &hh, &mi, &ss) >= 3 && mo >= 1 && mo <= 12)
-            return days_from_civil(y, mo, dd) * 86400 + (int64_t)hh * 3600 + mi * 60 + ss;
+            return dt_days_from_civil(y, mo, dd) * 86400 + (int64_t)hh * 3600 + mi * 60 + ss;
         return 0;
     }
     s = e;
@@ -269,7 +265,7 @@ int64_t pod_parse_date(const char *s)
         for (size_t i = 0; i < sizeof Z / sizeof Z[0]; i++)
             if (!strncasecmp(s, Z[i].z, 3)) off = Z[i].h * 60;
     }
-    return days_from_civil((int)y, m + 1, (int)d) * 86400 + (int64_t)hh * 3600 + mi * 60 + ss - (int64_t)off * 60;
+    return dt_days_from_civil((int)y, m + 1, (int)d) * 86400 + (int64_t)hh * 3600 + mi * 60 + ss - (int64_t)off * 60;
 }
 
 #define POD_MAX_DURATION (INT32_MAX / 1000)   /* seconds: ~24.8 days */
@@ -407,23 +403,29 @@ int pod_parse_feed(const char *xml, size_t len, pod_show_t *show, pod_episode_t 
                 xr_text(&x, name, d, sizeof d);
                 cur.dur_s = pod_parse_duration(d);
             } else if (!strcmp(name, "enclosure") && !cur.url[0]) {
-                char v[32];
-                xr_attr(a, ae, "url", cur.url, sizeof cur.url);
+                char v[32], u[sizeof cur.url + 8] = "";
+                xr_attr(a, ae, "url", u, sizeof u);
+                whole_address(u, cur.url, sizeof cur.url);
                 xr_attr(a, ae, "type", cur.type, sizeof cur.type);
                 if (xr_attr(a, ae, "length", v, sizeof v)) cur.size = strtoll(v, NULL, 10);
                 /* video podcasts: not for the H2 */
                 if (!strncasecmp(cur.type, "video/", 6)) cur.url[0] = '\0';
             } else if (!strcmp(name, "podcast:chapters")) {
-                xr_attr(a, ae, "url", cur.chapters, sizeof cur.chapters);
+                char u[sizeof cur.chapters + 8] = "";
+                xr_attr(a, ae, "url", u, sizeof u);
+                whole_address(u, cur.chapters, sizeof cur.chapters);
             }
             continue;
         }
         if (!strcmp(name, "image")) { if (!empty) in_image = 1; continue; }
         if (!strcmp(name, "title") && !empty && !in_image && !show->title[0]) xr_text(&x, name, show->title, sizeof show->title);
-        else if (!strcmp(name, "url") && !empty && in_image && !show->image[0]) xr_text(&x, name, show->image, sizeof show->image);
-        else if (!strcmp(name, "itunes:image")) {
-            char v[384];
-            if (xr_attr(a, ae, "href", v, sizeof v)) snprintf(show->image, sizeof show->image, "%s", v);
+        else if (!strcmp(name, "url") && !empty && in_image && !show->image[0]) {
+            char v[sizeof show->image + 8];
+            xr_text(&x, name, v, sizeof v);
+            whole_address(v, show->image, sizeof show->image);
+        } else if (!strcmp(name, "itunes:image")) {
+            char v[sizeof show->image + 8];
+            if (xr_attr(a, ae, "href", v, sizeof v) && strlen(v) < sizeof show->image) memcpy(show->image, v, strlen(v) + 1);
         } else if (!strcmp(name, "itunes:author") && !empty && !show->author[0]) xr_text(&x, name, show->author, sizeof show->author);
     }
     if (!is_feed) { free(all); return -1; }
@@ -450,7 +452,10 @@ int pod_parse_opml(const char *xml, size_t len, pod_show_t *out, int max)
         if (closing || strcasecmp(name, "outline")) continue;
         pod_show_t s;
         memset(&s, 0, sizeof s);
-        if (!xr_attr(a, ae, "xmlUrl", s.url, sizeof s.url) || !s.url[0]) continue;
+        char u[sizeof s.url + 8] = "";
+        xr_attr(a, ae, "xmlUrl", u, sizeof u);
+        whole_address(u, s.url, sizeof s.url);
+        if (!s.url[0]) continue;                     /* (none, or too long to keep whole: not a show) */
         if (!xr_attr(a, ae, "text", s.title, sizeof s.title) || !s.title[0]) xr_attr(a, ae, "title", s.title, sizeof s.title);
         if (!s.title[0]) snprintf(s.title, sizeof s.title, "%s", s.url);
         pod_hash(s.url, s.id);
@@ -483,15 +488,20 @@ int pod_parse_search(const char *json, size_t len, pod_show_t *out, int max)
     while (n < max && json_next(res, &at, &r)) {
         pod_show_t s;
         memset(&s, 0, sizeof s);
-        if (!json_member(r, "feedUrl", &v) || json_string(v, s.url, sizeof s.url) <= 0) continue;
+        char u[sizeof s.url + 8] = "", im[sizeof s.image + 8] = "";
+        if (json_member(r, "feedUrl", &v)) json_string(v, u, sizeof u);
+        whole_address(u, s.url, sizeof s.url);
+        if (!s.url[0]) continue;                     /* (none, or too long to keep whole: not a show) */
         if (json_member(r, "collectionName", &v)) json_string(v, s.title, sizeof s.title);
         if (json_member(r, "artistName", &v)) json_string(v, s.author, sizeof s.author);
         /* its picture, for the list until its feed is read: the 600 px one
          * when Apple gives it (the 100 px one is smaller than Now Playing's) */
-        long il = json_member(r, "artworkUrl600", &v) ? json_string(v, s.image, sizeof s.image) : 0;
-        if (il <= 0 || il >= (long)sizeof s.image - 1 || !is_http(s.image)) {   /* (none, or cut short) */
-            s.image[0] = '\0';
-            if (json_member(r, "artworkUrl100", &v)) json_string(v, s.image, sizeof s.image);
+        if (json_member(r, "artworkUrl600", &v)) json_string(v, im, sizeof im);
+        whole_address(im, s.image, sizeof s.image);
+        if (!is_http(s.image)) {                     /* (none, or too long to keep whole) */
+            im[0] = '\0';
+            if (json_member(r, "artworkUrl100", &v)) json_string(v, im, sizeof im);
+            whole_address(im, s.image, sizeof s.image);
         }
         if (json_member(r, "trackCount", &v)) s.episodes = (int)json_int(v, 0);
         if (!s.title[0]) snprintf(s.title, sizeof s.title, "%s", s.url);
@@ -551,31 +561,30 @@ int pod_file_chapters(const char *path, pod_chapter_t *out, int max)
 /* ---------- the card ---------- */
 
 /* path written whole: beside, then moved over */
-static int write_file(const char *path, const char *text, size_t len)
+/* path's text, or NULL: there's no such file, or (*unread set, when given)
+ * it's there and couldn't be read, all of it: it can't be opened, it's too
+ * big, there's no memory for it, the read stopped short. A file that
+ * couldn't be read isn't one that's empty: what reads it to write it again
+ * (shows.txt, a show's state.txt) wrote the little it had over the rest. */
+static char *read_file(const char *path, size_t *len, int *unread)
 {
-    char tmp[1100];
-    snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    FILE *f = fopen(tmp, "we");
-    if (!f) return -1;
-    int ok = fwrite(text, 1, len, f) == len && fflush(f) == 0;
-    ok &= fsync(fileno(f)) == 0;
-    ok &= fclose(f) == 0;
-    if (!ok || file_replace(tmp, path) != 0) { unlink(tmp); return -1; }
-    return 0;
-}
-
-static char *read_file(const char *path, size_t *len)
-{
+    if (unread) *unread = 0;
     FILE *f = fopen(path, "rbe");
-    if (!f) return NULL;
+    if (!f) {
+        if (unread) *unread = errno != ENOENT;
+        return NULL;
+    }
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (n < 0 || n > 4 * 1024 * 1024) { fclose(f); return NULL; }
-    char *b = malloc((size_t)n + 1);
-    if (!b) { fclose(f); return NULL; }
-    size_t got = fread(b, 1, (size_t)n, f);
+    char *b = n < 0 || n > 4 * 1024 * 1024 ? NULL : malloc((size_t)n + 1);
+    size_t got = b ? fread(b, 1, (size_t)n, f) : 0;
     fclose(f);
+    if (!b || got != (size_t)n) {
+        if (unread) *unread = 1;
+        free(b);
+        return NULL;
+    }
     b[got] = '\0';
     if (len) *len = got;
     return b;
@@ -598,10 +607,10 @@ static void show_details(const char *dir, pod_show_t *s)
 {
     char path[700];
     snprintf(path, sizeof path, "%s/%s/seen.txt", dir, s->id);
-    char *seen = read_file(path, NULL);
+    char *seen = read_file(path, NULL, NULL);
     if (seen) { s->seen = strtoll(seen, NULL, 10); free(seen); }
     snprintf(path, sizeof path, "%s/%s/show.txt", dir, s->id);
-    char *t = read_file(path, NULL);
+    char *t = read_file(path, NULL, NULL);
     if (!t) return;
     for (char *save = NULL, *l = strtok_r(t, "\n", &save); l; l = strtok_r(NULL, "\n", &save)) {
         char *eq = strchr(l, '=');
@@ -643,11 +652,15 @@ static char *line_address(char *l, char **first_out)
     return u ? u : first;
 }
 
-int pod_shows_load(const char *dir, pod_show_t *out, int max)
+/* pod_shows_load, and *unread: shows.txt is there and couldn't be read (0 shows).
+ * details: whose own files (show.txt, seen.txt: two reads a show) are read
+ * too. NULL: every show's; "": nobody's (the list alone); an address: that
+ * show's only. */
+static int shows_load(const char *dir, pod_show_t *out, int max, int *unread, const char *details)
 {
     char path[700];
     snprintf(path, sizeof path, "%s/shows.txt", dir);
-    char *t = read_file(path, NULL);
+    char *t = read_file(path, NULL, unread);
     if (!t) return 0;
     int n = 0;
     for (char *save = NULL, *l = strtok_r(t, "\n", &save); l && n < max; l = strtok_r(NULL, "\n", &save)) {
@@ -680,7 +693,7 @@ int pod_shows_load(const char *dir, pod_show_t *out, int max)
             show_dir(dir, s.id, nd, sizeof nd);
             if (stat(nd, &sb) != 0 && stat(od, &sb) == 0) memcpy(s.id, oid, sizeof oid);
         }
-        show_details(dir, &s);
+        if (!details || !strcmp(details, s.url)) show_details(dir, &s);
         if (!s.title[0]) snprintf(s.title, sizeof s.title, "%s", s.url);
         out[n++] = s;
     }
@@ -688,20 +701,44 @@ int pod_shows_load(const char *dir, pod_show_t *out, int max)
     return n;
 }
 
+int pod_shows_load(const char *dir, pod_show_t *out, int max)
+{
+    return shows_load(dir, out, max, NULL, NULL);
+}
+
+int pod_shows_list(const char *dir, pod_show_t *out, int max)
+{
+    return shows_load(dir, out, max, NULL, "");
+}
+
+int pod_show_find(const char *dir, const char *url, pod_show_t *out)
+{
+    pod_show_t *all = calloc(POD_MAX_SHOWS, sizeof *all);
+    if (!all || !url || !url[0]) { free(all); return 0; }
+    int n = shows_load(dir, all, POD_MAX_SHOWS, NULL, url), found = 0;
+    for (int i = 0; i < n; i++)
+        if (!strcmp(all[i].url, url)) { *out = all[i]; found = 1; }
+    free(all);
+    return found;
+}
+
 int pod_shows_add(const char *dir, const pod_show_t *s)
 {
     pod_show_t *have = calloc(POD_MAX_SHOWS, sizeof *have);
     if (!have) return -1;
-    int n = pod_shows_load(dir, have, POD_MAX_SHOWS);
+    int unread = 0;
+    int n = shows_load(dir, have, POD_MAX_SHOWS, &unread, "");   /* (their addresses are all this asks) */
     for (int i = 0; i < n; i++)
         if (!strcmp(have[i].url, s->url)) { free(have); return 0; }
     free(have);
+    if (unread) return -1;                           /* (not "none yet": a list of this one show would go over it) */
     if (n >= POD_MAX_SHOWS) return -2;
     mkdir(dir, 0755);
     char path[700];
     snprintf(path, sizeof path, "%s/shows.txt", dir);
     size_t len = 0;
-    char *t = read_file(path, &len);
+    char *t = read_file(path, &len, &unread);
+    if (!t && unread) return -1;
     if (!t) {
         t = strdup("# Podcasts: one show a line, Title = the feed's address (Fathom adds them here)\n");
         if (!t) return -1;
@@ -716,7 +753,7 @@ int pod_shows_add(const char *dir, const pod_show_t *s)
     memcpy(all, t, len);
     memcpy(all + len, line, (size_t)ln + 1);
     free(t);
-    int r = write_file(path, all, len + (size_t)ln);
+    int r = file_write_whole(path, all, len + (size_t)ln, NULL, 0);
     free(all);
     if (r) return -1;
     pod_show_t copy = *s;
@@ -744,15 +781,15 @@ int pod_shows_remove(const char *dir, const char *url)
     char id[13];                                     /* its folder: as loaded (an older show's may be named otherwise) */
     pod_hash(url, id);
     pod_show_t *have = calloc(POD_MAX_SHOWS, sizeof *have);
-    int nh = have ? pod_shows_load(dir, have, POD_MAX_SHOWS) : 0;
+    int nh = have ? pod_shows_list(dir, have, POD_MAX_SHOWS) : 0;
     for (int i = 0; i < nh; i++)
         if (!strcmp(have[i].url, url)) memcpy(id, have[i].id, sizeof id);
     free(have);
     char path[700];
     snprintf(path, sizeof path, "%s/shows.txt", dir);
     size_t len;
-    char *t = read_file(path, &len);
-    if (!t) return -1;
+    char *t = read_file(path, &len, NULL);
+    if (!t) return -1;                               /* (none, or not read whole: nothing written, its folder left) */
     char *out = malloc(len + 1);
     if (!out) { free(t); return -1; }
     size_t w = 0;
@@ -785,7 +822,7 @@ int pod_shows_remove(const char *dir, const char *url)
         else { memcpy(out + w, l, ll); w += ll; }
         l += ll;
     }
-    int r = found ? write_file(path, out, w) : 0;
+    int r = found ? file_write_whole(path, out, w, NULL, 0) : 0;
     free(out);
     free(t);
     if (r) return -1;
@@ -807,7 +844,7 @@ int pod_show_save(const char *dir, const pod_show_t *s)
     one_line(image, sizeof image, s->image);
     int n = snprintf(t, sizeof t, "title=%s\nurl=%s\nauthor=%s\nimage=%s\nrefreshed=%lld\nlatest=%lld\n",
                      title, s->url, author, image, (long long)s->refreshed, (long long)s->latest);
-    return write_file(path, t, (size_t)(n < (int)sizeof t ? n : (int)sizeof t - 1));
+    return file_write_whole(path, t, (size_t)(n < (int)sizeof t ? n : (int)sizeof t - 1), NULL, 0);
 }
 
 int pod_show_seen(const char *dir, const char *id, int64_t seen)
@@ -818,7 +855,7 @@ int pod_show_seen(const char *dir, const char *id, int64_t seen)
     mkdir(sd, 0755);
     snprintf(path, sizeof path, "%s/seen.txt", sd);
     int n = snprintf(t, sizeof t, "%lld\n", (long long)seen);
-    return write_file(path, t, (size_t)n);
+    return file_write_whole(path, t, (size_t)n, NULL, 0);
 }
 
 int pod_episodes_save(const char *dir, const char *id, const pod_episode_t *eps, int n)
@@ -841,7 +878,7 @@ int pod_episodes_save(const char *dir, const char *id, const pod_episode_t *eps,
                               eps[i].dur_s, (long long)eps[i].size, type, url, ch, title);
         if (w >= cap) { w = cap - 1; break; }
     }
-    int r = write_file(path, t, w);
+    int r = file_write_whole(path, t, w, NULL, 0);
     free(t);
     return r;
 }
@@ -861,7 +898,7 @@ int pod_episodes_load(const char *dir, const char *id, pod_episode_t *eps, int m
 {
     char path[760];
     snprintf(path, sizeof path, "%s/%s/episodes.txt", dir, id);
-    char *t = read_file(path, NULL);
+    char *t = read_file(path, NULL, NULL);
     if (!t) return 0;
     int n = 0;
     for (char *save = NULL, *l = strtok_r(t, "\n", &save); l && n < max; l = strtok_r(NULL, "\n", &save)) {
@@ -886,11 +923,12 @@ int pod_episodes_load(const char *dir, const char *id, pod_episode_t *eps, int m
     return n;
 }
 
-int pod_state_load(const char *dir, const char *id, pod_state_t *st, int max)
+/* pod_state_load, and *unread: state.txt is there and couldn't be read (0 states) */
+static int state_load(const char *dir, const char *id, pod_state_t *st, int max, int *unread)
 {
     char path[760];
     snprintf(path, sizeof path, "%s/%s/state.txt", dir, id);
-    char *t = read_file(path, NULL);
+    char *t = read_file(path, NULL, unread);
     if (!t) return 0;
     int n = 0;
     for (char *save = NULL, *l = strtok_r(t, "\n", &save); l && n < max; l = strtok_r(NULL, "\n", &save)) {
@@ -908,13 +946,20 @@ int pod_state_load(const char *dir, const char *id, pod_state_t *st, int max)
     return n;
 }
 
+int pod_state_load(const char *dir, const char *id, pod_state_t *st, int max)
+{
+    return state_load(dir, id, st, max, NULL);
+}
+
 #define POD_MAX_STATES 400   /* kept per show (an old episode's goes once it's long gone) */
 
 int pod_state_put(const char *dir, const char *id, const pod_state_t *s)
 {
     pod_state_t *st = calloc(POD_MAX_STATES, sizeof *st);
     if (!st) return -1;
-    int n = pod_state_load(dir, id, st, POD_MAX_STATES), i;
+    int unread = 0;
+    int n = state_load(dir, id, st, POD_MAX_STATES, &unread), i;
+    if (unread) { free(st); return -1; }             /* (not "none yet": this one episode's would go over every other's) */
     for (i = 0; i < n && strcmp(st[i].key, s->key); i++) {}
     if (i < n) st[i] = *s;
     else if (n < POD_MAX_STATES) st[n++] = *s;
@@ -935,7 +980,7 @@ int pod_state_put(const char *dir, const char *id, const pod_state_t *s)
         if (l < 0 || (size_t)l >= cap - w) break;
         w += (size_t)l;
     }
-    int r = write_file(path, t, w);
+    int r = file_write_whole(path, t, w, NULL, 0);
     free(t);
     free(st);
     return r;
@@ -969,7 +1014,7 @@ int pod_chapters(const char *dir, const char *id, const pod_episode_t *e, pod_ch
     char p[800];
     size_t len = 0;
     pod_chapters_path(dir, id, e->key, p, sizeof p);
-    char *t = read_file(p, &len);
+    char *t = read_file(p, &len, NULL);
     int n = t ? pod_parse_chapters(t, len, out, max) : 0;
     free(t);
     if (n > 0) return n;

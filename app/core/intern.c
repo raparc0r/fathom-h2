@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 #include "intern.h"
+#include "core/hash.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -14,12 +15,7 @@ struct intern {
     uint32_t  strs_cap;
 };
 
-static uint32_t fnv1a(const char *s)
-{
-    uint32_t h = 2166136261u;
-    for (; *s; s++) { h ^= (unsigned char)*s; h *= 16777619u; }
-    return h;
-}
+static uint32_t fnv1a(const char *s) { return fnv32(FNV32_START, s, strlen(s)); }
 
 intern_t *intern_new(void)
 {

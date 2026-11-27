@@ -39,6 +39,7 @@
 #include <unistd.h>
 
 #include "card_out.h"
+#include "core/clock.h"
 #include "hw_paths.h"
 
 #define LIT_MS        60000            /* the screen stays lit this long after a button */
@@ -54,11 +55,17 @@ static size_t g_map_size;
 
 static void on_signal(int s) { (void)s; g_quit = 1; }
 
-static long now_ms(void)
+/* (The milliseconds are clock_ms32's: they wrap every 49.7 days, and are
+ * only ever compared as the time gone since another, never one against the
+ * other. As a signed 32-bit count compared outright, it went negative after
+ * 24.8 days without a restart: Power then did nothing here, and the waits
+ * went wrong.) */
+
+/* What's left of `ms` counted from `from`, 0 once it's over */
+static uint32_t ms_left(uint32_t now, uint32_t from, uint32_t ms)
 {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+    uint32_t gone = now - from;
+    return gone < ms ? ms - gone : 0;
 }
 
 static int read_int(const char *path)
@@ -218,44 +225,53 @@ int main(void)
         if (fd >= 0) in[n_in++] = (struct pollfd){.fd = fd, .events = POLLIN};
     }
 
-    long now = now_ms(), lit_until = now + LIT_MS, off_at = now + OFF_MS, power_since = -1;
-    int lit = 1;
+    /* lit since, the wait to switch off counted from, Power down since (while power_down) */
+    uint32_t now = clock_ms32(), lit_from = now, off_from = now, power_since = 0;
+    int lit = 1, power_down = 0;
     while (!g_quit) {
-        long next = off_at;
-        if (lit && lit_until < next) next = lit_until;
-        if (power_since >= 0 && power_since + POWER_OFF_MS < next) next = power_since + POWER_OFF_MS;
-        int wait = next > now ? (int)(next - now) : 0;
-        poll(in, (nfds_t)n_in, wait);
-        now = now_ms();
+        uint32_t wait = ms_left(now, off_from, OFF_MS), w;
+        if (lit && (w = ms_left(now, lit_from, LIT_MS)) < wait) wait = w;
+        if (power_down && (w = ms_left(now, power_since, POWER_OFF_MS)) < wait) wait = w;
+        poll(in, (nfds_t)n_in, (int)wait);
+        now = clock_ms32();
         int wake = 0, toggle = 0;
         for (int i = 0; i < n_in; i++) {
             struct input_event ev;
-            while (read(in[i].fd, &ev, sizeof ev) == (ssize_t)sizeof ev) {
+            ssize_t r;
+            if (in[i].fd < 0) continue;
+            while ((r = read(in[i].fd, &ev, sizeof ev)) == (ssize_t)sizeof ev) {
                 if (ev.type == EV_KEY && ev.code == KEY_POWER) {
-                    if (ev.value == 1) power_since = now;
-                    else if (ev.value == 0 && power_since >= 0) { power_since = -1; toggle = 1; }
+                    if (ev.value == 1) { power_since = now; power_down = 1; }
+                    else if (ev.value == 0 && power_down) { power_down = 0; toggle = 1; }
                 } else if ((ev.type == EV_KEY && ev.value == 1) || (ev.type == EV_REL && ev.value)) {
                     wake = 1;
                 }
             }
+            /* A device that went away (USB or Bluetooth headphones' buttons):
+             * dropped (poll() passes over an fd of -1). Kept, poll() came back
+             * at once for it every time: all of the CPU until the card was back. */
+            if ((r < 0 && errno != EAGAIN && errno != EINTR) || (in[i].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                close(in[i].fd);
+                in[i].fd = -1;
+                in[i].revents = 0;
+            }
         }
         if (g_quit) break;
-        if (power_since >= 0 && now - power_since >= POWER_OFF_MS) {
+        if (power_down && now - power_since >= POWER_OFF_MS) {
             power_off("Power held");
-            power_since = -1;           /* (only if it failed) */
+            power_down = 0;             /* (only if it failed) */
         }
         if (toggle) wake = !lit;
         if (toggle && lit) { lit = 0; backlight(0); }
         if (wake) {
             if (!lit) backlight(level);
             lit = 1;
-            lit_until = now + LIT_MS;
-            off_at = now + OFF_MS;
+            lit_from = off_from = now;
         }
-        if (lit && now >= lit_until) { lit = 0; backlight(0); }
-        if (now >= off_at) {
-            if (read_int(HW_USB_ONLINE) == 1) off_at = now + OFF_MS;   /* on USB power */
-            else { power_off("No card for 10 minutes"); off_at = now + OFF_MS; }
+        if (lit && now - lit_from >= LIT_MS) { lit = 0; backlight(0); }
+        if (now - off_from >= OFF_MS) {
+            if (read_int(HW_USB_ONLINE) == 1) off_from = now;          /* on USB power */
+            else { power_off("No card for 10 minutes"); off_from = now; }
         }
     }
     /* The card is back: the drop alone, lit, until the player draws */

@@ -4,6 +4,7 @@
 #include "net/http.h"
 #include "net/netclock.h"
 #include "core/fsafe.h"
+#include "core/clock.h"
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -34,6 +35,16 @@ long http_get_result(size_t n, int64_t total, int cut, int failed, int aborted)
     return (long)n;
 }
 
+int http_too_slow(http_slow_t *w, uint64_t done, int64_t now_ms)
+{
+    int64_t ms = now_ms - w->since_ms;
+    if (ms < HTTP_SLOW_MS) return 0;
+    if ((done - w->since_done) * 1000 < (uint64_t)ms * HTTP_SLOW_BPS) return 1;
+    w->since_ms = now_ms;                            /* fast enough: counted afresh from here */
+    w->since_done = done;
+    return 0;
+}
+
 #ifdef FATHOM_HAVE_FFMPEG
 #include <libavformat/avio.h>
 #include <libavutil/dict.h>
@@ -42,20 +53,25 @@ long http_get_result(size_t n, int64_t total, int cut, int failed, int aborted)
 
 #define HTTP_TIMEOUT_US "15000000"
 
+/* What ends a fetch from outside its reads: the caller's flag, and the time
+ * by which it has taken too long (http.h; 0: none) */
+typedef struct { const volatile int *abort; int64_t until_ms; } watch_t;
+
 static int interrupted(void *ctx)
 {
-    const volatile int *abort = ctx;
-    return abort && *abort;
+    const watch_t *w = ctx;
+    return (w->abort && *w->abort) || (w->until_ms && clock_ms() >= w->until_ms);
 }
 
 /* *gone: the server said it isn't there (HTTP 4xx: not found, forbidden...),
  * as opposed to not reaching it (a name that didn't resolve, a timeout).
  * file: a download to the card, which FFmpeg takes up again by itself when
  * its connection goes partway. */
-static AVIOContext *open_url(const char *url, const volatile int *abort, int *gone, int file)
+static AVIOContext *open_url(const char *url, const watch_t *w, int *gone, int file)
 {
+    const volatile int *abort = w->abort;
     AVIOContext *pb = NULL;
-    AVIOInterruptCB icb = {interrupted, (void *)abort};
+    AVIOInterruptCB icb = {interrupted, (void *)w};  /* (w: the caller's own, there until the fetch is closed) */
     AVDictionary *opt = NULL;
     av_dict_set(&opt, "rw_timeout", HTTP_TIMEOUT_US, 0);
     av_dict_set(&opt, "user_agent", g_ua, 0);
@@ -92,7 +108,8 @@ long http_get(const char *url, char *buf, size_t cap, const volatile int *abort)
     if (!buf || cap < 1) return -1;
     buf[0] = '\0';
     int gone = 0;
-    AVIOContext *pb = open_url(url, abort, &gone, 0);
+    watch_t w = {abort, clock_ms() + HTTP_GET_MS};   /* (the whole of it: the name, the connection, the body) */
+    AVIOContext *pb = open_url(url, &w, &gone, 0);
     if (!pb) return gone ? -3 : -1;
     int64_t total = avio_size(pb);                   /* (its Content-Length; negative when it gave none) */
     size_t n = 0;
@@ -108,9 +125,13 @@ long http_get(const char *url, char *buf, size_t cap, const volatile int *abort)
         n += (size_t)k;
     }
     int failed = pb->error < 0 && pb->error != AVERROR_EOF;
+    /* cut at its minute: as one cancelled, whatever of it is here (with no
+     * length given, the part would be taken for the whole) */
+    int late = failed && clock_ms() >= w.until_ms;
     avio_closep(&pb);
     buf[n] = '\0';
-    return http_get_result(n, total, cut, failed, abort && *abort);
+    if (late) fprintf(stderr, "http: %s: given up after %d s\n", url, HTTP_GET_MS / 1000);
+    return http_get_result(n, total, cut, failed, late || (abort && *abort));
 }
 
 /* A download stops before the card has less than this free: a server that
@@ -128,7 +149,8 @@ int64_t http_download(const char *url, const char *path, http_progress_fn progre
                       const volatile int *abort)
 {
     int gone = 0;
-    AVIOContext *pb = open_url(url, abort, &gone, 1);
+    watch_t w = {abort, clock_ms() + HTTP_SLOW_MS};
+    AVIOContext *pb = open_url(url, &w, &gone, 1);
     if (!pb) return gone ? -3 : -1;
     char part[1024];
     snprintf(part, sizeof part, "%s.part", path);
@@ -146,12 +168,19 @@ int64_t http_download(const char *url, const char *path, http_progress_fn progre
     int64_t total = avio_size(pb);
     uint64_t done = 0;
     int ok = 1, card = 0;                            /* card: what failed was the card (HTTP_ERR_*), not the network */
+    int slow = 0;                                    /* given up for its speed (http.h) */
+    http_slow_t speed = {clock_ms(), 0};
     for (;;) {
+        /* (a chunk not here within the minute is under the least speed by
+         * itself, whatever came before: its read is cut there) */
+        w.until_ms = clock_ms() + HTTP_SLOW_MS;
         int k = avio_read(pb, chunk, CHUNK);
         if (k == AVERROR_EOF || k == 0) break;
-        if (k < 0 || (abort && *abort)) { ok = 0; break; }
+        slow = clock_ms() >= w.until_ms;
+        if (k < 0 || slow || (abort && *abort)) { ok = 0; break; }
         if (fwrite(chunk, 1, (size_t)k, f) != (size_t)k) { ok = 0; card = HTTP_ERR_WRITE; break; }
         done += (uint64_t)k;
+        if (http_too_slow(&speed, done, clock_ms())) { ok = 0; slow = 1; break; }
         /* Each MB to the card and out of the page cache: a 16 MB download
          * would otherwise push out the player's own code (run from the card,
          * in 24 MB of RAM) and leave it all to write at once. */
@@ -165,13 +194,12 @@ int64_t http_download(const char *url, const char *path, http_progress_fn progre
                 break;
             }
         }
-#ifdef POSIX_FADV_DONTNEED
-        if ((done & 0xFFFFF) < (uint64_t)k) posix_fadvise(fileno(f), 0, 0, POSIX_FADV_DONTNEED);
-#endif
+        if ((done & 0xFFFFF) < (uint64_t)k) file_drop_cache(fileno(f), 0, 0);
         if (progress) progress(done, total > 0 ? (uint64_t)total : 0, ctx);
     }
     avio_closep(&pb);
     free(chunk);
+    if (slow) fprintf(stderr, "http: download given up: under %d KB/s for a minute\n", HTTP_SLOW_BPS / 1024);
     if (fclose(f) && ok) { ok = 0; card = HTTP_ERR_WRITE; }
     if (ok && total > 0 && done != (uint64_t)total) ok = 0;   /* cut short */
     if (ok && file_replace(part, path)) { ok = 0; card = HTTP_ERR_WRITE; }

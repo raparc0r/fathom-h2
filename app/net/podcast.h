@@ -111,11 +111,22 @@ const char *pod_ext(const pod_episode_t *e);
 
 /* ---- the card (dir: fathom/podcasts) ---- */
 
-/* The subscriptions, in order, with each show's details from show.txt. How many. */
+/* The subscriptions, in order, with each show's details from show.txt. How
+ * many (0 too when shows.txt is there and can't be read). */
 int pod_shows_load(const char *dir, pod_show_t *out, int max);
-/* Subscribe: 1 added (at the end), 0 already there (the same feed), -2 full, -1 couldn't write. */
+/* The list alone: each show's address, its folder (id) and the title it was
+ * added with, nothing read of the shows' own files (two a show): for asking
+ * "is it subscribed to" and "which folder is its". How many. */
+int pod_shows_list(const char *dir, pod_show_t *out, int max);
+/* One show by its address, with its details as pod_shows_load gives them: 1,
+ * or 0 if it isn't subscribed to. Reads the list and that show's files only. */
+int pod_show_find(const char *dir, const char *url, pod_show_t *out);
+/* Subscribe: 1 added (at the end), 0 already there (the same feed), -2 full,
+ * -1 couldn't write, or shows.txt is there and couldn't be read (nothing is
+ * written over it). */
 int pod_shows_add(const char *dir, const pod_show_t *s);
-/* Unsubscribe: its line and its folder (downloads included). 0, -1. */
+/* Unsubscribe: its line and its folder (downloads included). 0, -1 (shows.txt
+ * not read whole: nothing written, nothing removed). */
 int pod_shows_remove(const char *dir, const char *url);
 /* A show's details (show.txt), and the time its feed was read (not `seen`). */
 int pod_show_save(const char *dir, const pod_show_t *s);
@@ -127,7 +138,8 @@ int pod_episodes_save(const char *dir, const char *id, const pod_episode_t *eps,
 int pod_episodes_load(const char *dir, const char *id, pod_episode_t *eps, int max);
 
 int pod_state_load(const char *dir, const char *id, pod_state_t *st, int max);
-/* One episode's state, kept (the others as they were). 0, -1. */
+/* One episode's state, kept (the others as they were). 0, -1 (-1 too when
+ * state.txt is there and couldn't be read: nothing is written over it). */
 int pod_state_put(const char *dir, const char *id, const pod_state_t *s);
 /* An episode's in st (or all zero, its key set, if it has none). */
 void pod_state_find(const pod_state_t *st, int n, const char *key, pod_state_t *out);

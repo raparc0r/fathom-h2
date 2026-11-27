@@ -31,6 +31,7 @@
  * drive's own certificate, tlscert.c) go straight through.
  */
 #include "net/tls_wrap.h"
+#include "core/thread.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -127,13 +128,7 @@ static void idle(void)
     deadline.tv_nsec += (long)(grace_ms % 1000) * 1000000L;
     if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
     if (reaping) return;
-    pthread_attr_t a;
-    pthread_t t;
-    pthread_attr_init(&a);
-    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&a, 64 * 1024);
-    reaping = pthread_create(&t, &a, reap, NULL) == 0;
-    pthread_attr_destroy(&a);
+    reaping = thread_detached(reap, NULL, 64 * 1024) == 0;
     if (!reaping) drop(cur);             /* no thread to wait: don't keep it */
 }
 
@@ -300,13 +295,7 @@ void tls_wrap_warm(void)
         start = 0;
     }
     if (start) {
-        pthread_attr_t a;
-        pthread_t t;
-        pthread_attr_init(&a);
-        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-        pthread_attr_setstacksize(&a, 128 * 1024);
-        warming = pthread_create(&t, &a, warm, NULL) == 0;
-        pthread_attr_destroy(&a);
+        warming = thread_detached(warm, NULL, 128 * 1024) == 0;
     }
     pthread_mutex_unlock(&mu);
 }

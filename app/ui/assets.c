@@ -18,14 +18,23 @@ static const char *const BUILTIN[] = {"studio-mint.theme", "studio-ember.theme",
 
 static char g_assets[512];
 
-static void *slurp(const char *path, size_t *len)
+/* Our own files (the fonts, the logo) are far under this; a theme's have limits of their own. */
+#define FILE_MAX (16 * 1024 * 1024)
+/* A theme's icon is 16 x 16 pixels: 1 KB of them, so any real file is far under this. */
+#define ICON_FILE_MAX (64 * 1024)
+/* A theme's own font: read whole at every start to check its letters, and kept
+ * for good once the theme is shown (ours are 50 to 160 KB). */
+#define THEME_FONT_MAX (2 * 1024 * 1024)
+
+/* A whole file under max bytes (to free); NULL if it is missing, empty or larger. */
+static void *slurp(const char *path, size_t *len, long max)
 {
     FILE *f = fopen(path, "rbe");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    void *buf = n > 0 && n < 16 * 1024 * 1024 ? malloc((size_t)n) : NULL;
+    void *buf = n > 0 && n < max ? malloc((size_t)n) : NULL;
     if (buf && fread(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); buf = NULL; }
     fclose(f);
     *len = buf ? (size_t)n : 0;
@@ -37,28 +46,39 @@ static void *slurp(const char *path, size_t *len)
 #define MAX_FILES 12
 static struct { char path[640]; void *data; size_t len; } g_files[MAX_FILES];
 
-static int font_file(const char *path, void **data, size_t *len)
+static int font_file(const char *path, long max, void **data, size_t *len)
 {
-    for (int i = 0; i < MAX_FILES && g_files[i].path[0]; i++)
-        if (!strcmp(g_files[i].path, path)) { *data = g_files[i].data; *len = g_files[i].len; return 0; }
-    void *d = slurp(path, len);
+    int slot = 0;
+    for (; slot < MAX_FILES && g_files[slot].path[0]; slot++)
+        if (!strcmp(g_files[slot].path, path)) { *data = g_files[slot].data; *len = g_files[slot].len; return 0; }
+    /* No room to remember another: refused. (Read all the same, it was read
+     * again for each size of the set, and every copy kept.) */
+    if (slot == MAX_FILES) return -1;
+    void *d = slurp(path, len, max);
     if (!d) return -1;
-    for (int i = 0; i < MAX_FILES; i++)
-        if (!g_files[i].path[0]) {
-            snprintf(g_files[i].path, sizeof g_files[i].path, "%s", path);
-            g_files[i].data = d;
-            g_files[i].len = *len;
-            break;
-        }
+    snprintf(g_files[slot].path, sizeof g_files[slot].path, "%s", path);
+    g_files[slot].data = d;
+    g_files[slot].len = *len;
     *data = d;   /* kept for the program's lifetime: tiny_ttf reads from it */
     return 0;
 }
 
-static const lv_font_t *ttf(const char *path, int px, const lv_font_t *fallback)
+/* Room to keep a set's two files (those not kept already): asked before any
+ * of its fonts is made. With one file kept and the other refused, the set's
+ * first fonts were made and lost, and the last place taken for nothing. */
+static int files_room(const char *a, const char *b)
+{
+    int used = 0, need = strcmp(a, b) ? 2 : 1;
+    for (; used < MAX_FILES && g_files[used].path[0]; used++)
+        if (!strcmp(g_files[used].path, a) || !strcmp(g_files[used].path, b)) need--;
+    return used + need <= MAX_FILES;
+}
+
+static const lv_font_t *ttf(const char *path, long max, int px, const lv_font_t *fallback)
 {
     void *data;
     size_t len;
-    if (font_file(path, &data, &len)) { fprintf(stderr, "cannot read %s\n", path); return NULL; }
+    if (font_file(path, max, &data, &len)) { fprintf(stderr, "cannot read %s\n", path); return NULL; }
     lv_font_t *f = ui_font_ttf(data, len, px, fallback);
     if (!f) fprintf(stderr, "cannot load font %s\n", path);
     return f;
@@ -91,7 +111,8 @@ static const char *const FALLBACK_FILE = "NotoSans-Subset.ttf";
 /* Tabler Icons (MIT), cut down to the icons the UI uses (tools/fonts/subset_ttf.py --keep) */
 static const char *const ICON_FILE = "TablerIcons-Home.ttf";
 
-static const ui_fonts_t *load_set(const char *family, const char *file, const char *file_title,
+/* (max: the most a font file of the set may be: FILE_MAX, or a theme's THEME_FONT_MAX) */
+static const ui_fonts_t *load_set(const char *family, const char *file, const char *file_title, long max,
                                   const int *px, int value_add, const ui_fonts_t *fallback)
 {
     char key[900];
@@ -102,21 +123,22 @@ static const ui_fonts_t *load_set(const char *family, const char *file, const ch
         if (!g_sets[i].key[0] && free_slot < 0) free_slot = i;
     }
     if (free_slot < 0) return NULL;
+    if (!files_room(file, file_title)) { fprintf(stderr, "no room to keep %s\n", file); return NULL; }
     ui_fonts_t f = {
         .family = family,
-        .meta  = ttf(file, px[THEME_PX_META], fallback ? fallback->meta : NULL),
-        .body  = ttf(file, px[THEME_PX_BODY], fallback ? fallback->body : NULL),
-        .sub   = ttf(file, px[THEME_PX_SUB], fallback ? fallback->sub : NULL),
-        .title = ttf(file_title, px[THEME_PX_TITLE], fallback ? fallback->title : NULL),
-        .head  = ttf(file_title, px[THEME_PX_HEAD], fallback ? fallback->head : NULL),
+        .meta  = ttf(file, max, px[THEME_PX_META], fallback ? fallback->meta : NULL),
+        .body  = ttf(file, max, px[THEME_PX_BODY], fallback ? fallback->body : NULL),
+        .sub   = ttf(file, max, px[THEME_PX_SUB], fallback ? fallback->sub : NULL),
+        .title = ttf(file_title, max, px[THEME_PX_TITLE], fallback ? fallback->title : NULL),
+        .head  = ttf(file_title, max, px[THEME_PX_HEAD], fallback ? fallback->head : NULL),
     };
-    f.value = value_add ? ttf(file, px[THEME_PX_META] + value_add, fallback ? fallback->value : NULL) : f.meta;
+    f.value = value_add ? ttf(file, max, px[THEME_PX_META] + value_add, fallback ? fallback->value : NULL) : f.meta;
     if (!f.meta || !f.body || !f.sub || !f.title || !f.head || !f.value) return NULL;
     /* Home's icons, the same for every family (Pixel Pastel draws its own) */
     char icons[600];
     snprintf(icons, sizeof icons, "%s/fonts/%s", g_assets, ICON_FILE);
-    f.icon = ttf(icons, px[THEME_PX_BODY], NULL);
-    f.icon_big = ttf(icons, 72, NULL);      /* drawn at its size, not a 20 px glyph stretched */
+    f.icon = ttf(icons, FILE_MAX, px[THEME_PX_BODY], NULL);
+    f.icon_big = ttf(icons, FILE_MAX, 72, NULL);      /* drawn at its size, not a 20 px glyph stretched */
     snprintf(g_sets[free_slot].key, sizeof g_sets[free_slot].key, "%s", key);
     g_sets[free_slot].fonts = f;
     return &g_sets[free_slot].fonts;
@@ -130,7 +152,15 @@ static const ui_fonts_t *fallback_set(const int *px, int value_add)
     FILE *probe = fopen(f, "rbe");
     if (!probe) return NULL;
     fclose(probe);
-    return load_set("noto", f, f, px, value_add, NULL);
+    /* ...and behind Noto, the character packs (Japanese...), in the cell size
+     * nearest each role's: there for every set, whether a pack is on the card
+     * or not (it is looked for when a character first needs one) */
+    ui_fonts_t packs = {
+        .meta = ui_font_pack(px[THEME_PX_META]), .body = ui_font_pack(px[THEME_PX_BODY]), .sub = ui_font_pack(px[THEME_PX_SUB]),
+        .title = ui_font_pack(px[THEME_PX_TITLE]), .head = ui_font_pack(px[THEME_PX_HEAD]),
+        .value = ui_font_pack(px[THEME_PX_META] + (value_add > 0 ? value_add : 0)),
+    };
+    return load_set("noto", f, f, FILE_MAX, px, value_add, &packs);
 }
 
 /* value_add: the family's own (-1), or the one of the set this is the fallback of. */
@@ -147,7 +177,7 @@ static const ui_fonts_t *builtin_family(const char *family, const int *override_
          * like "‹" that pixel fonts lack), then Noto */
         int add = value_add < 0 ? FAMILIES[i].value_add : value_add;
         const ui_fonts_t *fb = i == 0 ? fallback_set(px, add) : builtin_family("atkinson", px, add);
-        return load_set(FAMILIES[i].family, f, ft, px, add, fb);
+        return load_set(FAMILIES[i].family, f, ft, FILE_MAX, px, add, fb);
     }
     return NULL;
 }
@@ -163,7 +193,7 @@ const ui_fonts_t *ui_theme_fonts(const theme_t *t)
     char f[640], ft[640];
     snprintf(f, sizeof f, "%s/%s", t->dir, t->font_file);
     snprintf(ft, sizeof ft, "%s/%s", t->dir, t->font_file_title[0] ? t->font_file_title : t->font_file);
-    return load_set("theme", f, ft, px, 0, fallback);
+    return load_set("theme", f, ft, THEME_FONT_MAX, px, 0, fallback);
 }
 
 /* ---------- icons ---------- */
@@ -172,14 +202,10 @@ const ui_fonts_t *ui_theme_fonts(const theme_t *t)
 static struct { char path[640]; lv_image_dsc_t dsc; int ok; } g_icons[MAX_ICONS];
 
 /* Decode a PNG to LVGL's ARGB8888 (B, G, R, A in memory). Size in *w, *h. */
-static uint8_t *load_png(const char *path, int *w, int *h)
+static uint8_t *decode_png(const unsigned char *file, size_t len, int *w, int *h)
 {
-    size_t len;
-    unsigned char *file = slurp(path, &len);
-    if (!file) return NULL;
     int ch;
     unsigned char *rgba = stbi_load_from_memory(file, (int)len, w, h, &ch, 4);
-    free(file);
     if (!rgba) return NULL;
     for (int i = 0; i < *w * *h; i++) {          /* RGBA -> BGRA */
         unsigned char r = rgba[4 * i];
@@ -187,6 +213,36 @@ static uint8_t *load_png(const char *path, int *w, int *h)
         rgba[4 * i + 2] = r;
     }
     return rgba;
+}
+
+static uint8_t *load_png(const char *path, int *w, int *h)
+{
+    size_t len;
+    unsigned char *file = slurp(path, &len, FILE_MAX);
+    if (!file) return NULL;
+    uint8_t *px = decode_png(file, len, w, h);
+    free(file);
+    return px;
+}
+
+/* A theme's icon: its size from the PNG's header (0 = read; -1 = can't be), and
+ * its pixels in *px (to free) only when that is an icon's size. A picture of any
+ * other size is never decoded: 2048 x 2048 would be two 17 MB buffers, at every
+ * start, for a theme nobody has chosen. */
+static int load_icon(const char *path, int *w, int *h, uint8_t **px)
+{
+    size_t len;
+    int ch;
+    *px = NULL;
+    unsigned char *file = slurp(path, &len, ICON_FILE_MAX);
+    if (!file) return -1;
+    int ok = stbi_info_from_memory(file, (int)len, w, h, &ch);
+    if (ok && *w == THEME_ICON_PX && *h == THEME_ICON_PX) {
+        *px = decode_png(file, len, w, h);
+        ok = *px != NULL;
+    }
+    free(file);
+    return ok ? 0 : -1;
 }
 
 static lv_image_dsc_t g_logo;
@@ -230,8 +286,8 @@ const lv_image_dsc_t *ui_theme_icon(const theme_t *t, int which)
     if (slot < 0) return NULL;
     snprintf(g_icons[slot].path, sizeof g_icons[slot].path, "%s", path);
     int w, h;
-    uint8_t *px = load_png(path, &w, &h);
-    if (!px || w != THEME_ICON_PX || h != THEME_ICON_PX) { free(px); return NULL; }   /* remembered as unusable */
+    uint8_t *px;
+    if (load_icon(path, &w, &h, &px) || !px) return NULL;   /* remembered as unusable */
     lv_image_dsc_t *d = &g_icons[slot].dsc;
     memset(d, 0, sizeof *d);
     d->header.magic = LV_IMAGE_HEADER_MAGIC;
@@ -259,10 +315,10 @@ static void note(theme_t *t, theme_status_t st, const char *msg)
 }
 
 /* Accented letters U+00C0..U+017F (without x and division signs) the font lacks. */
-static int missing_accents(const char *path)
+static int missing_accents(const char *path, long max)
 {
     size_t len;
-    void *data = slurp(path, &len);
+    void *data = slurp(path, &len, max);
     if (!data) return -1;
     font_cov_t *c = font_cov_new(data, len);
     int missing = 0;
@@ -280,7 +336,7 @@ static int default_missing(void)
     if (m == -2) {
         char path[640];
         snprintf(path, sizeof path, "%s/fonts/%s", g_assets, "AtkinsonHyperlegibleNext-Regular.ttf");
-        m = missing_accents(path);
+        m = missing_accents(path, FILE_MAX);
         if (m < 0) m = 0;
     }
     return m;
@@ -296,7 +352,7 @@ static void check_theme(theme_t *t)
             if (!files[i][0]) continue;
             char path[640];
             snprintf(path, sizeof path, "%s/%s", t->dir, files[i]);
-            int m = missing_accents(path);
+            int m = missing_accents(path, THEME_FONT_MAX);
             if (m < 0) { snprintf(msg, sizeof msg, "font %s can't be read", files[i]); note(t, THEME_ERROR, msg); }
             else if (m > default_missing()) {
                 snprintf(msg, sizeof msg, "font lacks %d accented letters (the default font, %d)", m, default_missing());
@@ -309,8 +365,8 @@ static void check_theme(theme_t *t)
         char path[640];
         snprintf(path, sizeof path, "%s/%s", t->dir, t->icon[i]);
         int w, h;
-        uint8_t *px = load_png(path, &w, &h);
-        int readable = px != NULL;
+        uint8_t *px;
+        int readable = load_icon(path, &w, &h, &px) == 0;
         free(px);
         if (!readable) { snprintf(msg, sizeof msg, "icon %s can't be read", t->icon[i]); note(t, THEME_ERROR, msg); }
         else if (w != THEME_ICON_PX || h != THEME_ICON_PX) {

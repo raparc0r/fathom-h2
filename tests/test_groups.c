@@ -2,8 +2,6 @@
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 /* Genres, Composers, Years and Folders (app/library/library.c), on a small
  * generated library in nested folders. */
-#include <FLAC/metadata.h>
-#include <FLAC/stream_encoder.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,10 +13,8 @@
 #include <sqlite3.h>
 
 #include "library/library.h"
-#include "tmpdir.h"
-
-static int failures;
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
+#include "test_flac.h"
+#include "test_util.h"
 
 typedef struct { const char *dir, *file, *title, *artist, *album, *genre, *composer, *year; int track; const char *album_artist; } spec_t;
 
@@ -33,39 +29,15 @@ static const spec_t SPECS[] = {
 };
 #define N ((int)(sizeof SPECS / sizeof SPECS[0]))
 
-static void tag(FLAC__StreamMetadata *vc, const char *k, const char *v)
-{
-    if (!v || !*v) return;
-    FLAC__StreamMetadata_VorbisComment_Entry en;
-    FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&en, k, v);
-    FLAC__metadata_object_vorbiscomment_append_comment(vc, en, false);
-}
-
+/* (a tag that is empty is left out) */
 static int write_flac(const char *path, const spec_t *sp)
 {
-    FLAC__StreamEncoder *e = FLAC__stream_encoder_new();
-    FLAC__stream_encoder_set_channels(e, 2);
-    FLAC__stream_encoder_set_bits_per_sample(e, 16);
-    FLAC__stream_encoder_set_sample_rate(e, 44100);
-    FLAC__StreamMetadata *vc = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
     char tr[8];
     snprintf(tr, sizeof tr, "%d", sp->track);
-    tag(vc, "TITLE", sp->title);
-    tag(vc, "ARTIST", sp->artist);
-    tag(vc, "ALBUM", sp->album);
-    tag(vc, "ALBUMARTIST", sp->album_artist);
-    tag(vc, "GENRE", sp->genre);
-    tag(vc, "COMPOSER", sp->composer);
-    tag(vc, "DATE", sp->year);
-    tag(vc, "TRACKNUMBER", tr);
-    FLAC__stream_encoder_set_metadata(e, &vc, 1);
-    if (FLAC__stream_encoder_init_file(e, path, NULL, NULL) != FLAC__STREAM_ENCODER_INIT_STATUS_OK) return -1;
-    static FLAC__int32 pcm[2 * 4410];
-    FLAC__stream_encoder_process_interleaved(e, pcm, 4410);
-    FLAC__stream_encoder_finish(e);
-    FLAC__stream_encoder_delete(e);
-    FLAC__metadata_object_delete(vc);
-    return 0;
+    return t_write_flac(path, &(t_flac_t){.frames = 4410, .tags = {
+        {"TITLE", t_flac_some(sp->title)}, {"ARTIST", t_flac_some(sp->artist)}, {"ALBUM", t_flac_some(sp->album)},
+        {"ALBUMARTIST", t_flac_some(sp->album_artist)}, {"GENRE", t_flac_some(sp->genre)},
+        {"COMPOSER", t_flac_some(sp->composer)}, {"DATE", t_flac_some(sp->year)}, {"TRACKNUMBER", tr}}});
 }
 
 static void mkdirs(const char *path)
@@ -89,8 +61,7 @@ static const char *row(library_t *lib, const lib_list_t *l, int i, char *meta)
 int main(void)
 {
     char dir[200];
-    test_tmp(dir, sizeof dir, "fathom-test-groups");
-    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    t_mkdtemp(dir, sizeof dir, "fathom-test-groups");
     char music[300], path[700], db[300], art[300], meta[64], name[128];
     snprintf(music, sizeof music, "%s/music", dir);
     for (int i = 0; i < N; i++) {
@@ -249,7 +220,5 @@ int main(void)
         library_close(la);
     }
 
-    if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
-    printf("groups: all good\n");
-    return 0;
+    return t_result();
 }

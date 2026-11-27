@@ -3,6 +3,7 @@
 /* Podcasts over the network: one worker, one job at a time (podsync.h). */
 #include "net/podsync.h"
 #include "core/fsafe.h"
+#include "core/clock.h"
 
 #include <dirent.h>
 #include <pthread.h>
@@ -32,6 +33,8 @@ typedef struct job {
     pod_show_t show;          /* J_SUBSCRIBE */
     int64_t now;              /* J_AUTO: */
     int wifi, charging, keep, clean_days;
+    int automatic;            /* J_REFRESH of every show: nobody asked (podsync_auto), so what's asked for goes between its shows */
+    int by_hand;              /* J_DOWNLOAD: the user asked for it (not the automatic downloads) */
 } job_t;
 
 static struct {
@@ -39,10 +42,14 @@ static struct {
     pthread_cond_t cv;
     pthread_t th;
     int started, stop;
+    pthread_cond_t done_cv;
+    int done;                 /* the worker has ended (under mu; done_cv tells) */
+    int left;                 /* a stop gave up waiting for it (podsync_stop_wait) */
     char dir[512];
     job_t *head, *tail;
     int n_jobs;
     job_t *cur;               /* the job under way (owned by the worker) */
+    job_t *round;             /* an automatic round waiting while what was asked for meanwhile is done (asked_first) */
     volatile int abort;       /* the job under way gives up */
     volatile int img_abort;   /* a show's image being downloaded gives up (cover_download) */
     int pct;                  /* its download's progress */
@@ -58,10 +65,11 @@ static struct {
     pod_show_t *found;
     int n_found;
     int64_t auto_refreshed;   /* podsync_auto: the last time it read the feeds */
-} P = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .search_state = -1};
+} P = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .done_cv = PTHREAD_COND_INITIALIZER,
+     .search_state = -1};
 
-static podsync_fetch_fn g_fetch_once = http_get;
-static podsync_download_fn g_download_once = http_download;
+static http_get_fn g_fetch_once = http_get;
+static http_download_fn g_download_once = http_download;
 
 /* A name lookup or a connection fails now and then (a home router slow to
  * answer for a name it hasn't cached: "Try again"), and a download goes
@@ -147,8 +155,8 @@ static int bad_wait(const char *id, const char *key, int64_t now)
     if (wait > 86400) wait = 86400;
     return now >= g_bad[i].at && now - g_bad[i].at < wait;   /* (a clock set back: tried) */
 }
-void podsync_set_fetch(podsync_fetch_fn fn) { g_fetch_once = fn ? fn : http_get; }
-void podsync_set_download(podsync_download_fn fn) { g_download_once = fn ? fn : http_download; }
+void podsync_set_fetch(http_get_fn fn) { g_fetch_once = fn ? fn : http_get; }
+void podsync_set_download(http_download_fn fn) { g_download_once = fn ? fn : http_download; }
 const char *podsync_dir(void) { return P.dir; }
 
 static void failed(const char *what)
@@ -181,19 +189,6 @@ static void touched(void)
 #define THUMB_BYTES ((size_t)LIB_ART_SMALL * LIB_ART_SMALL * 2)
 
 /* path written whole: beside (path.tmp), then moved over. 0, -1 */
-static int put_file(const char *path, const void *data, size_t len)
-{
-    char tmp[840];
-    snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    FILE *f = fopen(tmp, "wbe");
-    if (!f) return -1;
-    int ok = fwrite(data, 1, len, f) == len && fflush(f) == 0;
-    ok &= fsync(fileno(f)) == 0;
-    ok &= fclose(f) == 0;
-    if (!ok || file_replace(tmp, path)) { remove(tmp); return -1; }
-    return 0;
-}
-
 static int file_is(const char *path, size_t bytes)
 {
     struct stat st;
@@ -234,7 +229,7 @@ static int thumb_from_cover(const char *cover_path, const char *thumb_path)
                     }
                 out[y * SMALL + x] = (uint16_t)(((r + n / 2) / n) << 11 | ((g + n / 2) / n) << 5 | (b + n / 2) / n);
             }
-        ok = put_file(thumb_path, out, THUMB_BYTES) == 0;
+        ok = file_write_whole(thumb_path, out, THUMB_BYTES, NULL, 0) == 0;
     }
     free(px);
     free(out);
@@ -280,7 +275,7 @@ static void cover(const pod_show_t *s, const char *old_image)
     int legacy = !was[0] && have && !strcmp(s->image, old_image);
     if (legacy || !strcmp(was, s->image)) {          /* nothing to fetch */
         int made = have && !file_is(thumb, THUMB_BYTES) && thumb_from_cover(path, thumb) == 0;
-        if (legacy) put_file(mark, s->image, strlen(s->image));
+        if (legacy) file_write_whole(mark, s->image, strlen(s->image), NULL, 0);
         if (made) touched();
         return;
     }
@@ -297,14 +292,14 @@ static void cover(const pod_show_t *s, const char *old_image)
         if (!large || !small) answered = 0;
         else if (library_art_decode_file(img, large, small) == 0) {
             /* the thumbnail, the cover, then the mark: a cut between them leaves no mark, and it's fetched again */
-            written = put_file(thumb, small, THUMB_BYTES) == 0 && put_file(path, large, COVER_BYTES) == 0;
+            written = file_write_whole(thumb, small, THUMB_BYTES, NULL, 0) == 0 && file_write_whole(path, large, COVER_BYTES, NULL, 0) == 0;
             if (!written) answered = 0;              /* (the card wouldn't take them: not this image's fault) */
         }
         free(large);
         free(small);
     }
     remove(img);
-    if (answered) put_file(mark, s->image, strlen(s->image));
+    if (answered) file_write_whole(mark, s->image, strlen(s->image), NULL, 0);
     if (written) touched();
 }
 
@@ -312,23 +307,20 @@ static void cover(const pod_show_t *s, const char *old_image)
  * or -2: no server was reached (the network, as far as can be told). */
 static int refresh_one(const char *url)
 {
-    pod_show_t *shows = calloc(POD_MAX_SHOWS, sizeof *shows);
+    pod_show_t was;                     /* the show as the card has it (its own files read, not every show's) */
     char *buf = malloc(POD_FEED_MAX);
     pod_episode_t *eps = calloc(POD_MAX_EPISODES, sizeof *eps);
     int r = -1;
-    if (!shows || !buf || !eps) goto out;
-    int ns = pod_shows_load(P.dir, shows, POD_MAX_SHOWS), at = -1;
-    for (int i = 0; i < ns; i++)
-        if (!strcmp(shows[i].url, url)) at = i;
-    if (at < 0) goto out;                            /* unsubscribed meanwhile */
+    if (!buf || !eps) goto out;
+    if (!pod_show_find(P.dir, url, &was)) goto out;  /* unsubscribed meanwhile */
     long n = g_fetch(url, buf, POD_FEED_MAX, &P.abort);
     if (n == -1) r = -2;
     if (n == -2) n = (long)strlen(buf);              /* too big: the episodes before the cut */
     else if (n > 0 && !pod_feed_complete(buf, (size_t)n)) n = -1;   /* cut off: the list stays as it was */
-    if (n <= 0) { failed(shows[at].title); goto out; }
-    pod_show_t s = shows[at], parsed = s;
+    if (n <= 0) { failed(was.title); goto out; }
+    pod_show_t s = was, parsed = s;
     int m = pod_parse_feed(buf, (size_t)n, &parsed, eps, POD_MAX_EPISODES);
-    if (m < 0) { failed(shows[at].title); goto out; }
+    if (m < 0) { failed(was.title); goto out; }
     if (parsed.author[0]) snprintf(s.author, sizeof s.author, "%s", parsed.author);
     if (parsed.image[0]) snprintf(s.image, sizeof s.image, "%s", parsed.image);
     /* show.txt keeps the feed's own title (shows.txt the one it was added with) */
@@ -337,11 +329,10 @@ static int refresh_one(const char *url)
     s.refreshed = (int64_t)time(NULL);
     s.latest = m ? eps[0].date : 0;
     char old_image[384];
-    snprintf(old_image, sizeof old_image, "%s", shows[at].image);
+    snprintf(old_image, sizeof old_image, "%s", was.image);
     if (pod_episodes_save(P.dir, s.id, eps, m) == 0 && pod_show_save(P.dir, &s) == 0) r = 0;
     if (r == 0) cover(&s, old_image);
 out:
-    free(shows);
     free(buf);
     free(eps);
     if (r == 0) touched();
@@ -355,15 +346,20 @@ out:
  * whose servers have gone, at the top of the list, don't keep the rest from
  * ever being read. */
 #define OFFLINE_RUN 3
-static void refresh_all(void)
+static void asked_first(job_t *round);
+
+/* round: the job itself when it's an automatic round (NULL: one asked for) */
+static void refresh_all(job_t *round)
 {
     static int from;                    /* (the worker's own) where the next round starts */
     pod_show_t *shows = calloc(POD_MAX_SHOWS, sizeof *shows);
     if (!shows) return;
-    int n = pod_shows_load(P.dir, shows, POD_MAX_SHOWS), run = 0, start = n > 0 ? from % n : 0;
+    int n = pod_shows_list(P.dir, shows, POD_MAX_SHOWS), run = 0, start = n > 0 ? from % n : 0;   /* (their addresses) */
     from = 0;
     for (int k = 0; k < n && !P.abort && !P.stop; k++) {
         int i = (start + k) % n;
+        if (round) asked_first(round);
+        if (P.stop) break;
         run = refresh_one(shows[i].url) == -2 ? run + 1 : 0;
         if (run >= OFFLINE_RUN && k + 1 < n) {
             fprintf(stderr, "podcasts: no server reached for %d shows running: the other %d left for the next time\n",
@@ -391,10 +387,25 @@ static int subscribed(const char *id)
 {
     pod_show_t *shows = calloc(POD_MAX_SHOWS, sizeof *shows);
     if (!shows) return 1;
-    int n = pod_shows_load(P.dir, shows, POD_MAX_SHOWS), yes = 0;
+    int n = pod_shows_list(P.dir, shows, POD_MAX_SHOWS), yes = 0;
     for (int i = 0; i < n; i++) yes |= !strcmp(shows[i].id, id);
     free(shows);
     return yes;
+}
+
+/* What was saved is a web page, not sound: after a byte-order mark and
+ * blanks, it starts with '<' (a hotel's or a cafe's sign-in page, answered
+ * for any address until signed in). No sound file starts so (ID3, a frame's
+ * 0xFF, fLaC, OggS, RIFF, an MP4's length). */
+static int is_page(const char *path)
+{
+    unsigned char b[64];
+    FILE *f = fopen(path, "rbe");
+    size_t n = f ? fread(b, 1, sizeof b, f) : 0, i = 0;
+    if (f) fclose(f);
+    if (n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) i = 3;
+    while (i < n && (b[i] == ' ' || b[i] == '\t' || b[i] == '\r' || b[i] == '\n')) i++;
+    return i < n && b[i] == '<';
 }
 
 static void download(job_t *j)
@@ -415,6 +426,9 @@ static void download(job_t *j)
     }
     pod_episode_path(P.dir, j->id, &j->ep, path, sizeof path);
     int64_t got = g_download(j->ep.url, path, progress, j, &P.abort);
+    /* (kept, it showed as downloaded, was never asked for again and didn't
+     * play: as a server not reached, so it's tried again later) */
+    if (got > 0 && is_page(path)) { remove(path); got = -1; }
     if (got > 0 && j->ep.chapters[0]) {          /* the feed's chapters, kept beside it */
         char *buf = malloc(128 * 1024), cp[820];
         long n = buf ? g_fetch(j->ep.chapters, buf, 128 * 1024, &P.abort) : -1;
@@ -486,7 +500,7 @@ static void import(job_t *j)
             if (pod_shows_add(P.dir, &s[i]) == 1) {
                 added++;
                 touched();
-                if (run < OFFLINE_RUN) run = refresh_one(s[i].url) == -2 ? run + 1 : 0;
+                if (run < OFFLINE_RUN && !P.stop) run = refresh_one(s[i].url) == -2 ? run + 1 : 0;   /* (stopping: added, not read) */
             }
     }
     free(t);
@@ -551,7 +565,7 @@ static void run(job_t *j, unsigned search_gen)
         P.last_failed = 0;
         pthread_mutex_unlock(&P.mu);
         if (j->url[0]) refresh_one(j->url);
-        else refresh_all();
+        else refresh_all(j->automatic ? j : NULL);
         break;
     case J_SUBSCRIBE: {
         int added = pod_shows_add(P.dir, &j->show);
@@ -611,6 +625,57 @@ static void sweep(void)
     if (d) closedir(d);
 }
 
+/* (with P.mu held, and held again on return) j, out of the queue, is the
+ * job under way until it's done */
+static void run_job(job_t *j)
+{
+    P.cur = j;
+    P.abort = 0;
+    P.pct = j->kind == J_DOWNLOAD ? 1 : 0;
+    unsigned gen = P.search_gen;
+    pthread_mutex_unlock(&P.mu);
+    run(j, gen);
+    pthread_mutex_lock(&P.mu);
+    P.cur = NULL;
+    free(j);
+}
+
+static int list_job(int kind);
+
+/* What the user asked for and is waiting to see (not a round of the feeds,
+ * nor the automatic downloads and their clean-up) */
+static int asked(const job_t *j)
+{
+    return list_job(j->kind) || j->kind == J_SEARCH || (j->kind == J_DOWNLOAD && j->by_hand);
+}
+
+/* Between the shows of an automatic round (round: its job): what the user
+ * has asked for meanwhile is done first, in the order asked: a search, a
+ * download asked for by hand, shows.txt's work. They waited for the whole
+ * round, a feed's server that's slow holding each show's turn for a minute:
+ * "Find podcasts" answered nothing until every feed had been read. The
+ * round then carries on with its next show. */
+static void asked_first(job_t *round)
+{
+    pthread_mutex_lock(&P.mu);
+    P.round = round;
+    while (!P.stop) {
+        job_t **pp = &P.head;
+        while (*pp && !asked(*pp)) pp = &(*pp)->next;
+        job_t *j = *pp;
+        if (!j) break;
+        *pp = j->next;
+        P.tail = NULL;
+        for (job_t *q = P.head; q; q = q->next) P.tail = q;
+        P.n_jobs--;
+        run_job(j);
+    }
+    P.round = NULL;
+    P.cur = round;                                   /* the round is the job under way again */
+    P.abort = P.stop;                                /* (what ended the job asked for doesn't end the round) */
+    pthread_mutex_unlock(&P.mu);
+}
+
 static void *worker(void *arg)
 {
     (void)arg;
@@ -622,16 +687,10 @@ static void *worker(void *arg)
         P.head = j->next;
         if (!P.head) P.tail = NULL;
         P.n_jobs--;
-        P.cur = j;
-        P.abort = 0;
-        P.pct = j->kind == J_DOWNLOAD ? 1 : 0;
-        unsigned gen = P.search_gen;
-        pthread_mutex_unlock(&P.mu);
-        run(j, gen);
-        pthread_mutex_lock(&P.mu);
-        P.cur = NULL;
-        free(j);
+        run_job(j);
     }
+    P.done = 1;
+    pthread_cond_broadcast(&P.done_cv);
     pthread_mutex_unlock(&P.mu);
     return NULL;
 }
@@ -657,10 +716,32 @@ static int enqueue_locked(job_t *j)
     return 0;
 }
 
+/* shows.txt's work (subscribe, unsubscribe, import): what the UI has said is
+ * done when it's asked ("Unsubscribed"), so it goes before everything else
+ * waiting, and podsync_stop does what's left of it. At the queue's tail,
+ * behind a refresh of every show or a download, the player stopped
+ * meanwhile lost it. */
+static int list_job(int kind) { return kind == J_SUBSCRIBE || kind == J_UNSUBSCRIBE || kind == J_IMPORT; }
+
+/* enqueue_locked for a list job: ahead of the rest, behind the list jobs
+ * already waiting (they keep the order asked) */
+static int enqueue_first_locked(job_t *j)
+{
+    if (!P.started || P.n_jobs >= MAX_JOBS) return -1;
+    job_t **pp = &P.head;
+    while (*pp && list_job((*pp)->kind)) pp = &(*pp)->next;
+    j->next = *pp;
+    *pp = j;
+    if (!j->next) P.tail = j;
+    P.n_jobs++;
+    pthread_cond_signal(&P.cv);
+    return 0;
+}
+
 static int enqueue(job_t *j)
 {
     pthread_mutex_lock(&P.mu);
-    int r = enqueue_locked(j);
+    int r = list_job(j->kind) ? enqueue_first_locked(j) : enqueue_locked(j);
     pthread_mutex_unlock(&P.mu);
     return r;
 }
@@ -682,14 +763,23 @@ static int add(int kind, const char *id, const char *url, const char *title)
 int podsync_start(const char *dir)
 {
     if (P.started) return 0;
+    if (P.left) {                                    /* a worker the last stop left at its fetch */
+        pthread_mutex_lock(&P.mu);
+        int done = P.done;
+        pthread_mutex_unlock(&P.mu);
+        if (!done) return -1;                        /* (still there: not a second one beside it) */
+        pthread_join(P.th, NULL);
+        P.left = 0;
+    }
     snprintf(P.dir, sizeof P.dir, "%s", dir);
     P.stop = 0;
+    P.done = 0;
     if (pthread_create(&P.th, NULL, worker, NULL)) return -1;
     P.started = 1;
     return 0;
 }
 
-void podsync_stop(void)
+void podsync_stop_ask(void)
 {
     if (!P.started) return;
     pthread_mutex_lock(&P.mu);
@@ -698,24 +788,91 @@ void podsync_stop(void)
     P.img_abort = 1;
     pthread_cond_signal(&P.cv);
     pthread_mutex_unlock(&P.mu);
-    pthread_join(P.th, NULL);
-    while (P.head) { job_t *j = P.head; P.head = j->next; free(j); }
-    P.tail = NULL;
-    P.n_jobs = 0;
-    P.started = 0;
-    free(P.found);
-    P.found = NULL;
 }
 
-int podsync_refresh(const char *url)
+/* (with P.mu held) Wait for the worker to end, ms at most (under 0: as long
+ * as it takes): 1 it has, 0 not yet. In steps of 100 ms counted on the clock
+ * that only goes forward: a condition's wait goes by the wall clock, which
+ * is set days ahead (or back) when the network first gives the time. */
+static int wait_done(int ms)
+{
+    int64_t until = clock_ms() + ms;
+    while (!P.done) {
+        if (ms < 0) { pthread_cond_wait(&P.done_cv, &P.mu); continue; }
+        int64_t rest = until - clock_ms();
+        if (rest <= 0) break;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += (rest < 100 ? (long)rest : 100) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&P.done_cv, &P.mu, &ts);
+    }
+    return P.done;
+}
+
+int podsync_stop_wait(int ms)
+{
+    if (!P.started) return 1;
+    pthread_mutex_lock(&P.mu);
+    int back = wait_done(ms);
+    /* Not back: it's inside a name lookup, which nothing interrupts, and is
+     * left there (the player is stopping: it ends with it; the .part of a
+     * download it was at is removed when the worker next starts: sweep). The
+     * work waiting is taken from it all the same, unless the job it's in is
+     * shows.txt's own: it may be writing the file, and two writers of one
+     * file would spoil it. */
+    int mine = back || !(P.cur && list_job(P.cur->kind));
+    job_t *q = P.head;
+    P.head = P.tail = NULL;
+    P.n_jobs = 0;
+    P.started = 0;
+    P.left = !back;
+    free(P.found);
+    P.found = NULL;
+    pthread_mutex_unlock(&P.mu);
+    if (back) pthread_join(P.th, NULL);
+    while (q) {
+        job_t *j = q;
+        q = j->next;
+        /* shows.txt's work the worker didn't reach: done now, on the card
+         * only (a show added is read at the next refresh) */
+        if (mine && j->kind == J_UNSUBSCRIBE) pod_shows_remove(P.dir, j->url);
+        else if (mine && j->kind == J_SUBSCRIBE) pod_shows_add(P.dir, &j->show);
+        else if (mine && j->kind == J_IMPORT) import(j);
+        free(j);
+    }
+    return back;
+}
+
+void podsync_stop(void)
+{
+    podsync_stop_ask();
+    podsync_stop_wait(-1);
+}
+
+/* automatic: a round nobody asked for (what's asked for goes between its shows) */
+static int refresh(const char *url, int automatic)
 {
     pthread_mutex_lock(&P.mu);
     int dup = 0;   /* the same refresh already waiting */
     for (job_t *q = P.head; q; q = q->next)
-        dup |= q->kind == J_REFRESH && !strcmp(q->url, url ? url : "");
+        if (q->kind == J_REFRESH && !strcmp(q->url, url)) {
+            dup = 1;
+            if (!automatic) q->automatic = 0;        /* (asked for now: the user's) */
+        }
     pthread_mutex_unlock(&P.mu);
-    return dup ? 0 : add(J_REFRESH, NULL, url ? url : "", NULL);
+    if (dup) return 0;
+    job_t *j = calloc(1, sizeof *j);
+    if (!j) return -1;
+    j->kind = J_REFRESH;
+    snprintf(j->url, sizeof j->url, "%s", url);
+    j->automatic = automatic;
+    if (enqueue(j)) { free(j); return -1; }
+    return 0;
 }
+
+int podsync_refresh(const char *url) { return refresh(url ? url : "", 0); }
+int podsync_refresh_auto(void) { return refresh("", 1); }
 
 int podsync_subscribe(const pod_show_t *s)
 {
@@ -727,7 +884,42 @@ int podsync_subscribe(const pod_show_t *s)
     return 0;
 }
 
-int podsync_unsubscribe(const char *url) { return add(J_UNSUBSCRIBE, NULL, url, NULL); }
+int podsync_unsubscribe(const char *url)
+{
+    /* Its downloads first: the one under way given up, those waiting taken
+     * away (they ran before the unsubscribe, into a folder about to go). Its
+     * folder's name: as loaded (an older show's may be named otherwise). */
+    if (!P.started) return -1;
+    char id[13];
+    pod_hash(url, id);
+    pod_show_t *shows = calloc(POD_MAX_SHOWS, sizeof *shows);
+    int n = shows ? pod_shows_list(P.dir, shows, POD_MAX_SHOWS) : 0;
+    for (int i = 0; i < n; i++)
+        if (!strcmp(shows[i].url, url)) memcpy(id, shows[i].id, sizeof id);
+    free(shows);
+    job_t *j = calloc(1, sizeof *j);
+    if (!j) return -1;
+    j->kind = J_UNSUBSCRIBE;
+    snprintf(j->url, sizeof j->url, "%s", url);
+    pthread_mutex_lock(&P.mu);
+    for (job_t **pp = &P.head; *pp;) {
+        job_t *q = *pp;
+        if (q->kind == J_DOWNLOAD && !strcmp(q->id, id)) {
+            *pp = q->next;
+            P.n_jobs--;
+            free(q);
+        } else {
+            pp = &q->next;
+        }
+    }
+    P.tail = NULL;
+    for (job_t *q = P.head; q; q = q->next) P.tail = q;
+    if (P.cur && P.cur->kind == J_DOWNLOAD && !strcmp(P.cur->id, id)) P.abort = 1;
+    int r = enqueue_first_locked(j);
+    pthread_mutex_unlock(&P.mu);
+    if (r) free(j);
+    return r;
+}
 int podsync_import_opml(const char *path) { return add(J_IMPORT, NULL, path, NULL); }
 
 int podsync_search(const char *term)
@@ -777,11 +969,14 @@ int podsync_download(const char *id, const pod_episode_t *e)
 {
     pthread_mutex_lock(&P.mu);
     int dup = queued_download(id, e->key);
+    for (job_t *q = P.head; q; q = q->next)          /* (one the automatic downloads queued: the user's now) */
+        if (q->kind == J_DOWNLOAD && !strcmp(q->id, id) && !strcmp(q->ep.key, e->key)) q->by_hand = 1;
     pthread_mutex_unlock(&P.mu);
     if (dup) return 0;
     job_t *j = calloc(1, sizeof *j);
     if (!j) return -1;
     j->kind = J_DOWNLOAD;
+    j->by_hand = 1;
     snprintf(j->id, sizeof j->id, "%s", id);
     j->ep = *e;
     if (enqueue(j)) { free(j); return -1; }
@@ -825,7 +1020,7 @@ void podsync_status(podsync_status_t *st)
     st->busy = P.cur != NULL;
     st->queued = P.n_jobs;
     st->changed = P.changed;
-    st->refreshing = P.cur && (P.cur->kind == J_REFRESH || P.cur->kind == J_SUBSCRIBE || P.cur->kind == J_IMPORT);
+    st->refreshing = P.round || (P.cur && (P.cur->kind == J_REFRESH || P.cur->kind == J_SUBSCRIBE || P.cur->kind == J_IMPORT));
     for (job_t *q = P.head; q && !st->refreshing; q = q->next) st->refreshing = q->kind == J_REFRESH;
     st->last_failed = P.last_failed;
     st->failed_seq = P.failed_seq;
@@ -849,15 +1044,18 @@ int podsync_auto(int64_t now, int wifi, int charging, int every_s, int keep, int
     if (!P.auto_refreshed) {                        /* since the feeds were last read (after a restart) */
         pod_show_t *s = calloc(POD_MAX_SHOWS, sizeof *s);
         int n = s ? pod_shows_load(P.dir, s, POD_MAX_SHOWS) : 0;
-        int64_t oldest = now;
+        /* (the newest: the last round's time. Only a feed that was read
+         * sets its show's, so the oldest was a show whose feed has died, and
+         * every start read every feed again) */
+        int64_t newest = 0;
         for (int i = 0; i < n; i++)
-            if (s[i].refreshed < oldest) oldest = s[i].refreshed;
-        P.auto_refreshed = n ? oldest : now;
+            if (s[i].refreshed > newest) newest = s[i].refreshed;
+        P.auto_refreshed = n ? newest : now;
         free(s);
     }
     int due = wifi && every_s > 0 && (now - P.auto_refreshed >= every_s || now < P.auto_refreshed);
     pthread_mutex_unlock(&P.mu);
-    if (due && !refresh_waiting && podsync_refresh("") == 0) {
+    if (due && !refresh_waiting && podsync_refresh_auto() == 0) {
         P.auto_refreshed = now;
         queued = 1;
     }

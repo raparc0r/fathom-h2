@@ -8,9 +8,7 @@
 #include <time.h>
 
 #include "audio/tempo.h"
-
-static int fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+#include "test_util.h"
 
 #define RATE 44100
 
@@ -44,19 +42,19 @@ static void tone(int ch, int speed)
     int32_t *out;
     long w = run(ch, speed, 440.0, frames, &out);
     double want = (double)frames * 100 / speed;
-    CHECK(fabs(w - want) < want * 0.02 + 3000, "%d ch %d%%: %ld frames out, ~%.0f wanted", ch, speed, w, want);
+    CHECKF(fabs(w - want) < want * 0.02 + 3000, "%d ch %d%%: %ld frames out, ~%.0f wanted", ch, speed, w, want);
     /* the pitch: rising zero crossings per second, after the first piece */
     long up = 0, from = RATE / 10;
     for (long i = from + 1; i < w; i++) up += out[(i - 1) * ch] < 0 && out[i * ch] >= 0;
     double hz = up * (double)RATE / (double)(w - from - 1);
-    CHECK(fabs(hz - 440) < 440 * 0.02, "%d ch %d%%: %.1f Hz", ch, speed, hz);
+    CHECKF(fabs(hz - 440) < 440 * 0.02, "%d ch %d%%: %.1f Hz", ch, speed, hz);
     /* no clicks: no step much bigger than the tone's own */
     double amp = 0.5 * 2147483647.0, step = 2 * M_PI * 440 / RATE * amp, worst = 0;
     for (long i = 1; i < w; i++) {
         double d = fabs((double)out[i * ch] - (double)out[(i - 1) * ch]);
         if (d > worst) worst = d;
     }
-    CHECK(worst < 2.5 * step, "%d ch %d%%: a jump of %.2f x the tone's step", ch, speed, worst / step);
+    CHECKF(worst < 2.5 * step, "%d ch %d%%: a jump of %.2f x the tone's step", ch, speed, worst / step);
     printf("%d ch %3d%%: %ld frames (%.0f wanted), %.1f Hz, worst step %.2f x\n", ch, speed, w, want, hz, worst / step);
     free(out);
 }
@@ -68,7 +66,7 @@ static void high_rate(unsigned rate)
     enum { CHUNK = 1152 };
     static int32_t in[CHUNK * 2], out[(CHUNK * 2 + 4 * TEMPO_MAX_SEQ) * 2];
     tempo_t *t = tempo_new(rate, 2, 150);
-    CHECK(t != NULL, "%u Hz: no tempo", rate);
+    CHECKF(t != NULL, "%u Hz: no tempo", rate);
     if (!t) return;
     long w = 0, frames = 2L * rate;
     for (long at = 0; at < frames; at += CHUNK) {
@@ -77,7 +75,7 @@ static void high_rate(unsigned rate)
         w += tempo_run(t, in, CHUNK, out, CHUNK * 2 + 4 * TEMPO_MAX_SEQ);
     }
     tempo_free(t);
-    CHECK(labs(w - frames * 100 / 150) < 3 * TEMPO_MAX_SEQ, "%u Hz: %ld frames out, ~%ld wanted", rate, w, frames * 100 / 150);
+    CHECKF(labs(w - frames * 100 / 150) < 3 * TEMPO_MAX_SEQ, "%u Hz: %ld frames out, ~%ld wanted", rate, w, frames * 100 / 150);
     printf("%u Hz at 150%%: %ld frames\n", rate, w);
 }
 
@@ -115,9 +113,7 @@ int main(void)
         s += (double)(clock() - c0) / CLOCKS_PER_SEC;
     }
     tempo_free(t);
-    CHECK(labs(w - frames * 100 / 150) < 3 * TEMPO_MAX_SEQ, "speech-like: %ld frames out", w);
+    CHECKF(labs(w - frames * 100 / 150) < 3 * TEMPO_MAX_SEQ, "speech-like: %ld frames out", w);
     printf("cost: %.2f s for 60 s of stereo at 1.5x: %.1f %% of real time\n", s, s / 60 * 100);
-    if (fails) { printf("%d failed\n", fails); return 1; }
-    printf("tempo: ok\n");
-    return 0;
+    return t_result();
 }

@@ -23,6 +23,7 @@
  */
 #define _FILE_OFFSET_BITS 64
 #include "dsd.h"
+#include "core/bytes.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -285,10 +286,6 @@ void dsd2pcm_run(dsd2pcm_t *c, long n, int32_t *out)
 
 /* ---------- the files ---------- */
 
-static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
-static uint64_t le64(const uint8_t *p) { return le32(p) | (uint64_t)le32(p + 4) << 32; }
-static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
-static uint64_t be64(const uint8_t *p) { return (uint64_t)be32(p) << 32 | be32(p + 4); }
 
 static int read_at(FILE *f, uint64_t at, void *buf, size_t n)
 {
@@ -338,7 +335,8 @@ static int probe_dsf(FILE *f, dsd_info_t *in, const uint8_t *h)
     if (fsz < 52 || read_at(f, at, d, sizeof d) || memcmp(d, "data", 4) || le64(d + 4) < 12) return -1;
     in->data = at + 12;
     in->bytes = samples / 8;
-    if (in->channels < 1 || in->channels > 8 || !in->block || in->block > (1u << 20)) return -1;
+    /* (the format's one block size. Any up to 1 MB was taken: at 1, a seek and a read for each byte) */
+    if (in->channels < 1 || in->channels > 8 || in->block != 4096) return -1;
     /* the data chunk holds whole blocks; a count beyond it is a damaged file */
     uint64_t room = (le64(d + 4) - 12) / in->channels;
     if (in->bytes > room) in->bytes = room;
@@ -366,18 +364,22 @@ static void dff_text(FILE *f, uint64_t at, uint64_t size, char *out, size_t cap)
     out[len] = '\0';
 }
 
+/* A file has a dozen chunks, those inside PROP and DIIN counted. Empty ones
+ * by the million had the whole file read, twelve bytes at a time. */
+#define DFF_MAX_CHUNKS 4096
+
 static int probe_dff(FILE *f, dsd_info_t *in, const uint8_t *h)
 {
     in->dff = 1;
     uint64_t end = 12 + be64(h + 4), at = 16;
-    int have_cmpr = 0;
-    for (uint8_t c[12]; at + 12 <= end && read_at(f, at, c, 12) == 0;) {
+    int have_cmpr = 0, chunks = 0;
+    for (uint8_t c[12]; at + 12 <= end && chunks++ < DFF_MAX_CHUNKS && read_at(f, at, c, 12) == 0;) {
         uint64_t size = be64(c + 4), body = at + 12;
         if (size > end - body) size = end - body;      /* (a damaged size must not wrap round) */
         if (!memcmp(c, "PROP", 4)) {
             uint8_t t[4];
             if (size < 4 || read_at(f, body, t, 4) || memcmp(t, "SND ", 4)) return -1;
-            for (uint64_t p = body + 4; p + 12 <= body + size;) {
+            for (uint64_t p = body + 4; p + 12 <= body + size && chunks++ < DFF_MAX_CHUNKS;) {
                 uint8_t s[12], v[4];
                 if (read_at(f, p, s, 12)) return -1;
                 uint64_t sz = be64(s + 4);
@@ -396,7 +398,7 @@ static int probe_dff(FILE *f, dsd_info_t *in, const uint8_t *h)
         } else if (!memcmp(c, "DST ", 4)) {
             in->dst = 1;
         } else if (!memcmp(c, "DIIN", 4)) {
-            for (uint64_t p = body; p + 12 <= body + size;) {
+            for (uint64_t p = body; p + 12 <= body + size && chunks++ < DFF_MAX_CHUNKS;) {
                 uint8_t s[12];
                 if (read_at(f, p, s, 12)) break;
                 uint64_t sz = be64(s + 4);

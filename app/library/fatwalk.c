@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Additional terms under GPLv3 section 7: see LICENSE. */
 #include "fatwalk.h"
+#include "core/bytes.h"
+#include "core/utf8.h"
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -18,6 +20,8 @@ typedef struct {
     fatwalk_cb cb;
     void *ctx;
     int stop;
+    int failed;                   /* a folder not read whole (its chain of clusters loops, a read failed,
+                                   * no memory): the card is not ours to report on this way */
 } fw_t;
 
 static int rd(fw_t *f, uint64_t off, void *buf, size_t n)
@@ -30,12 +34,15 @@ static uint32_t next_cluster(fw_t *f, uint32_t c)
     uint64_t byte = (uint64_t)c * 4;
     int64_t sec = (int64_t)(byte / f->bps);
     if (sec != f->fat_sec_no) {
-        if (rd(f, (uint64_t)(f->fat_start + sec) * f->bps, f->fat_sec, f->bps)) return 0x0FFFFFFF;
+        if (rd(f, (uint64_t)(f->fat_start + sec) * f->bps, f->fat_sec, f->bps)) {
+            /* (not the chain's end: the folder would look short, and its other files gone) */
+            f->fat_sec_no = -1;
+            f->failed = f->stop = 1;
+            return 0x0FFFFFFF;
+        }
         f->fat_sec_no = sec;
     }
-    uint32_t v;
-    memcpy(&v, f->fat_sec + byte % f->bps, 4);
-    return v & 0x0FFFFFFF;
+    return le32(f->fat_sec + byte % f->bps) & 0x0FFFFFFF;
 }
 
 /* FAT date and time (local, 2 s steps) as the kernel shows them with no tz=
@@ -57,12 +64,8 @@ static int64_t fat_time(uint16_t date, uint16_t time)
 static void utf8_put(char *out, size_t cap, size_t *w, uint32_t u)
 {
     char b[4];
-    int n;
-    if (u < 0x80) { b[0] = (char)u; n = 1; }
-    else if (u < 0x800) { b[0] = (char)(0xc0 | u >> 6); b[1] = (char)(0x80 | (u & 0x3f)); n = 2; }
-    else if (u < 0x10000) { b[0] = (char)(0xe0 | u >> 12); b[1] = (char)(0x80 | ((u >> 6) & 0x3f)); b[2] = (char)(0x80 | (u & 0x3f)); n = 3; }
-    else { b[0] = (char)(0xf0 | u >> 18); b[1] = (char)(0x80 | ((u >> 12) & 0x3f)); b[2] = (char)(0x80 | ((u >> 6) & 0x3f)); b[3] = (char)(0x80 | (u & 0x3f)); n = 4; }
-    if (*w + (size_t)n < cap) { memcpy(out + *w, b, (size_t)n); *w += (size_t)n; }
+    size_t n = utf8_encode(u, b);
+    if (*w + n < cap) { memcpy(out + *w, b, n); *w += n; }
 }
 
 static uint8_t sfn_checksum(const uint8_t *name)
@@ -99,9 +102,53 @@ static void short_name(const uint8_t *e, char *out, size_t cap)
     out[w] = '\0';
 }
 
+/* A long name as its pieces come before the entry they name (the last piece
+ * first). */
+typedef struct {
+    uint16_t u[20 * 13 + 1];
+    int n;                        /* pieces still expected; -1 = none collected */
+    int max;
+    uint8_t sum;
+} lfn_t;
+
+/* The long-name piece at e, taken into l (or what l held given up: a piece out of turn) */
+static void lfn_piece(lfn_t *l, const uint8_t *e)
+{
+    static const int at[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+    int ord = e[0] & 0x1f;
+    if (e[0] & 0x40) { l->n = ord; l->max = ord; l->sum = e[13]; memset(l->u, 0, sizeof l->u); }
+    if (l->n < 1 || ord != l->n || e[13] != l->sum || ord > 20) { l->n = -1; return; }
+    for (int k = 0; k < 13; k++) l->u[(ord - 1) * 13 + k] = (uint16_t)le16(e + at[k]);
+    l->n = ord - 1;
+}
+
+/* The name of the entry at e: its long name when l holds all of it and it is
+ * this entry's, else its 8.3 name. A surrogate pair is written as the one
+ * character it stands for, as the kernel names it (find wrote each half as it
+ * came: a start folder with an emoji in its name was never found, and every
+ * scan went the slow way). */
+static void entry_name(const lfn_t *l, const uint8_t *e, char *out, size_t cap)
+{
+    if (l->n != 0 || sfn_checksum(e) != l->sum) { short_name(e, out, cap); return; }
+    size_t w = 0;
+    for (int k = 0; k < l->max * 13; k++) {
+        uint32_t u = l->u[k];
+        if (u == 0 || u == 0xffff) break;
+        if (u >= 0xd800 && u < 0xdc00 && k + 1 < l->max * 13) {
+            uint32_t lo = l->u[k + 1];
+            if (lo >= 0xdc00 && lo < 0xe000) { u = 0x10000 + ((u - 0xd800) << 10) + (lo - 0xdc00); k++; }
+        }
+        utf8_put(out, cap, &w, u);
+    }
+    out[w] = '\0';
+}
+
+static uint32_t entry_cluster(const uint8_t *e) { return le16(e + 20) << 16 | le16(e + 26); }
+
 static void walk_dir(fw_t *f, uint32_t cluster, const char *path, int depth);
 
 #define DIR_PIECE 4096
+#define DIR_MAX (65536u * 32)     /* FAT32's own limit: 65,536 entries a folder (2 MB) */
 
 static fatwalk_entry_fn g_entry_fn;
 static void *g_entry_ctx;
@@ -112,37 +159,50 @@ void fatwalk_set_entry_hook(fatwalk_entry_fn fn, void *ctx)
     g_entry_ctx = ctx;
 }
 
-/* Read a directory (all its clusters) into memory; caller frees. */
+/* Read a directory (all its clusters) into memory; caller frees. No more of
+ * it than a folder can be, and none at all of one whose chain of clusters
+ * comes round again (the walk is given up: the kernel's takes over): a loop
+ * was followed 4,096 clusters round, 128 MB at 32 KB a cluster, and its files
+ * reported as many times. Given up too when a read fails or there's no
+ * memory: the folder ended there, looked short, and fatwalk still said 0, so
+ * the songs past that point were later dropped as gone. */
 static uint8_t *read_dir(fw_t *f, uint32_t cluster, size_t *len)
 {
     uint8_t *buf = NULL;
     size_t n = 0;
-    for (int guard = 0; cluster >= 2 && cluster < 0x0FFFFFF8 && guard < 4096; guard++) {
-        if (cluster - 2 >= f->nclusters) break;
+    uint32_t mark = cluster, steps = 0, lap = 1;   /* a cluster passed, to meet again in a loop (moved on by doubling steps) */
+    *len = 0;
+    while (cluster >= 2 && cluster < 0x0FFFFFF8 && n + f->cluster_bytes <= DIR_MAX) {
+        if (cluster - 2 >= f->nclusters) goto fail;   /* (a chain that leaves the card: damage, not the folder's end) */
         uint8_t *nb = realloc(buf, n + f->cluster_bytes);
-        if (!nb) break;
+        if (!nb) goto fail;
         buf = nb;
         /* A piece at a time, up to the entry that ends the folder: an album's
          * dozen files take a kilobyte or two of a 32 KB cluster, and reading
          * all of it, for each of thousands of folders, was most of a walk. */
         uint64_t at = (uint64_t)(f->data_start + (cluster - 2) * f->spc) * f->bps;
         uint32_t got = 0;
-        int ended = 0, bad = 0;
+        int ended = 0;
         while (got < f->cluster_bytes && !ended) {
             uint32_t piece = f->cluster_bytes - got < DIR_PIECE ? f->cluster_bytes - got : DIR_PIECE;
-            if (rd(f, at + got, buf + n + got, piece)) { bad = 1; break; }
+            if (rd(f, at + got, buf + n + got, piece)) goto fail;
             for (uint32_t o = 0; o + 32 <= piece; o += 32)
                 if (buf[n + got + o] == 0x00) { ended = 1; break; }
             got += piece;
         }
-        if (bad) break;
         if (got < f->cluster_bytes) memset(buf + n + got, 0, f->cluster_bytes - got);   /* (past its end: none) */
         n += f->cluster_bytes;
         if (ended) break;
         cluster = next_cluster(f, cluster);
+        if (f->failed || cluster == mark) goto fail;
+        if (++steps == lap) { mark = cluster; steps = 0; lap *= 2; }
     }
     *len = n;
     return buf;
+fail:
+    f->failed = f->stop = 1;
+    free(buf);
+    return NULL;
 }
 
 /* A folder's subfolders, gone into once its own files are given, in name
@@ -167,45 +227,23 @@ static void walk_dir(fw_t *f, uint32_t cluster, const char *path, int depth)
     if (!d) return;
     subdir_t *sub = NULL;
     int nsub = 0, capsub = 0;
-    uint16_t lfn[20 * 13 + 1];
-    int lfn_n = -1;               /* pieces expected; -1 = none collected */
-    uint8_t lfn_sum = 0;
-    int lfn_max = 0;
+    lfn_t lfn;
+    lfn.n = -1;
+    lfn.max = 0;
+    lfn.sum = 0;
     for (size_t off = 0; off + 32 <= len && !f->stop; off += 32) {
         const uint8_t *e = d + off;
         if (e[0] == 0x00) break;                 /* end of directory */
-        if (e[0] == 0xe5) { lfn_n = -1; continue; }
-        if (e[11] == 0x0f) {                     /* a long-name piece */
-            int ord = e[0] & 0x1f;
-            if (e[0] & 0x40) { lfn_n = ord; lfn_max = ord; lfn_sum = e[13]; memset(lfn, 0, sizeof lfn); }
-            if (lfn_n < 1 || ord != lfn_n || e[13] != lfn_sum || ord > 20) { lfn_n = -1; continue; }
-            static const int at[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
-            for (int k = 0; k < 13; k++) lfn[(ord - 1) * 13 + k] = (uint16_t)(e[at[k]] | e[at[k] + 1] << 8);
-            lfn_n = ord - 1;
-            continue;
-        }
-        if (e[11] & 0x08) { lfn_n = -1; continue; }   /* volume label */
+        if (e[0] == 0xe5) { lfn.n = -1; continue; }
+        if (e[11] == 0x0f) { lfn_piece(&lfn, e); continue; }   /* a long-name piece */
+        if (e[11] & 0x08) { lfn.n = -1; continue; }   /* volume label */
         char name[1024];
-        size_t w = 0;
-        if (lfn_n == 0 && sfn_checksum(e) == lfn_sum) {
-            for (int k = 0; k < lfn_max * 13; k++) {
-                uint32_t u = lfn[k];
-                if (u == 0 || u == 0xffff) break;
-                if (u >= 0xd800 && u < 0xdc00 && k + 1 < lfn_max * 13) {
-                    uint32_t lo = lfn[k + 1];
-                    if (lo >= 0xdc00 && lo < 0xe000) { u = 0x10000 + ((u - 0xd800) << 10) + (lo - 0xdc00); k++; }
-                }
-                utf8_put(name, sizeof name, &w, u);
-            }
-            name[w] = '\0';
-        } else {
-            short_name(e, name, sizeof name);
-        }
-        lfn_n = -1;
+        entry_name(&lfn, e, name, sizeof name);
+        lfn.n = -1;
         if (name[0] == '.' || !name[0]) continue;     /* ".", "..", hidden: as walk() */
         char p[2048];
         snprintf(p, sizeof p, "%s/%s", path, name);
-        uint32_t c = (uint32_t)(e[20] | e[21] << 8) << 16 | (uint32_t)(e[26] | e[27] << 8);
+        uint32_t c = entry_cluster(e);
         if (e[11] & 0x10) {
             if (nsub == capsub) {
                 int nc = capsub ? capsub * 2 : 32;
@@ -217,9 +255,8 @@ static void walk_dir(fw_t *f, uint32_t cluster, const char *path, int depth)
             if ((sub[nsub].name = strdup(name))) sub[nsub++].cluster = c;
             else walk_dir(f, c, p, depth + 1);
         } else {
-            uint32_t size;
-            memcpy(&size, e + 28, 4);
-            int64_t mt = fat_time((uint16_t)(e[24] | e[25] << 8), (uint16_t)(e[22] | e[23] << 8));
+            uint32_t size = le32(e + 28);
+            int64_t mt = fat_time((uint16_t)le16(e + 24), (uint16_t)le16(e + 22));
             if (g_entry_fn) g_entry_fn(p, c, c >= 2 && c - 2 < f->nclusters ? next_cluster(f, c) : 0xFFFFFFFFu, size, g_entry_ctx);
             if (f->cb(p, mt, size, f->ctx)) f->stop = 1;
         }
@@ -244,33 +281,19 @@ static uint32_t find(fw_t *f, uint32_t cluster, const char *name)
     uint8_t *d = read_dir(f, cluster, &len);
     if (!d) return 0;
     uint32_t found = 0;
-    uint16_t lfn[20 * 13 + 1];
-    int lfn_n = -1, lfn_max = 0;
-    uint8_t lfn_sum = 0;
+    lfn_t lfn;
+    lfn.n = -1;
+    lfn.max = 0;
+    lfn.sum = 0;
     for (size_t off = 0; off + 32 <= len && !found; off += 32) {
         const uint8_t *e = d + off;
         if (e[0] == 0x00) break;
-        if (e[0] == 0xe5) { lfn_n = -1; continue; }
-        if (e[11] == 0x0f) {
-            int ord = e[0] & 0x1f;
-            if (e[0] & 0x40) { lfn_n = ord; lfn_max = ord; lfn_sum = e[13]; memset(lfn, 0, sizeof lfn); }
-            if (lfn_n < 1 || ord != lfn_n || e[13] != lfn_sum || ord > 20) { lfn_n = -1; continue; }
-            static const int at[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
-            for (int k = 0; k < 13; k++) lfn[(ord - 1) * 13 + k] = (uint16_t)(e[at[k]] | e[at[k] + 1] << 8);
-            lfn_n = ord - 1;
-            continue;
-        }
+        if (e[0] == 0xe5) { lfn.n = -1; continue; }
+        if (e[11] == 0x0f) { lfn_piece(&lfn, e); continue; }
         char nm[1024];
-        size_t w = 0;
-        if (lfn_n == 0 && sfn_checksum(e) == lfn_sum) {
-            for (int k = 0; k < lfn_max * 13 && lfn[k] && lfn[k] != 0xffff; k++) utf8_put(nm, sizeof nm, &w, lfn[k]);
-            nm[w] = '\0';
-        } else {
-            short_name(e, nm, sizeof nm);
-        }
-        lfn_n = -1;
-        if ((e[11] & 0x10) && !strcmp(nm, name))
-            found = (uint32_t)(e[20] | e[21] << 8) << 16 | (uint32_t)(e[26] | e[27] << 8);
+        entry_name(&lfn, e, nm, sizeof nm);
+        lfn.n = -1;
+        if ((e[11] & 0x10) && !strcmp(nm, name)) found = entry_cluster(e);
     }
     free(d);
     return found;
@@ -286,15 +309,14 @@ int fatwalk(const char *dev, const char *mount, const char *rel, fatwalk_cb cb, 
     uint8_t bs[512];
     int rc = -1;
     if (rd(&f, 0, bs, sizeof bs) || bs[510] != 0x55 || bs[511] != 0xaa || memcmp(bs + 82, "FAT32", 5)) goto out;
-    f.bps = (uint32_t)(bs[11] | bs[12] << 8);
+    f.bps = le16(bs + 11);
     f.spc = bs[13];
-    uint32_t reserved = (uint32_t)(bs[14] | bs[15] << 8), nfats = bs[16], fatsz, total;
-    memcpy(&fatsz, bs + 36, 4);
-    memcpy(&total, bs + 32, 4);
-    memcpy(&f.root, bs + 44, 4);
+    uint32_t reserved = le16(bs + 14), nfats = bs[16], fatsz = le32(bs + 36), total = le32(bs + 32);
+    f.root = le32(bs + 44);
     if (f.bps != 512 || !f.spc || !nfats || !fatsz) goto out;
     f.fat_start = reserved;
     f.data_start = reserved + nfats * fatsz;
+    if (total <= f.data_start) goto out;        /* (no room for data: the count of clusters would wrap) */
     f.cluster_bytes = f.bps * f.spc;
     f.nclusters = (total - f.data_start) / f.spc;
     uint32_t c = f.root;
@@ -311,7 +333,7 @@ int fatwalk(const char *dev, const char *mount, const char *rel, fatwalk_cb cb, 
         }
     }
     walk_dir(&f, c, base, 0);
-    rc = 0;
+    rc = f.failed ? -1 : 0;
 out:
     close(f.fd);
     return rc;
